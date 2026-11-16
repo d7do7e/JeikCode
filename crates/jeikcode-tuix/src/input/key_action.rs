@@ -13,6 +13,8 @@ pub enum Action {
     Complete,
     CursorLeft,
     CursorRight,
+    CursorWordLeft,
+    CursorWordRight,
     LineStart,
     LineEnd,
     HistoryPrev,
@@ -128,14 +130,20 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         (KeyCode::Char('?'), true) => Action::DeleteForward,
         (KeyCode::Char(c), false) => Action::Insert(c),
         (KeyCode::Tab, _) => Action::Complete,
-        (KeyCode::Left, _) => Action::CursorLeft,
-        (KeyCode::Right, _) => Action::CursorRight,
+        (KeyCode::Left, true) => Action::CursorWordLeft,
+        (KeyCode::Left, false) if alt => Action::CursorWordLeft,
+        (KeyCode::Left, false) => Action::CursorLeft,
+        (KeyCode::Right, true) => Action::CursorWordRight,
+        (KeyCode::Right, false) if alt => Action::CursorWordRight,
+        (KeyCode::Right, false) => Action::CursorRight,
         (KeyCode::Home, _) => Action::LineStart,
         (KeyCode::End, _) => Action::LineEnd,
         (KeyCode::Up, _) => Action::HistoryPrev,
         (KeyCode::Down, _) => Action::HistoryNext,
         (KeyCode::Esc, _) => Action::Cancel,
-        (KeyCode::Backspace, _) => Action::Backspace,
+        (KeyCode::Backspace, true) => Action::DeleteWordBackward,
+        (KeyCode::Backspace, false) if alt => Action::DeleteWordBackward,
+        (KeyCode::Backspace, false) => Action::Backspace,
         (KeyCode::Delete, _) => Action::DeleteForward,
         _ => Action::NoOp,
     }
@@ -315,8 +323,33 @@ mod tests {
     fn backspace_and_delete() {
         assert_eq!(k(KeyCode::Backspace, KeyModifiers::NONE), Action::Backspace);
         assert_eq!(
+            k(KeyCode::Backspace, KeyModifiers::CONTROL),
+            Action::DeleteWordBackward
+        );
+        assert_eq!(
+            k(KeyCode::Backspace, KeyModifiers::ALT),
+            Action::DeleteWordBackward
+        );
+        assert_eq!(
             k(KeyCode::Delete, KeyModifiers::NONE),
             Action::DeleteForward
+        );
+    }
+
+    #[test]
+    fn ctrl_and_alt_arrows_move_by_word() {
+        assert_eq!(
+            k(KeyCode::Left, KeyModifiers::CONTROL),
+            Action::CursorWordLeft
+        );
+        assert_eq!(
+            k(KeyCode::Right, KeyModifiers::CONTROL),
+            Action::CursorWordRight
+        );
+        assert_eq!(k(KeyCode::Left, KeyModifiers::ALT), Action::CursorWordLeft);
+        assert_eq!(
+            k(KeyCode::Right, KeyModifiers::ALT),
+            Action::CursorWordRight
         );
     }
 

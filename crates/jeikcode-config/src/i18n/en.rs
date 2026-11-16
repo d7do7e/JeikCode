@@ -90,12 +90,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Tab                              Accept slash-command or file completion
     Backspace / Ctrl+H               Delete previous char
     Delete / Ctrl+?                  Delete next char
-    Ctrl+W                           Delete word backward
+    Ctrl+W / Ctrl+Backspace / Alt+Backspace  Delete word backward
     Ctrl+U                           Clear current line
     Ctrl+K                           Delete to end of line
     Ctrl+A / Home                    Jump to line start
     Ctrl+E / End                     Jump to line end
     Left / Right                     Move cursor
+    Ctrl+Left / Ctrl+Right           Move cursor by word (also Alt+Left / Alt+Right)
 
   ── History ──
     Up / Down                        Previous / next input

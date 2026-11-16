@@ -89,12 +89,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Tab                              接受斜杠菜单、文件路径等补全
     Backspace / Ctrl+H               删除上一个字符
     Delete / Ctrl+?                  删除下一个字符
-    Ctrl+W                           删除前一个单词
+    Ctrl+W / Ctrl+Backspace / Alt+Backspace  删除前一个单词
     Ctrl+U                           清空当前行
     Ctrl+K                           删除到行尾
     Ctrl+A / Home                    跳到行首
     Ctrl+E / End                     跳到行尾
     Left / Right                     光标左右移动
+    Ctrl+Left / Ctrl+Right           按单词左右移动光标（也支持 Alt+Left / Alt+Right）
 
   ── 历史 ──
     Up / Down                        上一条 / 下一条输入

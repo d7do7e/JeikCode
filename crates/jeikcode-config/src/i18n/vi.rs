@@ -87,12 +87,13 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
     Tab                              Chấp nhận gợi ý lệnh hoặc tệp
     Backspace / Ctrl+H               Xóa ký tự trước
     Delete / Ctrl+?                  Xóa ký tự sau
-    Ctrl+W                           Xóa từ phía trước
+    Ctrl+W / Ctrl+Backspace / Alt+Backspace  Xóa từ phía trước
     Ctrl+U                           Xóa dòng hiện tại
     Ctrl+K                           Xóa tới cuối dòng
     Ctrl+A / Home                    Về đầu dòng
     Ctrl+E / End                     Tới cuối dòng
     Left / Right                     Di chuyển con trỏ
+    Ctrl+Left / Ctrl+Right           Di chuyển con trỏ theo từ (hoặc Alt+Left / Alt+Right)
 
   ── Lịch sử ──
     Up / Down                        Nội dung nhập trước / sau

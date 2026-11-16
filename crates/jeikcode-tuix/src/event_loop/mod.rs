@@ -4168,6 +4168,155 @@ impl Buffer {
         self.pastes.clear();
     }
 
+    /// Return byte ranges `(start, end)` of every active `[Pasted #N ...]`
+    /// placeholder in `self.text` that resolves to `1..=self.pastes.len()`.
+    fn active_paste_spans(&self) -> Vec<(usize, usize)> {
+        if self.pastes.is_empty() {
+            return Vec::new();
+        }
+        let mut spans = Vec::new();
+        let mut offset = 0usize;
+        while let Some(rel) = self.text[offset..].find("[Pasted #") {
+            let start = offset + rel;
+            if let Some(end) = parse_paste_placeholder_at(&self.text, start, self.pastes.len()) {
+                spans.push((start, end));
+                offset = end;
+            } else {
+                offset = start + "[Pasted #".len();
+            }
+        }
+        spans
+    }
+
+    fn paste_span_ending_or_inside(&self, pos: usize) -> Option<(usize, usize)> {
+        self.active_paste_spans()
+            .into_iter()
+            .find(|&(start, end)| start < pos && pos <= end)
+    }
+
+    fn paste_span_starting_or_inside(&self, pos: usize) -> Option<(usize, usize)> {
+        self.active_paste_spans()
+            .into_iter()
+            .find(|&(start, end)| start <= pos && pos < end)
+    }
+
+    fn clear_pastes_if_unused(&mut self) {
+        if !self.pastes.is_empty() && self.active_paste_spans().is_empty() {
+            self.pastes.clear();
+        }
+    }
+
+    fn prev_word_boundary(&self, cursor: usize) -> usize {
+        if cursor == 0 {
+            return 0;
+        }
+        let spans = self.active_paste_spans();
+        if let Some((start, _)) = spans
+            .iter()
+            .copied()
+            .find(|&(s, e)| s < cursor && cursor <= e)
+        {
+            return start;
+        }
+        let mut p = cursor;
+        let first_prev = prev_boundary(&self.text, p);
+        if &self.text[first_prev..p] == "\n" {
+            return first_prev;
+        }
+        while p > 0 {
+            if spans.iter().any(|&(s, e)| s < p && p <= e) {
+                break;
+            }
+            let prev = prev_boundary(&self.text, p);
+            let ch = self.text[prev..p].chars().next().unwrap_or(' ');
+            if ch == '\n' || !ch.is_whitespace() {
+                break;
+            }
+            p = prev;
+        }
+        if p == 0 {
+            return 0;
+        }
+        if let Some((start, _)) = spans.iter().copied().find(|&(s, e)| s < p && p <= e) {
+            return start;
+        }
+        let prev = prev_boundary(&self.text, p);
+        let ch = self.text[prev..p].chars().next().unwrap_or(' ');
+        if ch == '\n' {
+            return p;
+        }
+        let target_class = classify_word_char(ch);
+        p = prev;
+        while p > 0 {
+            if spans.iter().any(|&(s, e)| s < p && p <= e) {
+                break;
+            }
+            let prev = prev_boundary(&self.text, p);
+            let ch = self.text[prev..p].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() || classify_word_char(ch) != target_class {
+                break;
+            }
+            p = prev;
+        }
+        p
+    }
+
+    fn next_word_boundary(&self, cursor: usize) -> usize {
+        let len = self.text.len();
+        if cursor >= len {
+            return len;
+        }
+        let spans = self.active_paste_spans();
+        if let Some((_, end)) = spans
+            .iter()
+            .copied()
+            .find(|&(s, e)| s <= cursor && cursor < e)
+        {
+            return end;
+        }
+        let mut p = cursor;
+        let first_next = next_boundary(&self.text, p);
+        if &self.text[p..first_next] == "\n" {
+            return first_next;
+        }
+        while p < len {
+            if spans.iter().any(|&(s, e)| s <= p && p < e) {
+                break;
+            }
+            let next = next_boundary(&self.text, p);
+            let ch = self.text[p..next].chars().next().unwrap_or(' ');
+            if ch == '\n' || !ch.is_whitespace() {
+                break;
+            }
+            p = next;
+        }
+        if p >= len {
+            return len;
+        }
+        if let Some((_, end)) = spans.iter().copied().find(|&(s, e)| s <= p && p < e) {
+            return end;
+        }
+        let next = next_boundary(&self.text, p);
+        let ch = self.text[p..next].chars().next().unwrap_or(' ');
+        if ch == '\n' {
+            return p;
+        }
+        let target_class = classify_word_char(ch);
+        p = next;
+        while p < len {
+            if spans.iter().any(|&(s, e)| s <= p && p < e) {
+                break;
+            }
+            let next = next_boundary(&self.text, p);
+            let ch = self.text[p..next].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() || classify_word_char(ch) != target_class {
+                break;
+            }
+            p = next;
+        }
+        p
+    }
+
     /// Current buffer text with every `[Pasted #N …]` placeholder expanded
     /// back to its original contents. Modals that consume `text` directly
     /// (instead of going through the Submit/Commit path, which expands at
@@ -4260,11 +4409,12 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteWordBackward => {
-                let before = &self.text[..self.cursor];
-                let trimmed = before.trim_end_matches(' ');
-                let word_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                self.text.drain(word_start..self.cursor);
-                self.cursor = word_start;
+                if self.cursor > 0 {
+                    let word_start = self.prev_word_boundary(self.cursor);
+                    self.text.drain(word_start..self.cursor);
+                    self.cursor = word_start;
+                    self.clear_pastes_if_unused();
+                }
                 BufferResult::Redraw
             }
             Action::DeleteToEnd => {
@@ -4273,32 +4423,67 @@ impl Buffer {
                     .map(|i| self.cursor + i)
                     .unwrap_or(self.text.len());
                 self.text.drain(self.cursor..end);
+                self.clear_pastes_if_unused();
                 BufferResult::Redraw
             }
             Action::Backspace => {
                 if self.cursor > 0 {
-                    let p = prev_boundary(&self.text, self.cursor);
-                    self.text.drain(p..self.cursor);
-                    self.cursor = p;
+                    if let Some((start, end)) = self.paste_span_ending_or_inside(self.cursor) {
+                        self.text.drain(start..end);
+                        self.cursor = start;
+                        self.clear_pastes_if_unused();
+                    } else {
+                        let p = prev_boundary(&self.text, self.cursor);
+                        self.text.drain(p..self.cursor);
+                        self.cursor = p;
+                        self.clear_pastes_if_unused();
+                    }
                 }
                 BufferResult::Redraw
             }
             Action::DeleteForward => {
                 if self.cursor < self.text.len() {
-                    let n = next_boundary(&self.text, self.cursor);
-                    self.text.drain(self.cursor..n);
+                    if let Some((start, end)) = self.paste_span_starting_or_inside(self.cursor) {
+                        self.text.drain(start..end);
+                        self.cursor = start;
+                        self.clear_pastes_if_unused();
+                    } else {
+                        let n = next_boundary(&self.text, self.cursor);
+                        self.text.drain(self.cursor..n);
+                        self.clear_pastes_if_unused();
+                    }
                 }
                 BufferResult::Redraw
             }
             Action::CursorLeft => {
                 if self.cursor > 0 {
-                    self.cursor = prev_boundary(&self.text, self.cursor);
+                    if let Some((start, _)) = self.paste_span_ending_or_inside(self.cursor) {
+                        self.cursor = start;
+                    } else {
+                        self.cursor = prev_boundary(&self.text, self.cursor);
+                    }
                 }
                 BufferResult::Redraw
             }
             Action::CursorRight => {
                 if self.cursor < self.text.len() {
-                    self.cursor = next_boundary(&self.text, self.cursor);
+                    if let Some((_, end)) = self.paste_span_starting_or_inside(self.cursor) {
+                        self.cursor = end;
+                    } else {
+                        self.cursor = next_boundary(&self.text, self.cursor);
+                    }
+                }
+                BufferResult::Redraw
+            }
+            Action::CursorWordLeft => {
+                if self.cursor > 0 {
+                    self.cursor = self.prev_word_boundary(self.cursor);
+                }
+                BufferResult::Redraw
+            }
+            Action::CursorWordRight => {
+                if self.cursor < self.text.len() {
+                    self.cursor = self.next_word_boundary(self.cursor);
                 }
                 BufferResult::Redraw
             }
@@ -4879,6 +5064,118 @@ mod buffer_tests {
         b.insert_paste(big.clone());
         assert!(b.text.contains("[Pasted #1 +10 lines]"));
         assert_eq!(b.pastes, vec![big]);
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_paste_placeholder_atomically() {
+        let reg = CommandRegistry::builtin();
+        let history = Vec::new();
+        let mut b = Buffer::new();
+        b.insert_paste("line\n".repeat(65));
+        assert_eq!(b.text, "[Pasted #1 +65 lines]");
+        b.apply(Action::Backspace, &history, &reg);
+        assert_eq!(b.text, "");
+        assert_eq!(b.cursor, 0);
+        assert!(b.pastes.is_empty());
+
+        // Single-line char-count placeholder via DeleteForward from start.
+        b.insert_paste("x".repeat(450));
+        assert_eq!(b.text, "[Pasted #1 450 chars]");
+        b.apply(Action::LineStart, &history, &reg);
+        assert_eq!(b.cursor, 0);
+        b.apply(Action::DeleteForward, &history, &reg);
+        assert_eq!(b.text, "");
+        assert_eq!(b.cursor, 0);
+        assert!(b.pastes.is_empty());
+    }
+
+    #[test]
+    fn cursor_navigation_and_multi_paste_deletion_preserve_remaining_paste() {
+        let reg = CommandRegistry::builtin();
+        let history = Vec::new();
+        let mut b = Buffer::new();
+        b.insert_paste("first\n".repeat(6));
+        b.insert_paste("second\n".repeat(7));
+        assert_eq!(b.text, "[Pasted #1 +6 lines][Pasted #2 +7 lines]");
+
+        // One Left jumps across #2 atomically; one more jumps across #1.
+        b.apply(Action::CursorLeft, &history, &reg);
+        assert_eq!(b.cursor, "[Pasted #1 +6 lines]".len());
+        b.apply(Action::CursorLeft, &history, &reg);
+        assert_eq!(b.cursor, 0);
+
+        // One Right jumps across #1; Backspace deletes #1 while keeping #2 valid.
+        b.apply(Action::CursorRight, &history, &reg);
+        assert_eq!(b.cursor, "[Pasted #1 +6 lines]".len());
+        b.apply(Action::Backspace, &history, &reg);
+        assert_eq!(b.text, "[Pasted #2 +7 lines]");
+        assert_eq!(b.cursor, 0);
+        assert_eq!(b.expanded_text(), "second\n".repeat(7));
+    }
+
+    #[test]
+    fn word_delete_and_word_navigation_cover_words_punct_newlines_and_pastes() {
+        let reg = CommandRegistry::builtin();
+        let history = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "alpha beta/gamma\n  delta".to_string();
+        b.cursor = b.text.len();
+
+        // Word-left navigation.
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/gamma\n  ".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/gamma\n".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/gamma".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "alpha ".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, 0);
+
+        // Word-right navigation.
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "alpha".len());
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta".len());
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/".len());
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/gamma".len());
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "alpha beta/gamma\n".len());
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, b.text.len());
+
+        // Word-backward deletion.
+        b.apply(Action::DeleteWordBackward, &history, &reg);
+        assert_eq!(b.text, "alpha beta/gamma\n  ");
+        b.apply(Action::DeleteWordBackward, &history, &reg);
+        assert_eq!(b.text, "alpha beta/gamma\n");
+        b.apply(Action::DeleteWordBackward, &history, &reg);
+        assert_eq!(b.text, "alpha beta/gamma");
+        b.apply(Action::DeleteWordBackward, &history, &reg);
+        assert_eq!(b.text, "alpha beta/");
+
+        // Word deletion & navigation over an atomic paste placeholder.
+        b.text.clear();
+        b.cursor = 0;
+        b.insert_paste("x\n".repeat(10));
+        b.text.push_str(" tail");
+        b.cursor = b.text.len();
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, "[Pasted #1 +10 lines] ".len());
+        b.apply(Action::CursorWordLeft, &history, &reg);
+        assert_eq!(b.cursor, 0);
+        b.apply(Action::CursorWordRight, &history, &reg);
+        assert_eq!(b.cursor, "[Pasted #1 +10 lines]".len());
+        b.apply(Action::DeleteWordBackward, &history, &reg);
+        assert_eq!(b.text, " tail");
+        assert!(b.pastes.is_empty());
     }
 
     #[test]
@@ -7730,6 +8027,54 @@ fn next_boundary(s: &str, mut p: usize) -> usize {
         p += 1;
     }
     p
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Punct,
+}
+
+fn classify_word_char(c: char) -> WordClass {
+    if c.is_alphanumeric() || c == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punct
+    }
+}
+
+/// If `s[start..]` begins with an exact `[Pasted #N +M lines]` or
+/// `[Pasted #N C chars]` placeholder whose `N` falls in `1..=paste_count`,
+/// return the exclusive byte offset immediately after `']'`.
+fn parse_paste_placeholder_at(s: &str, start: usize, paste_count: usize) -> Option<usize> {
+    let tail = s.get(start..)?.strip_prefix("[Pasted #")?;
+    let space_rel = tail.find(' ')?;
+    let id_str = &tail[..space_rel];
+    if id_str.is_empty() || !id_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let id = id_str.parse::<usize>().ok()?;
+    if id < 1 || id > paste_count {
+        return None;
+    }
+    let after_space = &tail[space_rel + 1..];
+    let close_rel = after_space.find(']')?;
+    let body = &after_space[..close_rel];
+    let valid_body = if let Some(lines) = body
+        .strip_prefix('+')
+        .and_then(|b| b.strip_suffix(" lines"))
+    {
+        !lines.is_empty() && lines.bytes().all(|b| b.is_ascii_digit())
+    } else if let Some(chars) = body.strip_suffix(" chars") {
+        !chars.is_empty() && chars.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        false
+    };
+    if valid_body {
+        Some(start + "[Pasted #".len() + space_rel + 1 + close_rel + 1)
+    } else {
+        None
+    }
 }
 
 /// All the per-session UI state that flows through key/event handlers.
@@ -11106,7 +11451,7 @@ fn handle_input(
                 handle_input(app, ctx, renderer, ev)?;
             }
         }
-        InputEvent::Paste(text) => {
+        InputEvent::Paste(mut text) => {
             // Route paste to the active modal when one is installed — the
             // provider/model/session wizards all have text-input steps
             // where pasting URLs / API keys / tokens is the natural UX.
@@ -11194,6 +11539,28 @@ fn handle_input(
                 if attach_image_to_input(app, ctx, renderer, image_paste)? {
                     return Ok(());
                 }
+                // Coalesce any consecutive text-paste events already queued in
+                // `input_rx` (e.g., if a huge paste stalled past the reader's
+                // bridging window while the UI was busy). Stop if a queued
+                // event is not a plain text paste, and dispatch it right after.
+                const EVENT_LOOP_PASTE_CAP: usize = 4 * 1024 * 1024;
+                let mut deferred: Vec<InputEvent> = Vec::new();
+                while text.len() < EVENT_LOOP_PASTE_CAP {
+                    match ctx.input_rx.try_recv() {
+                        Ok(InputEvent::Paste(next_text))
+                            if !next_text.trim().is_empty()
+                                && try_attach_image_from_path(&next_text).is_none() =>
+                        {
+                            text.push_str(&next_text);
+                        }
+                        Ok(InputEvent::Key(k)) if k.kind == KeyEventKind::Release => {}
+                        Ok(other) => {
+                            deferred.push(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
@@ -11206,6 +11573,9 @@ fn handle_input(
                     );
                 } else {
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                for ev in deferred {
+                    handle_input(app, ctx, renderer, ev)?;
                 }
             }
         }
@@ -12277,6 +12647,7 @@ fn handle_idle_key(
                 // Close menu by clearing buffer.
                 app.buf.text.clear();
                 app.buf.cursor = 0;
+                app.buf.clear_pastes();
                 app.menu.selected = 0;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -14420,6 +14791,7 @@ fn handle_streaming_key(
         if !app.buf.text.is_empty() {
             app.buf.text.clear();
             app.buf.cursor = 0;
+            app.buf.clear_pastes();
             app.menu.selected = 0;
             draw_spinner_now(
                 &mut app.state,

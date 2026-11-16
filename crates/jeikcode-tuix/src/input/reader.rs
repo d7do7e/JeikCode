@@ -37,9 +37,13 @@ use super::InputEvent;
 ///     fallback. 4 ms covers occasional 2-3 ms gaps on slow SSH sessions.
 const BURST_PENDING_TIMEOUT_MS: u64 = 4;
 #[cfg(target_os = "windows")]
-const BURST_ACTIVE_TIMEOUT_MS: u64 = 15;
+const BURST_ACTIVE_TIMEOUT_MS: u64 = 60;
 #[cfg(not(target_os = "windows"))]
-const BURST_ACTIVE_TIMEOUT_MS: u64 = 4;
+const BURST_ACTIVE_TIMEOUT_MS: u64 = 15;
+
+/// Upper bound on a single coalesced paste payload (both char-burst fallback
+/// and bracketed `Event::Paste` chunking).
+const PASTE_CAP: usize = 4 * 1024 * 1024;
 
 /// If a Key event could plausibly be part of a paste burst, return the
 /// character it contributes. Enter maps to `\n`, Tab to `\t`, Char(c) to
@@ -509,7 +513,6 @@ fn run(
         if let Some(c0) = paste_candidate_char(&ev) {
             let mut chars = vec![c0];
             let mut trailing: Option<Event> = None;
-            const BATCH_CAP: usize = 8192;
             // Two-stage burst detection (see BURST_*_TIMEOUT_MS): the first
             // peek uses the short PENDING window so a lone keystroke — the
             // common case — is emitted with near-zero latency instead of
@@ -517,7 +520,7 @@ fn run(
             // Only once a 2nd candidate char confirms a burst do we widen to
             // the longer ACTIVE window to bridge chunked paste records.
             let mut burst_confirmed = false;
-            while chars.len() < BATCH_CAP {
+            while chars.len() < PASTE_CAP {
                 let timeout_ms = if burst_confirmed {
                     BURST_ACTIVE_TIMEOUT_MS
                 } else {
@@ -651,9 +654,8 @@ fn run(
                 }
                 continue;
             }
-            // 16 MiB ceiling: a pathologically large paste that keeps arriving
+            // 4 MiB ceiling: a pathologically large paste that keeps arriving
             // can't wedge the reader indefinitely; we ship what we have.
-            const PASTE_CAP: usize = 16 * 1024 * 1024;
             let (payload, trailing) = coalesce_paste(first, PASTE_CAP, || {
                 match event::poll(Duration::from_millis(BURST_ACTIVE_TIMEOUT_MS)) {
                     Ok(true) => event::read().ok(),
@@ -808,6 +810,10 @@ fn coalesce_paste(
     while payload.len() < cap {
         match next() {
             Some(Event::Paste(p)) => payload.push_str(&p),
+            // Key-release events (e.g. releasing Ctrl/V on Windows right as
+            // the terminal starts streaming bracketed paste chunks) are noise
+            // and must not split the paste into multiple placeholders.
+            Some(Event::Key(k)) if k.kind == KeyEventKind::Release => continue,
             Some(other) => {
                 trailing = Some(other);
                 break;
@@ -875,6 +881,33 @@ mod tests {
         let (out, trailing) = coalesce_paste("solo".to_string(), 1 << 20, || None);
         assert_eq!(out, "solo");
         assert!(trailing.is_none());
+    }
+
+    /// Releasing Ctrl/V right as the terminal starts streaming bracketed-paste
+    /// chunks must not split the paste into multiple placeholders.
+    #[test]
+    fn paste_coalesce_ignores_key_release_events() {
+        let mut evs = vec![
+            Event::Paste("chunk1\n".to_string()),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+            Event::Paste("chunk2\n".to_string()),
+        ]
+        .into_iter();
+        let (out, trailing) = coalesce_paste("head\n".to_string(), 1 << 20, || evs.next());
+        assert_eq!(out, "head\nchunk1\nchunk2\n");
+        assert!(trailing.is_none());
+    }
+
+    #[test]
+    fn paste_cap_allows_large_multi_line_pastes() {
+        assert!(
+            PASTE_CAP >= 1024 * 1024,
+            "PASTE_CAP ({PASTE_CAP}) must hold large pastes without splitting at 8 KiB"
+        );
     }
 
     /// Pause/Resume round trip without touching crossterm — feeds commands
@@ -991,27 +1024,27 @@ mod tests {
     }
 
     /// Lock the Windows-specific tuned ACTIVE value. PowerShell / Windows
-    /// Terminal stdin chunks have 5-12 ms gaps; if a future edit
-    /// collapses Windows to the Unix baseline (4 ms), the original
-    /// Ctrl+V fragmentation bug returns.
+    /// Terminal / ConPTY stdin chunks can have multi-millisecond gaps; 60 ms
+    /// matches prior-art burst detectors and avoids splitting large pastes
+    /// into multiple `[Pasted #N]` placeholders.
     #[cfg(target_os = "windows")]
     #[test]
     fn burst_active_timeout_windows_is_tuned_value() {
         assert_eq!(
-            BURST_ACTIVE_TIMEOUT_MS, 15,
-            "Windows requires the tuned 15ms value, not the Unix baseline"
+            BURST_ACTIVE_TIMEOUT_MS, 60,
+            "Windows requires the tuned 60ms value, not the Unix baseline"
         );
     }
 
-    /// Lock the Unix baseline. 15 ms is the Windows-tuned value and
-    /// would add unnecessary per-keystroke lag for the macOS/Linux
-    /// majority where bracketed paste delivers as a single event.
+    /// Lock the Unix baseline. 15 ms bridges occasional SSH / bracketed-paste
+    /// chunk gaps without adding latency to normal keystrokes (which only pay
+    /// the 4 ms PENDING window).
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn burst_active_timeout_unix_is_baseline() {
         assert_eq!(
-            BURST_ACTIVE_TIMEOUT_MS, 4,
-            "non-Windows targets use the 4ms baseline, not the Windows 15ms"
+            BURST_ACTIVE_TIMEOUT_MS, 15,
+            "non-Windows targets use the 15ms baseline, not the Windows 60ms"
         );
     }
 
