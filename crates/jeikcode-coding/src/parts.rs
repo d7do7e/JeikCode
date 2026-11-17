@@ -285,6 +285,7 @@ pub struct CodingParts {
     /// adds zero overhead (no registration at all).
     pub cc_external_hooks: Option<Arc<CCExternalHooks>>,
     rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
+    pub(crate) git_branch: String,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -922,6 +923,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         subagent_provider,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
+        git_branch: crate::custom_prompts::detect_git_branch(&cfg.working_dir)
+            .unwrap_or_else(|| "(not a git repo)".to_string()),
     })
 }
 
@@ -1255,7 +1258,7 @@ impl CodingParts {
             self.request_user_input_enabled,
             self.review_provider.is_some(),
             Some(&cfg.working_dir),
-            None,
+            Some(&self.git_branch),
             self.session.is_some(),
         );
         [b1, b2, b3, b4]
@@ -1556,7 +1559,7 @@ pub fn assemble(
         parts.request_user_input_enabled,
         parts.review_provider.is_some(),
         Some(&cfg.working_dir),
-        None,
+        Some(&parts.git_branch),
         parts.session.is_some(),
     );
     let mut builder = Agent::builder()
@@ -1689,7 +1692,7 @@ pub fn assemble(
             }
             Arc::new(strategy)
         })
-        .compact_threshold(cfg.effective_compact_threshold())
+        .compact_threshold(cfg.effective_stub_compact_threshold())
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)
@@ -1713,13 +1716,14 @@ pub fn assemble(
     // Live Block 1/2 reconciliation (init.yaml / rules.yaml mtime + working_dir).
     // Wired here rather than `prepare` so a /model swap (assemble-only) rebuilds
     // the hook against the current model, and a /cd reprepare picks up the new cwd.
-    builder = builder.hook(Arc::new(crate::CodingPersonaHook::new(
+    builder = builder.hook(Arc::new(crate::CodingPersonaHook::with_git_branch(
         &cfg.model,
         cfg.preferred_language,
         parts.todo_enabled,
         parts.request_user_input_enabled,
         parts.review_provider.is_some(),
         cfg.working_dir.clone(),
+        parts.git_branch.clone(),
         None,
         parts.session.is_some(),
     )));
@@ -1845,7 +1849,7 @@ pub fn assemble(
 
 const JEIKCODE_PERSONA_PREFIX: &str =
     "You are JeikCode, an AI coding agent by JeikCode running the ";
-const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
+pub(crate) const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
 fn persona_model(text: &str) -> Option<&str> {
     // Legacy snapshots / custom persona templates that still name the model in the prose.

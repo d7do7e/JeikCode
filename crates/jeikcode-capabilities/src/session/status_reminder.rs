@@ -51,10 +51,12 @@ impl StatusReminderHook {
 
     /// Build the `<system-reminder>` body from wall-clock `now` and the turn context. Pure
     /// (clock + ctx injected) so it is unit-testable without a running agent.
+    #[cfg(test)]
     fn render(now: DateTime<Local>, ctx: &TurnCtx) -> String {
         Self::new().render_with_runtime(now, ctx)
     }
 
+    #[cfg(test)]
     fn render_with_runtime(&self, now: DateTime<Local>, ctx: &TurnCtx) -> String {
         let mut lines = Vec::with_capacity(2);
         // Date + weekday only — NO wall-clock time. The minute-level clock made chatty weak
@@ -173,11 +175,11 @@ fn append_background_task_lines(runtime: &BashRuntimeState, lines: &mut Vec<Stri
 #[cfg(feature = "tools")]
 fn active_task_line(t: &ActiveBackgroundTask) -> String {
     let pid_label = if cfg!(windows) { "WinPID" } else { "pid" };
+    let _ = t.uptime_secs;
     format!(
-        "- cmd: `{}` | {pid_label}: {} | status: running | uptime: {}s | stop: {}",
+        "- cmd: `{}` | {pid_label}: {} | status: running | stop: {}",
         t.command,
         t.pid,
-        t.uptime_secs,
         crate::tools::bash_runtime::stop_hint(t.pid)
     )
 }
@@ -203,6 +205,49 @@ impl LifecycleHooks for StatusReminderHook {
         }
         query.text.push_str("\n\n");
         query.text.push_str(&self.render_turn_start(Local::now()));
+    }
+
+    #[cfg(feature = "tools")]
+    async fn pre_request(
+        &self,
+        messages: &mut Vec<jeikcode_kernel::message::Message>,
+        ctx: &TurnCtx,
+    ) {
+        if ctx.round <= 1 {
+            return;
+        }
+        let mut alert_lines = Vec::new();
+        let alerts = self.bash_runtime.drain_background_alerts();
+        if alerts.is_empty() {
+            return;
+        }
+        alert_lines.push("[Background Task Alert]".to_string());
+        for a in alerts {
+            let exit_info = a
+                .exit_code
+                .map(|c| format!("exit code {c}"))
+                .unwrap_or_else(|| "terminated".to_string());
+            alert_lines.push(format!(
+                "- Background command `{}` (pid {}) exited: {exit_info}. \
+                 The status is the wrapper shell's own report, so it also covers an external \
+                 stop — ignore this alert if it was stopped deliberately; otherwise inspect its \
+                 log (path from the start message).",
+                a.command, a.pid
+            ));
+            if !a.error_tail.is_empty() {
+                alert_lines.push("  Recent output:".to_string());
+                for l in a.error_tail.lines() {
+                    alert_lines.push(format!("    {l}"));
+                }
+            }
+        }
+        let wrapped = crate::reminder::system_reminder(&alert_lines.join("\n"));
+        if let Some(last) = messages.last_mut() {
+            if !last.text.is_empty() {
+                last.text.push_str("\n\n");
+            }
+            last.text.push_str(&wrapped);
+        }
     }
 }
 

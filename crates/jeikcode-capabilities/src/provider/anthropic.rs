@@ -511,25 +511,28 @@ fn build_request_body(
 
     let is_official = is_official_anthropic(&cfg.base_url);
     let echo_thinking = policy == ReasoningPolicy::Include;
+    let leading_synthetic_user_blocks = count_leading_synthetic_user_blocks(messages);
     let (system_blocks, mut msgs) = format_messages(messages, echo_thinking, is_official);
     if !system_blocks.is_empty() {
-        // Prompt-cache breakpoints: Anthropic allows at most 4 breakpoints per request.
-        // We set cache_control on Block 1 (idx 0) and Block 2 (idx 1).
-        // Along with tools (last tool) and last history message, this precisely utilizes
-        // the 4-breakpoint budget: [Tools, Block 1, Block 2, Last Message].
-        let mut sys_values: Vec<Value> = Vec::with_capacity(system_blocks.len());
+        // Prompt-cache breakpoints: Anthropic allows at most 4 breakpoints per request:
+        // [1] tools.last(), [2] system.last() (covering all system blocks including
+        // <explore_strategy>), [3] last frozen synthetic-user block in messages[0]
+        // (e.g. <project_instructions>), and [4] messages.last().
+        let sys_len = system_blocks.len();
+        let mut sys_values: Vec<Value> = Vec::with_capacity(sys_len);
         for (idx, text) in system_blocks.into_iter().enumerate() {
             let mut block = json!({
                 "type": "text",
                 "text": text,
             });
-            if idx == 0 || idx == 1 {
+            if idx + 1 == sys_len {
                 block["cache_control"] = json!({ "type": "ephemeral" });
             }
             sys_values.push(block);
         }
         body.insert("system".into(), json!(sys_values));
     }
+    apply_synthetic_user_cache_breakpoint(&mut msgs, leading_synthetic_user_blocks);
     apply_message_cache_breakpoint(&mut msgs);
     body.insert("messages".into(), json!(msgs));
 
@@ -632,6 +635,47 @@ fn build_request_body(
         body.insert("tools".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Count leading frozen synthetic `Role::User` messages (e.g. `<available_skills>`,
+/// `<mcp_server_instructions>`, `<memory>`, `<user_preferences>`, `<project_instructions>`)
+/// immediately after the leading `Role::System` prefix so `messages[0]` can anchor
+/// a dedicated cache breakpoint at the end of the static repo/session prefix.
+fn count_leading_synthetic_user_blocks(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .skip_while(|m| m.role == Role::System)
+        .take_while(|m| {
+            m.role == Role::User
+                && m.synthetic
+                && m.images.is_empty()
+                && !m.text.trim().is_empty()
+                && !crate::compaction::is_compaction_anchor_text(&m.text)
+        })
+        .count()
+}
+
+/// Mark the last frozen synthetic-user content block in `messages[0]` as a cache
+/// breakpoint so multi-turn conversations and >20-block tool loops never lose Anthropic's
+/// 20-block lookback reach into the 10–30 KB static instructions prefix.
+fn apply_synthetic_user_cache_breakpoint(
+    messages: &mut [Value],
+    leading_synthetic_user_blocks: usize,
+) {
+    if leading_synthetic_user_blocks == 0 {
+        return;
+    }
+    let Some(first) = messages.first_mut() else {
+        return;
+    };
+    if let Some(Value::Array(blocks)) = first.get_mut("content") {
+        let target_idx = leading_synthetic_user_blocks - 1;
+        if let Some(block) = blocks.get_mut(target_idx) {
+            if block.is_object() {
+                block["cache_control"] = json!({ "type": "ephemeral" });
+            }
+        }
+    }
 }
 
 /// Mark the last user/assistant content block as a cache breakpoint so the next
@@ -1925,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_segment_system_has_two_cache_breakpoints() {
+    fn multi_segment_system_caches_final_system_and_synthetic_user_prefix() {
         let c = cfg();
         let body = build_request_body(
             "claude-opus-4-8",
@@ -1933,6 +1977,8 @@ mod tests {
                 Message::system("block1"),
                 Message::system("block2"),
                 Message::system("block3"),
+                Message::synthetic_user("<memory>\nm\n</memory>"),
+                Message::synthetic_user("<project_instructions>\np\n</project_instructions>"),
                 Message::user("hi"),
             ],
             &[],
@@ -1942,11 +1988,25 @@ mod tests {
         let sys = body["system"].as_array().expect("system is array");
         assert_eq!(sys.len(), 3);
         assert_eq!(sys[0]["text"], "block1");
-        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert!(sys[0].get("cache_control").is_none());
         assert_eq!(sys[1]["text"], "block2");
-        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+        assert!(sys[1].get("cache_control").is_none());
         assert_eq!(sys[2]["text"], "block3");
-        assert!(sys[2].get("cache_control").is_none());
+        assert_eq!(sys[2]["cache_control"]["type"], "ephemeral");
+
+        let msg0_blocks = body["messages"][0]["content"]
+            .as_array()
+            .expect("merged user content is array");
+        assert_eq!(msg0_blocks.len(), 3);
+        assert!(msg0_blocks[0].get("cache_control").is_none());
+        assert_eq!(
+            msg0_blocks[1]["cache_control"]["type"], "ephemeral",
+            "last frozen synthetic user block must carry cache_control"
+        );
+        assert_eq!(
+            msg0_blocks[2]["cache_control"]["type"], "ephemeral",
+            "last message block must carry cache_control"
+        );
     }
 
     #[test]

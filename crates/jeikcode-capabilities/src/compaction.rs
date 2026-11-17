@@ -70,6 +70,38 @@ impl StubCompaction {
             exempt_read_file,
         }
     }
+
+    pub(crate) fn stub_rewrites_in_range(
+        &self,
+        msgs: &[Message],
+        from: usize,
+        to: usize,
+    ) -> Vec<(usize, String)> {
+        if to <= from {
+            return Vec::new();
+        }
+        let id_to_tool = call_id_to_tool(msgs);
+        let superseded_reads = superseded_read_call_ids(msgs);
+        let mut rewrites: Vec<(usize, String)> = Vec::new();
+        for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
+            if m.role != Role::Tool || m.text.len() <= MIN_COLLAPSE_SIZE {
+                continue;
+            }
+            let call_id = m.tool_call_id.as_deref().unwrap_or("");
+            let tool = id_to_tool
+                .get(call_id)
+                .map(String::as_str)
+                .unwrap_or("tool");
+            if self.exempt_read_file
+                && is_file_read_tool(tool)
+                && !superseded_reads.contains(call_id)
+            {
+                continue;
+            }
+            rewrites.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
+        }
+        rewrites
+    }
 }
 
 #[async_trait]
@@ -80,27 +112,7 @@ impl CompactionStrategy for StubCompaction {
         if boundary <= view.sacred_floor {
             return CompactionPlan::noop(); // nothing older than the kept window
         }
-        let id_to_tool = call_id_to_tool(msgs);
-        let mut rewrites: Vec<(usize, String)> = Vec::new();
-        for (i, m) in msgs.iter().enumerate().take(boundary) {
-            if i < view.sacred_floor {
-                continue; // protected prefix (kernel re-enforces; skip early)
-            }
-            if m.role != Role::Tool || m.text.len() <= MIN_COLLAPSE_SIZE {
-                continue; // not a (big enough) tool result; already-small = idempotent
-            }
-            let tool = m
-                .tool_call_id
-                .as_deref()
-                .and_then(|id| id_to_tool.get(id))
-                .map(String::as_str)
-                .unwrap_or("tool");
-            if self.exempt_read_file && is_file_read_tool(tool) {
-                continue;
-            }
-            // Tool RESULT success = NOT is_error.
-            rewrites.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
-        }
+        let rewrites = self.stub_rewrites_in_range(msgs, view.sacred_floor, boundary);
         if rewrites.is_empty() {
             return CompactionPlan::noop();
         }
@@ -439,11 +451,16 @@ impl OverflowCompaction {
                 return plan;
             }
         };
+        let rewrites = self.inner.stub_rewrites_in_range(
+            msgs,
+            drain_to,
+            active_turn_start(msgs, self.inner.keep_recent_turns),
+        );
         CompactionPlan {
             drain_from: floor,
             drain_to,
             summary,
-            rewrites: Vec::new(),
+            rewrites,
             resume_note: None,
         }
     }
@@ -1071,6 +1088,128 @@ fn call_id_to_tool(msgs: &[Message]) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Identify `tool_call_id`s of older `read` / `read_file` calls whose exact `(path, range)`
+/// (or full-file content) was subsequently re-read by a later non-error `read` call in `msgs`.
+/// Even when `exempt_read_file` is enabled, superseded duplicate reads of the same file slice
+/// can be safely stubbed without losing line-number context.
+fn superseded_read_call_ids(msgs: &[Message]) -> std::collections::HashSet<String> {
+    let mut call_meta: HashMap<String, (String, String)> = HashMap::new();
+    for m in msgs {
+        if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                if is_file_read_tool(&tc.name) {
+                    if let Some(sig) = parse_read_call_signature(&tc.arguments) {
+                        call_meta.insert(tc.id.clone(), sig);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut latest_by_slice: HashMap<(String, String), String> = HashMap::new();
+    let mut latest_full_by_path: HashMap<String, String> = HashMap::new();
+    let mut prior_by_path: HashMap<String, Vec<String>> = HashMap::new();
+    let mut superseded = std::collections::HashSet::new();
+
+    for m in msgs {
+        if m.role != Role::Tool || m.is_error {
+            continue;
+        }
+        let Some(call_id) = m.tool_call_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some((path_key, range_key)) = call_meta
+            .get(call_id)
+            .cloned()
+            .or_else(|| parse_read_footer_signature(&m.text))
+        else {
+            continue;
+        };
+        let is_complete_file = range_key == "full" || m.text.contains("| Complete file.\n");
+
+        if is_complete_file {
+            if let Some(prev_ids) = prior_by_path.get(&path_key) {
+                for prev in prev_ids {
+                    if prev != call_id {
+                        superseded.insert(prev.clone());
+                    }
+                }
+            }
+            if let Some(prev_full) =
+                latest_full_by_path.insert(path_key.clone(), call_id.to_string())
+            {
+                if prev_full != call_id {
+                    superseded.insert(prev_full);
+                }
+            }
+        } else if let Some(prev_id) =
+            latest_by_slice.insert((path_key.clone(), range_key), call_id.to_string())
+        {
+            if prev_id != call_id {
+                superseded.insert(prev_id);
+            }
+        }
+        prior_by_path
+            .entry(path_key)
+            .or_default()
+            .push(call_id.to_string());
+    }
+
+    superseded
+}
+
+fn normalize_read_path_key(raw: &str) -> Option<String> {
+    let clean = raw.trim().replace('\\', "/");
+    let clean = clean.strip_prefix("./").unwrap_or(&clean).trim();
+    if clean.is_empty() {
+        None
+    } else if cfg!(windows) {
+        Some(clean.to_ascii_lowercase())
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+fn parse_read_call_signature(args_json: &str) -> Option<(String, String)> {
+    let v = serde_json::from_str::<serde_json::Value>(args_json).ok()?;
+    let path = v
+        .get("path")
+        .or_else(|| v.get("file_path"))
+        .and_then(|p| p.as_str())
+        .and_then(normalize_read_path_key)?;
+    if let Some(kw) = v
+        .get("keyword")
+        .or_else(|| v.get("key_string"))
+        .and_then(|k| k.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let up = v.get("upward").and_then(|x| x.as_u64()).unwrap_or(25);
+        let down = v.get("downward").and_then(|x| x.as_u64()).unwrap_or(75);
+        return Some((path, format!("kw:{}:{up}:{down}", kw.to_ascii_lowercase())));
+    }
+    let offset = v.get("offset").and_then(|x| x.as_i64()).unwrap_or(1);
+    let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(1500);
+    Some((path, format!("range:{offset}:{limit}")))
+}
+
+fn parse_read_footer_signature(text: &str) -> Option<(String, String)> {
+    let mut file_path = None;
+    let mut showing = None;
+    for line in text.lines().rev().take(6) {
+        if let Some(rest) = line.strip_prefix("File: ") {
+            file_path = normalize_read_path_key(rest);
+        } else if let Some(rest) = line.strip_prefix("Showing lines ") {
+            if rest.contains("| Complete file.") {
+                showing = Some("full".to_string());
+            } else if let Some((range, _)) = rest.split_once(" |") {
+                showing = Some(format!("lines:{}", range.trim()));
+            }
+        }
+    }
+    Some((file_path?, showing.unwrap_or_else(|| "default".to_string())))
 }
 
 /// Recoverable stub for a compacted tool result.
@@ -2734,6 +2873,62 @@ Dependencies verified.
             plan.drain_to > floor,
             "multi-round /goal history must drain older synthetic rounds instead of clamping to floor={floor}, got {:?}",
             plan
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_compaction_stubs_superseded_read_outputs_while_keeping_latest_read() {
+        let read_body_1 = format!(
+            "1→fn alpha() {{}}\n{}\nFile: src/lib.rs\nTotal Lines: 50 | Total Bytes: 1200\nShowing lines 1-50 | Complete file.\n",
+            "x".repeat(800)
+        );
+        let read_body_2 = format!(
+            "1→fn alpha_v2() {{}}\n{}\nFile: src/lib.rs\nTotal Lines: 50 | Total Bytes: 1200\nShowing lines 1-50 | Complete file.\n",
+            "y".repeat(800)
+        );
+        let other_read = format!(
+            "1→fn beta() {{}}\n{}\nFile: src/other.rs\nTotal Lines: 20 | Total Bytes: 900\nShowing lines 1-20 | Complete file.\n",
+            "z".repeat(800)
+        );
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::assistant(
+                "",
+                vec![
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "r1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    },
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "r_other".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src/other.rs"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("r1", &read_body_1, false),
+            Message::tool_result("r_other", &other_read, false),
+            Message::user("turn 2"),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            ),
+            Message::tool_result("r2", &read_body_2, false),
+            Message::user("turn 3 active"),
+        ];
+        let v = view(&msgs, 2);
+        let plan = StubCompaction::default().plan(&v).await;
+        let rewritten_indices: Vec<usize> = plan.rewrites.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(
+            rewritten_indices,
+            vec![3],
+            "superseded read r1 (idx 3) must be stubbed while non-superseded r_other (idx 4) and latest r2 (idx 7) stay exempt"
         );
     }
 }

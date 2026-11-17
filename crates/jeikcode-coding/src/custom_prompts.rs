@@ -141,6 +141,12 @@ fn cache() -> &'static RwLock<PromptCacheState> {
 #[doc(hidden)]
 pub fn invalidate_cache_for_test() {
     *cache().write().unwrap_or_else(|error| error.into_inner()) = PromptCacheState::default();
+    if let Some(seeded) = SEEDED_PROMPT_DIRS.get() {
+        seeded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
 }
 
 /// Resolve the user prompts dir.
@@ -182,6 +188,9 @@ const PROMPT_SEEDS: &[(&str, &str)] = &[
     ("rules.yaml", include_str!("../assets/prompts/rules.yaml")),
 ];
 
+static SEEDED_PROMPT_DIRS: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    OnceLock::new();
+
 /// Idempotent first-run seed of `~/.jeikcode/prompts/` (or `$JEIKCODE_HOME/prompts/`).
 ///
 /// Called from persona assembly so a fresh install gets editable templates without
@@ -200,6 +209,14 @@ pub fn seed_default_prompts() {
         let Some(dir) = resolve_prompts_dir() else {
             return;
         };
+        let seeded = SEEDED_PROMPT_DIRS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        {
+            let mut guard = seeded.lock().unwrap_or_else(|error| error.into_inner());
+            if !guard.insert(dir.clone()) {
+                return;
+            }
+        }
         seed_prompts_into(&dir);
     }
 }
@@ -624,12 +641,12 @@ pub(crate) fn render_init_environment_from_with_git(
         });
     let git_branch = git_branch
         .map(ToOwned::to_owned)
-        .or_else(|| working_dir.and_then(detect_git_branch))
-        .or_else(|| {
-            std::env::current_dir()
+        .or_else(|| match working_dir {
+            Some(dir) => detect_git_branch(dir),
+            None => std::env::current_dir()
                 .ok()
                 .as_deref()
-                .and_then(detect_git_branch)
+                .and_then(detect_git_branch),
         })
         .unwrap_or_else(|| "(not a git repo)".to_string());
 

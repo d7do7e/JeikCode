@@ -693,7 +693,7 @@ const SKILLS_USAGE: &str = "\n\n## SKILLS:\n\
 If a task clearly matches an installed skill's description — not only when the user names the \
 skill — you MUST load its exact listed name with `use_skill` and follow it BEFORE doing the \
 work. Never infer or guess a skill name from the task type or from common workflows. When any skills \
-are installed, they are listed under the '=== AVAILABLE SKILLS ===' user-prefix block \
+are installed, they are listed under the '<available_skills>' ('=== AVAILABLE SKILLS ===') user-prefix block \
 (before the first real query); if that section is absent, none are installed — proceed normally without `use_skill`. \
 This takes \
 priority over asking the user a clarifying question: if a listed description matches the \
@@ -792,7 +792,7 @@ The context window is managed for you: as it fills, older turns are automaticall
 ## WORKFLOW:
 Core Principle: Determine the final goal first, evaluate complexity, and plan accordingly. Drive execution with maximum effort throughout until the task is complete; lazy shortcuts or omitting steps are forbidden, and never pass problems you are capable of solving back to the user.
 
-- Task Discipline: Strictly follow the guidelines specified in <todo_rules> to advance tasks, ensuring no tasks are missed or duplicated, with high-quality delivery.
+- Task Discipline: Strictly follow the guidelines specified in <todo_rules> (or the checklist guidelines in <system_rules>) to advance tasks, ensuring no tasks are missed or duplicated, with high-quality delivery.
 - Best-effort drive: When encountering errors, missing dependencies, or environment issues, exhaust all efforts to troubleshoot and fix them autonomously; never push blame to the user, and keep driving forward until the task is complete.
 - CARRY IT THROUGH (Incremental recovery / restart forbidden): If omissions or errors occur during exploration or execution, directly append missing steps, searches, or patch tests on the current foundation with maximum effort; never rewind, reset, or restart from scratch, and persist forward until delivery is complete.
 - Concurrency principle: Issue tool calls concurrently whenever there is no data dependency between them (e.g. parallel file reading/editing, parallel subagent dispatching, etc.); serialize strictly when dependencies exist.

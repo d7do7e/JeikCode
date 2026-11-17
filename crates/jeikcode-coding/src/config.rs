@@ -847,6 +847,21 @@ impl CodingAgentConfig {
         )
     }
 
+    /// Lower-water threshold at which the kernel fires `CompactTrigger::Auto` so
+    /// [`StubCompaction`](jeikcode_capabilities::compaction::StubCompaction) folds
+    /// old tool outputs *before* utilization reaches [`Self::effective_compact_threshold`]
+    /// (where [`OverflowCompaction`](jeikcode_capabilities::compaction::OverflowCompaction)
+    /// escalates to full LLM drain+summarize).
+    pub fn effective_stub_compact_threshold(&self) -> f32 {
+        let eff = self.effective_compact_threshold();
+        if !eff.is_finite() || eff >= 1.0 {
+            return eff;
+        }
+        (eff * 0.75)
+            .min(jeikcode_capabilities::compaction::AUTO_DRAIN_UTILIZATION)
+            .max(0.05)
+    }
+
     /// Build the shared `OverflowCompaction` strategy configured for this agent's
     /// effective auto-compaction threshold.
     pub(crate) fn build_compaction_strategy(
@@ -858,7 +873,7 @@ impl CodingAgentConfig {
             jeikcode_capabilities::compaction::StubCompaction::default(),
             Some(summary_provider),
         );
-        if eff < 1.0 && eff < jeikcode_capabilities::compaction::AUTO_DRAIN_UTILIZATION {
+        if eff < 1.0 {
             strategy = strategy.with_auto_drain_utilization(eff);
         }
         strategy

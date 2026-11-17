@@ -146,7 +146,7 @@ fn build_coding_agent_from_tools(
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).
         .compaction(Arc::new(cfg.build_compaction_strategy(summary_provider)))
-        .compact_threshold(cfg.effective_compact_threshold())
+        .compact_threshold(cfg.effective_stub_compact_threshold())
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)
@@ -256,15 +256,40 @@ impl CodingPersonaHook {
         let working_dir = working_dir.into();
         let git_branch = crate::custom_prompts::detect_git_branch(&working_dir)
             .unwrap_or_else(|| "(not a git repo)".to_string());
+        Self::with_git_branch(
+            model,
+            preferred_language,
+            todo_enabled,
+            request_user_input_enabled,
+            review_enabled,
+            working_dir,
+            git_branch,
+            startup_warning,
+            has_session,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_git_branch(
+        model: impl Into<String>,
+        preferred_language: Option<jeikcode_config::locale::Locale>,
+        todo_enabled: bool,
+        request_user_input_enabled: bool,
+        review_enabled: bool,
+        working_dir: impl Into<PathBuf>,
+        git_branch: impl Into<String>,
+        startup_warning: Option<String>,
+        has_session: bool,
+    ) -> Self {
         Self {
             model: model.into(),
             preferred_language,
             todo_enabled,
             request_user_input_enabled,
             review_enabled,
-            working_dir,
+            working_dir: working_dir.into(),
             startup_warning,
-            git_branch,
+            git_branch: git_branch.into(),
             has_session,
         }
     }
@@ -285,6 +310,19 @@ impl CodingPersonaHook {
             block_1.push_str("\n\n<system-reminder>");
             block_1.push_str(warning);
             block_1.push_str("</system-reminder>");
+        }
+        let existing_transition = convo
+            .messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .find_map(|m| {
+                m.text
+                    .find(crate::parts::MODEL_CHANGE_CONTEXT_PREFIX)
+                    .map(|idx| m.text[idx..].to_string())
+            });
+        if let Some(transition) = existing_transition {
+            block_1.push_str("\n\n");
+            block_1.push_str(&transition);
         }
         let existing_b1 = convo
             .messages
@@ -416,5 +454,53 @@ mod tests {
             );
         }
         assert!(names.iter().any(|name| name == "code_explore"));
+    }
+
+    #[tokio::test]
+    async fn coding_persona_hook_preserves_model_change_transition_suffix() {
+        use super::CodingPersonaHook;
+        use jeikcode_kernel::hook::LifecycleHooks;
+        use jeikcode_kernel::message::{Conversation, Message};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = CodingPersonaHook::with_git_branch(
+            "model-b",
+            None,
+            true,
+            true,
+            true,
+            dir.path(),
+            "(not a git repo)",
+            None,
+            true,
+        );
+        let (b1, b2, _, b4) = crate::persona::coding_persona_blocks_with_session(
+            "model-b",
+            None,
+            true,
+            true,
+            true,
+            Some(dir.path()),
+            Some("(not a git repo)"),
+            true,
+        );
+        let transition = format!(
+            "{}\nThe active model changed from model-a to model-b.",
+            crate::parts::MODEL_CHANGE_CONTEXT_PREFIX
+        );
+        let mut convo = Conversation::new();
+        convo.push(Message::system(format!("{b1}\n\n{transition}")));
+        convo.push(Message::system(b2));
+        convo.push(Message::system(b4));
+        convo.push(Message::user("hello"));
+
+        hook.session_start(&mut convo, true).await;
+        hook.turn_start(&mut convo).await;
+
+        assert!(
+            convo.messages[0].text.contains(&transition),
+            "CodingPersonaHook must preserve MODEL_CHANGE_CONTEXT_PREFIX across session_start/turn_start: {}",
+            convo.messages[0].text
+        );
     }
 }
