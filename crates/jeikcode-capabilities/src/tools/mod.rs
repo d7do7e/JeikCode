@@ -58,6 +58,10 @@ pub mod report_finding;
 pub mod request_user_input;
 pub mod sensitive_path;
 mod subagent_context;
+mod subagent_store;
+#[cfg(test)]
+mod subagent_v2_tests;
+mod subagent_verifier;
 pub mod task;
 pub mod todo;
 /// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
@@ -99,6 +103,7 @@ pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
+pub use subagent_store::TaskOutputTool;
 pub use task::TaskTool;
 pub use todo::{
     bind_todo_session, bind_todowrite, clear_todo_board, close_todo_board_if_complete,

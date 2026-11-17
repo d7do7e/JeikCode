@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use jeikcode_config::config::instructions::PROJECT_INSTRUCTION_FILES;
 
+use super::subagent_verifier::SubagentRole;
+
 /// Maximum inner byte budget for `<project_instructions>` passed to a subagent child.
 pub(crate) const SUBAGENT_PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 4096;
 
@@ -26,6 +28,13 @@ const WORKER_TOOL_GUIDANCE: &str = "\
 - Prefer dedicated tools: use `code_explore` (directory scope), `grep`, `glob`, and generous `read` calls before editing; use `edit` / `write` (never `sed`/`awk`/redirects) strictly within your declared `scope`.
 - Concurrency first: batch independent reads/searches or independent in-scope edits in the same turn.
 - Use `run_command` only for builds, tests, or checks dedicated tools cannot cover; run one focused verification check after edits, and never run pagers or interactive/watch commands.
+</explore_strategy>";
+
+const VERIFIER_TOOL_GUIDANCE: &str = "\
+<explore_strategy>
+- Prefer dedicated tools (`read` in generous chunks, `code_explore` on directory scopes, `grep`, `glob`) to inspect changed code and callers/callees concurrently.
+- Use `run_command` ONLY for read-only inspection and verification checks (`cargo check`, `cargo test`, `cargo fmt --check`, `npm test`, `pytest`, `git diff`, etc.). File mutations and output redirects are hard-blocked.
+- Verify independently from fresh workspace state; cite exact commands run, pass/fail output, and file:line evidence.
 </explore_strategy>";
 
 /// Load bounded `<project_instructions>` for `working_dir`, preferring an embedder-supplied
@@ -71,27 +80,33 @@ pub(crate) fn resolve_project_instructions(
 /// scope, `<explore_strategy>` tool guidance, and bounded `<project_instructions>`.
 pub(crate) fn build_child_persona(
     base_persona: &str,
-    is_worker: bool,
+    role: SubagentRole,
     scope: &[String],
     project_instructions: Option<&str>,
 ) -> String {
     let mut parts = vec![base_persona.to_string()];
-    if is_worker {
-        let non_empty: Vec<&str> = scope
-            .iter()
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !non_empty.is_empty() {
-            parts.push(format!(
-                "Declared writable scope (enforced by WorkerScopeGate): {}",
-                non_empty.join(", ")
-            ));
+    match role {
+        SubagentRole::Worker => {
+            let non_empty: Vec<&str> = scope
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !non_empty.is_empty() {
+                parts.push(format!(
+                    "Declared writable scope (enforced by WorkerScopeGate): {}",
+                    non_empty.join(", ")
+                ));
+            }
+            parts.push(WORKER_TOOL_GUIDANCE.to_string());
         }
-        parts.push(WORKER_TOOL_GUIDANCE.to_string());
-    } else {
-        parts.push(EXPLORE_TOOL_GUIDANCE.to_string());
+        SubagentRole::Verifier => {
+            parts.push(VERIFIER_TOOL_GUIDANCE.to_string());
+        }
+        SubagentRole::Explore => {
+            parts.push(EXPLORE_TOOL_GUIDANCE.to_string());
+        }
     }
     if let Some(instr) = project_instructions
         .map(str::trim)
@@ -158,7 +173,7 @@ mod tests {
     fn builds_role_specific_persona_with_scope_and_explore_strategy() {
         let explore = build_child_persona(
             "EXPLORE",
-            false,
+            SubagentRole::Explore,
             &[],
             Some("<project_instructions>\nx\n</project_instructions>"),
         );
@@ -167,12 +182,21 @@ mod tests {
         assert!(explore.contains("<project_instructions>"));
         assert!(!explore.contains("Declared writable scope"));
 
-        let worker =
-            build_child_persona("WORKER", true, &["crates/jeikcode-coding/**".into()], None);
+        let worker = build_child_persona(
+            "WORKER",
+            SubagentRole::Worker,
+            &["crates/jeikcode-coding/**".into()],
+            None,
+        );
         assert!(worker.contains("<explore_strategy>"));
         assert!(worker.contains(
             "Declared writable scope (enforced by WorkerScopeGate): crates/jeikcode-coding/**"
         ));
         assert!(!worker.contains("<project_instructions>"));
+
+        let verifier = build_child_persona("VERIFIER", SubagentRole::Verifier, &[], None);
+        assert!(verifier.contains("<explore_strategy>"));
+        assert!(verifier.contains("File mutations and output redirects are hard-blocked"));
+        assert!(!verifier.contains("Declared writable scope"));
     }
 }

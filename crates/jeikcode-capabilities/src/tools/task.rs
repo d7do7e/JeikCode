@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use jeikcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
 use jeikcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use jeikcode_kernel::hook::{LifecycleHooks, TurnCtx};
-use jeikcode_kernel::message::Message;
+use jeikcode_kernel::message::{Message, SessionSnapshot};
 use jeikcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use jeikcode_kernel::provider::LlmProvider;
 use jeikcode_kernel::request::RequestCtx;
@@ -18,6 +18,11 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use super::subagent_store::{
+    BackgroundCompletion, BackgroundTaskHandle, SavedSubagentState, SubagentStore, TaskOutputTool,
+};
+use super::subagent_verifier::{SubagentRole, VerifierReadOnlyShellGuard, VERIFIER_PERSONA};
 
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
@@ -153,13 +158,19 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
-/// declare its writable lane so the dispatch approval shows it and the gate can enforce it.
+/// 1-based indices of explicit fresh `worker` subtasks that declared no non-empty `scope`.
+/// Resumed workers (`resume_agent_id` set) inherit their saved scope when `scope` is omitted.
 fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.is_worker() && t.scope.iter().all(|s| s.trim().is_empty()))
+        .filter(|(_, t)| {
+            t.is_worker()
+                && t.resume_agent_id
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty())
+                && t.scope.iter().all(|s| s.trim().is_empty())
+        })
         .map(|(i, _)| i + 1)
         .collect()
 }
@@ -305,21 +316,25 @@ impl ToolMiddleware for WorkerScopeGate {
 }
 
 /// The middleware stack for a subagent child: sensitive-path guard for everyone,
-/// air-gap offline network shielding, plus a `WorkerScopeGate` confining a `worker`'s writes to its `scope`.
-/// `explore` children mount only read tools, so the latter gate is unnecessary.
+/// air-gap offline network shielding, plus `WorkerScopeGate` for `worker` and
+/// `VerifierReadOnlyShellGuard` for `verifier`.
 fn child_middlewares(
-    is_worker: bool,
+    role: SubagentRole,
     scope: &[String],
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> =
         vec![Arc::new(DenySensitivePaths), Arc::new(DenyOfflineNetwork)];
-    if is_worker {
-        mw.extend(inherited_worker_middlewares.iter().cloned());
-    }
-    if is_worker {
-        mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+    match role {
+        SubagentRole::Worker => {
+            mw.extend(inherited_worker_middlewares.iter().cloned());
+            mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+        }
+        SubagentRole::Verifier => {
+            mw.push(Arc::new(VerifierReadOnlyShellGuard));
+        }
+        SubagentRole::Explore => {}
     }
     mw
 }
@@ -333,36 +348,37 @@ described — no more, no less — honoring the working directory. Make the chan
 if cheap, then stop with a one-line summary of what you changed. Do not wander outside the \
 task's stated scope.";
 
-fn default_subagent_type() -> String {
-    "explore".to_string()
-}
-
 #[derive(Deserialize)]
 struct SubTask {
     #[serde(default, alias = "desc", alias = "name", alias = "title")]
     description: String,
     prompt: String,
-    #[serde(
-        default = "default_subagent_type",
-        alias = "type",
-        alias = "agent_type",
-        alias = "role"
-    )]
+    #[serde(default, alias = "type", alias = "agent_type", alias = "role")]
     subagent_type: String,
     #[serde(default, alias = "tier", alias = "level", alias = "model_tier")]
     difficulty: String,
     /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
-    /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
+    /// `worker`; ignored for `explore` / `verifier` (read-only). Enforced by `WorkerScopeGate`.
     #[serde(
         default,
         deserialize_with = "crate::tools::repair::deserialize_lenient_string_list"
     )]
     scope: Vec<String>,
+    /// Optional `agent_id` from a prior `<task>` output to resume its conversation.
+    #[serde(default, alias = "agent_id")]
+    resume_agent_id: Option<String>,
+    /// When true, spawn in the background and return an immediate `<task_spawned>` handle.
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 impl SubTask {
+    fn requested_role(&self) -> Option<SubagentRole> {
+        SubagentRole::parse_opt(&self.subagent_type)
+    }
+
     fn is_worker(&self) -> bool {
-        self.subagent_type.trim().eq_ignore_ascii_case("worker")
+        self.requested_role().is_some_and(SubagentRole::is_worker)
     }
 
     fn is_hard(&self) -> bool {
@@ -387,20 +403,25 @@ impl SubTask {
 #[derive(Deserialize)]
 struct Args {
     tasks: Vec<SubTask>,
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 pub struct TaskTool {
-    make_fast_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
-    make_capable_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
-    make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
-    make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
+    make_fast_provider: Arc<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
+    make_capable_provider: Arc<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
+    make_explore_tools: Arc<dyn Fn() -> MountedTools + Send + Sync>,
+    make_worker_tools: Arc<dyn Fn() -> MountedTools + Send + Sync>,
+    make_verifier_tools: Option<Arc<dyn Fn() -> MountedTools + Send + Sync>>,
     /// `Some(n)` bounds how many children run at once; `None` = unbounded
     /// (config `[subagent] max_concurrent = 0`).
     max_concurrent: Option<usize>,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     project_context_loader: Option<Arc<super::subagent_context::ProjectContextLoader>>,
+    store: Arc<SubagentStore>,
 }
 
 impl TaskTool {
@@ -411,17 +432,42 @@ impl TaskTool {
         make_worker_tools: impl Fn() -> MountedTools + Send + Sync + 'static,
     ) -> Self {
         Self {
-            make_fast_provider: Box::new(make_fast_provider),
-            make_capable_provider: Box::new(make_capable_provider),
-            make_explore_tools: Box::new(make_explore_tools),
-            make_worker_tools: Box::new(make_worker_tools),
+            make_fast_provider: Arc::new(make_fast_provider),
+            make_capable_provider: Arc::new(make_capable_provider),
+            make_explore_tools: Arc::new(make_explore_tools),
+            make_worker_tools: Arc::new(make_worker_tools),
+            make_verifier_tools: None,
             // Unbounded by default: the shipped config is `max_concurrent = 0`.
             max_concurrent: None,
+            semaphore: None,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             project_context_loader: None,
+            store: Arc::new(SubagentStore::new()),
         }
+    }
+
+    /// Supply the toolset factory for read-only `verifier` subagents (read/search +
+    /// guarded verification `run_command`, zero write/edit tools). Falls back to
+    /// `make_explore_tools` when unset.
+    pub fn with_verifier_tools(
+        mut self,
+        make_verifier_tools: impl Fn() -> MountedTools + Send + Sync + 'static,
+    ) -> Self {
+        self.make_verifier_tools = Some(Arc::new(make_verifier_tools));
+        self
+    }
+
+    /// Construct the companion `task_output` tool sharing this `TaskTool`'s state store.
+    pub fn output_tool(&self) -> TaskOutputTool {
+        TaskOutputTool::new(Arc::clone(&self.store))
+    }
+
+    /// Bind the parent session ID so resumable `agent_id` snapshots stay strictly isolated
+    /// per parent session.
+    pub fn bind_session(&self, session_id: &str) {
+        self.store.bind_session(session_id);
     }
 
     /// Bound how many children run at once. `0` removes the bound entirely —
@@ -430,6 +476,9 @@ impl TaskTool {
     /// Any other value is used as-is (no floor, so `1` means strictly serial).
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = (n != 0).then_some(n);
+        self.semaphore = self
+            .max_concurrent
+            .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
         self
     }
 
@@ -475,14 +524,21 @@ impl Tool for TaskTool {
     fn description(&self) -> &str {
         "Dispatch subagents to execute isolated subtasks. \
          `explore` is read-only for research and findings; \
-         `worker` can edit files and must declare a `scope` to restrict write access. \
-         Use for complex exploration and parallel tasks that benefit from independent execution."
+         `worker` can edit files and must declare a `scope` to restrict write access; \
+         `verifier` is a blind, fresh-context read-only evaluator that inspects files and runs \
+         verification checks (emitting PASS / NEEDS_WORK). \
+         Pass `resume_agent_id` to continue a prior subagent's conversation, or set \
+         `run_in_background: true` and poll/await with `task_output`."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Optional: dispatch all subtasks asynchronously in the background and return task_id handles for `task_output`."
+                },
                 "tasks": {
                     "type": "array",
                     "items": {
@@ -490,15 +546,23 @@ impl Tool for TaskTool {
                         "properties": {
                             "description": {"type": "string", "description": "3-5 word label"},
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
-                            "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
+                            "subagent_type": {"type": "string", "enum": ["explore", "worker", "verifier"]},
                             "difficulty": {"type": "string", "enum": ["simple", "hard"]},
                             "scope": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Worker-only, REQUIRED for worker: working-directory-relative globs the worker may write within (e.g. [\"src/auth/**\", \"Cargo.toml\"]). The worker can only write files inside this scope; reads are unrestricted. Ignored for explore."
+                                "description": "Worker-only, REQUIRED for worker: working-directory-relative globs the worker may write within (e.g. [\"src/auth/**\", \"Cargo.toml\"]). The worker can only write files inside this scope; reads are unrestricted. Ignored for explore/verifier."
+                            },
+                            "resume_agent_id": {
+                                "type": "string",
+                                "description": "Optional agent_id from a prior `<task>` output to resume its conversation state."
+                            },
+                            "run_in_background": {
+                                "type": "boolean",
+                                "description": "Optional: run this subtask asynchronously in the background and return a task_id handle immediately."
                             }
                         },
-                        "required": ["description", "prompt", "subagent_type"]
+                        "required": ["description", "prompt"]
                     }
                 }
             },
@@ -507,11 +571,20 @@ impl Tool for TaskTool {
     }
 
     fn risk(&self, args: &str) -> RiskLevel {
-        // Use the SAME repair-aware parse as `execute` so a `worker` dispatch with
-        // control-char args is still detected as Risky (not silently downgraded to
-        // Safe, which would let a file-editing worker skip the approval gate).
+        // Use the SAME repair-aware parse as `execute` so a `worker` dispatch (or
+        // resumed worker via `resume_agent_id`) is still detected as Risky.
         match parse_task_args(args) {
-            Ok(a) if a.tasks.iter().any(|t| t.is_worker()) => RiskLevel::Risky,
+            Ok(a)
+                if a.tasks.iter().any(|t| {
+                    t.is_worker()
+                        || t.resume_agent_id
+                            .as_deref()
+                            .and_then(|id| self.store.peek_role(id))
+                            .is_some_and(SubagentRole::is_worker)
+                }) =>
+            {
+                RiskLevel::Risky
+            }
             _ => RiskLevel::Safe,
         }
     }
@@ -561,12 +634,9 @@ impl Tool for TaskTool {
             };
         }
 
+        let top_bg = parsed.run_in_background;
         let offline_active = jeikcode_config::config::offline::is_offline_active();
-        // `None` = unbounded: skip the semaphore entirely instead of handing out
-        // an effectively-infinite permit count.
-        let sem = self
-            .max_concurrent
-            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+        let sem = self.semaphore.clone();
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
@@ -574,9 +644,10 @@ impl Tool for TaskTool {
             &ctx.working_dir,
             self.project_context_loader.as_ref(),
         );
+        let session_scope = self.store.current_session_scope();
         let mut set = tokio::task::JoinSet::new();
-        // Live progress: the whole batch would otherwise be a black box until every subtask
-        // finishes. Emit a header + per-subtask start/done so the driver renders them live.
+        let mut immediate_blocks: Vec<(String, String, bool)> = Vec::new();
+
         if offline_active {
             ctx.progress.emit(format!(
                 "dispatching {} subtask(s) [air-gap offline mode]…",
@@ -588,61 +659,204 @@ impl Tool for TaskTool {
         }
 
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
-            let is_worker = t.is_worker();
-            let scope = t.scope.clone();
+            let requested_role = t.requested_role();
+            let desc = t.resolved_description(idx);
             let is_hard = t.is_hard();
-            // Fresh provider + fresh tools per child (a session consumes its provider).
+            let run_bg = top_bg || t.run_in_background;
+            let resume_id = t
+                .resume_agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            let (role, scope, agent_id, resume_snapshot) = if let Some(rid) = resume_id {
+                match self.store.get_for_resume(&rid, requested_role, &t.scope) {
+                    Ok(saved) => (
+                        saved.role,
+                        saved.scope,
+                        saved.agent_id,
+                        Some(saved.snapshot),
+                    ),
+                    Err(err_msg) => {
+                        let role_guess = requested_role.unwrap_or(SubagentRole::Explore);
+                        let label = format!("{}#{}", role_guess.as_str(), idx + 1);
+                        let block = render_task_block(
+                            &label,
+                            &rid,
+                            &desc,
+                            "none",
+                            "error",
+                            "task_error",
+                            &err_msg,
+                        );
+                        immediate_blocks.push((label, block, true));
+                        continue;
+                    }
+                }
+            } else {
+                let role = requested_role.unwrap_or(SubagentRole::Explore);
+                let agent_id = self.store.mint_agent_id(role);
+                (role, t.scope.clone(), agent_id, None)
+            };
+
             let provider = if is_hard {
                 (self.make_capable_provider)()
             } else {
                 (self.make_fast_provider)()
             };
-            // Capture the actual model this subtask runs on (for display + routing proof)
-            // BEFORE the provider is moved into the child builder.
             let model = provider.model_name().to_string();
-            let tools = if is_worker {
-                (self.make_worker_tools)()
-            } else {
-                (self.make_explore_tools)()
+            let tools = match role {
+                SubagentRole::Worker => (self.make_worker_tools)(),
+                SubagentRole::Verifier => match &self.make_verifier_tools {
+                    Some(mk) => mk(),
+                    None => (self.make_explore_tools)(),
+                },
+                SubagentRole::Explore => (self.make_explore_tools)(),
             };
-            let base_persona = if is_worker {
-                WORKER_PERSONA
-            } else {
-                EXPLORE_PERSONA
+            let base_persona = match role {
+                SubagentRole::Worker => WORKER_PERSONA,
+                SubagentRole::Verifier => VERIFIER_PERSONA,
+                SubagentRole::Explore => EXPLORE_PERSONA,
             };
             let persona = super::subagent_context::build_child_persona(
                 base_persona,
-                is_worker,
+                role,
                 &scope,
                 project_instructions.as_deref(),
             );
-            let child_cancel = ctx.cancel.child_token();
-            // A second handle for the progress hook to short-circuit emits once cancelled.
-            let hook_cancel = child_cancel.clone();
             let wd = ctx.working_dir.clone();
-            let label = format!(
-                "{}#{}",
-                if is_worker { "worker" } else { "explore" },
-                idx + 1
-            );
-            // Resolve the display description BEFORE the prompt is moved out of `t`:
-            // `resolved_description` borrows `self`, but `t.prompt` is moved on the next line.
-            let desc = t.resolved_description(idx);
+            let label = format!("{}#{}", role.as_str(), idx + 1);
             let prompt = t.prompt;
             let sem = sem.clone();
-            let progress = ctx.progress.clone();
             let inherited_worker_middlewares = inherited_worker_middlewares.clone();
-            // Advertise the selected model while this child is still queued.
-            // Marker-prefixed means retained UIs update the fixed panel without
-            // committing an extra transcript row. The later ↻ event is the sole
-            // start-time boundary.
+            let store_weak = Arc::downgrade(&self.store);
+            let session_scope = session_scope.clone();
+
+            if run_bg {
+                let task_id = self.store.mint_task_id();
+                let child_cancel = self.store.child_cancel_token();
+                let hook_cancel = child_cancel.clone();
+                let bg_handle = self.store.register_background(
+                    task_id.clone(),
+                    agent_id.clone(),
+                    label.clone(),
+                    desc.clone(),
+                    role,
+                    model.clone(),
+                    child_cancel.clone(),
+                );
+                let parent_cancel = ctx.cancel.clone();
+                let watcher_cancel = child_cancel.clone();
+                let mut watcher_rx = bg_handle.subscribe();
+                tokio::spawn(async move {
+                    if watcher_rx.borrow().is_some() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = parent_cancel.cancelled() => watcher_cancel.cancel(),
+                        _ = watcher_rx.changed() => {}
+                    }
+                });
+                ctx.progress.emit(subtask_progress_line(
+                    &format!("\u{21bb} bg {label} [{task_id}]"),
+                    &model,
+                    &desc,
+                ));
+                let spawned_block = format!(
+                    "<task_spawned id=\"{label}\" task_id=\"{task_id}\" agent_id=\"{agent_id}\" role=\"{}\" model=\"{model}\" status=\"running\">\n<summary>{desc}</summary>\nDispatched in background. Call `task_output` with `{{\"task_id\": \"{task_id}\"}}` to poll or await completion.\n</task_spawned>",
+                    role.as_str()
+                );
+                immediate_blocks.push((label.clone(), spawned_block, false));
+                let bg_handle_for_task = Arc::clone(&bg_handle);
+                tokio::spawn(async move {
+                    let _permit = match &sem {
+                        Some(sem) => Some(
+                            sem.clone()
+                                .acquire_owned()
+                                .await
+                                .expect("semaphore not closed"),
+                        ),
+                        None => None,
+                    };
+                    let ledger = Arc::new(Mutex::new(ActionReceiptLedger::default()));
+                    let progress_hook = Arc::new(
+                        SubtaskProgressHook::with_ledger(
+                            ProgressSink::noop(),
+                            label.clone(),
+                            desc.contains(|ch: char| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
+                            hook_cancel,
+                            ledger.clone(),
+                        )
+                        .with_background_handle(Arc::clone(&bg_handle_for_task)),
+                    );
+                    let (outcome, snapshot) = spawn_and_run_child(
+                        provider,
+                        tools,
+                        persona,
+                        resume_snapshot,
+                        wd.clone(),
+                        child_cancel,
+                        progress_hook,
+                        tool_loop_policy,
+                        max_rounds,
+                        role,
+                        &scope,
+                        &inherited_worker_middlewares,
+                        prompt,
+                    )
+                    .await;
+                    if let Some(snap) = snapshot {
+                        if let Some(store) = store_weak.upgrade() {
+                            store.save_state(SavedSubagentState {
+                                agent_id: agent_id.clone(),
+                                session_scope,
+                                role,
+                                scope,
+                                working_dir: wd,
+                                model: model.clone(),
+                                snapshot: snap,
+                                updated_seq: 0,
+                            });
+                        }
+                    }
+                    let receipt_ledger = ledger.lock().map(|l| l.clone()).unwrap_or_default();
+                    let (rendered_block, is_err) = render_subtask_outcome(
+                        &label,
+                        &agent_id,
+                        &desc,
+                        &model,
+                        role,
+                        outcome,
+                        &receipt_ledger,
+                    );
+                    let status_label = if is_err {
+                        if bg_handle_for_task.cancel.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        }
+                    } else {
+                        "completed"
+                    };
+                    bg_handle_for_task.finish(BackgroundCompletion {
+                        rendered_block,
+                        is_error: is_err,
+                        status_label,
+                    });
+                });
+                continue;
+            }
+
+            let child_cancel = ctx.cancel.child_token();
+            let hook_cancel = child_cancel.clone();
+            let progress = ctx.progress.clone();
             progress.emit(format!(
                 "{SUBAGENT_ACTIVITY_MARKER}{}",
                 subtask_progress_line(&format!("\u{25cb} queued \u{b7} {label}"), &model, &desc,)
             ));
 
             set.spawn(async move {
-                // Unbounded mode carries no permit guard at all.
                 let _permit = match &sem {
                     Some(sem) => Some(
                         sem.clone()
@@ -652,8 +866,6 @@ impl Tool for TaskTool {
                     ),
                     None => None,
                 };
-                // ↻ started — include a compact preview of WHAT this subtask is, so a live
-                // fan-out shows each child's job, not just its number.
                 progress.emit(subtask_progress_line(
                     &format!("\u{21bb} {label}"),
                     &model,
@@ -667,155 +879,192 @@ impl Tool for TaskTool {
                     hook_cancel,
                     ledger.clone(),
                 ));
-                let mut builder = Agent::builder()
-                    .provider(provider)
-                    .tools(tools)
-                    .persona(persona)
-                    .working_dir(wd.clone())
-                    .cancel_token(child_cancel)
-                    .hook(progress_hook.clone());
-                if let Some(policy) = tool_loop_policy {
-                    builder = builder.tool_loop_policy(policy);
-                }
-                if let Some(max_rounds) = max_rounds {
-                    builder = builder.max_rounds(max_rounds);
-                }
-                // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
-                // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
-                // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in child_middlewares(is_worker, &scope, &wd, &inherited_worker_middlewares) {
-                    builder = builder.middleware(mw);
-                }
-                let child = builder.build();
-                // DETACH: inner spawn lets the child run independent of this future;
-                // cancel propagates only via the child_token.
-                //
-                // NOTE: under `panic = "abort"` (workspace default), a child panic aborts
-                // the whole process before the JoinError can surface, so the join-Err arm
-                // below cannot fire from a panic. Defensive parity with parallel_edit.rs.
-                let handle = tokio::spawn(run_child_to_completion(
-                    child,
-                    prompt,
-                    AutoRespond::AllowAll,
+                let (outcome, snapshot) = spawn_and_run_child(
+                    provider,
+                    tools,
+                    persona,
+                    resume_snapshot,
+                    wd.clone(),
+                    child_cancel,
                     progress_hook,
-                    ledger.clone(),
-                ));
-                // There is deliberately no total wall-clock timeout here. Long-running
-                // research may make steady progress for many minutes; liveness is bounded by
-                // provider idle timeouts, the child round cap, and explicit parent/user cancel.
-                let outcome = match handle.await {
-                    Ok(o) => o,
-                    Err(join_err) => Outcome {
-                        stop: StopReason::ProviderError,
-                        error: Some(format!("subagent task crashed: {join_err}")),
-                        ..Default::default()
-                    },
-                };
+                    tool_loop_policy,
+                    max_rounds,
+                    role,
+                    &scope,
+                    &inherited_worker_middlewares,
+                    prompt,
+                )
+                .await;
+                if let Some(snap) = snapshot {
+                    if let Some(store) = store_weak.upgrade() {
+                        store.save_state(SavedSubagentState {
+                            agent_id: agent_id.clone(),
+                            session_scope,
+                            role,
+                            scope,
+                            working_dir: wd,
+                            model: model.clone(),
+                            snapshot: snap,
+                            updated_seq: 0,
+                        });
+                    }
+                }
                 let receipt_ledger = ledger.lock().map(|l| l.clone()).unwrap_or_default();
-                // Include the failure reason on the terminal ✗ line. Retained UIs
-                // commit terminal child events to scrollback while keeping only
-                // running children in the fixed panel.
                 let head = if outcome.stop == StopReason::Stopped {
                     format!("\u{2713} done \u{b7} {label}")
                 } else {
                     format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
                 progress.emit(subtask_progress_line(&head, &model, &desc));
-                (label, desc, model, outcome, receipt_ledger, is_worker)
+                let (block, is_err) = render_subtask_outcome(
+                    &label,
+                    &agent_id,
+                    &desc,
+                    &model,
+                    role,
+                    outcome,
+                    &receipt_ledger,
+                );
+                (label, block, is_err)
             });
         }
 
-        // Collect all child results (order determined by completion, then sorted by label).
-        // The outer closure always returns Ok(tuple); inner JoinErrors are handled at the
-        // inner spawn site above and mapped to an errored Outcome.
-        let mut collected: Vec<(String, String, String, Outcome, ActionReceiptLedger, bool)> =
-            Vec::new();
+        let mut all_blocks = immediate_blocks;
         while let Some(res) = set.join_next().await {
             if let Ok(tuple) = res {
-                collected.push(tuple);
+                all_blocks.push(tuple);
             }
         }
-        // Sort by label for deterministic output regardless of scheduling order.
-        collected.sort_by(|a, b| a.0.cmp(&b.0));
+        all_blocks.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let n_total = collected.len();
-        let mut n_error = 0usize;
-        let mut blocks: Vec<String> = Vec::new();
-        for (label, desc, model, outcome, ledger, is_worker) in collected {
-            let is_err = outcome.stop != StopReason::Stopped;
-            if is_err {
-                n_error += 1;
-            }
-            // Collect any output the child produced (assistant text, else tool results).
-            let produced = if !outcome.text.is_empty() {
-                outcome.text
-            } else {
-                outcome
-                    .tool_results
-                    .iter()
-                    .map(|r| r.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let produced = compact_subtask_output(&produced);
-            let (state, tag, body) = if is_err {
-                // Preserve partial output on a bounded/failed stop (MaxRounds,
-                // ProviderError, Cancelled, …) —
-                // a worker that did real work before hitting a limit is not a total loss (#2).
-                let mut b = String::new();
-                if is_worker {
-                    b.push_str(&ledger.render_worker_receipt());
-                    b.push('\n');
-                } else {
-                    b.push_str(&ledger.render_explore_receipt());
-                    b.push('\n');
-                }
-                b.push_str(&format!("subagent stopped early ({:?})", outcome.stop));
-                if let Some(e) = &outcome.error {
-                    b.push_str(&format!(": {e}"));
-                }
-                match outcome.stop {
-                    StopReason::MaxRounds => {
-                        b.push_str("\n[Hint: subagent reached max turn rounds before completing. Consider decomposing into smaller, focused subtasks with narrower scopes.]");
-                    }
-                    StopReason::RepeatLoop | StopReason::ToolLoopDetected => {
-                        b.push_str("\n[Hint: subagent repeated identical tool calls in a loop. Clarify task instructions or provide direct guidance.]");
-                    }
-                    StopReason::PolicyDenied => {
-                        b.push_str("\n[Hint: subagent action violated safety or scope policy (e.g. attempted out-of-scope write or sensitive path). Check declared `scope`.]");
-                    }
-                    _ => {}
-                }
-                if !produced.is_empty() {
-                    b.push_str(&format!("\n--- partial output ---\n{produced}"));
-                }
-                ("error", "task_error", b)
-            } else {
-                let receipt = if is_worker {
-                    ledger.render_worker_receipt()
-                } else {
-                    ledger.render_explore_receipt()
-                };
-                let b = if produced.trim().is_empty() {
-                    receipt
-                } else {
-                    format!("{receipt}\n{produced}")
-                };
-                ("completed", "task_result", b)
-            };
-            blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
-        }
+        let n_total = all_blocks.len();
+        let n_error = all_blocks.iter().filter(|(_, _, is_err)| *is_err).count();
+        let blocks: Vec<String> = all_blocks.into_iter().map(|(_, b, _)| b).collect();
 
         ToolResult {
             call_id: String::new(),
             content: blocks.join("\n"),
-            // Fail the whole tool call only when EVERY subtask failed. A partial failure is
-            // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
-            // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
             is_error: n_total > 0 && n_error == n_total,
             images: vec![],
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_and_run_child(
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    persona: String,
+    resume_snapshot: Option<SessionSnapshot>,
+    wd: PathBuf,
+    child_cancel: tokio_util::sync::CancellationToken,
+    progress_hook: Arc<SubtaskProgressHook>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
+    max_rounds: Option<u32>,
+    role: SubagentRole,
+    scope: &[String],
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    prompt: String,
+) -> (Outcome, Option<SessionSnapshot>) {
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .working_dir(wd.clone())
+        .cancel_token(child_cancel)
+        .hook(progress_hook.clone());
+    if let Some(snap) = resume_snapshot {
+        builder = builder.resume(snap);
+    } else {
+        builder = builder.persona(persona);
+    }
+    if let Some(policy) = tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
+    if let Some(max_rounds) = max_rounds {
+        builder = builder.max_rounds(max_rounds);
+    }
+    for mw in child_middlewares(role, scope, &wd, inherited_worker_middlewares) {
+        builder = builder.middleware(mw);
+    }
+    let child = builder.build();
+    let handle = tokio::spawn(run_child_to_completion(
+        child,
+        prompt,
+        AutoRespond::AllowAll,
+        progress_hook,
+    ));
+    match handle.await {
+        Ok(res) => res,
+        Err(join_err) => (
+            Outcome {
+                stop: StopReason::ProviderError,
+                error: Some(format!("subagent task crashed: {join_err}")),
+                ..Default::default()
+            },
+            None,
+        ),
+    }
+}
+
+fn render_subtask_outcome(
+    label: &str,
+    agent_id: &str,
+    desc: &str,
+    model: &str,
+    role: SubagentRole,
+    outcome: Outcome,
+    ledger: &ActionReceiptLedger,
+) -> (String, bool) {
+    let is_err = outcome.stop != StopReason::Stopped;
+    let produced = if !outcome.text.is_empty() {
+        outcome.text
+    } else {
+        outcome
+            .tool_results
+            .iter()
+            .map(|r| r.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let produced = compact_subtask_output(&produced);
+    let receipt = if role.is_worker() {
+        ledger.render_worker_receipt()
+    } else {
+        ledger.render_explore_receipt()
+    };
+    let (state, tag, body) = if is_err {
+        let mut b = format!("{receipt}\nsubagent stopped early ({:?})", outcome.stop);
+        if let Some(e) = &outcome.error {
+            b.push_str(&format!(": {e}"));
+        }
+        match outcome.stop {
+            StopReason::MaxRounds => {
+                b.push_str("\n[Hint: subagent reached max turn rounds before completing. Consider decomposing into smaller, focused subtasks with narrower scopes.]");
+            }
+            StopReason::RepeatLoop | StopReason::ToolLoopDetected => {
+                b.push_str("\n[Hint: subagent repeated identical tool calls in a loop. Clarify task instructions or provide direct guidance.]");
+            }
+            StopReason::PolicyDenied => {
+                b.push_str("\n[Hint: subagent action violated safety or scope policy (e.g. attempted out-of-scope write or sensitive path). Check declared `scope`.]");
+            }
+            _ => {}
+        }
+        if !produced.is_empty() {
+            b.push_str(&format!("\n--- partial output ---\n{produced}"));
+        }
+        ("error", "task_error", b)
+    } else {
+        let b = if produced.trim().is_empty() {
+            receipt
+        } else {
+            format!("{receipt}\n{produced}")
+        };
+        ("completed", "task_result", b)
+    };
+    (
+        render_task_block(label, agent_id, desc, model, state, tag, &body),
+        is_err,
+    )
 }
 
 /// Parse the tool args, repairing unescaped control characters on failure (weak
@@ -1325,6 +1574,7 @@ struct SubtaskProgressHook {
     cancel: tokio_util::sync::CancellationToken,
     live: Mutex<SubtaskLiveState>,
     ledger: Arc<Mutex<ActionReceiptLedger>>,
+    background_handle: Option<Arc<BackgroundTaskHandle>>,
 }
 
 #[derive(Default)]
@@ -1368,7 +1618,13 @@ impl SubtaskProgressHook {
             cancel,
             live: Mutex::new(SubtaskLiveState::default()),
             ledger,
+            background_handle: None,
         }
+    }
+
+    fn with_background_handle(mut self, handle: Arc<BackgroundTaskHandle>) -> Self {
+        self.background_handle = Some(handle);
+        self
     }
 
     fn thinking_label(&self) -> &'static str {
@@ -1473,11 +1729,13 @@ impl SubtaskProgressHook {
             }
             live.last_emit = Some(now);
             let estimated = (live.round_chars / 4) as u64;
+            let tokens = live.total_tokens.saturating_add(estimated);
+            if let Some(bg) = &self.background_handle {
+                bg.set_activity(format!("{} · tokens={}", live.activity, tokens));
+            }
             format!(
                 "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
-                self.label,
-                live.activity,
-                live.total_tokens.saturating_add(estimated)
+                self.label, live.activity, tokens
             )
         };
         self.progress.emit(message);
@@ -1592,14 +1850,16 @@ async fn run_child_to_completion(
     input: String,
     policy: AutoRespond,
     progress: Arc<SubtaskProgressHook>,
-    ledger: Arc<Mutex<ActionReceiptLedger>>,
-) -> Outcome {
+) -> (Outcome, Option<SessionSnapshot>) {
     let mut handle = child.spawn();
     let _ = handle.commands.send(AgentCommand::SendMessage {
         text: input,
         images: vec![],
     });
     let mut outcome = Outcome::default();
+    let mut snapshot = None;
+    let mut requested_snapshot = false;
+    let ledger = progress.ledger.clone();
     while let Some(event) = handle.events.recv().await {
         match event {
             AgentEvent::TextDelta(text) => outcome.text.push_str(&text),
@@ -1645,6 +1905,16 @@ async fn run_child_to_completion(
             }
             AgentEvent::TurnComplete { reason } => {
                 outcome.stop = reason;
+                if !requested_snapshot {
+                    requested_snapshot = true;
+                    if handle.commands.send(AgentCommand::Snapshot).is_err() {
+                        let _ = handle.commands.send(AgentCommand::Shutdown);
+                        break;
+                    }
+                }
+            }
+            AgentEvent::Snapshot { snapshot: snap } => {
+                snapshot = Some(snap);
                 let _ = handle.commands.send(AgentCommand::Shutdown);
                 break;
             }
@@ -1652,7 +1922,7 @@ async fn run_child_to_completion(
         }
     }
     let _ = handle.task.await;
-    outcome
+    (outcome, snapshot)
 }
 
 /// A live-progress line for one subtask: `<head> · <model> · <desc>`. `head` is the
@@ -1671,9 +1941,10 @@ fn subtask_progress_line(head: &str, model: &str, desc: &str) -> String {
 
 /// Wrap a child-agent result in an opencode-style `<task>` block. `model` is the
 /// model the subagent actually ran on (surfaced so the user can see which tier/model
-/// executed — the strong/weak routing proof).
+/// executed — the strong/weak routing proof), and `agent_id` enables `resume_agent_id`.
 fn render_task_block(
     id: &str,
+    agent_id: &str,
     summary: &str,
     model: &str,
     state: &str,
@@ -1681,7 +1952,7 @@ fn render_task_block(
     body: &str,
 ) -> String {
     format!(
-        "<task id=\"{id}\" model=\"{model}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+        "<task id=\"{id}\" agent_id=\"{agent_id}\" model=\"{model}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
     )
 }
 
@@ -2423,6 +2694,8 @@ mod tests {
             subagent_type: ty.into(),
             difficulty: String::new(),
             scope: scope.into_iter().map(String::from).collect(),
+            resume_agent_id: None,
+            run_in_background: false,
         };
         let tasks = vec![
             mk("worker", vec!["src/a/**"]), // #1 ok
@@ -2435,25 +2708,42 @@ mod tests {
 
     #[test]
     fn child_middlewares_add_the_scope_gate_only_for_workers() {
-        use super::{child_middlewares, DenySensitivePaths};
+        use super::{child_middlewares, DenySensitivePaths, SubagentRole};
         use std::path::Path;
         let base = 2; // DenySensitivePaths + DenyOfflineNetwork.
         assert_eq!(
-            child_middlewares(false, &[], Path::new("/w"), &[]).len(),
+            child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &[]).len(),
             base
         );
         assert_eq!(
-            child_middlewares(true, &["src/**".into()], Path::new("/w"), &[]).len(),
+            child_middlewares(
+                SubagentRole::Worker,
+                &["src/**".into()],
+                Path::new("/w"),
+                &[]
+            )
+            .len(),
             base + 1
+        );
+        assert_eq!(
+            child_middlewares(SubagentRole::Verifier, &[], Path::new("/w"), &[]).len(),
+            base + 1,
+            "verifier receives VerifierReadOnlyShellGuard"
         );
         let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
         assert_eq!(
-            child_middlewares(false, &[], Path::new("/w"), &inherited).len(),
+            child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &inherited).len(),
             base,
             "read-only explore children do not need worker execution policy"
         );
         assert_eq!(
-            child_middlewares(true, &["src/**".into()], Path::new("/w"), &inherited,).len(),
+            child_middlewares(
+                SubagentRole::Worker,
+                &["src/**".into()],
+                Path::new("/w"),
+                &inherited,
+            )
+            .len(),
             base + 2,
             "worker receives inherited policy plus its scope gate"
         );
@@ -2488,6 +2778,8 @@ mod tests {
             subagent_type: ty.into(),
             difficulty: String::new(),
             scope: scope.into_iter().map(String::from).collect(),
+            resume_agent_id: None,
+            run_in_background: false,
         };
         let tasks = vec![
             mk("Worker", vec!["src/**"]), // PascalCase ok

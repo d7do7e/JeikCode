@@ -150,6 +150,8 @@ async fn full_assembly_lifecycle() {
             "code_explore",
             "web_fetch",
             "use_skill",
+            "task",
+            "task_output",
         ] {
             assert!(
                 defs.contains(&expected),

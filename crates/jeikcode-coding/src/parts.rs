@@ -392,115 +392,130 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     // `task` subagent tool (env-gated, default ON; opt out with JEIKCODE_SUBAGENT=0). Configured fast/capable tiers use
     // runtime-owned provider cells; missing/same-as-host tiers reuse the host slot.
-    // Child tools: read-only `explore` vs edit-capable `worker`.
-    let subagent_provider: Option<SharedReviewProvider> =
-        if subagent_enabled_from_env(std::env::var("JEIKCODE_SUBAGENT").ok().as_deref()) {
-            use jeikcode_capabilities::tools::TaskTool;
+    // Child tools: read-only `explore`, edit-capable `worker`, and read-only blind `verifier`.
+    let (subagent_provider, subagent_tool): (
+        Option<SharedReviewProvider>,
+        Option<Arc<jeikcode_capabilities::tools::TaskTool>>,
+    ) = if subagent_enabled_from_env(std::env::var("JEIKCODE_SUBAGENT").ok().as_deref()) {
+        use jeikcode_capabilities::tools::TaskTool;
 
-            let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
+        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
 
-            // Child subagent tool registry (mount a subset per type).
-            let mut child_reg = jeikcode_kernel::tool::ToolRegistry::new();
-            register_coding_tools_with_vision_and_bash_state(
-                &mut child_reg,
-                false,
-                Arc::clone(&bash_runtime),
-            );
-            jeikcode_capabilities::codeintel::register_codeintel_tools_with_mode(
-                &mut child_reg,
-                &codeintel_mode,
-            );
-            let child_reg = Arc::new(child_reg);
+        // Child subagent tool registry (mount a subset per type).
+        let mut child_reg = jeikcode_kernel::tool::ToolRegistry::new();
+        register_coding_tools_with_vision_and_bash_state(
+            &mut child_reg,
+            false,
+            Arc::clone(&bash_runtime),
+        );
+        jeikcode_capabilities::codeintel::register_codeintel_tools_with_mode(
+            &mut child_reg,
+            &codeintel_mode,
+        );
+        let child_reg = Arc::new(child_reg);
 
-            let explore_names: Vec<String> = ["read", "code_explore", "grep", "glob"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let worker_names: Vec<String> = [
-                "read",
-                "code_explore",
-                "edit",
-                "write",
-                "run_command",
-                "grep",
-                "glob",
-            ]
+        let explore_names: Vec<String> = ["read", "code_explore", "grep", "glob"]
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let verifier_names: Vec<String> = ["read", "code_explore", "run_command", "grep", "glob"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let worker_names: Vec<String> = [
+            "read",
+            "code_explore",
+            "edit",
+            "write",
+            "run_command",
+            "grep",
+            "glob",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
-            let reg_e = child_reg.clone();
-            let reg_w = child_reg.clone();
-            let make_explore_tools = move || {
-                let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-                reg_e.mount(&refs)
-            };
-            let make_worker_tools = move || {
-                let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-                reg_w.mount(&refs)
-            };
-
-            // Prefer a runtime-injected tier provider, else fall back to the host-provider
-            // slot (filled at assemble — the single-model / same-as-host collapse path). The
-            // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
-            // first `task` use (startup never pays the reqwest-client cost) and its cache is
-            // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
-            let fast_cell = cfg.subagent_fast_provider.clone();
-            let cap_cell = cfg.subagent_capable_provider.clone();
-            let slot_fast = slot.clone();
-            let slot_cap = slot.clone();
-            let make_fast = move || {
-                fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                    slot_fast
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
-            };
-            let make_capable = move || {
-                cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                    slot_cap
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
-            };
-
-            // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
-            // a productive child is never cancelled for total wall-clock age.
-            let subagent_cfg = cfg
-                .subagent_config
-                .as_ref()
-                .map(|c| c.subagent.clone())
-                .unwrap_or_default();
-            let (max_concurrent, max_rounds) = subagent_runtime_knobs(
-                &subagent_cfg,
-                std::env::var("JEIKCODE_SUBAGENT_MAX_ROUNDS")
-                    .ok()
-                    .as_deref(),
-            );
-            registry.register(Arc::new(
-                TaskTool::new(
-                    make_fast,
-                    make_capable,
-                    make_explore_tools,
-                    make_worker_tools,
-                )
-                .with_max_concurrent(max_concurrent)
-                .with_max_rounds(max_rounds)
-                .with_tool_loop_policy(cfg.tool_loop_policy)
-                .with_worker_middleware(turn_execution_policy.clone())
-                .with_project_context_loader(|wd| {
-                    jeikcode_capabilities::session::instructions::render_project_instructions(wd)
-                }),
-            ));
-            names.push("task".to_string());
-            Some(slot)
-        } else {
-            None
+        let reg_e = child_reg.clone();
+        let reg_v = child_reg.clone();
+        let reg_w = child_reg.clone();
+        let make_explore_tools = move || {
+            let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
+            reg_e.mount(&refs)
         };
+        let make_verifier_tools = move || {
+            let refs: Vec<&str> = verifier_names.iter().map(|s| s.as_str()).collect();
+            reg_v.mount(&refs)
+        };
+        let make_worker_tools = move || {
+            let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
+            reg_w.mount(&refs)
+        };
+
+        // Prefer a runtime-injected tier provider, else fall back to the host-provider
+        // slot (filled at assemble — the single-model / same-as-host collapse path). The
+        // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
+        // first `task` use (startup never pays the reqwest-client cost) and its cache is
+        // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
+        let fast_cell = cfg.subagent_fast_provider.clone();
+        let cap_cell = cfg.subagent_capable_provider.clone();
+        let slot_fast = slot.clone();
+        let slot_cap = slot.clone();
+        let make_fast = move || {
+            fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                slot_fast
+                    .read()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            })
+        };
+        let make_capable = move || {
+            cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                slot_cap
+                    .read()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            })
+        };
+
+        // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
+        // a productive child is never cancelled for total wall-clock age.
+        let subagent_cfg = cfg
+            .subagent_config
+            .as_ref()
+            .map(|c| c.subagent.clone())
+            .unwrap_or_default();
+        let (max_concurrent, max_rounds) = subagent_runtime_knobs(
+            &subagent_cfg,
+            std::env::var("JEIKCODE_SUBAGENT_MAX_ROUNDS")
+                .ok()
+                .as_deref(),
+        );
+        let task_tool = Arc::new(
+            TaskTool::new(
+                make_fast,
+                make_capable,
+                make_explore_tools,
+                make_worker_tools,
+            )
+            .with_verifier_tools(make_verifier_tools)
+            .with_max_concurrent(max_concurrent)
+            .with_max_rounds(max_rounds)
+            .with_tool_loop_policy(cfg.tool_loop_policy)
+            .with_worker_middleware(turn_execution_policy.clone())
+            .with_project_context_loader(|wd| {
+                jeikcode_capabilities::session::instructions::render_project_instructions(wd)
+            }),
+        );
+        registry.register(task_tool.clone());
+        registry.register(Arc::new(task_tool.output_tool()));
+        names.push("task".to_string());
+        names.push("task_output".to_string());
+        (Some(slot), Some(task_tool))
+    } else {
+        (None, None)
+    };
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
@@ -649,6 +664,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // Bind the runtime state to this session so every live bash task it registers
         // is attributable to (and cancellable only by) this session.
         bash_runtime.bind_session(b.id.as_str());
+        if let Some(task_tool) = &subagent_tool {
+            task_tool.bind_session(b.id.as_str());
+        }
         let keywords = b.manager.load_bash_keywords(&b.id).unwrap_or_default();
         if let Ok(path) = b.manager.bashkw_path(&b.id) {
             bash_runtime.bind_session_long_keywords(path, keywords);

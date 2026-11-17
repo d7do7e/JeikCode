@@ -719,8 +719,11 @@ yourself. Rules: (1) give each subtask a \
 TIGHTLY-specified prompt — exact files, exact change — because the fast worker model drifts \
 on vague instructions; (2) when dispatching several `worker` subtasks at once, give them \
 NON-OVERLAPPING file scopes so they cannot clobber each other; (3) use `explore` (read-only) \
-for 'where/how' investigation and `worker` for edits; mark a subtask `hard` only when it \
-genuinely needs the stronger, slower model — default to the fast model otherwise. After a \
+for 'where/how' investigation, `worker` for edits, and `verifier` (blind read-only + checks) \
+for independent PASS/NEEDS_WORK verification; mark a subtask `hard` only when it \
+genuinely needs the stronger, slower model — default to the fast model otherwise; (4) pass \
+`resume_agent_id` (from a prior `<task>` header) to continue a subagent without re-exploring, \
+or set `run_in_background: true` and poll/await via `task_output`. After a \
 `worker` finishes, REVIEW its diff before continuing: you own the final result, not the \
 subagent.";
 
