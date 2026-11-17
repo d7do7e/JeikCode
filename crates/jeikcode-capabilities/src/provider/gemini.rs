@@ -168,6 +168,8 @@ impl LlmProvider for GeminiProvider {
             'reopen: loop {
                 let mut dec = GeminiSseDecoder::default();
                 let mut emitted_replay_sensitive = false;
+                let mut saw_usable_content = false;
+                let mut saw_reasoning_or_sig = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
@@ -182,6 +184,14 @@ impl LlmProvider for GeminiProvider {
                             return;
                         }
                         Ok(None) => {
+                            if !dec.done && !saw_usable_content && saw_reasoning_or_sig {
+                                yield StreamEvent::Error(ProviderError {
+                                    retryable: true,
+                                    message: "gemini stream ended prematurely before finishReason (thought signature only, 0 content/tool tokens)".to_string(),
+                                    ..Default::default()
+                                });
+                                return;
+                            }
                             for ev in dec.finish() {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -245,6 +255,18 @@ impl LlmProvider for GeminiProvider {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                match &ev {
+                                    StreamEvent::TextDelta(t) if !t.is_empty() => {
+                                        saw_usable_content = true;
+                                    }
+                                    StreamEvent::ToolCall(_) => {
+                                        saw_usable_content = true;
+                                    }
+                                    StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. } => {
+                                        saw_reasoning_or_sig = true;
+                                    }
+                                    _ => {}
+                                }
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
                                 }

@@ -96,14 +96,15 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+static NEXT_TODO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn new_todo_id() -> String {
-    format!(
-        "todo-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(1)
-    )
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(1);
+    let seq = NEXT_TODO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("todo-{nanos}-{seq}")
 }
 
 fn normalize_todo_content_key(content: &str) -> String {
@@ -141,8 +142,8 @@ fn normalize_todo_ids(existing: &[TodoItem], items: &mut [TodoItem]) {
     }
 }
 
-/// Terminal-safe status glyph. Unicode `[•]`/`[✓]` gated behind `unicode`; ASCII
-/// `[~]`/`[x]` fallback (mirrors the spinner / hint-marker unicode gating).
+/// Terminal-safe status glyph. Unicode `[•]`/`[√]` gated behind `unicode`;
+/// `[~]`/`[√]` fallback (mirrors the spinner / hint-marker unicode gating).
 pub fn todo_glyph(status: TodoStatus, unicode: bool) -> &'static str {
     match (status, unicode) {
         (TodoStatus::Pending, _) => "[ ]",

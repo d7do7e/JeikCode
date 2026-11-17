@@ -287,6 +287,9 @@ pub struct CodingParts {
     pub cc_external_hooks: Option<Arc<CCExternalHooks>>,
     rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
     pub(crate) git_branch: String,
+    pub(crate) skill_dirs: Vec<PathBuf>,
+    pub(crate) plugin_skill_dirs: Vec<(PathBuf, String)>,
+    pub(crate) skill_catalog_hook: Arc<SkillCatalogHook>,
 }
 
 /// Phase 1 — gather + connect everything the agent needs (async: MCP connect,
@@ -773,7 +776,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Skill catalog — independent System block (Block 3, order 30), so
     // the model sees which skills are installed and can trigger one on a description
     // match. `None` (no skills) makes the hook a no-op. Reconciles in place on resume.
-    hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
+    let skill_catalog_hook = Arc::new(SkillCatalogHook::new(skill_catalog));
+    hooks.push(skill_catalog_hook.clone());
     let code_explore_mounted = names.iter().any(|n| n == "code_explore");
     let mcp_registries: Vec<_> = mcp_registry
         .iter()
@@ -941,6 +945,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         rate_limit_source: opts.rate_limit_source,
         git_branch: crate::custom_prompts::detect_git_branch(&cfg.working_dir)
             .unwrap_or_else(|| "(not a git repo)".to_string()),
+        skill_dirs,
+        plugin_skill_dirs: opts.plugin_skill_dirs,
+        skill_catalog_hook,
     })
 }
 
@@ -1442,6 +1449,23 @@ pub fn assemble(
     parts
         .registry
         .register(Arc::new(ReadFileTool::new(cfg.supports_vision)));
+
+    // Refresh skills and `SkillCatalogHook` on assemble (`/reload context` / model swap)
+    // so newly created or edited `SKILL.md` files take effect without tearing down MCP pools.
+    {
+        let mut skills = SkillRegistry::load(&parts.skill_dirs);
+        for (dir, ns) in &parts.plugin_skill_dirs {
+            skills.load_dir(dir, Some(ns));
+        }
+        skills.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(
+            &cfg.working_dir,
+        ));
+        let skills = Arc::new(skills);
+        parts
+            .skill_catalog_hook
+            .set_catalog(skills.render_catalog());
+        register_skill_tools(&mut parts.registry, skills);
+    }
 
     // Session-bound: reload the complete canonical aggregate. Only a fresh
     // runtime intentionally staged in memory is allowed to assemble before its

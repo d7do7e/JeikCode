@@ -129,10 +129,46 @@ impl MemoryStore {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
-            fs::write(&self.path, out)?;
+            super::auto_store::atomic_write_str(&self.path, &out)?;
         }
 
         Ok(removed)
+    }
+
+    pub fn update_matching(&self, target: &str, replacement: &str) -> io::Result<bool> {
+        let content = fs::read_to_string(&self.path).unwrap_or_default();
+        if content.is_empty() {
+            return Ok(false);
+        }
+        let target_lower = target.trim().to_lowercase();
+        let clean_repl = replacement
+            .trim()
+            .strip_prefix("- ")
+            .unwrap_or(replacement.trim())
+            .trim();
+        let mut updated = false;
+        let mut out_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !updated {
+                if let Some(body) = trimmed.strip_prefix("- ") {
+                    if body.to_lowercase().contains(&target_lower) {
+                        out_lines.push(format!("- {clean_repl}"));
+                        updated = true;
+                        continue;
+                    }
+                }
+            }
+            out_lines.push(line.to_string());
+        }
+        if updated {
+            let mut out = out_lines.join("\n");
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            super::auto_store::atomic_write_str(&self.path, &out)?;
+        }
+        Ok(updated)
     }
 
     pub fn find_matching(&self, keyword: &str) -> Vec<String> {

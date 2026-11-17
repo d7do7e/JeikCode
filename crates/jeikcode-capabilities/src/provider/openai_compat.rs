@@ -1511,13 +1511,33 @@ impl SseDecoder {
     }
 
     /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
-    /// then emit `Done`.
+    /// then emit `Done` (or a retryable error if a buffered tool call was cut off mid-JSON).
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if self.done {
             return out;
         }
-        for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+        let pending = std::mem::take(&mut self.tool_calls);
+        if !self.seen_finish && self.tool_call_delta_count < MAX_TOOL_CALL_DELTAS {
+            let has_truncated_json = pending.iter().any(|(id, name, args)| {
+                let trimmed = args.trim();
+                (!id.is_empty() || !name.is_empty() || !trimmed.is_empty())
+                    && (trimmed.starts_with('{') || trimmed.starts_with('['))
+                    && serde_json::from_str::<Value>(trimmed).is_err()
+                    && serde_json::from_str::<Value>(&crate::argument_repair::repair_json(args))
+                        .is_err()
+            });
+            if has_truncated_json {
+                self.done = true;
+                out.push(StreamEvent::Error(ProviderError {
+                    retryable: true,
+                    message: "upstream stream ended prematurely mid-tool-call with truncated JSON arguments before finish_reason".to_string(),
+                    ..Default::default()
+                }));
+                return out;
+            }
+        }
+        for (id, name, args) in pending {
             if !id.is_empty() || !name.is_empty() || !args.is_empty() {
                 out.push(StreamEvent::ToolCall(ToolCall {
                     id,

@@ -643,6 +643,24 @@ impl ResponsesSseDecoder {
             return Vec::new();
         }
         self.emitted_done = true;
+        let has_truncated_json = self.pending_calls.values().any(|(id, name, args)| {
+            let trimmed = args.trim();
+            (!id.is_empty() || !name.is_empty() || !trimmed.is_empty())
+                && (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && serde_json::from_str::<Value>(trimmed).is_err()
+                && serde_json::from_str::<Value>(&crate::argument_repair::repair_json(args))
+                    .is_err()
+        });
+        if has_truncated_json {
+            self.pending_calls.clear();
+            return vec![StreamEvent::Error(ProviderError {
+                retryable: true,
+                message:
+                    "responses stream ended prematurely mid-tool-call with truncated JSON arguments"
+                        .to_string(),
+                ..Default::default()
+            })];
+        }
         self.flush_calls()
             .into_iter()
             .chain(std::iter::once(StreamEvent::Done { truncated: false }))

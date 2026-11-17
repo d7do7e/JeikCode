@@ -194,9 +194,10 @@ impl Tool for EditFileTool {
             Err(e) => return e.into_tool_result(),
         };
         // 顶层 `replace_all` 只属于“便捷形”（无 edits[]，顶层 old/new 对）。
-        // 一旦调用方用了 `edits[]`，顶层开关会静默失效（仅 hunk 级生效），
+        // 一旦调用方用了 `edits[]` 且存在未显式声明 `replace_all: true` 的 hunk，顶层开关会静默失效，
         // 造成“我以为全局全替换、实际只替换第一处”——宁可响亮报错也不静默降级。
-        if caller_passed_edits && a.replace_all {
+        // 若每个 hunk 本身已声明 `replace_all: true`，顶层重复声明无歧义，直接放行。
+        if caller_passed_edits && a.replace_all && a.edits.iter().any(|h| !h.replace_all) {
             return err(
                 "edit: `replace_all` is per-hunk — move it inside `edits[]` \
                  (e.g. edits:[{\"old_string\":…,\"new_string\":…,\"replace_all\":true}]). \

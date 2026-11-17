@@ -264,29 +264,33 @@ impl Tool for MemoryTool {
                     Ok(_) => {}
                     Err(e) => return tool_err(e),
                 }
-                if let Some(q) = query {
-                    let g_hits = global.find_matching(q);
-                    if !g_hits.is_empty() {
-                        sections.push(format!(
-                            "[Global memory.md]\n{}",
-                            g_hits
-                                .into_iter()
-                                .map(|e| format!("- {e}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ));
-                    }
-                    let p_hits = legacy_project.find_matching(q);
-                    if !p_hits.is_empty() {
-                        sections.push(format!(
-                            "[Project memory.md]\n{}",
-                            p_hits
-                                .into_iter()
-                                .map(|e| format!("- {e}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ));
-                    }
+                let g_hits = match query {
+                    Some(q) => global.find_matching(q),
+                    None => global.load(),
+                };
+                if !g_hits.is_empty() {
+                    sections.push(format!(
+                        "[Global memory.md]\n{}",
+                        g_hits
+                            .into_iter()
+                            .map(|e| format!("- {e}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+                let p_hits = match query {
+                    Some(q) => legacy_project.find_matching(q),
+                    None => legacy_project.load(),
+                };
+                if !p_hits.is_empty() {
+                    sections.push(format!(
+                        "[Project memory.md]\n{}",
+                        p_hits
+                            .into_iter()
+                            .map(|e| format!("- {e}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
                 }
                 tool_ok(sections.join("\n\n"))
             }
@@ -319,10 +323,45 @@ impl Tool for MemoryTool {
                             "`update` without `topic` requires `target` substring to match in MEMORY.md",
                         );
                     };
-                    match auto.update_index_entry(target, raw_content) {
-                        Ok(true) => tool_ok(format!("Updated MEMORY.md entry matching `{target}`")),
-                        Ok(false) => tool_err(format!("no MEMORY.md entry matched `{target}`")),
-                        Err(e) => tool_err(e),
+                    let scope = parsed
+                        .scope
+                        .as_deref()
+                        .map(str::trim)
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_else(|| "project".to_string());
+                    if scope == "global" {
+                        if raw_content.contains('\n') || raw_content.len() > 240 {
+                            return tool_err(
+                                "global memory entries must be a single concise line (<= 240 chars)",
+                            );
+                        }
+                        match global.update_matching(target, raw_content) {
+                            Ok(true) => tool_ok(format!(
+                                "Updated global memory.md entry matching `{target}`"
+                            )),
+                            Ok(false) => {
+                                tool_err(format!("no global memory.md entry matched `{target}`"))
+                            }
+                            Err(e) => tool_err(format!("failed to update global memory: {e}")),
+                        }
+                    } else {
+                        match auto.update_index_entry(target, raw_content) {
+                            Ok(true) => {
+                                tool_ok(format!("Updated MEMORY.md entry matching `{target}`"))
+                            }
+                            Ok(false) => {
+                                match legacy_project.update_matching(target, raw_content) {
+                                    Ok(true) => tool_ok(format!(
+                                        "Updated project memory.md entry matching `{target}`"
+                                    )),
+                                    Ok(false) => {
+                                        tool_err(format!("no MEMORY.md entry matched `{target}`"))
+                                    }
+                                    Err(e) => tool_err(e.to_string()),
+                                }
+                            }
+                            Err(e) => tool_err(e),
+                        }
                     }
                 }
             }
@@ -350,15 +389,28 @@ impl Tool for MemoryTool {
                     else {
                         return tool_err("`prune` requires `query` or `topic`");
                     };
+                    let scope = parsed
+                        .scope
+                        .as_deref()
+                        .map(str::trim)
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_else(|| "project".to_string());
                     let mut count = 0usize;
-                    if let Ok(removed) = auto.prune_index(kw) {
-                        count += removed.len();
-                    }
-                    if let Ok(removed) = legacy_project.remove_matching(kw) {
-                        count += removed.len();
-                    }
-                    if let Ok(removed) = global.remove_matching(kw) {
-                        count += removed.len();
+                    if scope == "global" {
+                        if let Ok(removed) = global.remove_matching(kw) {
+                            count += removed.len();
+                        }
+                    } else if scope == "project" || scope == "topic" {
+                        if let Ok(removed) = auto.prune_index(kw) {
+                            count += removed.len();
+                        }
+                        if let Ok(removed) = legacy_project.remove_matching(kw) {
+                            count += removed.len();
+                        }
+                    } else {
+                        return tool_err(format!(
+                            "unsupported scope `{scope}` (expected `project`, `global`, or `topic`)"
+                        ));
                     }
                     tool_ok(format!("Pruned {count} matching memory entries for `{kw}`"))
                 }
@@ -422,11 +474,20 @@ mod tests {
         )
     }
 
+    fn test_ctx(dir: &Path) -> ToolContext {
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: jeikcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
+    }
+
     #[tokio::test]
     async fn memory_tool_remember_recall_update_and_prune_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let tool = test_tool(dir.path());
-        let ctx = ToolContext::default();
+        let ctx = test_ctx(dir.path());
 
         let res = tool
             .execute(
@@ -473,7 +534,7 @@ mod tests {
     async fn memory_tool_rejects_secrets_and_oversized_index_entries() {
         let dir = tempfile::tempdir().unwrap();
         let tool = test_tool(dir.path());
-        let ctx = ToolContext::default();
+        let ctx = test_ctx(dir.path());
 
         let secret = tool
             .execute(
@@ -488,5 +549,56 @@ mod tests {
         let oversized = tool.execute(&huge, &ctx).await;
         assert!(oversized.is_error);
         assert!(oversized.content.contains("topic"));
+    }
+
+    #[tokio::test]
+    async fn memory_tool_scopes_prune_and_update_and_includes_global_in_queryless_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = test_tool(dir.path());
+        let ctx = test_ctx(dir.path());
+
+        tool.execute(
+            r#"{"action":"remember","scope":"global","content":"Shared token: global-pref"}"#,
+            &ctx,
+        )
+        .await;
+        tool.execute(
+            r#"{"action":"remember","scope":"project","content":"Shared token: project-pref"}"#,
+            &ctx,
+        )
+        .await;
+
+        let all_recalled = tool.execute(r#"{"action":"recall"}"#, &ctx).await;
+        assert!(!all_recalled.is_error);
+        assert!(
+            all_recalled.content.contains("global-pref")
+                && all_recalled.content.contains("project-pref"),
+            "queryless recall must include both global and project memory: {}",
+            all_recalled.content
+        );
+
+        // Project-scoped prune must NOT delete global memory
+        let pruned_proj = tool
+            .execute(r#"{"action":"prune","query":"Shared token"}"#, &ctx)
+            .await;
+        assert!(!pruned_proj.is_error);
+        let after_prune = tool.execute(r#"{"action":"recall"}"#, &ctx).await;
+        assert!(
+            after_prune.content.contains("global-pref")
+                && !after_prune.content.contains("project-pref"),
+            "default project prune must leave global memory untouched: {}",
+            after_prune.content
+        );
+
+        // Global update works
+        let updated_global = tool
+            .execute(
+                r#"{"action":"update","scope":"global","target":"global-pref","content":"Shared token: global-pref-v2"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!updated_global.is_error, "{}", updated_global.content);
+        let after_update = tool.execute(r#"{"action":"recall"}"#, &ctx).await;
+        assert!(after_update.content.contains("global-pref-v2"));
     }
 }

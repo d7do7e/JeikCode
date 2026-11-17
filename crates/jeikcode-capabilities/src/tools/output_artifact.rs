@@ -107,8 +107,17 @@ impl ArtifactStore {
                     .try_into()
                     .expect("fixed 8-byte length"),
             ) as usize;
-            let mut decoded = Vec::new();
-            GzDecoder::new(&bytes[ARTIFACT_GZIP_HEADER_LEN..]).read_to_end(&mut decoded)?;
+            const MAX_DECOMPRESSED_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+            if (expected as u64) > MAX_DECOMPRESSED_ARTIFACT_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact exceeds 64 MiB decompression ceiling",
+                ));
+            }
+            let mut decoded = Vec::with_capacity(expected.min(1024 * 1024));
+            GzDecoder::new(&bytes[ARTIFACT_GZIP_HEADER_LEN..])
+                .take(MAX_DECOMPRESSED_ARTIFACT_BYTES + 1)
+                .read_to_end(&mut decoded)?;
             if decoded.len() != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -120,8 +129,16 @@ impl ArtifactStore {
         // Touch mtime on access so this artifact is marked recently used (true cross-platform LRU).
         touch_mtime(&path);
 
-        let start = offset.min(bytes.len());
-        let end = start.saturating_add(limit).min(bytes.len());
+        let mut start = offset.min(bytes.len());
+        let mut end = start.saturating_add(limit).min(bytes.len());
+        if let Ok(utf8) = std::str::from_utf8(&bytes) {
+            while start > 0 && !utf8.is_char_boundary(start) {
+                start -= 1;
+            }
+            while end < utf8.len() && !utf8.is_char_boundary(end) {
+                end += 1;
+            }
+        }
         Ok(Some(bytes[start..end].to_vec()))
     }
 

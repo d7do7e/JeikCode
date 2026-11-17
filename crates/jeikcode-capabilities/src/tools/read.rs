@@ -527,22 +527,32 @@ impl Tool for ReadFileTool {
         // Virtual artifact URI path: `artifact://<artifact_id>`
         if let Some(artifact_id) = a.path.strip_prefix("artifact://") {
             let store = match &self.artifact_store {
-                Some(s) => s,
+                Some(s) => Arc::clone(s),
                 None => {
                     return err(
                         "Artifact storage is unavailable (session not initialized or no active session).",
                     );
                 }
             };
-            let bytes = match store.get(artifact_id, 0, usize::MAX) {
-                Ok(Some(b)) => b,
-                Ok(None) => {
+            let id_owned = artifact_id.to_string();
+            let fetched =
+                tokio::task::spawn_blocking(move || store.get(&id_owned, 0, usize::MAX)).await;
+            let bytes = match fetched {
+                Ok(Ok(Some(b))) => b,
+                Ok(Ok(None)) => {
                     return err(format!(
                         "Artifact '{artifact_id}' is no longer available (truncated captures don't survive across machines or after cleanup). \
                          Re-run the original command to regenerate its output."
                     ));
                 }
-                Err(e) => return err(format!("Failed to retrieve artifact '{artifact_id}': {e}")),
+                Ok(Err(e)) => {
+                    return err(format!("Failed to retrieve artifact '{artifact_id}': {e}"))
+                }
+                Err(e) => {
+                    return err(format!(
+                        "Artifact reader task failed for '{artifact_id}': {e}"
+                    ))
+                }
             };
             let text = String::from_utf8_lossy(&bytes);
             let total_bytes = bytes.len() as u64;

@@ -6,11 +6,13 @@
 //! `memory` tool (`action:"recall"`), shared across git worktrees via `--git-common-dir`.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 /// Hard line ceiling for Tier-1 `MEMORY.md` index.
 pub const MEMORY_INDEX_MAX_LINES: usize = 150;
@@ -21,19 +23,31 @@ pub const MEMORY_TOPIC_MAX_BYTES: usize = 16 * 1024;
 /// Maximum character length of a single Tier-1 `MEMORY.md` bullet entry.
 pub const MEMORY_INDEX_ENTRY_MAX_CHARS: usize = 240;
 
+static CANONICAL_REPO_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+
 /// Resolve the canonical project root for auto-memory keying.
 ///
 /// Inside a git worktree, `git rev-parse --git-common-dir` returns the shared `.git`
 /// directory across all worktrees; its parent is used as the canonical repository root.
 /// Outside git repos, falls back to canonicalized `working_dir`.
 pub fn resolve_canonical_repo_root(working_dir: &Path) -> PathBuf {
-    if working_dir.exists() {
-        if let Ok(output) = Command::new("git")
-            .arg("-C")
-            .arg(working_dir)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-        {
+    let key = fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    let cache = CANONICAL_REPO_ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+    }
+
+    let resolved = if working_dir.exists() {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(working_dir).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]);
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !raw.is_empty() {
@@ -49,12 +63,23 @@ pub fn resolve_canonical_repo_root(working_dir: &Path) -> PathBuf {
                         .filter(|&n| n == ".git")
                         .and_then(|_| abs_common.parent())
                         .unwrap_or(&abs_common);
-                    return fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    let canon = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(key, canon.clone());
+                    }
+                    return canon;
                 }
             }
         }
+        key.clone()
+    } else {
+        key.clone()
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, resolved.clone());
     }
-    fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
+    resolved
 }
 
 /// Deterministic 16-hex-char bucket hash for a canonical project root path.
@@ -327,15 +352,18 @@ impl AutoMemoryStore {
         // Compute and validate the index pointer update BEFORE touching disk so budget
         // violations never leave an orphaned unindexed topic.
         let pointer_prefix = format!("[topics/{valid_slug}.md]");
-        let short_summary = summary
+        let pointer_head = format!("- {pointer_prefix}(topics/{valid_slug}.md) — ");
+        let max_summary_chars = MEMORY_INDEX_ENTRY_MAX_CHARS
+            .saturating_add(2)
+            .saturating_sub(pointer_head.chars().count())
+            .max(16);
+        let raw_summary = summary
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.lines().next().unwrap_or(s).trim().to_string())
             .unwrap_or_else(|| first_meaningful_line(clean, 120));
-        let pointer_line = format!("- {pointer_prefix}(topics/{valid_slug}.md) — {short_summary}");
-        if pointer_line.chars().count() > MEMORY_INDEX_ENTRY_MAX_CHARS + 4 {
-            return Err("topic index pointer summary is too long".to_string());
-        }
+        let short_summary: String = raw_summary.chars().take(max_summary_chars).collect();
+        let pointer_line = format!("{pointer_head}{short_summary}");
 
         let existing_index = self.load_index_raw();
         let next_index = upsert_topic_pointer(&existing_index, &pointer_prefix, &pointer_line);
@@ -344,7 +372,7 @@ impl AutoMemoryStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        fs::write(&path, next_body).map_err(|e| e.to_string())?;
+        atomic_write_str(&path, &next_body).map_err(|e| e.to_string())?;
         self.write_index(&next_index).map_err(|e| e.to_string())?;
         Ok(path)
     }
@@ -465,8 +493,32 @@ impl AutoMemoryStore {
 
     fn write_index(&self, content: &str) -> io::Result<()> {
         fs::create_dir_all(&self.root_dir)?;
-        let mut file = fs::File::create(self.index_path())?;
-        file.write_all(content.as_bytes())
+        atomic_write_str(&self.index_path(), content)
+    }
+}
+
+pub(crate) fn atomic_write_str(target: &Path, content: &str) -> io::Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("memory");
+    let tmp = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        let _ = f.sync_all();
+    }
+    match fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let res = fs::write(target, content.as_bytes());
+            let _ = fs::remove_file(&tmp);
+            res
+        }
     }
 }
 

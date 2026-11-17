@@ -28,7 +28,7 @@ use std::sync::Mutex;
 /// Injects the pre-rendered skill catalog. `None` catalog (no skills installed) →
 /// the hook is a no-op on a fresh session and prunes a stale block on resume.
 pub struct SkillCatalogHook {
-    catalog: Option<String>,
+    catalog: Mutex<Option<String>>,
     /// Last reconciled catalog. `turn_start` early-returns when unchanged so the
     /// prefix cache stays byte-stable (same memo pattern as `McpInstructionsHook`).
     last_block: Mutex<Option<Option<String>>>,
@@ -38,29 +38,42 @@ impl SkillCatalogHook {
     /// Build from a rendered catalog (see [`super::SkillRegistry::render_catalog`]).
     pub fn new(catalog: Option<String>) -> Self {
         Self {
-            catalog,
+            catalog: Mutex::new(catalog),
             last_block: Mutex::new(None),
+        }
+    }
+
+    /// Update the rendered catalog (e.g. during `/reload context` / `parts::assemble`)
+    /// so newly added or edited `SKILL.md` files take effect without tearing down MCP pools.
+    pub fn set_catalog(&self, catalog: Option<String>) {
+        if let Ok(mut guard) = self.catalog.lock() {
+            *guard = catalog;
         }
     }
 
     /// Reconcile the catalog block in place. No-op when the catalog is unchanged.
     fn refresh_in_place(&self, convo: &mut Conversation) {
+        let current_catalog = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         {
             let mut last = self
                 .last_block
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if last.as_ref() == Some(&self.catalog) {
+            if last.as_ref() == Some(&current_catalog) {
                 return;
             }
-            *last = Some(self.catalog.clone());
+            *last = Some(current_catalog.clone());
         }
         // Clean up any legacy system block if resuming from older versions
         convo.reconcile_system_block(CATALOG_HEADER, None);
         convo.reconcile_system_block("=== AVAILABLE SKILLS ===", None);
         convo.reconcile_system_block("=== AVAILABLE SKILLS (*.md) ===", None);
         // Reconcile as ordered frozen synthetic user block (Block 3)
-        convo.reconcile_frozen_user_block(CATALOG_HEADER, self.catalog.clone());
+        convo.reconcile_frozen_user_block(CATALOG_HEADER, current_catalog);
     }
 }
 

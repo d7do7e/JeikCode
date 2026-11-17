@@ -227,7 +227,14 @@ fn build_verifier_tools(bash_runtime: Arc<BashRuntimeState>) -> MountedTools {
 }
 
 pub(crate) fn snapshot_has_file_mutations(messages: &[Message]) -> bool {
-    messages.iter().any(|m| {
+    let start = messages
+        .iter()
+        .rposition(|m| {
+            m.role == jeikcode_kernel::message::Role::User
+                && (!m.synthetic || m.is_compaction_turn_start())
+        })
+        .unwrap_or(0);
+    messages[start..].iter().any(|m| {
         m.tool_calls.iter().any(|call| {
             matches!(
                 call.name.as_str(),
@@ -239,7 +246,8 @@ pub(crate) fn snapshot_has_file_mutations(messages: &[Message]) -> bool {
                     | "search_replace"
                     | "parallel_edit_files"
                     | "create_file"
-            )
+            ) || (call.name.eq_ignore_ascii_case("task")
+                && call.arguments.to_ascii_lowercase().contains("worker"))
         })
     })
 }
