@@ -1021,6 +1021,7 @@ pub enum Msg<'a> {
     BgUseSessionsInstead,
     CmdDescResume,
     CmdDescRename,
+    CmdDescName,
     CmdDescModel,
     CmdDescModelAdd,
     CmdDescProvider,

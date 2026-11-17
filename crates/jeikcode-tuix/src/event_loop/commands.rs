@@ -2240,6 +2240,65 @@ fn execute_slash_command_impl(
                 }
             }
         }
+        "name" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() {
+                let current_name = ctx
+                    .current_session
+                    .user_renamed
+                    .then(|| ctx.current_session.name.trim())
+                    .filter(|s| !s.is_empty());
+                let clean_wd = jeikcode_coding::display_clean_path(&ctx.working_dir);
+                let repo_root =
+                    jeikcode_capabilities::memory::resolve_canonical_repo_root(&ctx.working_dir);
+                let default_label = jeikcode_coding::default_display_name(
+                    &ctx.working_dir,
+                    &repo_root,
+                    &ctx.current_session.id,
+                );
+                let msg = match current_name {
+                    Some(name) => format!(
+                        "  Session mesh name: {name}\n  Session ID:        {}\n  Working dir:       {clean_wd}\n",
+                        ctx.current_session.id
+                    ),
+                    None => format!(
+                        "  Session mesh name: (unset — default `{default_label}`)\n  Session ID:        {}\n  Working dir:       {clean_wd}\n  Use `/name <label>` to set a live mesh nickname.\n",
+                        ctx.current_session.id
+                    ),
+                };
+                if matches!(state.phase, crate::state::UiPhase::Streaming) && !ctx.is_plain_renderer
+                {
+                    state.footer_command_output = Some(msg);
+                } else {
+                    renderer.render(UiLine::CommandOutput(msg));
+                    renderer.flush();
+                }
+            } else {
+                match jeikcode_coding::sanitize_mesh_name(trimmed) {
+                    Ok(valid_name) => {
+                        if ctx
+                            .runtime
+                            .set_mesh_name(
+                                Some(valid_name),
+                                ctx.foreground_runtime_id,
+                                ctx.runtime_event_tx.clone(),
+                            )
+                            .is_err()
+                        {
+                            renderer.render(UiLine::Error(
+                                "Runtime is still starting or unavailable; try `/name` again in a moment."
+                                    .to_string(),
+                            ));
+                            renderer.flush();
+                        }
+                    }
+                    Err(err) => {
+                        renderer.render(UiLine::Error(err));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
         "rename" => {
             // Rename targets `ctx.current_session` (the in-flight conversation),
             // not whichever id `/resume` last loaded — the user expects /rename
@@ -5298,9 +5357,10 @@ fn assemble_status(body: &str, proxy: Option<&str>, instructions: &str) -> Strin
 /// `/status` report text shared by TUI and remote command surfaces.
 /// `proxy` = interactive `/status` Proxy line; remote view passes `None`.
 pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
+    let clean_dir = jeikcode_coding::display_clean_path(&ctx.working_dir);
     let body = t(Msg::StatusBody {
         model: &ctx.model_name,
-        dir: &ctx.working_dir.display().to_string(),
+        dir: &clean_dir,
         config: &ctx.config_store.path().display().to_string(),
     })
     .into_owned();

@@ -1,7 +1,8 @@
-//! Cross-process mesh IPC client, stale-PID descriptor reaper, and parent-only peer tools:
+//! Cross-process mesh IPC client and parent-only peer tools:
 //! - `list_live_sessions`: discover PID-checked live JeikCode sessions
-//! - `read_session_turns`: inspect recent conversation turns from a peer session
-//! - `send_to_session`: send a guarded peer message and return the peer's reply/outcome
+//! - `read_session_turns`: inspect recent conversation turns from a peer session (by name or ID)
+//! - `send_to_session`: send a guarded peer message (by name or ID) and return the peer's reply/outcome
+//! - `set_session_name`: set or update this session's own live mesh nickname/role
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,9 +18,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::session_mesh::{
-    max_mesh_hops, same_canonical_path, validate_live_session_id, IpcRequestEnvelope,
-    LiveSessionDescriptor, LiveSessionView, MeshLocalState, MeshRequest, MeshResponse,
-    DEFAULT_PEER_REPLY_TIMEOUT_SECS, IPC_CONNECT_TIMEOUT, IPC_IO_TIMEOUT,
+    IpcRequestEnvelope, LiveSessionDescriptor, LiveSessionView, MeshLocalState, MeshRequest,
+    MeshResponse, DEFAULT_PEER_REPLY_TIMEOUT_SECS, IPC_CONNECT_TIMEOUT, IPC_IO_TIMEOUT,
+};
+use crate::session_mesh_naming::{
+    default_display_name, display_clean_path, max_mesh_hops_from_mesh,
+    read_live_descriptors_reaping_stale, resolve_live_target, same_canonical_path,
 };
 
 fn tool_ok(content: impl Into<String>) -> ToolResult {
@@ -38,30 +42,6 @@ fn tool_err(content: impl Into<String>) -> ToolResult {
         is_error: true,
         images: Vec::new(),
     }
-}
-
-/// Format an incoming peer message for visible display in TUI / WebUI timelines.
-pub fn format_peer_message_banner(
-    from_session_id: &str,
-    from_working_dir: &Path,
-    from_repo_root: &Path,
-    same_repo: bool,
-    hop_depth: u32,
-    steered: bool,
-    text: &str,
-) -> String {
-    let short_id: String = from_session_id.chars().take(8).collect();
-    let scope_badge = if same_repo {
-        "same-repo".to_string()
-    } else {
-        format!("EXTERNAL REPO: {}", from_repo_root.display())
-    };
-    let mode_tag = if steered { ", steered" } else { "" };
-    format!(
-        "[peer {short_id} @ {} | {scope_badge} | hop {hop_depth}{mode_tag}]\n{}",
-        from_working_dir.display(),
-        text.trim()
-    )
 }
 
 pub(crate) fn last_assistant_reply_text(snapshot: &SessionSnapshot) -> String {
@@ -123,52 +103,39 @@ pub async fn discover_live_sessions(
     self_session_id: Option<&str>,
     self_repo_root: Option<&Path>,
 ) -> Vec<LiveSessionView> {
-    let Ok(entries) = fs::read_dir(live_dir) else {
-        return Vec::new();
-    };
-    let mut descriptors = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(desc) = serde_json::from_str::<LiveSessionDescriptor>(&raw) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        if validate_live_session_id(&desc.session_id).is_err() || !is_pid_alive(desc.pid) {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        descriptors.push((path, desc));
-    }
-
+    let descriptors = read_live_descriptors_reaping_stale(live_dir);
     let mut views = Vec::new();
     for (path, desc) in descriptors {
         match send_ipc_request(&desc, MeshRequest::PingStatus, IPC_IO_TIMEOUT).await {
             Ok(MeshResponse::Status {
                 session_id,
+                name,
                 pid,
                 phase,
                 busy,
                 message_count,
             }) if session_id == desc.session_id => {
+                let effective_name = name.or(desc.name);
+                let display_name = effective_name.clone().unwrap_or_else(|| {
+                    default_display_name(&desc.working_dir, &desc.repo_root, &session_id)
+                });
                 let is_self = self_session_id.is_some_and(|s| s == session_id);
                 let same_repo =
                     self_repo_root.is_some_and(|r| same_canonical_path(r, &desc.repo_root));
+                let clean_wd = display_clean_path(&desc.working_dir);
+                let clean_repo = display_clean_path(&desc.repo_root);
                 let repo_scope = if same_repo {
                     "same_repo".to_string()
                 } else {
-                    format!("EXTERNAL REPO: {}", desc.repo_root.display())
+                    format!("EXTERNAL REPO: {clean_repo}")
                 };
                 views.push(LiveSessionView {
                     session_id,
+                    name: effective_name,
+                    display_name,
                     pid,
-                    working_dir: desc.working_dir,
-                    repo_root: desc.repo_root,
+                    working_dir: clean_wd,
+                    repo_root: clean_repo,
                     same_repo,
                     repo_scope,
                     is_self,
@@ -186,36 +153,20 @@ pub async fn discover_live_sessions(
             }
         }
     }
-    views.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    views.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     views
-}
-
-/// Load a live session descriptor by ID, checking OS PID liveness.
-pub(crate) fn load_live_descriptor(
-    live_dir: &Path,
-    session_id: &str,
-) -> Result<LiveSessionDescriptor, String> {
-    let valid_id = validate_live_session_id(session_id)?;
-    let path = live_dir.join(format!("{valid_id}.json"));
-    let raw = fs::read_to_string(&path)
-        .map_err(|_| format!("live session `{valid_id}` not found in mesh registry"))?;
-    let desc: LiveSessionDescriptor = serde_json::from_str(&raw)
-        .map_err(|e| format!("corrupt descriptor for `{valid_id}`: {e}"))?;
-    if !is_pid_alive(desc.pid) {
-        let _ = fs::remove_file(&path);
-        return Err(format!(
-            "live session `{valid_id}` (pid {}) is no longer alive (reaped stale entry)",
-            desc.pid
-        ));
-    }
-    Ok(desc)
 }
 
 async fn ipc_read_session_turns(
     desc: &LiveSessionDescriptor,
     last_n: usize,
     max_chars: usize,
-) -> Result<(String, usize, String), String> {
+) -> Result<(Option<String>, String, usize, String), String> {
     match send_ipc_request(
         desc,
         MeshRequest::ReadTurns { last_n, max_chars },
@@ -224,17 +175,19 @@ async fn ipc_read_session_turns(
     .await?
     {
         MeshResponse::Turns {
+            name,
             phase,
             total_messages,
             rendered,
             ..
-        } => Ok((phase, total_messages, rendered)),
+        } => Ok((name, phase, total_messages, rendered)),
         MeshResponse::Error { message } => Err(message),
         _ => Err("unexpected IPC response for read_session_turns".to_string()),
     }
 }
 
 struct PeerDeliveryOutcome {
+    name: Option<String>,
     turn_id: u64,
     steered: bool,
     hop_depth: u32,
@@ -249,6 +202,7 @@ struct PeerDeliveryOutcome {
 async fn ipc_send_to_session(
     desc: &LiveSessionDescriptor,
     from_session_id: &str,
+    from_session_name: Option<String>,
     from_working_dir: &Path,
     from_repo_root: &Path,
     text: String,
@@ -270,6 +224,7 @@ async fn ipc_send_to_session(
         desc,
         MeshRequest::SendMessage {
             from_session_id: from_session_id.to_string(),
+            from_session_name,
             from_working_dir: from_working_dir.to_path_buf(),
             from_repo_root: from_repo_root.to_path_buf(),
             text,
@@ -284,6 +239,7 @@ async fn ipc_send_to_session(
     .await?
     {
         MeshResponse::Delivered {
+            name,
             turn_id,
             steered,
             hop_depth,
@@ -294,6 +250,7 @@ async fn ipc_send_to_session(
             reply,
             ..
         } => Ok(PeerDeliveryOutcome {
+            name,
             turn_id,
             steered,
             hop_depth,
@@ -360,7 +317,7 @@ impl Tool for ListLiveSessionsTool {
     }
 
     fn description(&self) -> &str {
-        "Discover live JeikCode sessions running across local OS processes (standalone TUIs, CLI, daemon) with PID verification, repo scope (`same_repo` or `EXTERNAL REPO`), working directory, and busy status."
+        "Discover live JeikCode sessions across local OS processes with PID verification, nicknames (`name`/`display_name`), repo scope (`same_repo` or `EXTERNAL REPO`), clean paths, and busy status. Reuse known session names or IDs from earlier turns instead of calling this repeatedly."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -391,7 +348,8 @@ impl Tool for ListLiveSessionsTool {
 
 #[derive(Deserialize)]
 struct ReadSessionTurnsArgs {
-    session_id: String,
+    #[serde(alias = "session_id")]
+    target: String,
     #[serde(default)]
     last_n: Option<usize>,
     #[serde(default)]
@@ -414,16 +372,16 @@ impl Tool for ReadSessionTurnsTool {
     }
 
     fn description(&self) -> &str {
-        "Read recent user/assistant turns from another live JeikCode session (same-repo or cross-repo; external repositories are clearly annotated)."
+        "Read recent user/assistant turns from another live JeikCode session by `target` (accepts either a session `name` or `session_id`; reuse known names/IDs from earlier turns). External repositories are clearly annotated."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "session_id": {
+                "target": {
                     "type": "string",
-                    "description": "Target live session ID from `list_live_sessions`."
+                    "description": "Target live session `name` or `session_id` (alias: `session_id`). Reuse known values from earlier turns."
                 },
                 "last_n": {
                     "type": "integer",
@@ -434,7 +392,7 @@ impl Tool for ReadSessionTurnsTool {
                     "description": "Character cap on returned transcript snippet (default 6000, max 32000)."
                 }
             },
-            "required": ["session_id"]
+            "required": ["target"]
         })
     }
 
@@ -443,26 +401,32 @@ impl Tool for ReadSessionTurnsTool {
             Ok(v) => v,
             Err(e) => return tool_err(format!("invalid read_session_turns arguments: {e}")),
         };
-        let desc = match load_live_descriptor(&self.local.live_dir, &parsed.session_id) {
+        let desc = match resolve_live_target(&self.local.live_dir, &parsed.target) {
             Ok(d) => d,
             Err(e) => return tool_err(e),
         };
         let self_repo = self.local.current_repo_root();
         let same_repo = same_canonical_path(&self_repo, &desc.repo_root);
+        let clean_wd = display_clean_path(&desc.working_dir);
+        let clean_repo = display_clean_path(&desc.repo_root);
         let scope_tag = if same_repo {
             "SAME REPO".to_string()
         } else {
-            format!("EXTERNAL REPO: {}", desc.repo_root.display())
+            format!("EXTERNAL REPO: {clean_repo}")
         };
 
         let last_n = parsed.last_n.unwrap_or(8).clamp(1, 50);
         let max_chars = parsed.max_chars.unwrap_or(6000).clamp(256, 32_000);
         match ipc_read_session_turns(&desc, last_n, max_chars).await {
-            Ok((phase, total_messages, rendered)) => tool_ok(format!(
-                "Session `{}` ([{scope_tag}], cwd={}, phase={phase}, total_messages={total_messages}):\n\n{rendered}",
-                desc.session_id,
-                desc.working_dir.display(),
-            )),
+            Ok((live_name, phase, total_messages, rendered)) => {
+                let display = live_name.or(desc.name).unwrap_or_else(|| {
+                    default_display_name(&desc.working_dir, &desc.repo_root, &desc.session_id)
+                });
+                tool_ok(format!(
+                    "Session `{display}` (id={}, [{scope_tag}], cwd={clean_wd}, phase={phase}, total_messages={total_messages}):\n\n{rendered}",
+                    desc.session_id,
+                ))
+            }
             Err(e) => tool_err(e),
         }
     }
@@ -470,7 +434,8 @@ impl Tool for ReadSessionTurnsTool {
 
 #[derive(Deserialize)]
 struct SendToSessionArgs {
-    session_id: String,
+    #[serde(alias = "session_id")]
+    target: String,
     message: String,
     #[serde(default)]
     steer_if_busy: Option<bool>,
@@ -492,16 +457,16 @@ impl Tool for SendToSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Send a peer message to another live JeikCode session (same-repo or cross-repo, clearly annotated) and wait for its reply by default. Enforces self/cycle prevention, max hop-depth, and busy-turn admission."
+        "Send a peer message to another live JeikCode session by `target` (accepts either a session `name` or `session_id`; reuse known names/IDs from earlier turns) and wait for its reply by default. Enforces self/cycle prevention, max hop-depth, and busy-turn admission."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "session_id": {
+                "target": {
                     "type": "string",
-                    "description": "Target live session ID from `list_live_sessions`."
+                    "description": "Target live session `name` or `session_id` (alias: `session_id`). Reuse known values from earlier turns."
                 },
                 "message": {
                     "type": "string",
@@ -520,7 +485,7 @@ impl Tool for SendToSessionTool {
                     "description": "Seconds to wait for the peer reply before returning a pending delivery status (default 120, max 300)."
                 }
             },
-            "required": ["session_id", "message"]
+            "required": ["target", "message"]
         })
     }
 
@@ -537,19 +502,22 @@ impl Tool for SendToSessionTool {
         if self_id.is_empty() {
             return tool_err("current runtime has no active session_id for mesh messaging");
         }
-        let target_id = parsed.session_id.trim();
-        if target_id == self_id {
+        let desc = match resolve_live_target(&self.local.live_dir, &parsed.target) {
+            Ok(d) => d,
+            Err(e) => return tool_err(e),
+        };
+        if desc.session_id == self_id {
             return tool_err("cannot send a peer message to self");
         }
 
         let hop = self.local.current_hop_context();
-        if hop.visited_sessions.iter().any(|s| s == target_id) {
+        if hop.visited_sessions.iter().any(|s| s == &desc.session_id) {
             return tool_err(format!(
-                "mesh cycle detected: `{target_id}` is already in visited chain {:?}",
-                hop.visited_sessions
+                "mesh cycle detected: `{}` is already in visited chain {:?}",
+                desc.session_id, hop.visited_sessions
             ));
         }
-        let max_hops = max_mesh_hops();
+        let max_hops = max_mesh_hops_from_mesh();
         if hop.hop_depth >= max_hops {
             return tool_err(format!(
                 "mesh hop-depth limit reached (hop_depth={} >= max_hops={max_hops})",
@@ -557,17 +525,14 @@ impl Tool for SendToSessionTool {
             ));
         }
 
-        let desc = match load_live_descriptor(&self.local.live_dir, target_id) {
-            Ok(d) => d,
-            Err(e) => return tool_err(e),
-        };
-
         let self_wd = self.local.current_working_dir();
         let self_repo = self.local.current_repo_root();
+        let self_name = self.local.current_name();
 
         match ipc_send_to_session(
             &desc,
             &self_id,
+            self_name,
             &self_wd,
             &self_repo,
             parsed.message,
@@ -580,10 +545,16 @@ impl Tool for SendToSessionTool {
         .await
         {
             Ok(outcome) => {
+                let display = outcome.name.or(desc.name).unwrap_or_else(|| {
+                    default_display_name(&desc.working_dir, &desc.repo_root, &desc.session_id)
+                });
                 let scope_tag = if outcome.same_repo {
                     "SAME REPO".to_string()
                 } else {
-                    format!("EXTERNAL REPO: {}", outcome.target_repo_root.display())
+                    format!(
+                        "EXTERNAL REPO: {}",
+                        display_clean_path(&outcome.target_repo_root)
+                    )
                 };
                 if outcome.completed {
                     let reason = outcome.stop_reason.as_deref().unwrap_or("Stopped");
@@ -594,16 +565,68 @@ impl Tool for SendToSessionTool {
                         .filter(|s| !s.is_empty())
                         .unwrap_or("(peer completed turn with no text output)");
                     tool_ok(format!(
-                        "Peer session `{}` ([{scope_tag}], turn_id={}, steered={}, hop_depth={}, stop_reason={reason}) replied:\n\n{reply}",
+                        "Peer session `{display}` (id={}, [{scope_tag}], turn_id={}, steered={}, hop_depth={}, stop_reason={reason}) replied:\n\n{reply}",
                         desc.session_id, outcome.turn_id, outcome.steered, outcome.hop_depth
                     ))
                 } else {
                     tool_ok(format!(
-                        "Delivered peer message to session `{}` ([{scope_tag}], turn_id={}, steered={}, hop_depth={}); turn still running (use `read_session_turns` to inspect its output).",
+                        "Delivered peer message to session `{display}` (id={}, [{scope_tag}], turn_id={}, steered={}, hop_depth={}); turn still running (use `read_session_turns` to inspect its output).",
                         desc.session_id, outcome.turn_id, outcome.steered, outcome.hop_depth
                     ))
                 }
             }
+            Err(e) => tool_err(e),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetSessionNameArgs {
+    name: String,
+}
+
+/// `set_session_name` — set this session's own live mesh nickname/role (self-owned only).
+pub(crate) struct SetSessionNameTool {
+    pub local: MeshLocalState,
+}
+
+#[async_trait]
+impl Tool for SetSessionNameTool {
+    fn name(&self) -> &str {
+        "set_session_name"
+    }
+
+    fn description(&self) -> &str {
+        "Set or update this session's own live mesh nickname/role (e.g. `backend`, `frontend`, `coordinator`, max 48 chars). Updates only the current session and enforces live uniqueness."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Nickname/role label for this session (1..=48 characters, no control characters)."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let parsed: SetSessionNameArgs = match serde_json::from_str(args) {
+            Ok(v) => v,
+            Err(e) => return tool_err(format!("invalid set_session_name arguments: {e}")),
+        };
+        match self.local.handle.set_mesh_name(Some(parsed.name)).await {
+            Ok(Some(assigned)) => tool_ok(format!(
+                "Session mesh name set to `{assigned}` (session_id={}).",
+                self.local.current_session_id()
+            )),
+            Ok(None) => tool_ok(format!(
+                "Session mesh name cleared (session_id={}).",
+                self.local.current_session_id()
+            )),
             Err(e) => tool_err(e),
         }
     }
@@ -619,6 +642,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dead_desc = LiveSessionDescriptor {
             session_id: "dead-session-1".to_string(),
+            name: Some("stale".to_string()),
             pid: 0,
             endpoint: "127.0.0.1:9".to_string(),
             auth_token: "tok".to_string(),

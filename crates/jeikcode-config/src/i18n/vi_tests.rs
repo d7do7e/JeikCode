@@ -599,6 +599,7 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
         Msg::BgUseSessionsInstead,
         Msg::CmdDescResume,
         Msg::CmdDescRename,
+        Msg::CmdDescName,
         Msg::CmdDescModel,
         Msg::CmdDescModelAdd,
         Msg::CmdDescProvider,

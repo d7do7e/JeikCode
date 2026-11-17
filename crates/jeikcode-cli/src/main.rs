@@ -130,7 +130,8 @@ fn restore_terminal_if_tui() {
 /// remains a TUI picker convenience only; it must never override cwd.
 fn resolve_working_dir(cli_dir: Option<PathBuf>) -> PathBuf {
     if let Some(d) = cli_dir {
-        std::fs::canonicalize(&d).unwrap_or(d)
+        let resolved = std::fs::canonicalize(&d).unwrap_or(d);
+        jeikcode_capabilities::pathnorm::strip_verbatim_path(&resolved)
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
@@ -1047,6 +1048,10 @@ struct Cli {
     /// Working directory (defaults to current directory)
     #[arg(long, short = 'C', value_hint = clap::ValueHint::DirPath)]
     dir: Option<PathBuf>,
+
+    /// Optional live session nickname/role for the Session Mesh (e.g. `backend`)
+    #[arg(long, value_name = "LABEL")]
+    name: Option<String>,
 
     /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
     #[arg(short = 'p', long)]
@@ -2655,6 +2660,12 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.next_prompt_suggestions = false;
+    if let Some(raw_name) = cli.name.as_deref() {
+        match jeikcode_coding::sanitize_mesh_name(raw_name) {
+            Ok(clean) => runtime_cfg.initial_mesh_name = Some(clean),
+            Err(err) => anyhow::bail!("invalid --name value: {err}"),
+        }
+    }
     let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         jeikcode_coding::ProviderBootstrap::Required
@@ -2986,6 +2997,8 @@ fn spawn_deferred_tui_runtime(
         endpoint: jeikcode_tuix::RuntimeEndpoint { native: control },
         event_rx,
         session_id: Some(session_id),
+        session_name: (!session.name.is_empty() && session.user_renamed)
+            .then(|| session.name.clone()),
     }
 }
 
@@ -2994,6 +3007,10 @@ fn into_tui_native_runtime(
     _coding_cfg: jeikcode_coding::CodingAgentConfig,
 ) -> jeikcode_tuix::SpawnedRuntime {
     let session_id = runtime.session.as_ref().map(|session| session.id.clone());
+    let session_name = runtime
+        .session
+        .as_ref()
+        .and_then(|session| session.mesh_name.clone());
     let jeikcode_coding::CodingRuntime {
         handle,
         mut events,
@@ -3020,6 +3037,7 @@ fn into_tui_native_runtime(
         endpoint: jeikcode_tuix::RuntimeEndpoint { native: control },
         event_rx,
         session_id,
+        session_name,
     }
 }
 

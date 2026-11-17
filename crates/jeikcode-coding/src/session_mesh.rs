@@ -1,13 +1,13 @@
 //! Cross-process live session mesh & peer talk engine (`~/.jeikcode/live/*.json` + loopback IPC).
 //!
 //! Enables standalone TUI, CLIx, and daemon `CodingRuntime` processes to discover
-//! live peer sessions across OS PIDs, inspect recent conversation turns non-blockingly,
-//! and exchange peer messages under strict cycle/hop-depth, busy-turn, and cross-repo
-//! trust guardrails.
+//! live peer sessions across OS PIDs, name sessions cleanly, inspect recent conversation
+//! turns non-blockingly, and exchange peer messages under strict cycle/hop-depth and
+//! busy-turn guardrails.
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::{
     CodingRuntimeHandle, PeerSubmitOrigin, RuntimePhase, SubmitReceipt, UserInput,
+};
+use crate::session_mesh_naming::{
+    default_display_name, display_clean_path, resolve_unique_live_name, same_canonical_path,
+    sanitize_mesh_name,
 };
 use crate::session_mesh_tools::{format_snapshot_turns, last_assistant_reply_text};
 
@@ -55,51 +59,8 @@ pub fn live_registry_dir() -> PathBuf {
     jeikcode_config::Config::config_dir().join("live")
 }
 
-/// Validate a session ID before turning it into a filename under `live/`.
-pub(crate) fn validate_live_session_id(id: &str) -> Result<&str, String> {
-    let trimmed = id.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return Err("session_id must be 1..=128 characters".to_string());
-    }
-    if trimmed.starts_with('.')
-        || !trimmed
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(format!("invalid session_id `{trimmed}`"));
-    }
-    Ok(trimmed)
-}
-
-/// Descriptor persisted at `~/.jeikcode/live/<session_id>.json`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveSessionDescriptor {
-    pub session_id: String,
-    pub pid: u32,
-    pub endpoint: String,
-    pub auth_token: String,
-    pub working_dir: PathBuf,
-    pub repo_root: PathBuf,
-    pub model: String,
-    pub started_at_ms: i64,
-}
-
-/// Live session summary returned by [`discover_live_sessions`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveSessionView {
-    pub session_id: String,
-    pub pid: u32,
-    pub working_dir: PathBuf,
-    pub repo_root: PathBuf,
-    pub same_repo: bool,
-    pub repo_scope: String,
-    pub is_self: bool,
-    pub model: String,
-    pub phase: String,
-    pub busy: bool,
-    pub message_count: usize,
-    pub started_at_ms: i64,
-}
+pub(crate) use crate::session_mesh_naming::{validate_live_session_id, write_descriptor};
+pub use crate::session_mesh_naming::{LiveSessionDescriptor, LiveSessionView};
 
 /// Cycle / hop-depth provenance carried while a runtime processes a peer-originated turn.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +83,7 @@ pub(crate) struct MeshTurnOutcome {
 pub(crate) struct MeshLocalState {
     pub live_dir: PathBuf,
     pub session_id: Arc<RwLock<String>>,
+    pub name: Arc<RwLock<Option<String>>>,
     pub working_dir: Arc<RwLock<PathBuf>>,
     pub repo_root: Arc<RwLock<PathBuf>>,
     pub model: Arc<RwLock<String>>,
@@ -137,6 +99,20 @@ impl MeshLocalState {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn current_name(&self) -> Option<String> {
+        self.name.read().ok().and_then(|g| g.clone())
+    }
+
+    pub(crate) fn current_display_name(&self) -> String {
+        self.current_name().unwrap_or_else(|| {
+            default_display_name(
+                &self.current_working_dir(),
+                &self.current_repo_root(),
+                &self.current_session_id(),
+            )
+        })
     }
 
     pub(crate) fn current_working_dir(&self) -> PathBuf {
@@ -214,6 +190,7 @@ impl SessionMeshHost {
     pub(crate) fn start(
         live_dir: PathBuf,
         session_id: String,
+        initial_name: Option<String>,
         working_dir: PathBuf,
         model: String,
         handle: CodingRuntimeHandle,
@@ -230,11 +207,16 @@ impl SessionMeshHost {
         let repo_root = resolve_canonical_repo_root(&working_dir);
         let auth_token = uuid::Uuid::new_v4().simple().to_string();
         let started_at_ms = now_ms();
+        let resolved_name = initial_name
+            .as_deref()
+            .and_then(|raw| sanitize_mesh_name(raw).ok())
+            .and_then(|clean| resolve_unique_live_name(&live_dir, &valid_id, &clean, true).ok());
 
         let (turn_outcomes, _) = broadcast::channel(TURN_OUTCOME_CHANNEL_CAP);
         let local = MeshLocalState {
             live_dir: live_dir.clone(),
             session_id: Arc::new(RwLock::new(valid_id.clone())),
+            name: Arc::new(RwLock::new(resolved_name.clone())),
             working_dir: Arc::new(RwLock::new(working_dir.clone())),
             repo_root: Arc::new(RwLock::new(repo_root.clone())),
             model: Arc::new(RwLock::new(model.clone())),
@@ -245,7 +227,8 @@ impl SessionMeshHost {
         };
 
         let descriptor = LiveSessionDescriptor {
-            session_id: valid_id.clone(),
+            session_id: valid_id,
+            name: resolved_name,
             pid: std::process::id(),
             endpoint: endpoint.clone(),
             auth_token: auth_token.clone(),
@@ -275,6 +258,55 @@ impl SessionMeshHost {
             *guard = Some(task);
         }
         Ok(host)
+    }
+
+    /// Update this session's own nickname (`None` clears it) with live-PID uniqueness checks.
+    pub(crate) fn set_name(
+        &self,
+        new_name: Option<&str>,
+        auto_suffix_on_collision: bool,
+    ) -> Result<Option<String>, String> {
+        let sid = self.local.current_session_id();
+        if sid.is_empty() {
+            return Err("runtime has no active session_id".to_string());
+        }
+        let resolved = match new_name {
+            Some(raw) => {
+                let clean = sanitize_mesh_name(raw)?;
+                Some(resolve_unique_live_name(
+                    &self.local.live_dir,
+                    &sid,
+                    &clean,
+                    auto_suffix_on_collision,
+                )?)
+            }
+            None => None,
+        };
+        if let Ok(mut guard) = self.local.name.write() {
+            *guard = resolved.clone();
+        }
+        let desc = LiveSessionDescriptor {
+            session_id: sid,
+            name: resolved.clone(),
+            pid: std::process::id(),
+            endpoint: self.endpoint.clone(),
+            auth_token: self.auth_token.clone(),
+            working_dir: self.local.current_working_dir(),
+            repo_root: self.local.current_repo_root(),
+            model: self
+                .local
+                .model
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
+            started_at_ms: self.started_at_ms,
+        };
+        let path = write_descriptor(&self.local.live_dir, &desc)
+            .map_err(|e| format!("failed to update live session descriptor: {e}"))?;
+        if let Ok(mut g) = self.descriptor_path.lock() {
+            *g = Some(path);
+        }
+        Ok(resolved)
     }
 
     /// Re-publish the descriptor after session transition (`FreshSession`, `ResumeSession`, `ChangeDirectory`, `Reprepare`).
@@ -307,8 +339,16 @@ impl SessionMeshHost {
         self.local.update_snapshot(None);
         self.local.clear_hop_context();
 
+        let kept_name = self.local.current_name().and_then(|existing| {
+            resolve_unique_live_name(&self.local.live_dir, valid_id, &existing, true).ok()
+        });
+        if let Ok(mut g) = self.local.name.write() {
+            *g = kept_name.clone();
+        }
+
         let desc = LiveSessionDescriptor {
             session_id: valid_id.to_string(),
+            name: kept_name,
             pid: std::process::id(),
             endpoint: self.endpoint.clone(),
             auth_token: self.auth_token.clone(),
@@ -365,6 +405,8 @@ pub(crate) enum MeshRequest {
     },
     SendMessage {
         from_session_id: String,
+        #[serde(default)]
+        from_session_name: Option<String>,
         from_working_dir: PathBuf,
         from_repo_root: PathBuf,
         text: String,
@@ -381,6 +423,8 @@ pub(crate) enum MeshRequest {
 pub(crate) enum MeshResponse {
     Status {
         session_id: String,
+        #[serde(default)]
+        name: Option<String>,
         pid: u32,
         phase: String,
         busy: bool,
@@ -388,12 +432,16 @@ pub(crate) enum MeshResponse {
     },
     Turns {
         session_id: String,
+        #[serde(default)]
+        name: Option<String>,
         phase: String,
         total_messages: usize,
         rendered: String,
     },
     Delivered {
         session_id: String,
+        #[serde(default)]
+        name: Option<String>,
         turn_id: u64,
         steered: bool,
         hop_depth: u32,
@@ -483,6 +531,7 @@ async fn write_ipc_response(
 
 async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> MeshResponse {
     let session_id = local.current_session_id();
+    let local_name = local.current_name();
     let phase = local.handle.status().phase;
     let phase_label = phase_name(phase).to_string();
     let busy = !matches!(phase, RuntimePhase::Ready);
@@ -494,6 +543,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 .unwrap_or(0);
             MeshResponse::Status {
                 session_id,
+                name: local_name,
                 pid: std::process::id(),
                 phase: phase_label,
                 busy,
@@ -505,6 +555,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             let Some(snap) = snapshot else {
                 return MeshResponse::Turns {
                     session_id,
+                    name: local_name,
                     phase: phase_label,
                     total_messages: 0,
                     rendered: "(session has no recorded turns yet)".to_string(),
@@ -514,6 +565,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 format_snapshot_turns(&snap, last_n.clamp(1, 50), max_chars.clamp(256, 32_000));
             MeshResponse::Turns {
                 session_id,
+                name: local_name,
                 phase: phase_label,
                 total_messages: snap.messages.len(),
                 rendered,
@@ -521,6 +573,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
         }
         MeshRequest::SendMessage {
             from_session_id,
+            from_session_name,
             from_working_dir,
             from_repo_root,
             text,
@@ -591,21 +644,20 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             } else {
                 "external_repo"
             };
+            let clean_cwd = display_clean_path(&from_working_dir);
+            let clean_repo = display_clean_path(&from_repo_root);
             let external_repo_note = if same_repo {
                 String::new()
             } else {
-                format!("[EXTERNAL REPO: {}]\n", from_repo_root.display())
+                format!("[EXTERNAL REPO: {clean_repo}]\n")
             };
+            let from_name_attr = from_session_name
+                .as_deref()
+                .map(|n| format!(" from_name=\"{}\"", n.replace('"', "'")))
+                .unwrap_or_default();
             let trimmed_text = text.trim().to_string();
             let framed = format!(
-                "<peer_message from_session=\"{}\" from_cwd=\"{}\" from_repo=\"{}\" repo_scope=\"{}\" hop=\"{}\">\n{}{}\n</peer_message>",
-                from_session_id,
-                from_working_dir.display(),
-                from_repo_root.display(),
-                repo_scope_attr,
-                next_hop,
-                external_repo_note,
-                trimmed_text
+                "<peer_message from_session=\"{from_session_id}\"{from_name_attr} from_cwd=\"{clean_cwd}\" from_repo=\"{clean_repo}\" repo_scope=\"{repo_scope_attr}\" hop=\"{next_hop}\">\n{external_repo_note}{trimmed_text}\n</peer_message>",
             );
 
             let should_wait = wait_for_reply.unwrap_or(!steered);
@@ -613,6 +665,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
 
             let origin = PeerSubmitOrigin {
                 from_session_id,
+                from_session_name,
                 from_working_dir,
                 from_repo_root,
                 same_repo,
@@ -652,6 +705,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                             }
                             return MeshResponse::Delivered {
                                 session_id,
+                                name: local_name,
                                 turn_id,
                                 steered,
                                 hop_depth: next_hop,
@@ -671,6 +725,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
 
             MeshResponse::Delivered {
                 session_id,
+                name: local_name,
                 turn_id,
                 steered,
                 hop_depth: next_hop,
@@ -701,22 +756,6 @@ fn resolve_snapshot_nonblocking(local: &MeshLocalState) -> Option<Arc<SessionSna
         .map(|loaded| Arc::new(loaded.snapshot))
 }
 
-pub(crate) fn same_canonical_path(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| -> String {
-        let s = fs::canonicalize(p)
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let stripped = s.strip_prefix("//?/").unwrap_or(&s);
-        if cfg!(windows) {
-            stripped.to_ascii_lowercase()
-        } else {
-            stripped.to_string()
-        }
-    };
-    norm(a) == norm(b)
-}
-
 fn phase_name(phase: RuntimePhase) -> &'static str {
     match phase {
         RuntimePhase::Ready => "Ready",
@@ -728,25 +767,6 @@ fn phase_name(phase: RuntimePhase) -> &'static str {
         RuntimePhase::Stopped => "Stopped",
         RuntimePhase::Failed => "Failed",
     }
-}
-
-pub(crate) fn write_descriptor(
-    live_dir: &Path,
-    desc: &LiveSessionDescriptor,
-) -> io::Result<PathBuf> {
-    fs::create_dir_all(live_dir)?;
-    let target = live_dir.join(format!("{}.json", desc.session_id));
-    let tmp = live_dir.join(format!(".{}.{}.tmp", desc.session_id, uuid::Uuid::new_v4()));
-    let json = serde_json::to_vec_pretty(desc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&tmp, &json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(&tmp, &target)?;
-    Ok(target)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -765,18 +785,4 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_live_session_id_rejects_traversal() {
-        assert!(validate_live_session_id("abc-123_XYZ").is_ok());
-        assert!(validate_live_session_id("../evil").is_err());
-        assert!(validate_live_session_id(".hidden").is_err());
-        assert!(validate_live_session_id("a/b").is_err());
-        assert!(validate_live_session_id("").is_err());
-    }
 }

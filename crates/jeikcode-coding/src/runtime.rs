@@ -42,7 +42,9 @@ use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
 use crate::session_mesh::{live_registry_dir, session_mesh_enabled, SessionMeshHost};
-use crate::session_mesh_tools::{ListLiveSessionsTool, ReadSessionTurnsTool, SendToSessionTool};
+use crate::session_mesh_tools::{
+    ListLiveSessionsTool, ReadSessionTurnsTool, SendToSessionTool, SetSessionNameTool,
+};
 use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
 /// Runtime facts emitted by the coding engine without depending on the legacy
@@ -55,12 +57,18 @@ pub enum CodingRuntimeEvent {
     /// A peer session delivered a message into this runtime via the session mesh.
     PeerMessageReceived {
         from_session_id: String,
+        from_session_name: Option<String>,
         from_working_dir: std::path::PathBuf,
         from_repo_root: std::path::PathBuf,
         same_repo: bool,
         hop_depth: u32,
         steered: bool,
         text: String,
+    },
+    /// This session's live mesh nickname was set or updated.
+    MeshNameChanged {
+        name: Option<String>,
+        display_name: String,
     },
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
@@ -842,6 +850,7 @@ pub struct CodingRuntime {
 pub struct RuntimeSessionInfo {
     pub id: String,
     pub resumed: bool,
+    pub mesh_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1460,6 +1469,21 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn set_mesh_name(&self, name: Option<String>) -> Result<Option<String>, String> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::SetMeshName {
+                generation: runtime_state_generation(state),
+                name,
+                done,
+            })
+            .map_err(|_| "coding runtime unavailable".to_string())?;
+        result
+            .await
+            .map_err(|_| "coding runtime unavailable".to_string())?
+    }
+
     pub async fn set_mode(&self, mode: RuntimeMode) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -2025,6 +2049,7 @@ impl CodingRuntime {
                 SessionMeshHost::start(
                     live_registry_dir(),
                     binding.id.clone(),
+                    agent.initial_mesh_name.clone(),
                     agent.working_dir.clone(),
                     agent.model.clone(),
                     handle.clone(),
@@ -2036,9 +2061,13 @@ impl CodingRuntime {
         };
         register_mesh_tools(&mut parts, mesh_host.as_ref());
         let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
+        let initial_mesh_name = mesh_host
+            .as_ref()
+            .and_then(|host| host.local.current_name());
         let session = parts.session.as_ref().map(|binding| RuntimeSessionInfo {
             id: binding.id.clone(),
             resumed: binding.resume.is_some(),
+            mesh_name: initial_mesh_name,
         });
         let (kernel_agent, unavailable_reason) = match bootstrap {
             ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
@@ -2244,6 +2273,7 @@ impl CodingRuntimeControlReceiver {
 #[derive(Clone, Debug)]
 pub struct PeerSubmitOrigin {
     pub from_session_id: String,
+    pub from_session_name: Option<String>,
     pub from_working_dir: std::path::PathBuf,
     pub from_repo_root: std::path::PathBuf,
     pub same_repo: bool,
@@ -2297,6 +2327,11 @@ pub enum CodingRuntimeControl {
         generation: u64,
         mode: RuntimeMode,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    SetMeshName {
+        generation: u64,
+        name: Option<String>,
+        done: oneshot::Sender<Result<Option<String>, String>>,
     },
     ContextStats {
         generation: u64,
@@ -3719,6 +3754,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::PeerMessageReceived {
                                         from_session_id: origin.from_session_id,
+                                        from_session_name: origin.from_session_name,
                                         from_working_dir: origin.from_working_dir,
                                         from_repo_root: origin.from_repo_root,
                                         same_repo: origin.same_repo,
@@ -4213,6 +4249,42 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                                 let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::SetMeshName {
+                        generation: request_generation,
+                        name,
+                        done,
+                    }) => {
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err("coding runtime unavailable".to_string()));
+                            continue;
+                        };
+                        if request_generation != generation || compaction_suspended {
+                            let _ = done.send(Err("coding runtime busy reconfiguring".to_string()));
+                            continue;
+                        }
+                        let Some(host) = runtime.mesh_host.as_ref() else {
+                            let _ = done.send(Err(
+                                "session mesh is disabled or runtime has no active session"
+                                    .to_string(),
+                            ));
+                            continue;
+                        };
+                        match host.set_name(name.as_deref(), false) {
+                            Ok(assigned) => {
+                                let display_name = host.local.current_display_name();
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::MeshNameChanged {
+                                        name: assigned.clone(),
+                                        display_name,
+                                    },
+                                );
+                                let _ = done.send(Ok(assigned));
+                            }
+                            Err(err) => {
+                                let _ = done.send(Err(err));
                             }
                         }
                     }
@@ -6742,6 +6814,9 @@ fn reject_runtime_control(
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
+        CodingRuntimeControl::SetMeshName { done, .. } => {
+            let _ = done.send(Err("coding runtime unavailable".to_string()));
+        }
         CodingRuntimeControl::WaitMcpReady { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
@@ -7118,6 +7193,9 @@ fn register_mesh_tools(parts: &mut crate::CodingParts, mesh_host: Option<&Arc<Se
         local: host.local.clone(),
     }));
     parts.register_extra_tool(Arc::new(SendToSessionTool {
+        local: host.local.clone(),
+    }));
+    parts.register_extra_tool(Arc::new(SetSessionNameTool {
         local: host.local.clone(),
     }));
 }

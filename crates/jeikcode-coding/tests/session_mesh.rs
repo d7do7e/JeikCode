@@ -94,10 +94,15 @@ impl CodingProviderFactory for ScriptedFactory {
     }
 }
 
-fn start_cfg(working_dir: &Path, factory: Arc<dyn CodingProviderFactory>) -> CodingRuntimeStart {
+fn start_cfg(
+    working_dir: &Path,
+    factory: Arc<dyn CodingProviderFactory>,
+    initial_mesh_name: Option<&str>,
+) -> CodingRuntimeStart {
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "scripted-mesh-model", working_dir);
     cfg.timeouts = cfg.timeouts.with_content_liveness(Duration::from_secs(5));
     cfg.request_timeout = Some(Duration::from_secs(5));
+    cfg.initial_mesh_name = initial_mesh_name.map(str::to_string);
     CodingRuntimeStart {
         agent: cfg,
         prepare: PrepareOptions {
@@ -141,35 +146,55 @@ async fn live_session_mesh_allows_cross_repo_by_default_returns_replies_and_emit
     let repo_a = tempfile::tempdir().unwrap();
     let repo_b = tempfile::tempdir().unwrap();
 
-    // Runtime B (same-repo peer in repo_a)
+    // Runtime B (same-repo peer in repo_a, started with --name "backend")
     let factory_b = Arc::new(ScriptedFactory::new(vec![vec![
         StreamEvent::TextDelta("B reply: auth.rs verified".into()),
         StreamEvent::Done { truncated: false },
     ]]));
     let b_messages = Arc::clone(&factory_b.seen_messages);
-    let mut rt_b = CodingRuntime::start(start_cfg(repo_a.path(), factory_b))
+    let mut rt_b = CodingRuntime::start(start_cfg(repo_a.path(), factory_b, Some("backend")))
         .await
         .unwrap();
     let sid_b = rt_b.session.as_ref().unwrap().id.clone();
+    assert_eq!(
+        rt_b.session.as_ref().unwrap().mesh_name.as_deref(),
+        Some("backend")
+    );
 
-    // Runtime C (cross-repo peer in repo_b — allowed by default with EXTERNAL REPO annotations!)
+    // Runtime C (cross-repo peer in repo_b, collides on "backend" at startup -> auto-suffixed to "backend-2"!)
     let factory_c = Arc::new(ScriptedFactory::new(vec![vec![
         StreamEvent::TextDelta("C reply from external repo".into()),
         StreamEvent::Done { truncated: false },
     ]]));
     let c_messages = Arc::clone(&factory_c.seen_messages);
-    let mut rt_c = CodingRuntime::start(start_cfg(repo_b.path(), factory_c))
+    let mut rt_c = CodingRuntime::start(start_cfg(repo_b.path(), factory_c, Some("backend")))
         .await
         .unwrap();
     let sid_c = rt_c.session.as_ref().unwrap().id.clone();
+    assert_eq!(
+        rt_c.session.as_ref().unwrap().mesh_name.as_deref(),
+        Some("backend-2")
+    );
 
-    // Runtime A (originator in repo_a):
-    // 1. list_live_sessions
-    // 2. send_to_session -> B (same repo, waits & receives B's reply)
-    // 3. send_to_session -> C (external repo by default, waits & receives C's reply)
-    // 4. read_session_turns -> C (external repo by default, annotated [EXTERNAL REPO: ...])
-    // 5. task(explore) -> child must NOT receive mesh tools
+    // Runtime A (originator in repo_a, starts unnamed then names itself "coordinator" via set_session_name):
+    // 1. set_session_name -> "coordinator"
+    // 2. list_live_sessions
+    // 3. send_to_session -> target="backend" (by nickname, same repo, waits & receives B's reply)
+    // 4. send_to_session -> target="backend-2" (by nickname, external repo by default, waits & receives C's reply)
+    // 5. read_session_turns -> target="backend-2" (by nickname)
+    // 6. task(explore) -> child must NOT receive mesh tools or set_session_name
     let factory_a = Arc::new(ScriptedFactory::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "t0".into(),
+                name: "set_session_name".into(),
+                arguments: serde_json::json!({
+                    "name": "coordinator"
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "t1".into(),
@@ -183,7 +208,7 @@ async fn live_session_mesh_allows_cross_repo_by_default_returns_replies_and_emit
                 id: "t2".into(),
                 name: "send_to_session".into(),
                 arguments: serde_json::json!({
-                    "session_id": sid_b,
+                    "target": "backend",
                     "message": "please inspect auth.rs"
                 })
                 .to_string(),
@@ -195,7 +220,7 @@ async fn live_session_mesh_allows_cross_repo_by_default_returns_replies_and_emit
                 id: "t3".into(),
                 name: "send_to_session".into(),
                 arguments: serde_json::json!({
-                    "session_id": sid_c,
+                    "target": "backend-2",
                     "message": "check cross-repo contract"
                 })
                 .to_string(),
@@ -207,7 +232,7 @@ async fn live_session_mesh_allows_cross_repo_by_default_returns_replies_and_emit
                 id: "t4".into(),
                 name: "read_session_turns".into(),
                 arguments: serde_json::json!({
-                    "session_id": sid_c
+                    "target": "backend-2"
                 })
                 .to_string(),
             }),
@@ -241,72 +266,102 @@ async fn live_session_mesh_allows_cross_repo_by_default_returns_replies_and_emit
     ]));
     let a_tools = Arc::clone(&factory_a.seen_tools);
     let a_messages = Arc::clone(&factory_a.seen_messages);
-    let mut rt_a = CodingRuntime::start(start_cfg(repo_a.path(), factory_a))
+    let mut rt_a = CodingRuntime::start(start_cfg(repo_a.path(), factory_a, None))
         .await
         .unwrap();
     let sid_a = rt_a.session.as_ref().unwrap().id.clone();
 
-    // Verify discovery annotates same_repo vs EXTERNAL REPO.
+    // Verify discovery annotates default_display_name, nicknames, clean paths, and repo_scope.
     let live =
         discover_live_sessions(&live_registry_dir(), Some(&sid_a), Some(repo_a.path())).await;
     assert_eq!(live.len(), 3, "expected 3 live sessions: {live:?}");
+    let view_a = live.iter().find(|v| v.session_id == sid_a).unwrap();
+    assert!(view_a.name.is_none());
+    assert!(view_a.display_name.contains('#'));
+    assert!(!view_a.working_dir.contains(r"\\?\"));
     let view_b = live.iter().find(|v| v.session_id == sid_b).unwrap();
+    assert_eq!(view_b.name.as_deref(), Some("backend"));
+    assert_eq!(view_b.display_name, "backend");
     assert!(view_b.same_repo);
     assert_eq!(view_b.repo_scope, "same_repo");
     let view_c = live.iter().find(|v| v.session_id == sid_c).unwrap();
+    assert_eq!(view_c.name.as_deref(), Some("backend-2"));
     assert!(!view_c.same_repo);
     assert!(view_c.repo_scope.starts_with("EXTERNAL REPO:"));
+    assert!(!view_c.repo_scope.contains(r"\\?\"));
 
-    // Submit A's turn: send_to_session waits for B and C replies synchronously!
+    // Submit A's turn: A renames itself "coordinator", discovers, then sends to "backend" & "backend-2"!
     rt_a.handle
         .submit(UserInput::from("coordinate with peers"))
         .await
         .unwrap();
-    let _a_events = wait_turn_finished(&mut rt_a).await;
+    let a_events = wait_turn_finished(&mut rt_a).await;
     let b_events = wait_turn_finished(&mut rt_b).await;
     let c_events = wait_turn_finished(&mut rt_c).await;
 
-    // Verify B and C both emitted CodingRuntimeEvent::PeerMessageReceived for TUI/Daemon visibility.
+    assert!(
+        a_events.iter().any(|e| matches!(
+            e,
+            CodingRuntimeEvent::MeshNameChanged { name: Some(n), .. } if n == "coordinator"
+        )),
+        "A must emit MeshNameChanged after set_session_name"
+    );
+
+    // Verify B and C both emitted CodingRuntimeEvent::PeerMessageReceived with from_session_name="coordinator".
     assert!(
         b_events.iter().any(|e| matches!(
             e,
-            CodingRuntimeEvent::PeerMessageReceived { from_session_id, same_repo: true, text, .. }
-                if from_session_id == &sid_a && text == "please inspect auth.rs"
+            CodingRuntimeEvent::PeerMessageReceived {
+                from_session_id,
+                from_session_name: Some(name),
+                same_repo: true,
+                text,
+                ..
+            } if from_session_id == &sid_a && name == "coordinator" && text == "please inspect auth.rs"
         )),
-        "B must emit PeerMessageReceived(same_repo=true)"
+        "B must emit PeerMessageReceived(from_session_name=coordinator, same_repo=true)"
     );
     assert!(
         c_events.iter().any(|e| matches!(
             e,
-            CodingRuntimeEvent::PeerMessageReceived { from_session_id, same_repo: false, text, .. }
-                if from_session_id == &sid_a && text == "check cross-repo contract"
+            CodingRuntimeEvent::PeerMessageReceived {
+                from_session_id,
+                from_session_name: Some(name),
+                same_repo: false,
+                text,
+                ..
+            } if from_session_id == &sid_a && name == "coordinator" && text == "check cross-repo contract"
         )),
-        "C must emit PeerMessageReceived(same_repo=false)"
+        "C must emit PeerMessageReceived(from_session_name=coordinator, same_repo=false)"
     );
 
-    // Verify B received <peer_message> (same_repo) and C received [EXTERNAL REPO: ...] annotation.
+    // Verify B received <peer_message> with from_name="coordinator" and C received [EXTERNAL REPO: ...].
     let b_seen = b_messages.lock().unwrap();
     assert!(b_seen[0].iter().any(|m| m.role == Role::User
         && m.text.contains("<peer_message")
+        && m.text.contains("from_name=\"coordinator\"")
         && m.text.contains("repo_scope=\"same_repo\"")
         && m.text.contains("please inspect auth.rs")));
     let c_seen = c_messages.lock().unwrap();
     assert!(c_seen[0].iter().any(|m| m.role == Role::User
         && m.text.contains("<peer_message")
+        && m.text.contains("from_name=\"coordinator\"")
         && m.text.contains("repo_scope=\"external_repo\"")
         && m.text.contains("[EXTERNAL REPO:")
         && m.text.contains("check cross-repo contract")));
 
-    // Verify A's parent tools include the 3 mesh tools, while child explore turn does NOT.
+    // Verify A's parent tools include all 4 mesh tools, while child explore turn does NOT.
     let tools_calls = a_tools.lock().unwrap();
     assert!(tools_calls[0].iter().any(|t| t == "list_live_sessions"));
     assert!(tools_calls[0].iter().any(|t| t == "read_session_turns"));
     assert!(tools_calls[0].iter().any(|t| t == "send_to_session"));
-    let child_tools = &tools_calls[5];
+    assert!(tools_calls[0].iter().any(|t| t == "set_session_name"));
+    let child_tools = &tools_calls[6];
     assert!(
         !child_tools.iter().any(|t| t == "list_live_sessions"
             || t == "read_session_turns"
-            || t == "send_to_session"),
+            || t == "send_to_session"
+            || t == "set_session_name"),
         "subagent child must NEVER mount mesh tools: {child_tools:?}"
     );
 
@@ -425,7 +480,7 @@ async fn mesh_cycle_and_read_turns_enforce_guardrails_end_to_end() {
         seen_messages: Arc::clone(&b_msgs),
         step: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
-    let mut rt_b = CodingRuntime::start(start_cfg(repo.path(), factory_b))
+    let mut rt_b = CodingRuntime::start(start_cfg(repo.path(), factory_b, None))
         .await
         .unwrap();
     let sid_b = rt_b.session.as_ref().unwrap().id.clone();
@@ -437,7 +492,7 @@ async fn mesh_cycle_and_read_turns_enforce_guardrails_end_to_end() {
         seen_messages: Arc::clone(&a_msgs),
         step: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
-    let mut rt_a = CodingRuntime::start(start_cfg(repo.path(), factory_a))
+    let mut rt_a = CodingRuntime::start(start_cfg(repo.path(), factory_a, None))
         .await
         .unwrap();
     let sid_a = rt_a.session.as_ref().unwrap().id.clone();

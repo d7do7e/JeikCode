@@ -259,6 +259,8 @@ pub struct CodingAgentConfig {
     /// Optional client-supplied system text (OpenAI/Anthropic compat API).
     /// Appended after AGENTS.md / glossary / db packs in the SESSION CONTEXT block.
     pub extra_system_append: Option<String>,
+    /// Optional initial nickname/role for the live session mesh (`--name`).
+    pub initial_mesh_name: Option<String>,
     /// Optional display name for a freshly created session (e.g. OpenAI `user` /
     /// user_title). Pinned with `user_renamed=true` so first-prompt seeding and
     /// AI session naming never overwrite it.
@@ -345,6 +347,8 @@ pub struct CodingRuntimeConfig {
     /// Optional client-supplied system text (OpenAI/Anthropic compat API).
     /// Appended after AGENTS.md / glossary / db packs in the SESSION CONTEXT block.
     pub extra_system_append: Option<String>,
+    /// Optional initial nickname/role for the live session mesh (`--name`).
+    pub initial_mesh_name: Option<String>,
     /// Optional display name for a freshly created session (e.g. OpenAI `user` /
     /// user_title). Applied only when the native runtime creates the session meta;
     /// existing sessions keep their stored name.
@@ -456,6 +460,7 @@ impl CodingRuntimeConfig {
             pricing,
             supports_vision: r.map(|r| r.accepts_images()).unwrap_or(false),
             extra_system_append: None,
+            initial_mesh_name: None,
             session_display_name: None,
             // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
             tool_output_max_bytes: std::env::var("JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES")
@@ -507,6 +512,7 @@ impl CodingRuntimeConfig {
         config.skip_tls_verify = self.skip_tls_verify;
         config.supports_vision = self.supports_vision;
         config.extra_system_append = self.extra_system_append.clone();
+        config.initial_mesh_name = self.initial_mesh_name.clone();
         config.session_display_name = self.session_display_name.clone();
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
@@ -892,6 +898,7 @@ impl CodingAgentConfig {
             // Callers that load from config overwrite this via `accepts_images()`.
             supports_vision: false,
             extra_system_append: None,
+            initial_mesh_name: None,
             session_display_name: None,
             subagent_config: None,
             subagent_fast_provider: None,

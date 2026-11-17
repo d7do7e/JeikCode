@@ -1857,19 +1857,22 @@ mod submit_hold_tests {
     fn peer_message_banner_marks_external_repo_and_same_repo() {
         let same = jeikcode_coding::format_peer_message_banner(
             "12345678-abcd",
-            std::path::Path::new("/repos/app"),
-            std::path::Path::new("/repos/app"),
+            Some("backend"),
+            std::path::Path::new(r"\\?\C:\repos\app"),
+            std::path::Path::new(r"\\?\C:\repos\app"),
             true,
             1,
             false,
             "ping",
         );
-        assert!(same.contains("[peer 12345678 @"));
+        assert!(same.contains("[peer backend (12345678) @"));
+        assert!(!same.contains(r"\\?\"));
         assert!(same.contains("same-repo"));
         assert!(same.ends_with("\nping"));
 
         let cross = jeikcode_coding::format_peer_message_banner(
             "abcdef01-9999",
+            None,
             std::path::Path::new("/repos/other/sub"),
             std::path::Path::new("/repos/other"),
             false,
@@ -1877,6 +1880,7 @@ mod submit_hold_tests {
             true,
             "check API",
         );
+        assert!(cross.contains("[peer abcdef01 @"));
         assert!(cross.contains("EXTERNAL REPO:"));
         assert!(cross.contains("hop 2, steered"));
         assert!(cross.ends_with("\ncheck API"));
@@ -3259,6 +3263,28 @@ impl RuntimeControl {
             Self::Deferred(_) => Err(jeikcode_coding::RuntimeUnavailable),
         }
     }
+
+    pub fn set_mesh_name(
+        &self,
+        name: Option<String>,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+        use jeikcode_daemon::live_hub::LiveRuntimeControl as _;
+        let Some(handle) = self.handle() else {
+            return Err(jeikcode_coding::RuntimeUnavailable);
+        };
+        tokio::spawn(async move {
+            if let Err(err) = handle.set_mesh_name(name).await {
+                RuntimeControl::send_native_result(
+                    &event_tx,
+                    runtime_id,
+                    CodingRuntimeEvent::ControllerWarning(err),
+                );
+            }
+        });
+        Ok(())
+    }
 }
 
 fn phase_has_active_turn(phase: jeikcode_coding::RuntimePhase) -> bool {
@@ -3331,6 +3357,7 @@ pub struct SpawnedRuntime {
     pub endpoint: RuntimeEndpoint,
     pub event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEventPayload>,
     pub session_id: Option<String>,
+    pub session_name: Option<String>,
 }
 
 /// Spawns agent runtimes for in-TUI session switches (`/session`, `/bg`, disk
@@ -13786,6 +13813,12 @@ mod streaming_slash_tests {
                 "cmd={cmd}"
             );
         }
+        // `/name` (show current) and `/name <label>` (set live mesh nickname) are safe mid-turn.
+        assert_eq!(exec("/name"), Some(("name".to_string(), String::new())));
+        assert_eq!(
+            exec("/name backend"),
+            Some(("name".to_string(), "backend".to_string()))
+        );
         // `/rename <name>` runs mid-stream; a bare `/rename` (would only error) does not.
         assert_eq!(
             exec("/rename my session"),
@@ -14723,6 +14756,9 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     //   error, and errors mid-stream are noise.
     if cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty() {
         return Some(("rename".to_string(), arg.trim().to_string()));
+    }
+    if cmd.eq_ignore_ascii_case("name") {
+        return Some(("name".to_string(), arg.trim().to_string()));
     }
     None
 }
@@ -19302,6 +19338,7 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::PeerMessageReceived {
                     from_session_id,
+                    from_session_name,
                     from_working_dir,
                     from_repo_root,
                     same_repo,
@@ -19311,6 +19348,7 @@ fn handle_runtime_event(
                 } => {
                     let banner = jeikcode_coding::format_peer_message_banner(
                         &from_session_id,
+                        from_session_name.as_deref(),
                         &from_working_dir,
                         &from_repo_root,
                         same_repo,
@@ -19332,6 +19370,26 @@ fn handle_runtime_event(
                         reasoning_buffer,
                         buf,
                     );
+                    return;
+                }
+                CodingRuntimeEvent::MeshNameChanged { name, display_name } => {
+                    if let Some(assigned) = name {
+                        ctx.current_session.rename(assigned.clone());
+                        ctx.bg_manager.set_foreground_session(
+                            ctx.current_session.clone(),
+                            ctx.working_dir.clone(),
+                        );
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Session mesh name: {} (id={})\n",
+                            assigned, ctx.current_session.id
+                        )));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Session mesh label: {} (id={})\n",
+                            display_name, ctx.current_session.id
+                        )));
+                    }
+                    renderer.flush();
                     return;
                 }
                 CodingRuntimeEvent::ControllerWarning(message) => {

@@ -924,6 +924,7 @@ pub(crate) fn chat_runtime_config(
         }),
         supports_vision: p.map(|provider| provider.accepts_images()).unwrap_or(false),
         extra_system_append: None,
+        initial_mesh_name: None,
         session_display_name: None,
         // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
         // Mirrors `CodingRuntimeConfig::from_config` so the daemon path honors the
@@ -2214,6 +2215,7 @@ impl NativeLiveWireProjector {
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::PeerMessageReceived {
                 from_session_id,
+                from_session_name,
                 from_working_dir,
                 from_repo_root,
                 same_repo,
@@ -2223,6 +2225,7 @@ impl NativeLiveWireProjector {
             }) => LiveWireEvent::UserMessage {
                 text: jeikcode_coding::format_peer_message_banner(
                     &from_session_id,
+                    from_session_name.as_deref(),
                     &from_working_dir,
                     &from_repo_root,
                     same_repo,
@@ -5897,6 +5900,7 @@ mod tests {
             .project(crate::live_hub::LiveViewEvent::Runtime(
                 jeikcode_coding::CodingRuntimeEvent::PeerMessageReceived {
                     from_session_id: "11223344-5566".into(),
+                    from_session_name: Some("backend".into()),
                     from_working_dir: PathBuf::from("/repo-a"),
                     from_repo_root: PathBuf::from("/repo-a"),
                     same_repo: false,

@@ -716,7 +716,7 @@ Keep `MEMORY.md` entries to one concise line, move multi-line details into `topi
 Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or session-specific one-offs.";
 
 const SESSION_MESH_USAGE: &str = "\n\n## SESSION MESH:\n\
-When coordinating with other live JeikCode sessions running in parallel on this machine (including sessions in external repositories), use `list_live_sessions` to discover PID-verified peers, `read_session_turns` to inspect their recent context, and `send_to_session` to message a peer and receive its reply (cycle/hop-depth and busy-turn guardrails are enforced, and cross-repo peers are annotated with `[EXTERNAL REPO: ...]`).";
+When coordinating with other live JeikCode sessions running in parallel on this machine (including sessions in external repositories), use `list_live_sessions` to discover PID-verified peers, `set_session_name` to give this session a short role nickname (e.g. `backend`, `frontend`), `read_session_turns` to inspect a peer's recent context, and `send_to_session` to message a peer by `name` or `session_id` and receive its reply. Reuse known peer names/IDs from earlier turns instead of redundantly calling `list_live_sessions`; cycle/hop-depth and busy-turn guardrails are enforced, and cross-repo peers are annotated with `[EXTERNAL REPO: ...]`.";
 
 /// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
 /// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak

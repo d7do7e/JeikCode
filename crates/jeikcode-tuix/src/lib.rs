@@ -348,6 +348,7 @@ pub async fn run(
         endpoint,
         event_rx,
         session_id: runtime_session_id,
+        session_name: runtime_session_name,
     } = spawned_runtime;
     let RuntimeEndpoint { native: runtime } = endpoint;
     let mut caps = TerminalCaps::probe();
@@ -587,6 +588,9 @@ pub async fn run(
     let mut current_session = crate::session::Session::default_session(working_dir.clone());
     if let Some(session_id) = runtime_session_id {
         current_session.id = session_id;
+    }
+    if let Some(mesh_name) = runtime_session_name {
+        current_session.rename(mesh_name);
     }
 
     // Passive "new version available" check. Detached — never blocks
