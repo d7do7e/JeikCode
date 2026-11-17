@@ -277,6 +277,16 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
             provider: "THAM_SO",
             model: "THAM_SO",
         },
+        Msg::CmdReloadContextDone {
+            provider: "THAM_SO",
+            model: "THAM_SO",
+        },
+        Msg::CmdReloadAllDone {
+            provider: "THAM_SO",
+            model: "THAM_SO",
+        },
+        Msg::CmdReloadBusy,
+        Msg::CmdReloadUsage,
         Msg::CmdReloadFailed { error: "THAM_SO" },
         Msg::CmdUndoNotSupported,
         Msg::CmdUndoDone {

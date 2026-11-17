@@ -508,6 +508,16 @@ pub enum Msg<'a> {
         provider: &'a str,
         model: &'a str,
     },
+    CmdReloadContextDone {
+        provider: &'a str,
+        model: &'a str,
+    },
+    CmdReloadAllDone {
+        provider: &'a str,
+        model: &'a str,
+    },
+    CmdReloadBusy,
+    CmdReloadUsage,
     CmdReloadFailed {
         error: &'a str,
     },

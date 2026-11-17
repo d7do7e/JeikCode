@@ -461,6 +461,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{name} 需要提供参数。用法：/{name} <你的输入>").into(),
         Msg::CmdReloadDone { provider, model } =>
             format!("  配置已重载。当前：{provider} · {model}\n").into(),
+        Msg::CmdReloadContextDone { provider, model } =>
+            format!("  上下文与配置已重载（MEMORY.md / 规则 / AGENTS.md）。当前：{provider} · {model}\n").into(),
+        Msg::CmdReloadAllDone { provider, model } =>
+            format!("  全部配置、上下文、技能、MCP 与钩子已重载。当前：{provider} · {model}\n").into(),
+        Msg::CmdReloadBusy =>
+            "  当前回合正在运行，无法重载；请等待本轮结束后再试。\n".into(),
+        Msg::CmdReloadUsage =>
+            "  用法：/reload [context|all]\n".into(),
         Msg::CmdReloadFailed { error } =>
             format!("重载失败：{error}（保留先前配置）").into(),
         Msg::CmdUndoNotSupported =>
@@ -873,7 +881,7 @@ Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
         Msg::CmdDescProvider => "管理 Provider（添加、编辑、删除、设为全局默认）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
-        Msg::CmdDescReload => "从磁盘重新加载 $JEIKCODE_HOME/config.toml".into(),
+        Msg::CmdDescReload => "重载配置、上下文（MEMORY.md/规则/AGENTS）或全部能力：/reload [context|all]".into(),
         Msg::CmdDescCd => "切换工作目录并开启新建对话".into(),
 Msg::CmdDescInit => "分析项目并生成 AGENTS.md".into(),
 Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),

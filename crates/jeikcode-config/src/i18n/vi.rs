@@ -457,6 +457,14 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{name} cần tham số. Cách dùng: /{name} <your-input>").into(),
         Msg::CmdReloadDone { provider, model } =>
             format!("  Đã tải lại cấu hình. Đang dùng: {provider} · {model}\n").into(),
+        Msg::CmdReloadContextDone { provider, model } =>
+            format!("  Đã tải lại ngữ cảnh & cấu hình (MEMORY.md / quy tắc / AGENTS.md). Đang dùng: {provider} · {model}\n").into(),
+        Msg::CmdReloadAllDone { provider, model } =>
+            format!("  Đã tải lại toàn bộ cấu hình, ngữ cảnh, kỹ năng, MCP và hook. Đang dùng: {provider} · {model}\n").into(),
+        Msg::CmdReloadBusy =>
+            "  Không thể tải lại khi lượt đang chạy; vui lòng đợi lượt hiện tại kết thúc.\n".into(),
+        Msg::CmdReloadUsage =>
+            "  Cách dùng: /reload [context|all]\n".into(),
         Msg::CmdReloadFailed { error } =>
             format!("tải lại thất bại: {error} (giữ cấu hình trước)").into(),
         Msg::CmdUndoNotSupported =>
@@ -853,7 +861,7 @@ Msg::CmdDescSetup =>
             "Quản lý nhà cung cấp (thêm / sửa / xóa / đặt mặc định toàn cục)".into(),
         Msg::CmdDescStatus => "Hiển thị trạng thái phiên".into(),
         Msg::CmdDescConfig => "Hiển thị đường dẫn cấu hình".into(),
-        Msg::CmdDescReload => "Tải lại $JEIKCODE_HOME/config.toml từ đĩa".into(),
+        Msg::CmdDescReload => "Tải lại cấu hình, ngữ cảnh (MEMORY.md/quy tắc/AGENTS) hoặc toàn bộ năng lực: /reload [context|all]".into(),
         Msg::CmdDescCd => "Đổi thư mục làm việc và bắt đầu phiên mới".into(),
 Msg::CmdDescInit => "Phân tích dự án và tạo AGENTS.md".into(),
 Msg::CmdDescBg => "Phiên nền: /bg, /bg list, /bg <N>, /bg drop <N>".into(),

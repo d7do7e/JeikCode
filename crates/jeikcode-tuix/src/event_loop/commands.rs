@@ -22,7 +22,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    apply_persisted_config, bg_runtime, provider_transition_pending, reload_persisted_config,
+    apply_persisted_config, bg_runtime, provider_transition_pending,
+    reload_all_capabilities_and_config, reload_context_and_config, reload_persisted_config,
     request_context_stats_render, save_and_reload, save_language_and_reload,
     update_config_and_reload, ConfigReloadSelection, LoopCtx, PersistedConfigReload,
 };
@@ -32,7 +33,7 @@ use crate::modals::{
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
-use crate::state::{AgentMode, UiState};
+use crate::state::{AgentMode, UiPhase, UiState};
 use anyhow::Result;
 use jeikcode_capabilities::commands::ArgsRequirement;
 use jeikcode_capabilities::memory::{AutoMemoryStore, MemoryStore};
@@ -2177,10 +2178,38 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "reload" => {
-            match reload_persisted_config(ctx) {
+            let sub = arg.trim().to_ascii_lowercase();
+            let outcome = match sub.as_str() {
+                "" => {
+                    let result = reload_persisted_config(ctx);
+                    if matches!(result, Ok(PersistedConfigReload::Applied { .. })) {
+                        crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
+                        state.on_model_window_changed(ctx.config.default_context_window());
+                    }
+                    result
+                }
+                "context" => {
+                    if state.phase != UiPhase::Idle {
+                        Ok(PersistedConfigReload::Busy)
+                    } else {
+                        reload_context_and_config(ctx)
+                    }
+                }
+                "all" => {
+                    if state.phase != UiPhase::Idle {
+                        Ok(PersistedConfigReload::Busy)
+                    } else {
+                        reload_all_capabilities_and_config(ctx)
+                    }
+                }
+                _ => {
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdReloadUsage).into_owned()));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            match outcome {
                 Ok(PersistedConfigReload::Applied { provider, model }) => {
-                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
-                    state.on_model_window_changed(ctx.config.default_context_window());
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
                             provider: &provider,
@@ -2188,6 +2217,9 @@ fn execute_slash_command_impl(
                         })
                         .into_owned(),
                     ));
+                }
+                Ok(PersistedConfigReload::Busy) => {
+                    renderer.render(UiLine::Warning(t(Msg::CmdReloadBusy).into_owned()));
                 }
                 Ok(PersistedConfigReload::Queued | PersistedConfigReload::Joined) => {}
                 Err(e) => {

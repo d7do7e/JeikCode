@@ -1283,6 +1283,7 @@ impl CodingRuntimeHandle {
                 CodingRuntimeControl::ReassembleProvider {
                     generation,
                     next,
+                    idle_only: false,
                     done,
                 }
             }
@@ -1612,6 +1613,32 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::ReassembleProvider {
                 generation: runtime_state_generation(state),
                 next,
+                idle_only: false,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Reassemble the provider/persona/hooks only when no turn is active.
+    /// Returns [`RuntimeError::Busy`] if a turn or approval wait is in flight.
+    pub async fn reassemble_provider_when_idle(
+        &self,
+        next: CodingAgentConfig,
+    ) -> Result<RuntimeGeneration, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        if matches!(
+            runtime_status(state).phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+        ) {
+            return Err(RuntimeError::Busy);
+        }
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ReassembleProvider {
+                generation: runtime_state_generation(state),
+                next,
+                idle_only: true,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1654,9 +1681,38 @@ impl CodingRuntimeHandle {
         &self,
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     ) -> Result<SessionChanged, RuntimeError> {
-        self.withdraw_mcp_tools().await?;
-        self.reprepare_target(ReprepareTarget::Reload { plugin_skill_dirs })
+        self.reload_capabilities_with_config_opt(plugin_skill_dirs, None)
             .await
+    }
+
+    /// Reload the full capability graph (`prepare` + `assemble`) using a freshly
+    /// loaded [`CodingAgentConfig`] instead of reusing the startup config.
+    pub async fn reload_capabilities_with_config(
+        &self,
+        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+        config: CodingAgentConfig,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reload_capabilities_with_config_opt(plugin_skill_dirs, Some(Box::new(config)))
+            .await
+    }
+
+    async fn reload_capabilities_with_config_opt(
+        &self,
+        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+        config: Option<Box<CodingAgentConfig>>,
+    ) -> Result<SessionChanged, RuntimeError> {
+        if matches!(
+            self.status().phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+        ) {
+            return Err(RuntimeError::Busy);
+        }
+        self.withdraw_mcp_tools().await?;
+        self.reprepare_target(ReprepareTarget::Reload {
+            plugin_skill_dirs,
+            config,
+        })
+        .await
     }
 
     pub async fn resume_session(
@@ -2392,6 +2448,7 @@ pub enum CodingRuntimeControl {
     ReassembleProvider {
         generation: u64,
         next: CodingAgentConfig,
+        idle_only: bool,
         done: oneshot::Sender<Result<RuntimeGeneration, RuntimeError>>,
     },
     DeactivateProvider {
@@ -2485,6 +2542,7 @@ pub enum ReprepareTarget {
     Exact(ReprepareInput),
     Reload {
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+        config: Option<Box<CodingAgentConfig>>,
     },
     Fresh,
     Resume(String),
@@ -4530,9 +4588,13 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::ReassembleProvider {
                         generation: request_generation,
                         mut next,
+                        idle_only,
                         done,
                     }) => {
-                        if request_generation != generation || compaction_suspended {
+                        if request_generation != generation
+                            || compaction_suspended
+                            || (idle_only && active_turn.is_some())
+                        {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
@@ -4960,7 +5022,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                 | ReconfigureKind::ResumeSession
                                 | ReconfigureKind::ChangeDirectory
                         ) && !reuses_current_session;
-                        if active_turn.is_some() && (reuses_current_session || changes_session) {
+                        if active_turn.is_some()
+                            && (operation == ReconfigureKind::Reprepare
+                                || reuses_current_session
+                                || changes_session)
+                        {
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -5048,7 +5114,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // current agent. A failed fresh/resume/cd transition must leave the
                         // previous runtime executable; rebuilding it as a rollback can fail for
                         // reasons (notably authentication) unrelated to the accepted operation.
-                        let replacement = match assemble_runtime_resources(&mut candidate) {
+                        let mut replacement = match assemble_runtime_resources(&mut candidate) {
                             Ok(replacement) => replacement,
                             Err(candidate_error) => {
                                 let cleanup_error =
@@ -5172,7 +5238,38 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
-                        preserve_sessionless_snapshot(&mut runtime, &stop_report);
+                        if candidate.parts.session.is_none()
+                            && operation == ReconfigureKind::Reprepare
+                        {
+                            let preserved = stop_report
+                                .snapshot
+                                .clone()
+                                .or_else(|| runtime.parts.runtime_resume_snapshot())
+                                .or_else(|| latest_snapshot.as_deref().cloned());
+                            if let Some(snapshot) = preserved {
+                                candidate.parts.set_runtime_resume(snapshot.clone());
+                                let _ = replacement.commands.send(AgentCommand::Shutdown);
+                                let _ = replacement.task.await;
+                                replacement = match assemble_runtime_resources(&mut candidate) {
+                                    Ok(rebuilt) => rebuilt,
+                                    Err(error) => {
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Failed),
+                                            Ordering::Release,
+                                        );
+                                        agent_available = false;
+                                        resources = Some(runtime);
+                                        let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                            error,
+                                        )));
+                                        continue;
+                                    }
+                                };
+                                latest_snapshot = Some(Arc::new(snapshot));
+                            }
+                        } else {
+                            preserve_sessionless_snapshot(&mut runtime, &stop_report);
+                        }
                         if changes_session {
                             // Irrevocable transition boundary: the outgoing state no longer owns
                             // any session, so detach its live jobs now (foreground is impossible
@@ -7008,7 +7105,10 @@ fn resolve_reprepare_input(
 ) -> Result<Option<(ReprepareInput, Option<SessionLease>)>, RuntimeError> {
     match target {
         ReprepareTarget::Exact(input) => Ok(Some((input, None))),
-        ReprepareTarget::Reload { plugin_skill_dirs } => {
+        ReprepareTarget::Reload {
+            plugin_skill_dirs,
+            config,
+        } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {
                 prepare.plugin_skill_dirs = plugin_skill_dirs;
@@ -7017,9 +7117,33 @@ fn resolve_reprepare_input(
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
                 None => crate::SessionMode::Disabled,
             };
+            let next_config = match config {
+                Some(mut fresh) => {
+                    fresh.working_dir = runtime.config.working_dir.clone();
+                    if fresh.initial_mesh_name.is_none() {
+                        fresh.initial_mesh_name = runtime.config.initial_mesh_name.clone();
+                    }
+                    if fresh.session_display_name.is_none() {
+                        fresh.session_display_name = runtime.config.session_display_name.clone();
+                    }
+                    if let Some(routing) = fresh.subagent_config.clone() {
+                        if fresh.subagent_fast_provider.is_none()
+                            && fresh.subagent_capable_provider.is_none()
+                        {
+                            crate::provider_factory::install_subagent_tiers(
+                                runtime.provider_factory.clone(),
+                                &mut fresh,
+                                routing.as_ref(),
+                            );
+                        }
+                    }
+                    *fresh
+                }
+                None => runtime.config.clone(),
+            };
             Ok(Some((
                 ReprepareInput {
-                    config: runtime.config.clone(),
+                    config: next_config,
                     prepare,
                     operation: ReconfigureKind::Reprepare,
                 },
@@ -15435,5 +15559,242 @@ mod tests {
         assert!(saw_circuit_breaker);
         assert!(paused_at_cap);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn reload_context_refreshes_tier1_memory_preserving_turns() {
+        #[derive(Default)]
+        struct CaptureRequestsFactory {
+            requests: Arc<std::sync::Mutex<Vec<(String, Vec<Message>)>>>,
+        }
+        impl CodingProviderFactory for CaptureRequestsFactory {
+            fn build(
+                &self,
+                config: &CodingAgentConfig,
+                _session_id: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                struct CaptureProvider {
+                    model: String,
+                    requests: Arc<std::sync::Mutex<Vec<(String, Vec<Message>)>>>,
+                }
+                #[async_trait::async_trait]
+                impl LlmProvider for CaptureProvider {
+                    fn model_name(&self) -> &str {
+                        &self.model
+                    }
+                    async fn chat_stream(
+                        &self,
+                        messages: &[Message],
+                        _tools: &[jeikcode_kernel::tool::ToolDef],
+                        _options: &jeikcode_kernel::provider::ChatOptions,
+                    ) -> Result<
+                        futures::stream::BoxStream<'static, jeikcode_kernel::stream::StreamEvent>,
+                        jeikcode_kernel::stream::ProviderError,
+                    > {
+                        self.requests
+                            .lock()
+                            .unwrap()
+                            .push((self.model.clone(), messages.to_vec()));
+                        Ok(Box::pin(futures::stream::iter(vec![
+                            jeikcode_kernel::stream::StreamEvent::TextDelta("ack".into()),
+                            jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                        ])))
+                    }
+                }
+                Ok(Arc::new(CaptureProvider {
+                    model: config.model.clone(),
+                    requests: Arc::clone(&self.requests),
+                }))
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        let auto = jeikcode_capabilities::memory::AutoMemoryStore::for_project(project.path());
+        auto.remember_index_entry("initial memory fact").unwrap();
+
+        let factory = Arc::new(CaptureRequestsFactory::default());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        start.prepare.memory = true;
+        start.provider_factory = factory.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("turn one prompt"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        // Update Tier-1 MEMORY.md after turn 1, then run /reload context seam.
+        auto.remember_index_entry("reloaded memory fact").unwrap();
+        let next_cfg = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "test-model",
+            project.path(),
+        );
+        runtime
+            .handle
+            .reassemble_provider_when_idle(next_cfg)
+            .await
+            .unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("turn two prompt"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let captured = factory.requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let (_, turn2_msgs) = &captured[1];
+        assert!(
+            turn2_msgs
+                .iter()
+                .any(|m| m.text.contains("turn one prompt")),
+            "turn 1 history must survive /reload context"
+        );
+        assert!(
+            turn2_msgs
+                .iter()
+                .any(|m| m.text.contains("<memory>") && m.text.contains("reloaded memory fact")),
+            "updated MEMORY.md must be injected into <memory> after /reload context"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn reload_all_applies_fresh_config_and_preserves_sessionless_turns() {
+        #[derive(Default)]
+        struct CaptureRequestsFactory {
+            requests: Arc<std::sync::Mutex<Vec<(String, Vec<Message>)>>>,
+        }
+        impl CodingProviderFactory for CaptureRequestsFactory {
+            fn build(
+                &self,
+                config: &CodingAgentConfig,
+                _session_id: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                struct CaptureProvider {
+                    model: String,
+                    requests: Arc<std::sync::Mutex<Vec<(String, Vec<Message>)>>>,
+                }
+                #[async_trait::async_trait]
+                impl LlmProvider for CaptureProvider {
+                    fn model_name(&self) -> &str {
+                        &self.model
+                    }
+                    async fn chat_stream(
+                        &self,
+                        messages: &[Message],
+                        _tools: &[jeikcode_kernel::tool::ToolDef],
+                        _options: &jeikcode_kernel::provider::ChatOptions,
+                    ) -> Result<
+                        futures::stream::BoxStream<'static, jeikcode_kernel::stream::StreamEvent>,
+                        jeikcode_kernel::stream::ProviderError,
+                    > {
+                        self.requests
+                            .lock()
+                            .unwrap()
+                            .push((self.model.clone(), messages.to_vec()));
+                        Ok(Box::pin(futures::stream::iter(vec![
+                            jeikcode_kernel::stream::StreamEvent::TextDelta("ok".into()),
+                            jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                        ])))
+                    }
+                }
+                Ok(Arc::new(CaptureProvider {
+                    model: config.model.clone(),
+                    requests: Arc::clone(&self.requests),
+                }))
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+
+        let factory = Arc::new(CaptureRequestsFactory::default());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.model = "model-a".into();
+        start.prepare.session = crate::SessionMode::Disabled;
+        start.provider_factory = factory.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("sessionless turn one"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let mut fresh_cfg =
+            CodingAgentConfig::new("key", "https://example.test/v1", "model-b", project.path());
+        fresh_cfg.provider_name = "provider-b".into();
+        runtime
+            .handle
+            .reload_capabilities_with_config(None, fresh_cfg)
+            .await
+            .unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("sessionless turn two"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        let captured = factory.requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].0, "model-b");
+        assert!(
+            captured[1]
+                .1
+                .iter()
+                .any(|m| m.text.contains("sessionless turn one")),
+            "sessionless (--no-session) history must survive /reload all Reprepare"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_idle_guard_rejects_active_turn_for_context_and_all() {
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(PendingProviderFactory);
+        let runtime = CodingRuntime::start(start).await.unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("active turn"))
+            .await
+            .unwrap();
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::InTurn);
+
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "next-model", ".");
+        assert_eq!(
+            runtime
+                .handle
+                .reassemble_provider_when_idle(next.clone())
+                .await,
+            Err(RuntimeError::Busy)
+        );
+        assert_eq!(
+            runtime
+                .handle
+                .reload_capabilities_with_config(None, next)
+                .await,
+            Err(RuntimeError::Busy)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::InTurn);
+
+        runtime.handle.shutdown().await.unwrap();
     }
 }

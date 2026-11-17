@@ -854,6 +854,7 @@ pub async fn run(
         pending_external_session_projection: None,
         pending_capability_reload: false,
         pending_mcp_reload_server_count: None,
+        pending_reload_all_announce: None,
         pending_capability_projection: None,
         clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
             crate::event_loop::ClipboardCheckState::default(),

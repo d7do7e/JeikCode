@@ -471,6 +471,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{name} requires an argument. Usage: /{name} <your-input>").into(),
         Msg::CmdReloadDone { provider, model } =>
             format!("  Config reloaded. Active: {provider} · {model}\n").into(),
+        Msg::CmdReloadContextDone { provider, model } =>
+            format!("  Context & config reloaded (MEMORY.md / rules / AGENTS.md). Active: {provider} · {model}\n").into(),
+        Msg::CmdReloadAllDone { provider, model } =>
+            format!("  All config, context, skills, MCP, and hooks reloaded. Active: {provider} · {model}\n").into(),
+        Msg::CmdReloadBusy =>
+            "  Cannot reload while a turn is active; wait for the current turn to finish.\n".into(),
+        Msg::CmdReloadUsage =>
+            "  Usage: /reload [context|all]\n".into(),
         Msg::CmdReloadFailed { error } =>
             format!("reload failed: {error} (kept previous config)").into(),
         Msg::CmdUndoNotSupported =>
@@ -886,7 +894,7 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             "Manage providers (add / edit / delete / set global default)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
         Msg::CmdDescConfig => "Show config path".into(),
-        Msg::CmdDescReload => "Reload $JEIKCODE_HOME/config.toml from disk".into(),
+        Msg::CmdDescReload => "Reload config, context (MEMORY.md/rules/AGENTS), or all capabilities: /reload [context|all]".into(),
         Msg::CmdDescCd => "Change working directory and start a new session".into(),
 Msg::CmdDescInit => "Analyze the project and generate AGENTS.md".into(),
 Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),

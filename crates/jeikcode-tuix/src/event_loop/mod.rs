@@ -92,14 +92,10 @@ fn submit_foreground_runtime(ctx: &LoopCtx, input: jeikcode_coding::UserInput) -
     }
 }
 
-fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
-    reload_runtime_provider_from(ctx, &ctx.config)
-}
-
-fn reload_runtime_provider_from(
+fn build_agent_config_for_reload(
     ctx: &LoopCtx,
     source: &Config,
-) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+) -> jeikcode_coding::CodingAgentConfig {
     let mut config = jeikcode_coding::CodingRuntimeConfig::from_config(
         source,
         &ctx.working_dir,
@@ -116,8 +112,34 @@ fn reload_runtime_provider_from(
     let mut agent_cfg = config.agent_config();
     agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
     agent_cfg.next_prompt_suggestions = false;
+    agent_cfg
+}
+
+fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+    reload_runtime_provider_from(ctx, &ctx.config)
+}
+
+fn reload_runtime_provider_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+    let agent_cfg = build_agent_config_for_reload(ctx, source);
     ctx.runtime.reload_provider(
         agent_cfg,
+        false,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+fn reload_runtime_provider_when_idle_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+    let agent_cfg = build_agent_config_for_reload(ctx, source);
+    ctx.runtime.reload_provider(
+        agent_cfg,
+        true,
         ctx.foreground_runtime_id,
         ctx.runtime_event_tx.clone(),
     )
@@ -2391,11 +2413,13 @@ enum ReadyRuntimeRequest {
     },
     ReloadCapabilities {
         plugin_skill_dirs: Vec<(PathBuf, String)>,
+        config: Option<Box<jeikcode_coding::CodingAgentConfig>>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
     ReloadProvider {
         next: jeikcode_coding::CodingAgentConfig,
+        idle_only: bool,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -2660,13 +2684,22 @@ impl ReadyRuntimeControl {
                 }
                 ReadyRuntimeRequest::ReloadCapabilities {
                     plugin_skill_dirs,
+                    config,
                     runtime_id,
                     event_tx,
                 } => {
-                    let result = self
-                        .handle
-                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
-                        .await;
+                    let result = match config {
+                        Some(cfg) => {
+                            self.handle
+                                .reload_capabilities_with_config(Some(plugin_skill_dirs), *cfg)
+                                .await
+                        }
+                        None => {
+                            self.handle
+                                .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                                .await
+                        }
+                    };
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -2676,10 +2709,15 @@ impl ReadyRuntimeControl {
                 }
                 ReadyRuntimeRequest::ReloadProvider {
                     next,
+                    idle_only,
                     runtime_id,
                     event_tx,
                 } => {
-                    let result = self.handle.reassemble_provider(next).await;
+                    let result = if idle_only {
+                        self.handle.reassemble_provider_when_idle(next).await
+                    } else {
+                        self.handle.reassemble_provider(next).await
+                    };
                     RuntimeControl::send_native_result(
                         &event_tx,
                         runtime_id,
@@ -3199,9 +3237,20 @@ impl RuntimeControl {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
+        self.reload_capabilities_with_config(plugin_skill_dirs, None, runtime_id, event_tx)
+    }
+
+    pub fn reload_capabilities_with_config(
+        &self,
+        plugin_skill_dirs: Vec<(PathBuf, String)>,
+        config: Option<jeikcode_coding::CodingAgentConfig>,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadCapabilities {
                 plugin_skill_dirs,
+                config: config.map(Box::new),
                 runtime_id,
                 event_tx,
             }),
@@ -3214,9 +3263,18 @@ impl RuntimeControl {
                     }
                 };
                 tokio::spawn(async move {
-                    let result = handle
-                        .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
-                        .await;
+                    let result = match config {
+                        Some(cfg) => {
+                            handle
+                                .reload_capabilities_with_config(Some(plugin_skill_dirs), cfg)
+                                .await
+                        }
+                        None => {
+                            handle
+                                .reload_capabilities_with_plugin_skills(Some(plugin_skill_dirs))
+                                .await
+                        }
+                    };
                     let _ = event_tx.send(bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: bg_runtime::RuntimeEventPayload::Driver(
@@ -3233,12 +3291,14 @@ impl RuntimeControl {
     pub fn reload_provider(
         &self,
         next: jeikcode_coding::CodingAgentConfig,
+        idle_only: bool,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), jeikcode_coding::RuntimeUnavailable> {
         match self {
             Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReloadProvider {
                 next,
+                idle_only,
                 runtime_id,
                 event_tx,
             }),
@@ -3247,6 +3307,11 @@ impl RuntimeControl {
             }
             Self::Deferred(_) => Err(jeikcode_coding::RuntimeUnavailable),
         }
+    }
+
+    pub(crate) fn is_turn_busy(&self) -> bool {
+        use jeikcode_daemon::live_hub::LiveRuntimeControl;
+        phase_has_active_turn(self.status().phase)
     }
 
     pub fn deactivate_provider(
@@ -3599,6 +3664,7 @@ mod local_restore_scope_tests {
         assert!(runtime
             .reload_provider(
                 CodingAgentConfig::new("", "", "model", "/project"),
+                false,
                 RuntimeId::new(1),
                 event_tx,
             )
@@ -3624,6 +3690,7 @@ mod local_restore_scope_tests {
         assert!(runtime
             .reload_provider(
                 CodingAgentConfig::new("", "", "model", "/project"),
+                false,
                 RuntimeId::new(1),
                 event_tx,
             )
@@ -3680,6 +3747,20 @@ impl LanguageChangeNotice {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManualReloadAnnouncement {
+    None,
+    Config,
+    Context,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingReloadAll {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) apply_mode: Option<crate::state::AgentMode>,
+}
+
 /// Bag of handles passed into the loop.
 pub(crate) struct PendingProviderReload {
     origin_generation: Option<jeikcode_coding::RuntimeGeneration>,
@@ -3695,7 +3776,7 @@ pub(crate) struct PendingProviderReload {
     /// same config revision and reload their prompt. Only the process that
     /// handled the explicit `/language` action owns the success notice.
     language_change_notice: LanguageChangeNotice,
-    manual_reload_announce: bool,
+    manual_reload_announce: ManualReloadAnnouncement,
     selection_mode_after_success: Option<crate::ProviderSelectionMode>,
 }
 
@@ -3897,6 +3978,9 @@ pub struct LoopCtx {
     /// Server count captured by an explicit `/mcp reload`. Its success message
     /// is emitted only after the correlated runtime terminal succeeds.
     pub(crate) pending_mcp_reload_server_count: Option<usize>,
+    /// Metadata captured by `/reload all`. Emits `CmdReloadAllDone` once
+    /// `CapabilitiesReloadFinished` succeeds.
+    pub(crate) pending_reload_all_announce: Option<PendingReloadAll>,
     /// Successful capability terminal waiting for the live binding generation
     /// and snapshot projection to commit.
     pub(crate) pending_capability_projection: Option<jeikcode_coding::SessionChanged>,
@@ -10935,6 +11019,7 @@ pub(crate) enum PersistedConfigReload {
     Applied { provider: String, model: String },
     Queued,
     Joined,
+    Busy,
 }
 
 fn resolved_provider_and_model(config: &Config) -> (String, String) {
@@ -11060,9 +11145,18 @@ fn reconcile_persisted_config(
         return Ok(PersistedConfigReload::Applied { provider, model });
     }
 
+    if manual_reload_announce && ctx.runtime.is_turn_busy() {
+        return Ok(PersistedConfigReload::Busy);
+    }
+
     let origin_generation = ctx.runtime.current_generation();
     jeikcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+    let enqueue_res = if manual_reload_announce {
+        reload_runtime_provider_when_idle_from(ctx, &desired)
+    } else {
+        reload_runtime_provider_from(ctx, &desired)
+    };
+    if let Err(error) = enqueue_res {
         jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
         return Err(anyhow::anyhow!(
             "provider reload could not be started: {error}"
@@ -11078,7 +11172,11 @@ fn reconcile_persisted_config(
         previous_model_name: None,
         announce: None,
         language_change_notice: LanguageChangeNotice::None,
-        manual_reload_announce,
+        manual_reload_announce: if manual_reload_announce {
+            ManualReloadAnnouncement::Config
+        } else {
+            ManualReloadAnnouncement::None
+        },
         selection_mode_after_success: None,
     });
     Ok(PersistedConfigReload::Queued)
@@ -11101,7 +11199,9 @@ pub(crate) fn reload_persisted_config(
     match manual_reload_disposition(pending_revision, &snapshot.revision) {
         ManualReloadDisposition::Join => {
             if let Some(pending) = ctx.pending_provider_reload.as_mut() {
-                pending.manual_reload_announce = true;
+                if pending.manual_reload_announce == ManualReloadAnnouncement::None {
+                    pending.manual_reload_announce = ManualReloadAnnouncement::Config;
+                }
             }
             Ok(PersistedConfigReload::Joined)
         }
@@ -11110,6 +11210,147 @@ pub(crate) fn reload_persisted_config(
         }
         ManualReloadDisposition::Start => reconcile_persisted_config(ctx, snapshot, true),
     }
+}
+
+/// Explicit `/reload context`: re-read `config.toml` and run a lightweight
+/// `ReassembleProvider` cutover when idle so Tier-1 `MEMORY.md` / `memory.md`
+/// (`MemoryHook`), `rules.yaml`, `AGENTS.md` / `CLAUDE.md`, and `git_branch`
+/// refresh in place without tearing down MCP servers or losing turns.
+pub(crate) fn reload_context_and_config(
+    ctx: &mut LoopCtx,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    if ctx.runtime.is_turn_busy() {
+        return Ok(PersistedConfigReload::Busy);
+    }
+    if ctx.pending_provider_deactivation || provider_transition_pending(ctx) {
+        anyhow::bail!("provider transition is already in progress");
+    }
+    if ctx.pending_capability_reload
+        || ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+    {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).trim()
+        );
+    }
+    let snapshot = ctx.config_store.read()?;
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, true);
+    let origin_generation = ctx.runtime.current_generation();
+    jeikcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    if let Err(error) = reload_runtime_provider_when_idle_from(ctx, &desired) {
+        jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        return Err(anyhow::anyhow!(
+            "context reload could not be started: {error}"
+        ));
+    }
+    ctx.observed_config_revision = Some(snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(snapshot.revision),
+        rollback_persisted_config: None,
+        rollback_runtime_config: None,
+        previous_model_name: None,
+        announce: None,
+        language_change_notice: LanguageChangeNotice::None,
+        manual_reload_announce: ManualReloadAnnouncement::Context,
+        selection_mode_after_success: None,
+    });
+    Ok(PersistedConfigReload::Queued)
+}
+
+/// Explicit `/reload all`: re-read `config.toml`, reload skills/commands/MCP/hooks,
+/// and run `ReprepareTarget::Reload` with the fresh `CodingAgentConfig` when idle.
+pub(crate) fn reload_all_capabilities_and_config(
+    ctx: &mut LoopCtx,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    if ctx.runtime.is_turn_busy() {
+        return Ok(PersistedConfigReload::Busy);
+    }
+    if ctx.pending_provider_deactivation || provider_transition_pending(ctx) {
+        anyhow::bail!("provider transition is already in progress");
+    }
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+    {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).trim()
+        );
+    }
+    let snapshot = ctx.config_store.read()?;
+    let desired = desired_config_from_snapshot(ctx, snapshot.config, true);
+    let apply_mode = if desired.default_mode != ctx.config.default_mode
+        && !ctx.dangerously_skip_permissions
+    {
+        desired
+            .default_mode
+            .as_deref()
+            .and_then(|raw| jeikcode_coding::RuntimeMode::parse(raw).ok())
+            .map(|rm| match rm {
+                jeikcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
+                jeikcode_coding::RuntimeMode::AcceptEdits => crate::state::AgentMode::AcceptEdits,
+                jeikcode_coding::RuntimeMode::Auto => crate::state::AgentMode::Auto,
+                jeikcode_coding::RuntimeMode::Plan => crate::state::AgentMode::Plan,
+            })
+    } else {
+        None
+    };
+    let agent_cfg = build_agent_config_for_reload(ctx, &desired);
+    let (provider, model) = resolved_provider_and_model(&desired);
+
+    if ctx.config.language != desired.language {
+        crate::i18n::set_locale(jeikcode_config::i18n::resolve_initial_locale(
+            None,
+            desired.language,
+        ));
+    }
+    ctx.config = desired;
+    ctx.model_name = model.clone();
+    sync_reasoning_effort_from_provider(ctx);
+    jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+    ctx.observed_config_revision = Some(snapshot.revision);
+    ctx.observed_auth = None;
+
+    if let Ok(mut guard) = ctx.skill_registry.write() {
+        let _ = reload_skill_registry(&mut guard, &ctx.working_dir);
+    }
+    ctx.custom_commands =
+        jeikcode_capabilities::commands::UserCommandRegistry::load(&ctx.working_dir);
+
+    let plugin_skill_dirs =
+        jeikcode_capabilities::plugin::loader::installed_plugin_skill_dirs(&ctx.working_dir);
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            jeikcode_capabilities::mcp::ProjectMcpPool::global()
+                .reload_full(&ctx.working_dir)
+                .await;
+        })
+    });
+    ctx.runtime
+        .reload_capabilities_with_config(
+            plugin_skill_dirs.clone(),
+            Some(agent_cfg),
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    ctx.bg_manager.reload_capabilities_for_working_dir(
+        &ctx.working_dir,
+        plugin_skill_dirs,
+        ctx.runtime_event_tx.clone(),
+    );
+    ctx.pending_capability_reload = true;
+    ctx.pending_reload_all_announce = Some(PendingReloadAll {
+        provider,
+        model,
+        apply_mode,
+    });
+    Ok(PersistedConfigReload::Queued)
 }
 
 /// Observe the shared config at an idle boundary. Normal interactive sessions
@@ -11132,7 +11373,11 @@ fn poll_external_config(ctx: &mut LoopCtx) -> bool {
     }
     match reconcile_persisted_config(ctx, snapshot, false) {
         Ok(PersistedConfigReload::Applied { .. }) => true,
-        Ok(PersistedConfigReload::Queued | PersistedConfigReload::Joined) => false,
+        Ok(
+            PersistedConfigReload::Queued
+            | PersistedConfigReload::Joined
+            | PersistedConfigReload::Busy,
+        ) => false,
         Err(error) => {
             crate::tuix_trace!(
                 "CONFIG",
@@ -11194,7 +11439,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     previous_model_name: None,
                     announce: None,
                     language_change_notice: LanguageChangeNotice::None,
-                    manual_reload_announce: false,
+                    manual_reload_announce: ManualReloadAnnouncement::None,
                     selection_mode_after_success: None,
                 });
             }
@@ -14254,7 +14499,7 @@ fn stage_committed_config_reload(
                 previous_model_name: Some(previous_model_name),
                 announce: None,
                 language_change_notice: LanguageChangeNotice::None,
-                manual_reload_announce: false,
+                manual_reload_announce: ManualReloadAnnouncement::None,
                 selection_mode_after_success: None,
             },
         );
@@ -14278,7 +14523,7 @@ fn stage_committed_config_reload(
         previous_model_name: Some(previous_model_name),
         announce: Some(success_message),
         language_change_notice,
-        manual_reload_announce: false,
+        manual_reload_announce: ManualReloadAnnouncement::None,
         selection_mode_after_success: None,
     });
     true
@@ -14447,7 +14692,7 @@ pub(crate) fn select_provider_and_reload(
             .into_owned(),
         ),
         language_change_notice: LanguageChangeNotice::None,
-        manual_reload_announce: false,
+        manual_reload_announce: ManualReloadAnnouncement::None,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
     true
@@ -14575,7 +14820,7 @@ pub(crate) fn set_default_provider_and_reload(
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
                 language_change_notice: LanguageChangeNotice::None,
-                manual_reload_announce: false,
+                manual_reload_announce: ManualReloadAnnouncement::None,
                 selection_mode_after_success: None,
             },
         );
@@ -14606,7 +14851,7 @@ pub(crate) fn set_default_provider_and_reload(
             .into_owned(),
         ),
         language_change_notice: LanguageChangeNotice::None,
-        manual_reload_announce: false,
+        manual_reload_announce: ManualReloadAnnouncement::None,
         selection_mode_after_success: Some(crate::ProviderSelectionMode::Pinned),
     });
     true
@@ -18604,10 +18849,10 @@ fn apply_provider_projection(
 }
 
 fn discard_pending_provider_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer, reason: &str) {
-    let visible = ctx
-        .pending_provider_reload
-        .as_ref()
-        .is_some_and(|pending| pending.manual_reload_announce || pending.announce.is_some());
+    let visible = ctx.pending_provider_reload.as_ref().is_some_and(|pending| {
+        pending.manual_reload_announce != ManualReloadAnnouncement::None
+            || pending.announce.is_some()
+    });
     ctx.pending_provider_reload = None;
     ctx.observed_config_revision = None;
     jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
@@ -19826,14 +20071,26 @@ fn handle_runtime_event(
                                 announcement.trim_end_matches(['\r', '\n']).to_string(),
                             ));
                         }
-                        if manual_reload_announce {
-                            renderer.render(UiLine::CommandOutput(
-                                crate::i18n::t(crate::i18n::Msg::CmdReloadDone {
-                                    provider: &provider,
-                                    model: &model,
-                                })
-                                .into_owned(),
-                            ));
+                        match manual_reload_announce {
+                            ManualReloadAnnouncement::Config => {
+                                renderer.render(UiLine::CommandOutput(
+                                    crate::i18n::t(crate::i18n::Msg::CmdReloadDone {
+                                        provider: &provider,
+                                        model: &model,
+                                    })
+                                    .into_owned(),
+                                ));
+                            }
+                            ManualReloadAnnouncement::Context => {
+                                renderer.render(UiLine::CommandOutput(
+                                    crate::i18n::t(crate::i18n::Msg::CmdReloadContextDone {
+                                        provider: &provider,
+                                        model: &model,
+                                    })
+                                    .into_owned(),
+                                ));
+                            }
+                            ManualReloadAnnouncement::None => {}
                         }
                     }
                     renderer.flush();
@@ -20005,6 +20262,7 @@ fn handle_runtime_event(
             Err(error) => {
                 ctx.pending_capability_reload = false;
                 ctx.pending_capability_projection = None;
+                ctx.pending_reload_all_announce = None;
                 complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, false);
                 let message = error.to_string();
                 renderer.render(UiLine::Error(
@@ -20018,6 +20276,25 @@ fn handle_runtime_event(
                     complete_mcp_reload_notice(&mut ctx.pending_mcp_reload_server_count, true)
                 {
                     renderer.render(UiLine::CommandOutput(message));
+                    renderer.flush();
+                }
+                if let Some(reload_all) = ctx.pending_reload_all_announce.take() {
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
+                    state.on_model_window_changed(ctx.config.default_context_window());
+                    if let Some(mode) = reload_all.apply_mode {
+                        state.agent_mode = mode;
+                        let _ = ctx
+                            .runtime
+                            .dispatch(jeikcode_coding::DriverCommand::SetMode(runtime_mode(mode)));
+                        jeikcode_daemon::live_set_mode(mode);
+                    }
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdReloadAllDone {
+                            provider: &reload_all.provider,
+                            model: &reload_all.model,
+                        })
+                        .into_owned(),
+                    ));
                     renderer.flush();
                 }
                 ctx.pending_capability_projection = Some(changed);
