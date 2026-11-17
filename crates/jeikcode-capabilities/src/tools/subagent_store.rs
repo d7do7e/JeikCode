@@ -23,12 +23,15 @@ const MAX_WAIT_TIMEOUT_SECS: u64 = 600;
 
 static NEXT_SCOPE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SavedSubagentState {
     pub agent_id: String,
     pub session_scope: String,
     pub role: SubagentRole,
     pub scope: Vec<String>,
+    #[serde(default)]
+    pub difficulty: Option<String>,
+    #[serde(default)]
     pub inherit_context: bool,
     #[allow(dead_code)]
     pub working_dir: PathBuf,

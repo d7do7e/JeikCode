@@ -356,7 +356,7 @@ struct SubTask {
     #[serde(default, alias = "type", alias = "agent_type", alias = "role")]
     subagent_type: String,
     #[serde(default, alias = "tier", alias = "level", alias = "model_tier")]
-    difficulty: String,
+    difficulty: Option<String>,
     /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
     /// `worker`; ignored for `explore` / `verifier` (read-only). Enforced by `WorkerScopeGate`.
     #[serde(
@@ -385,9 +385,16 @@ impl SubTask {
         self.requested_role().is_some_and(SubagentRole::is_worker)
     }
 
+    fn requested_difficulty(&self) -> Option<&str> {
+        self.difficulty
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    #[cfg(test)]
     fn is_hard(&self) -> bool {
-        let diff = self.difficulty.trim();
-        diff.eq_ignore_ascii_case("hard") || diff.eq_ignore_ascii_case("complex")
+        self.requested_difficulty().is_some_and(is_hard_difficulty)
     }
 
     fn resolved_description(&self, index: usize) -> String {
@@ -402,6 +409,11 @@ impl SubTask {
             format!("subtask #{}", index + 1)
         }
     }
+}
+
+fn is_hard_difficulty(raw: &str) -> bool {
+    let diff = raw.trim();
+    diff.eq_ignore_ascii_case("hard") || diff.eq_ignore_ascii_case("complex")
 }
 
 #[derive(Deserialize)]
@@ -687,7 +699,7 @@ impl Tool for TaskTool {
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let requested_role = t.requested_role();
             let desc = t.resolved_description(idx);
-            let is_hard = t.is_hard();
+            let requested_difficulty = t.requested_difficulty().map(str::to_string);
             let run_bg = top_bg || t.run_in_background;
             let resume_id = t
                 .resume_agent_id
@@ -696,7 +708,7 @@ impl Tool for TaskTool {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
 
-            let (role, scope, agent_id, resume_snapshot, inherit_context) =
+            let (role, scope, agent_id, resume_snapshot, difficulty, inherit_context) =
                 if let Some(rid) = resume_id {
                     match self.store.get_for_resume(&rid, requested_role, &t.scope) {
                         Ok(saved) => (
@@ -704,6 +716,7 @@ impl Tool for TaskTool {
                             saved.scope,
                             saved.agent_id,
                             Some(saved.snapshot),
+                            requested_difficulty.or(saved.difficulty),
                             t.inherit_context || saved.inherit_context,
                         ),
                         Err(err_msg) => {
@@ -725,8 +738,17 @@ impl Tool for TaskTool {
                 } else {
                     let role = requested_role.unwrap_or(SubagentRole::Explore);
                     let agent_id = self.store.mint_agent_id(role);
-                    (role, t.scope.clone(), agent_id, None, t.inherit_context)
+                    (
+                        role,
+                        t.scope.clone(),
+                        agent_id,
+                        None,
+                        requested_difficulty,
+                        t.inherit_context,
+                    )
                 };
+
+            let is_hard = difficulty.as_deref().is_some_and(is_hard_difficulty);
 
             let inherited_ctx = if inherit_context {
                 if cached_inherited_context.is_none() {
@@ -859,6 +881,7 @@ impl Tool for TaskTool {
                                 session_scope,
                                 role,
                                 scope,
+                                difficulty,
                                 inherit_context,
                                 working_dir: wd,
                                 model: model.clone(),
@@ -950,6 +973,7 @@ impl Tool for TaskTool {
                             session_scope,
                             role,
                             scope,
+                            difficulty,
                             inherit_context,
                             working_dir: wd,
                             model: model.clone(),
@@ -2747,7 +2771,7 @@ mod tests {
             description: "d".into(),
             prompt: "p".into(),
             subagent_type: ty.into(),
-            difficulty: String::new(),
+            difficulty: None,
             scope: scope.into_iter().map(String::from).collect(),
             resume_agent_id: None,
             run_in_background: false,
@@ -2832,7 +2856,7 @@ mod tests {
             description: "d".into(),
             prompt: "p".into(),
             subagent_type: ty.into(),
-            difficulty: String::new(),
+            difficulty: None,
             scope: scope.into_iter().map(String::from).collect(),
             resume_agent_id: None,
             run_in_background: false,

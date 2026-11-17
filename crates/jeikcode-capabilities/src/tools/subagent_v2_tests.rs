@@ -591,3 +591,139 @@ async fn inherit_context_flag_defaults_lean_and_injects_full_ordered_blocks_when
     assert!(proj_idx < prompt_idx);
     assert!(msgs[1][proj_idx].text.contains("TAIL_RULE_ABC"));
 }
+
+#[tokio::test]
+async fn resume_agent_id_preserves_hard_difficulty_when_omitted_and_allows_explicit_override() {
+    struct TierProvider {
+        model: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TierProvider {
+        fn model_name(&self) -> &str {
+            self.model
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _opts: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(stream::iter(vec![
+                StreamEvent::TextDelta(format!("ok from {}", self.model)),
+                StreamEvent::Done { truncated: false },
+            ])
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+    let fast_calls = Arc::new(AtomicUsize::new(0));
+    let capable_calls = Arc::new(AtomicUsize::new(0));
+    let fast_calls_c = fast_calls.clone();
+    let capable_calls_c = capable_calls.clone();
+
+    let tool = TaskTool::new(
+        move || {
+            Arc::new(TierProvider {
+                model: "fast-tier-model",
+                calls: fast_calls_c.clone(),
+            }) as Arc<dyn LlmProvider>
+        },
+        move || {
+            Arc::new(TierProvider {
+                model: "capable-tier-model",
+                calls: capable_calls_c.clone(),
+            }) as Arc<dyn LlmProvider>
+        },
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    );
+
+    // Round 1: spawn with difficulty="hard" -> must hit capable-tier-model
+    let out1 = tool
+        .execute(
+            r#"{"tasks":[{"description":"r1","prompt":"critique r1","subagent_type":"explore","difficulty":"hard"}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out1.is_error, "{}", out1.content);
+    assert!(out1.content.contains("capable-tier-model"));
+    assert_eq!(capable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+
+    let agent_id = extract_attr(&out1.content, "agent_id").expect("agent_id in header");
+
+    // Round 2: resume WITHOUT difficulty -> must inherit "hard" and stay on capable-tier-model
+    let args2 = serde_json::json!({
+        "tasks": [{
+            "description": "r2",
+            "prompt": "critique r2",
+            "resume_agent_id": agent_id
+        }]
+    })
+    .to_string();
+    let out2 = tool.execute(&args2, &tool_ctx(dir.path())).await;
+    assert!(!out2.is_error, "{}", out2.content);
+    assert!(
+        out2.content.contains("capable-tier-model"),
+        "omitted difficulty on resume must inherit capable tier: {}",
+        out2.content
+    );
+    assert_eq!(capable_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+
+    // Round 3: resume with blank difficulty ("   ") -> still inherits "hard"
+    let args3 = serde_json::json!({
+        "tasks": [{
+            "description": "r3",
+            "prompt": "critique r3",
+            "difficulty": "   ",
+            "resume_agent_id": agent_id
+        }]
+    })
+    .to_string();
+    let out3 = tool.execute(&args3, &tool_ctx(dir.path())).await;
+    assert!(!out3.is_error, "{}", out3.content);
+    assert!(out3.content.contains("capable-tier-model"));
+    assert_eq!(capable_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+
+    // Round 4: explicit difficulty="simple" overrides saved "hard"
+    let args4 = serde_json::json!({
+        "tasks": [{
+            "description": "r4",
+            "prompt": "quick summary",
+            "difficulty": "simple",
+            "resume_agent_id": agent_id
+        }]
+    })
+    .to_string();
+    let out4 = tool.execute(&args4, &tool_ctx(dir.path())).await;
+    assert!(!out4.is_error, "{}", out4.content);
+    assert!(out4.content.contains("fast-tier-model"));
+    assert_eq!(capable_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+
+    // SavedSubagentState deserializes legacy JSON lacking `difficulty` / `inherit_context`
+    let legacy_json = serde_json::json!({
+        "agent_id": "agent-explore-99",
+        "session_scope": "sess-legacy",
+        "role": "explore",
+        "scope": [],
+        "working_dir": dir.path(),
+        "model": "legacy-model",
+        "snapshot": jeikcode_kernel::message::SessionSnapshot::new(Vec::new()),
+        "updated_seq": 1
+    });
+    let decoded: super::subagent_store::SavedSubagentState =
+        serde_json::from_value(legacy_json).expect("legacy SavedSubagentState must deserialize");
+    assert_eq!(decoded.difficulty, None);
+    assert!(!decoded.inherit_context);
+}

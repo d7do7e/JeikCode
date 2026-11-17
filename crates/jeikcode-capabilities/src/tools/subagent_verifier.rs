@@ -24,7 +24,8 @@ use super::subagent_context::build_child_persona;
 use super::task::{DenyOfflineNetwork, DenySensitivePaths};
 
 /// Subagent execution role parsed from `SubTask.subagent_type`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SubagentRole {
     Explore,
     Worker,
