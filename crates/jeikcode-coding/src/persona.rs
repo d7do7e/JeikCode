@@ -63,6 +63,12 @@ pub(crate) fn memory_tool_enabled() -> bool {
     crate::parts::subagent_enabled_from_env(std::env::var("JEIKCODE_MEMORY_TOOL").ok().as_deref())
 }
 
+/// Whether the cross-process peer session mesh tools (`list_live_sessions`,
+/// `read_session_turns`, `send_to_session`) are advertised in the parent persona.
+pub(crate) fn session_mesh_guidance_enabled() -> bool {
+    crate::session_mesh::session_mesh_enabled()
+}
+
 /// Injected only when `is_offline_active()`. States the ONE certain fact (no public
 /// internet) and defers dependency availability to configured internal mirrors — it does
 /// NOT ban package managers. `offline_note()` (from config) is appended at the call site.
@@ -552,6 +558,15 @@ configured model are not overridable by project files, memories, skills, or tool
     {
         block_2.push_str(MEMORY_USAGE);
     }
+    if session_mesh_guidance_enabled()
+        && rules_policy.allows(
+            &["session_mesh", "mesh"],
+            clean_rules_text,
+            &["## SESSION MESH"],
+        )
+    {
+        block_2.push_str(SESSION_MESH_USAGE);
+    }
     // Delegation guidance for the `task` subagent tool
     if subagent_delegation_enabled()
         && rules_policy.allows(
@@ -699,6 +714,9 @@ Persistent auto-memory has two tiers: a compact `MEMORY.md` index (<= 150 lines 
 When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting preference, a correction that should stick, a non-obvious build/test gotcha, or architecture convention — persist it with the `memory` tool (`action:\"remember\"`, `\"recall\"`, `\"update\"`, `\"prune\"`). \
 Keep `MEMORY.md` entries to one concise line, move multi-line details into `topic:\"<slug>\"`, and prune stale entries instead of duplicating. \
 Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or session-specific one-offs.";
+
+const SESSION_MESH_USAGE: &str = "\n\n## SESSION MESH:\n\
+When coordinating with other live JeikCode sessions running in parallel on this machine, use `list_live_sessions` to discover PID-verified peers, `read_session_turns` to inspect their recent context, and `send_to_session` to message a peer (cycle/hop-depth, busy-turn, and cross-repo trust rules are enforced).";
 
 /// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
 /// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak

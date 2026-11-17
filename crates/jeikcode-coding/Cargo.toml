@@ -24,7 +24,7 @@ jeikcode-capabilities = { path = "../jeikcode-capabilities", features = [
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
 jeikcode-review = { path = "../jeikcode-review" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 # Stream proxying for the compaction-summary telemetry provider decorator (folds

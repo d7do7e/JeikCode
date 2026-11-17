@@ -48,6 +48,8 @@ pub mod plan_mode;
 pub mod plugin_hooks;
 pub mod provider_factory;
 pub mod runtime;
+pub mod session_mesh;
+mod session_mesh_tools;
 pub mod session_runtime_registry;
 pub mod session_title;
 pub mod steer_prompt;
@@ -101,6 +103,11 @@ pub use runtime::{
     RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt,
     TurnCompletion, UndoResult, UserInput, VisionNotice,
 };
+pub use session_mesh::{
+    live_registry_dir, LiveSessionDescriptor, LiveSessionView, MeshHopContext,
+    DEFAULT_MESH_MAX_HOPS,
+};
+pub use session_mesh_tools::discover_live_sessions;
 pub use session_runtime_registry::{
     OpenOutcome, RegistryError, RuntimeActivity, SequencedSessionEvent, SessionKey,
     SessionRuntimeEntry, SessionRuntimeRegistry, SessionViewEvent, MAX_LIVE_SESSIONS,

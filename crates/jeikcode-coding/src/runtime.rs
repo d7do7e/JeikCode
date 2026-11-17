@@ -41,6 +41,8 @@ use crate::goal_verifier::{evaluate_goal_with_harness, GoalEvalJob};
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
+use crate::session_mesh::{live_registry_dir, session_mesh_enabled, SessionMeshHost};
+use crate::session_mesh_tools::{ListLiveSessionsTool, ReadSessionTurnsTool, SendToSessionTool};
 use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
 /// Runtime facts emitted by the coding engine without depending on the legacy
@@ -700,6 +702,7 @@ struct RuntimeResources {
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
+    mesh_host: Option<Arc<SessionMeshHost>>,
 }
 
 struct NextPromptSuggestionOutcome {
@@ -1986,6 +1989,22 @@ impl CodingRuntime {
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
         )));
+        let (handle, controls) = coding_runtime_control_channel();
+        let mesh_host = if session_mesh_enabled() {
+            parts.session.as_ref().and_then(|binding| {
+                SessionMeshHost::start(
+                    live_registry_dir(),
+                    binding.id.clone(),
+                    agent.working_dir.clone(),
+                    agent.model.clone(),
+                    handle.clone(),
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+        register_mesh_tools(&mut parts, mesh_host.as_ref());
         let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
         let session = parts.session.as_ref().map(|binding| RuntimeSessionInfo {
             id: binding.id.clone(),
@@ -2024,7 +2043,6 @@ impl CodingRuntime {
         // user Submit — OpenCode-style /new drafts must not litter the session list.
         // `publish_staged_session` is a no-op when nothing is staged.
 
-        let (handle, controls) = coding_runtime_control_channel();
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
         let adapter = spawn_runtime_owner_with_optional_agent(
@@ -2048,6 +2066,7 @@ impl CodingRuntime {
                 wakeup_tx,
                 loop_active,
                 image_preprocessor,
+                mesh_host,
             }),
             Some(wakeup_rx),
         );
@@ -4821,6 +4840,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // Preserve the injected VL hook across reprepare
                                 // (/model swap, reconfigure).
                                 image_preprocessor: runtime.image_preprocessor.clone(),
+                                mesh_host: runtime.mesh_host.clone(),
                             },
                             Err(error) => {
                                 let error = runtime_prepare_error(error);
@@ -5001,6 +5021,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         compaction_suspended = false;
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
+                        if let Some(host) = runtime.mesh_host.as_ref() {
+                            host.reconfigure_session(
+                                changed.session_id.clone(),
+                                cwd.clone(),
+                                runtime.config.model.clone(),
+                            );
+                        }
                         resources = Some(runtime);
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -6046,6 +6073,15 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                                 let snapshot = Arc::new(snapshot);
                                 latest_snapshot = Some(snapshot.clone());
+                                if let Some(host) = resources
+                                    .as_ref()
+                                    .and_then(|runtime| runtime.mesh_host.as_ref())
+                                {
+                                    host.local.update_snapshot(Some(snapshot.clone()));
+                                    if terminal_reason.is_some() || cancel_pending {
+                                        host.local.clear_hop_context();
+                                    }
+                                }
                                 let undo_snapshot = resources
                                     .as_ref()
                                     .and_then(current_runtime_snapshot)
@@ -6510,6 +6546,12 @@ fn spawn_runtime_owner_with_optional_agent(
         }
         if let Some(task) = next_prompt_task.take() {
             task.abort();
+        }
+        if let Some(host) = resources
+            .as_ref()
+            .and_then(|runtime| runtime.mesh_host.as_ref())
+        {
+            host.shutdown();
         }
         controls.state.store(
             runtime_phase_state(generation, RuntimePhase::Stopped),
@@ -6987,6 +7029,21 @@ fn build_goal_evaluator_provider(
     factory.build(host, session_id)
 }
 
+fn register_mesh_tools(parts: &mut crate::CodingParts, mesh_host: Option<&Arc<SessionMeshHost>>) {
+    let Some(host) = mesh_host else {
+        return;
+    };
+    parts.register_extra_tool(Arc::new(ListLiveSessionsTool {
+        local: host.local.clone(),
+    }));
+    parts.register_extra_tool(Arc::new(ReadSessionTurnsTool {
+        local: host.local.clone(),
+    }));
+    parts.register_extra_tool(Arc::new(SendToSessionTool {
+        local: host.local.clone(),
+    }));
+}
+
 fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
     runtime
         .parts
@@ -6994,6 +7051,7 @@ fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHan
             runtime.wakeup_tx.clone(),
             Arc::clone(&runtime.loop_active),
         )));
+    register_mesh_tools(&mut runtime.parts, runtime.mesh_host.as_ref());
     let session_id = runtime
         .parts
         .session
@@ -8775,6 +8833,7 @@ mod tests {
             wakeup_tx: wakeup_tx.clone(),
             loop_active: loop_active.clone(),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -8877,6 +8936,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -9026,6 +9086,7 @@ mod tests {
             wakeup_tx,
             loop_active,
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -9117,6 +9178,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11348,6 +11410,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11547,6 +11610,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: pp,
+            mesh_host: None,
         };
         let adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11758,6 +11822,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11831,6 +11896,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11903,6 +11969,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -11998,6 +12065,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12061,6 +12129,7 @@ mod tests {
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12183,6 +12252,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12292,6 +12362,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12360,6 +12431,7 @@ mod tests {
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12463,6 +12535,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12561,6 +12634,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12665,6 +12739,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let _adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -12811,6 +12886,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let adapter = spawn_runtime_owner_with_protocol(
             agent,
@@ -14060,6 +14136,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor,
+            mesh_host: None,
         };
 
         let mut truncated = original_snapshot.clone();
@@ -14943,6 +15020,7 @@ mod tests {
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
+            mesh_host: None,
         };
         let agent = assemble_runtime_resources(&mut runtime).unwrap();
 

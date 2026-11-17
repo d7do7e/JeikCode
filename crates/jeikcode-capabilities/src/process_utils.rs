@@ -249,6 +249,51 @@ pub fn kill_windows_tree(job: &Option<JobHandle>, pid: Option<u32>) {
     }
 }
 
+/// Check whether an OS process with `pid` is currently alive.
+#[cfg(target_os = "windows")]
+pub fn is_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        let _ = CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+/// Check whether an OS process with `pid` is currently alive.
+#[cfg(unix)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let raw = pid as libc::pid_t;
+    if raw <= 0 {
+        return false;
+    }
+    let res = unsafe { libc::kill(raw, 0) };
+    if res == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+pub fn is_pid_alive(pid: u32) -> bool {
+    pid != 0
+}
+
 /// Build a shell command that runs `command` through the platform shell.
 ///
 /// - Windows: `cmd.exe /C <command>` — the command string is passed via
@@ -2236,5 +2281,26 @@ mod tests {
         let (cmd, envs) = extract_inline_scripts_to_env(simple_cmd);
         assert_eq!(cmd, simple_cmd);
         assert!(envs.is_empty());
+    }
+
+    #[test]
+    fn is_pid_alive_distinguishes_self_from_zero_and_exited_child() {
+        assert!(is_pid_alive(std::process::id()));
+        assert!(!is_pid_alive(0));
+
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+
+        let dead_pid = child.id();
+        let _ = child.wait();
+        assert!(!is_pid_alive(dead_pid));
     }
 }
