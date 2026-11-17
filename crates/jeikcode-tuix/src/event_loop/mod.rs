@@ -1854,6 +1854,35 @@ mod submit_hold_tests {
     }
 
     #[test]
+    fn peer_message_banner_marks_external_repo_and_same_repo() {
+        let same = jeikcode_coding::format_peer_message_banner(
+            "12345678-abcd",
+            std::path::Path::new("/repos/app"),
+            std::path::Path::new("/repos/app"),
+            true,
+            1,
+            false,
+            "ping",
+        );
+        assert!(same.contains("[peer 12345678 @"));
+        assert!(same.contains("same-repo"));
+        assert!(same.ends_with("\nping"));
+
+        let cross = jeikcode_coding::format_peer_message_banner(
+            "abcdef01-9999",
+            std::path::Path::new("/repos/other/sub"),
+            std::path::Path::new("/repos/other"),
+            false,
+            2,
+            true,
+            "check API",
+        );
+        assert!(cross.contains("EXTERNAL REPO:"));
+        assert!(cross.contains("hop 2, steered"));
+        assert!(cross.ends_with("\ncheck API"));
+    }
+
+    #[test]
     fn agent_error_is_diagnostic_and_does_not_touch_type_ahead() {
         let event = bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
             jeikcode_kernel::event::AgentEvent::Error {
@@ -19260,6 +19289,40 @@ fn handle_runtime_event(
                             label: progress.label,
                             last_reason: progress.last_reason,
                         },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
+                CodingRuntimeEvent::PeerMessageReceived {
+                    from_session_id,
+                    from_working_dir,
+                    from_repo_root,
+                    same_repo,
+                    hop_depth,
+                    steered,
+                    text,
+                } => {
+                    let banner = jeikcode_coding::format_peer_message_banner(
+                        &from_session_id,
+                        &from_working_dir,
+                        &from_repo_root,
+                        same_repo,
+                        hop_depth,
+                        steered,
+                        &text,
+                    );
+                    if !steered && matches!(state.phase, UiPhase::Idle) {
+                        state.on_submit();
+                    }
+                    handle_agent_event(
+                        AgentEvent::UserEcho(banner),
                         state,
                         think,
                         renderer,

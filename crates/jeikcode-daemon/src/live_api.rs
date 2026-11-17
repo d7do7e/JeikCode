@@ -2212,6 +2212,28 @@ impl NativeLiveWireProjector {
                     return None;
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PeerMessageReceived {
+                from_session_id,
+                from_working_dir,
+                from_repo_root,
+                same_repo,
+                hop_depth,
+                steered,
+                text,
+            }) => LiveWireEvent::UserMessage {
+                text: jeikcode_coding::format_peer_message_banner(
+                    &from_session_id,
+                    &from_working_dir,
+                    &from_repo_root,
+                    same_repo,
+                    hop_depth,
+                    steered,
+                    &text,
+                ),
+                images: Vec::new(),
+                message_id: None,
+                client_input_id: None,
+            },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
                 Kernel::TurnStarted => LiveWireEvent::State {
                     running: true,
@@ -5863,5 +5885,33 @@ mod tests {
         let prepared = res2.unwrap();
         assert_eq!(prepared.project_bucket, bucket2);
         assert_eq!(prepared.view.meta.working_dir, proj2_dir.to_string_lossy());
+    }
+
+    #[test]
+    fn native_live_wire_projector_renders_incoming_peer_message_as_user_message() {
+        let mut projector = NativeLiveWireProjector {
+            session_id: "peer-target".to_string(),
+            ..Default::default()
+        };
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                jeikcode_coding::CodingRuntimeEvent::PeerMessageReceived {
+                    from_session_id: "11223344-5566".into(),
+                    from_working_dir: PathBuf::from("/repo-a"),
+                    from_repo_root: PathBuf::from("/repo-a"),
+                    same_repo: false,
+                    hop_depth: 1,
+                    steered: false,
+                    text: "hello from repo-a".into(),
+                },
+            ))
+            .expect("PeerMessageReceived must project to LiveWireEvent");
+        match wire {
+            LiveWireEvent::UserMessage { text, .. } => {
+                assert!(text.contains("EXTERNAL REPO:"));
+                assert!(text.contains("hello from repo-a"));
+            }
+            _ => panic!("expected LiveWireEvent::UserMessage"),
+        }
     }
 }

@@ -1,23 +1,25 @@
 //! Cross-process mesh IPC client, stale-PID descriptor reaper, and parent-only peer tools:
 //! - `list_live_sessions`: discover PID-checked live JeikCode sessions
 //! - `read_session_turns`: inspect recent conversation turns from a peer session
-//! - `send_to_session`: send a guarded peer message (cycle/hop-depth, busy-turn, cross-repo trust)
+//! - `send_to_session`: send a guarded peer message and return the peer's reply/outcome
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use jeikcode_capabilities::process_utils::is_pid_alive;
-use jeikcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+use jeikcode_kernel::message::{Role, SessionSnapshot};
+use jeikcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::session_mesh::{
-    cross_repo_env_allowed, max_mesh_hops, same_canonical_path, validate_live_session_id,
-    IpcRequestEnvelope, LiveSessionDescriptor, LiveSessionView, MeshLocalState, MeshRequest,
-    MeshResponse, IPC_CONNECT_TIMEOUT, IPC_IO_TIMEOUT,
+    max_mesh_hops, same_canonical_path, validate_live_session_id, IpcRequestEnvelope,
+    LiveSessionDescriptor, LiveSessionView, MeshLocalState, MeshRequest, MeshResponse,
+    DEFAULT_PEER_REPLY_TIMEOUT_SECS, IPC_CONNECT_TIMEOUT, IPC_IO_TIMEOUT,
 };
 
 fn tool_ok(content: impl Into<String>) -> ToolResult {
@@ -35,6 +37,83 @@ fn tool_err(content: impl Into<String>) -> ToolResult {
         content: content.into(),
         is_error: true,
         images: Vec::new(),
+    }
+}
+
+/// Format an incoming peer message for visible display in TUI / WebUI timelines.
+pub fn format_peer_message_banner(
+    from_session_id: &str,
+    from_working_dir: &Path,
+    from_repo_root: &Path,
+    same_repo: bool,
+    hop_depth: u32,
+    steered: bool,
+    text: &str,
+) -> String {
+    let short_id: String = from_session_id.chars().take(8).collect();
+    let scope_badge = if same_repo {
+        "same-repo".to_string()
+    } else {
+        format!("EXTERNAL REPO: {}", from_repo_root.display())
+    };
+    let mode_tag = if steered { ", steered" } else { "" };
+    format!(
+        "[peer {short_id} @ {} | {scope_badge} | hop {hop_depth}{mode_tag}]\n{}",
+        from_working_dir.display(),
+        text.trim()
+    )
+}
+
+pub(crate) fn last_assistant_reply_text(snapshot: &SessionSnapshot) -> String {
+    let text = snapshot
+        .messages
+        .iter()
+        .rev()
+        .find(|m| !m.synthetic && m.role == Role::Assistant && !m.text.trim().is_empty())
+        .map(|m| m.text.trim().to_string())
+        .unwrap_or_default();
+    truncate_chars(&text, 6000)
+}
+
+pub(crate) fn format_snapshot_turns(
+    snap: &SessionSnapshot,
+    last_n: usize,
+    max_chars: usize,
+) -> String {
+    let real_msgs: Vec<_> = snap
+        .messages
+        .iter()
+        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
+        .collect();
+    if real_msgs.is_empty() {
+        return "(no user/assistant turns recorded yet)".to_string();
+    }
+    let start = real_msgs.len().saturating_sub(last_n);
+    let mut lines = Vec::new();
+    for (idx, msg) in real_msgs[start..].iter().enumerate() {
+        let role_label = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            _ => "other",
+        };
+        let mut body = msg.text.trim().to_string();
+        if body.is_empty() && !msg.tool_calls.is_empty() {
+            let tool_names: Vec<&str> = msg.tool_calls.iter().map(|t| t.name.as_str()).collect();
+            body = format!("[tool calls: {}]", tool_names.join(", "));
+        }
+        let clipped = truncate_chars(&body, 1200);
+        lines.push(format!("[{}] {}: {}", start + idx + 1, role_label, clipped));
+    }
+    truncate_chars(&lines.join("\n\n"), max_chars)
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 
@@ -69,7 +148,7 @@ pub async fn discover_live_sessions(
 
     let mut views = Vec::new();
     for (path, desc) in descriptors {
-        match send_ipc_request(&desc, MeshRequest::PingStatus).await {
+        match send_ipc_request(&desc, MeshRequest::PingStatus, IPC_IO_TIMEOUT).await {
             Ok(MeshResponse::Status {
                 session_id,
                 pid,
@@ -80,12 +159,18 @@ pub async fn discover_live_sessions(
                 let is_self = self_session_id.is_some_and(|s| s == session_id);
                 let same_repo =
                     self_repo_root.is_some_and(|r| same_canonical_path(r, &desc.repo_root));
+                let repo_scope = if same_repo {
+                    "same_repo".to_string()
+                } else {
+                    format!("EXTERNAL REPO: {}", desc.repo_root.display())
+                };
                 views.push(LiveSessionView {
                     session_id,
                     pid,
                     working_dir: desc.working_dir,
                     repo_root: desc.repo_root,
                     same_repo,
+                    repo_scope,
                     is_self,
                     model: desc.model,
                     phase,
@@ -131,7 +216,13 @@ async fn ipc_read_session_turns(
     last_n: usize,
     max_chars: usize,
 ) -> Result<(String, usize, String), String> {
-    match send_ipc_request(desc, MeshRequest::ReadTurns { last_n, max_chars }).await? {
+    match send_ipc_request(
+        desc,
+        MeshRequest::ReadTurns { last_n, max_chars },
+        IPC_IO_TIMEOUT,
+    )
+    .await?
+    {
         MeshResponse::Turns {
             phase,
             total_messages,
@@ -143,6 +234,17 @@ async fn ipc_read_session_turns(
     }
 }
 
+struct PeerDeliveryOutcome {
+    turn_id: u64,
+    steered: bool,
+    hop_depth: u32,
+    same_repo: bool,
+    target_repo_root: PathBuf,
+    completed: bool,
+    stop_reason: Option<String>,
+    reply: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ipc_send_to_session(
     desc: &LiveSessionDescriptor,
@@ -152,9 +254,18 @@ async fn ipc_send_to_session(
     text: String,
     hop_depth: u32,
     visited_sessions: Vec<String>,
-    allow_cross_repo: bool,
     steer_if_busy: bool,
-) -> Result<(bool, u32), String> {
+    wait_for_reply: Option<bool>,
+    timeout_secs: Option<u64>,
+) -> Result<PeerDeliveryOutcome, String> {
+    let wait_budget = if wait_for_reply == Some(false) {
+        IPC_IO_TIMEOUT
+    } else {
+        let secs = timeout_secs
+            .unwrap_or(DEFAULT_PEER_REPLY_TIMEOUT_SECS)
+            .clamp(1, 300);
+        Duration::from_secs(secs.saturating_add(5))
+    };
     match send_ipc_request(
         desc,
         MeshRequest::SendMessage {
@@ -164,15 +275,34 @@ async fn ipc_send_to_session(
             text,
             hop_depth,
             visited_sessions,
-            allow_cross_repo,
             steer_if_busy,
+            wait_for_reply,
+            timeout_secs,
         },
+        wait_budget,
     )
     .await?
     {
         MeshResponse::Delivered {
-            steered, hop_depth, ..
-        } => Ok((steered, hop_depth)),
+            turn_id,
+            steered,
+            hop_depth,
+            same_repo,
+            target_repo_root,
+            completed,
+            stop_reason,
+            reply,
+            ..
+        } => Ok(PeerDeliveryOutcome {
+            turn_id,
+            steered,
+            hop_depth,
+            same_repo,
+            target_repo_root,
+            completed,
+            stop_reason,
+            reply,
+        }),
         MeshResponse::Error { message } => Err(message),
         _ => Err("unexpected IPC response for send_to_session".to_string()),
     }
@@ -181,6 +311,7 @@ async fn ipc_send_to_session(
 async fn send_ipc_request(
     desc: &LiveSessionDescriptor,
     payload: MeshRequest,
+    read_timeout: Duration,
 ) -> Result<MeshResponse, String> {
     let stream = tokio::time::timeout(IPC_CONNECT_TIMEOUT, TcpStream::connect(&desc.endpoint))
         .await
@@ -202,7 +333,7 @@ async fn send_ipc_request(
 
     let mut reader = BufReader::new(read_half);
     let mut resp_line = String::new();
-    let n = tokio::time::timeout(IPC_IO_TIMEOUT, reader.read_line(&mut resp_line))
+    let n = tokio::time::timeout(read_timeout, reader.read_line(&mut resp_line))
         .await
         .map_err(|_| "IPC read timeout".to_string())?
         .map_err(|e| format!("IPC read failed: {e}"))?;
@@ -229,7 +360,7 @@ impl Tool for ListLiveSessionsTool {
     }
 
     fn description(&self) -> &str {
-        "Discover live JeikCode sessions running across local OS processes (standalone TUIs, CLI, daemon) with PID verification, repo match, working directory, and busy status."
+        "Discover live JeikCode sessions running across local OS processes (standalone TUIs, CLI, daemon) with PID verification, repo scope (`same_repo` or `EXTERNAL REPO`), working directory, and busy status."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -265,8 +396,6 @@ struct ReadSessionTurnsArgs {
     last_n: Option<usize>,
     #[serde(default)]
     max_chars: Option<usize>,
-    #[serde(default)]
-    allow_cross_repo: Option<bool>,
 }
 
 /// `read_session_turns` — inspect recent turns of a live peer session without blocking mid-turn.
@@ -285,7 +414,7 @@ impl Tool for ReadSessionTurnsTool {
     }
 
     fn description(&self) -> &str {
-        "Read recent user/assistant turns from another live JeikCode session. Same-repo sessions are allowed automatically; cross-repo reads require `allow_cross_repo: true`."
+        "Read recent user/assistant turns from another live JeikCode session (same-repo or cross-repo; external repositories are clearly annotated)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -303,10 +432,6 @@ impl Tool for ReadSessionTurnsTool {
                 "max_chars": {
                     "type": "integer",
                     "description": "Character cap on returned transcript snippet (default 6000, max 32000)."
-                },
-                "allow_cross_repo": {
-                    "type": "boolean",
-                    "description": "Set true to read a session in a different repository."
                 }
             },
             "required": ["session_id"]
@@ -324,21 +449,19 @@ impl Tool for ReadSessionTurnsTool {
         };
         let self_repo = self.local.current_repo_root();
         let same_repo = same_canonical_path(&self_repo, &desc.repo_root);
-        let allow_cross = parsed.allow_cross_repo.unwrap_or(false) || cross_repo_env_allowed();
-        if !same_repo && !allow_cross {
-            return tool_err(format!(
-                "cross-repo read_session_turns denied (`{}` vs `{}`); pass `allow_cross_repo: true`",
-                self_repo.display(),
-                desc.repo_root.display()
-            ));
-        }
+        let scope_tag = if same_repo {
+            "SAME REPO".to_string()
+        } else {
+            format!("EXTERNAL REPO: {}", desc.repo_root.display())
+        };
 
         let last_n = parsed.last_n.unwrap_or(8).clamp(1, 50);
         let max_chars = parsed.max_chars.unwrap_or(6000).clamp(256, 32_000);
         match ipc_read_session_turns(&desc, last_n, max_chars).await {
             Ok((phase, total_messages, rendered)) => tool_ok(format!(
-                "Session `{}` (phase={phase}, total_messages={total_messages}):\n\n{rendered}",
-                desc.session_id
+                "Session `{}` ([{scope_tag}], cwd={}, phase={phase}, total_messages={total_messages}):\n\n{rendered}",
+                desc.session_id,
+                desc.working_dir.display(),
             )),
             Err(e) => tool_err(e),
         }
@@ -352,7 +475,9 @@ struct SendToSessionArgs {
     #[serde(default)]
     steer_if_busy: Option<bool>,
     #[serde(default)]
-    allow_cross_repo: Option<bool>,
+    wait_for_reply: Option<bool>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 /// `send_to_session` — deliver a peer message to another live JeikCode session with guardrails.
@@ -367,7 +492,7 @@ impl Tool for SendToSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Send a peer message to another live JeikCode session. Enforces self/cycle prevention, max hop-depth, busy-turn admission, and cross-repo trust checks."
+        "Send a peer message to another live JeikCode session (same-repo or cross-repo, clearly annotated) and wait for its reply by default. Enforces self/cycle prevention, max hop-depth, and busy-turn admission."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -386,36 +511,17 @@ impl Tool for SendToSessionTool {
                     "type": "boolean",
                     "description": "When true, steer the message into an active InTurn session instead of rejecting busy targets (default false)."
                 },
-                "allow_cross_repo": {
+                "wait_for_reply": {
                     "type": "boolean",
-                    "description": "Required (and approval-gated) when targeting a session in a different repository."
+                    "description": "Wait for the peer turn to finish and return its response (default true when target is Ready, false when steered)."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds to wait for the peer reply before returning a pending delivery status (default 120, max 300)."
                 }
             },
             "required": ["session_id", "message"]
         })
-    }
-
-    fn risk(&self, args: &str) -> RiskLevel {
-        if cross_repo_env_allowed() {
-            return RiskLevel::Safe;
-        }
-        let Ok(parsed) = serde_json::from_str::<SendToSessionArgs>(args) else {
-            return RiskLevel::Safe;
-        };
-        let Ok(desc) = load_live_descriptor(&self.local.live_dir, &parsed.session_id) else {
-            return RiskLevel::Safe;
-        };
-        let self_repo = self.local.current_repo_root();
-        if same_canonical_path(&self_repo, &desc.repo_root) {
-            RiskLevel::Safe
-        } else if parsed.allow_cross_repo.unwrap_or(false) {
-            // Explicit cross-repo peer writes require user approval via ApprovalMiddleware.
-            RiskLevel::Risky
-        } else {
-            // Missing `allow_cross_repo: true`: `execute()` immediately fails closed with an
-            // actionable error instead of prompting the user for an unflagged call.
-            RiskLevel::Safe
-        }
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
@@ -458,15 +564,6 @@ impl Tool for SendToSessionTool {
 
         let self_wd = self.local.current_working_dir();
         let self_repo = self.local.current_repo_root();
-        let same_repo = same_canonical_path(&self_repo, &desc.repo_root);
-        let allow_cross = parsed.allow_cross_repo.unwrap_or(false) || cross_repo_env_allowed();
-        if !same_repo && !allow_cross {
-            return tool_err(format!(
-                "cross-repo send_to_session denied (`{}` -> `{}`); pass `allow_cross_repo: true`",
-                self_repo.display(),
-                desc.repo_root.display()
-            ));
-        }
 
         match ipc_send_to_session(
             &desc,
@@ -476,15 +573,37 @@ impl Tool for SendToSessionTool {
             parsed.message,
             hop.hop_depth,
             hop.visited_sessions,
-            allow_cross,
             parsed.steer_if_busy.unwrap_or(false),
+            parsed.wait_for_reply,
+            parsed.timeout_secs,
         )
         .await
         {
-            Ok((steered, delivered_hop)) => tool_ok(format!(
-                "Delivered peer message to session `{}` (steered={steered}, hop_depth={delivered_hop}).",
-                desc.session_id
-            )),
+            Ok(outcome) => {
+                let scope_tag = if outcome.same_repo {
+                    "SAME REPO".to_string()
+                } else {
+                    format!("EXTERNAL REPO: {}", outcome.target_repo_root.display())
+                };
+                if outcome.completed {
+                    let reason = outcome.stop_reason.as_deref().unwrap_or("Stopped");
+                    let reply = outcome
+                        .reply
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(peer completed turn with no text output)");
+                    tool_ok(format!(
+                        "Peer session `{}` ([{scope_tag}], turn_id={}, steered={}, hop_depth={}, stop_reason={reason}) replied:\n\n{reply}",
+                        desc.session_id, outcome.turn_id, outcome.steered, outcome.hop_depth
+                    ))
+                } else {
+                    tool_ok(format!(
+                        "Delivered peer message to session `{}` ([{scope_tag}], turn_id={}, steered={}, hop_depth={}); turn still running (use `read_session_turns` to inspect its output).",
+                        desc.session_id, outcome.turn_id, outcome.steered, outcome.hop_depth
+                    ))
+                }
+            }
             Err(e) => tool_err(e),
         }
     }

@@ -1371,6 +1371,11 @@ impl LiveViewHub {
         // 是否有「回合开始/结束或控制器变化」需要向所有实例广播权威运行态。
         let mut runtime_edge = false;
         match &event {
+            CodingRuntimeEvent::PeerMessageReceived { .. } => {
+                state.set_exec_turn_active(true);
+                replay = true;
+                runtime_edge = true;
+            }
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
                 state.set_exec_turn_active(true);
                 replay = true;

@@ -52,6 +52,16 @@ use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource
 pub enum CodingRuntimeEvent {
     /// A kernel observation that is not owned as a runtime terminal/request.
     Agent(AgentEvent),
+    /// A peer session delivered a message into this runtime via the session mesh.
+    PeerMessageReceived {
+        from_session_id: String,
+        from_working_dir: std::path::PathBuf,
+        from_repo_root: std::path::PathBuf,
+        same_repo: bool,
+        hop_depth: u32,
+        steered: bool,
+        text: String,
+    },
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
     VisionPreprocessSuccess {
@@ -1197,6 +1207,7 @@ impl CodingRuntimeHandle {
                 CodingRuntimeControl::Submit {
                     generation,
                     input,
+                    peer_origin: None,
                     done,
                 }
             }
@@ -1329,6 +1340,25 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::Submit {
                 generation: runtime_state_generation(state),
                 input,
+                peer_origin: None,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub(crate) async fn submit_peer_message(
+        &self,
+        input: UserInput,
+        origin: PeerSubmitOrigin,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Submit {
+                generation: runtime_state_generation(state),
+                input,
+                peer_origin: Some(origin),
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2210,6 +2240,17 @@ impl CodingRuntimeControlReceiver {
     }
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PeerSubmitOrigin {
+    pub from_session_id: String,
+    pub from_working_dir: std::path::PathBuf,
+    pub from_repo_root: std::path::PathBuf,
+    pub same_repo: bool,
+    pub hop_depth: u32,
+    pub display_text: String,
+}
+
 /// Internal control envelope consumed by the current runtime owner.
 ///
 /// Drivers should use capability methods on [`CodingRuntimeHandle`].
@@ -2225,6 +2266,7 @@ pub enum CodingRuntimeControl {
     Submit {
         generation: u64,
         input: UserInput,
+        peer_origin: Option<PeerSubmitOrigin>,
         done: oneshot::Sender<Result<SubmitReceipt, RuntimeError>>,
     },
     Respond {
@@ -3362,6 +3404,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::Submit {
                         generation: request_generation,
                         mut input,
+                        peer_origin,
                         done,
                     }) => {
                         if !native_protocol || request_generation != generation {
@@ -3672,6 +3715,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             },
                         };
                         if send_agent_command(&agent, command) {
+                            if let Some(origin) = peer_origin {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PeerMessageReceived {
+                                        from_session_id: origin.from_session_id,
+                                        from_working_dir: origin.from_working_dir,
+                                        from_repo_root: origin.from_repo_root,
+                                        same_repo: origin.same_repo,
+                                        hop_depth: origin.hop_depth,
+                                        steered: is_steer,
+                                        text: origin.display_text,
+                                    },
+                                );
+                            }
                             let _ = done.send(Ok(receipt));
                         } else {
                             agent_available = false;
@@ -5975,6 +6031,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                             code: None,
                                         },
                                     ));
+                                    if let Some(host) = resources
+                                        .as_ref()
+                                        .and_then(|runtime| runtime.mesh_host.as_ref())
+                                    {
+                                        host.local.notify_turn_failed(turn_id, &message);
+                                    }
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::TurnFinished(
                                             TurnCompletion::SnapshotUnavailable {
@@ -6438,6 +6500,16 @@ fn spawn_runtime_owner_with_optional_agent(
                                             }));
                                         }
                                     }
+                                    if let Some(host) = resources
+                                        .as_ref()
+                                        .and_then(|runtime| runtime.mesh_host.as_ref())
+                                    {
+                                        host.local.notify_turn_completed(
+                                            turn_id,
+                                            completion_reason,
+                                            &snapshot,
+                                        );
+                                    }
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::TurnFinished(
                                             TurnCompletion::Completed {
@@ -6522,6 +6594,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime.loop_active.store(false, Ordering::Release);
                             }
                             if let Some(turn_id) = active_turn.take() {
+                                if let Some(host) = resources
+                                    .as_ref()
+                                    .and_then(|runtime| runtime.mesh_host.as_ref())
+                                {
+                                    host.local.notify_turn_failed(turn_id, message);
+                                }
                                 let reason = terminal_reason
                                     .take()
                                     .unwrap_or(StopReason::ProviderError);

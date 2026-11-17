@@ -13,20 +13,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jeikcode_capabilities::memory::resolve_canonical_repo_root;
 use jeikcode_capabilities::session::SessionManager;
-use jeikcode_kernel::message::{Role, SessionSnapshot};
+use jeikcode_kernel::event::StopReason;
+use jeikcode_kernel::message::SessionSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::{CodingRuntimeHandle, RuntimePhase, UserInput};
+use crate::runtime::{
+    CodingRuntimeHandle, PeerSubmitOrigin, RuntimePhase, SubmitReceipt, UserInput,
+};
+use crate::session_mesh_tools::{format_snapshot_turns, last_assistant_reply_text};
 
 /// Default maximum cross-session peer message hop depth before rejecting forwarding.
 pub const DEFAULT_MESH_MAX_HOPS: u32 = 3;
+/// Default wait window when `send_to_session` waits for the peer's reply.
+pub const DEFAULT_PEER_REPLY_TIMEOUT_SECS: u64 = 120;
 /// Default timeout constants shared by IPC server and client.
 pub(crate) const IPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const IPC_IO_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_IPC_LINE_BYTES: usize = 512 * 1024;
+const TURN_OUTCOME_CHANNEL_CAP: usize = 32;
 
 /// Whether the cross-process session mesh is enabled (`JEIKCODE_SESSION_MESH`, default ON).
 pub(crate) fn session_mesh_enabled() -> bool {
@@ -40,20 +48,6 @@ pub(crate) fn max_mesh_hops() -> u32 {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MESH_MAX_HOPS)
-}
-
-/// Whether cross-repo `send_to_session` is globally allowed without interactive prompt
-/// (`JEIKCODE_MESH_ALLOW_CROSS_REPO=1/true/on`).
-pub(crate) fn cross_repo_env_allowed() -> bool {
-    matches!(
-        std::env::var("JEIKCODE_MESH_ALLOW_CROSS_REPO")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "on" | "yes")
-    )
 }
 
 /// Directory storing live session descriptor files (`$JEIKCODE_HOME/live`).
@@ -98,6 +92,7 @@ pub struct LiveSessionView {
     pub working_dir: PathBuf,
     pub repo_root: PathBuf,
     pub same_repo: bool,
+    pub repo_scope: String,
     pub is_self: bool,
     pub model: String,
     pub phase: String,
@@ -113,6 +108,15 @@ pub struct MeshHopContext {
     pub visited_sessions: Vec<String>,
 }
 
+/// Completion outcome broadcast when a local runtime turn ends.
+#[derive(Clone, Debug)]
+pub(crate) struct MeshTurnOutcome {
+    pub turn_id: u64,
+    pub stop_reason: String,
+    pub assistant_reply: String,
+    pub error: Option<String>,
+}
+
 /// Shared runtime identity + snapshot state exposed to the local mesh IPC server and tools.
 #[derive(Clone)]
 pub(crate) struct MeshLocalState {
@@ -123,6 +127,7 @@ pub(crate) struct MeshLocalState {
     pub model: Arc<RwLock<String>>,
     pub latest_snapshot: Arc<RwLock<Option<Arc<SessionSnapshot>>>>,
     pub active_hop: Arc<RwLock<Option<MeshHopContext>>>,
+    pub turn_outcomes: broadcast::Sender<MeshTurnOutcome>,
     pub handle: CodingRuntimeHandle,
 }
 
@@ -167,6 +172,30 @@ impl MeshLocalState {
             *guard = snap;
         }
     }
+
+    pub(crate) fn notify_turn_completed(
+        &self,
+        turn_id: u64,
+        reason: StopReason,
+        snapshot: &SessionSnapshot,
+    ) {
+        let assistant_reply = last_assistant_reply_text(snapshot);
+        let _ = self.turn_outcomes.send(MeshTurnOutcome {
+            turn_id,
+            stop_reason: format!("{reason:?}"),
+            assistant_reply,
+            error: None,
+        });
+    }
+
+    pub(crate) fn notify_turn_failed(&self, turn_id: u64, message: impl Into<String>) {
+        let _ = self.turn_outcomes.send(MeshTurnOutcome {
+            turn_id,
+            stop_reason: "Failed".to_string(),
+            assistant_reply: String::new(),
+            error: Some(message.into()),
+        });
+    }
 }
 
 /// RAII registration owning the loopback IPC listener task and descriptor file cleanup.
@@ -202,6 +231,7 @@ impl SessionMeshHost {
         let auth_token = uuid::Uuid::new_v4().simple().to_string();
         let started_at_ms = now_ms();
 
+        let (turn_outcomes, _) = broadcast::channel(TURN_OUTCOME_CHANNEL_CAP);
         let local = MeshLocalState {
             live_dir: live_dir.clone(),
             session_id: Arc::new(RwLock::new(valid_id.clone())),
@@ -210,6 +240,7 @@ impl SessionMeshHost {
             model: Arc::new(RwLock::new(model.clone())),
             latest_snapshot: Arc::new(RwLock::new(None)),
             active_hop: Arc::new(RwLock::new(None)),
+            turn_outcomes,
             handle,
         };
 
@@ -339,8 +370,9 @@ pub(crate) enum MeshRequest {
         text: String,
         hop_depth: u32,
         visited_sessions: Vec<String>,
-        allow_cross_repo: bool,
         steer_if_busy: bool,
+        wait_for_reply: Option<bool>,
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -362,8 +394,14 @@ pub(crate) enum MeshResponse {
     },
     Delivered {
         session_id: String,
+        turn_id: u64,
         steered: bool,
         hop_depth: u32,
+        same_repo: bool,
+        target_repo_root: PathBuf,
+        completed: bool,
+        stop_reason: Option<String>,
+        reply: Option<String>,
     },
     Error {
         message: String,
@@ -488,8 +526,9 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             text,
             hop_depth,
             visited_sessions,
-            allow_cross_repo,
             steer_if_busy,
+            wait_for_reply,
+            timeout_secs,
         } => {
             if session_id == from_session_id {
                 return MeshResponse::Error {
@@ -514,15 +553,6 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             }
             let target_repo = local.current_repo_root();
             let same_repo = same_canonical_path(&from_repo_root, &target_repo);
-            if !same_repo && !allow_cross_repo && !cross_repo_env_allowed() {
-                return MeshResponse::Error {
-                    message: format!(
-                        "cross-repo mesh send denied (`{}` -> `{}`); pass `allow_cross_repo: true`",
-                        from_repo_root.display(),
-                        target_repo.display()
-                    ),
-                };
-            }
 
             let steered = match phase {
                 RuntimePhase::Ready => false,
@@ -556,25 +586,99 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 });
             }
 
+            let repo_scope_attr = if same_repo {
+                "same_repo"
+            } else {
+                "external_repo"
+            };
+            let external_repo_note = if same_repo {
+                String::new()
+            } else {
+                format!("[EXTERNAL REPO: {}]\n", from_repo_root.display())
+            };
+            let trimmed_text = text.trim().to_string();
             let framed = format!(
-                "<peer_message from_session=\"{}\" from_cwd=\"{}\" hop=\"{}\">\n{}\n</peer_message>",
+                "<peer_message from_session=\"{}\" from_cwd=\"{}\" from_repo=\"{}\" repo_scope=\"{}\" hop=\"{}\">\n{}{}\n</peer_message>",
                 from_session_id,
                 from_working_dir.display(),
+                from_repo_root.display(),
+                repo_scope_attr,
                 next_hop,
-                text.trim()
+                external_repo_note,
+                trimmed_text
             );
-            match local.handle.submit(UserInput::from(framed)).await {
-                Ok(_) => MeshResponse::Delivered {
-                    session_id,
-                    steered,
-                    hop_depth: next_hop,
-                },
+
+            let should_wait = wait_for_reply.unwrap_or(!steered);
+            let mut outcome_rx = should_wait.then(|| local.turn_outcomes.subscribe());
+
+            let origin = PeerSubmitOrigin {
+                from_session_id,
+                from_working_dir,
+                from_repo_root,
+                same_repo,
+                hop_depth: next_hop,
+                display_text: trimmed_text,
+            };
+            let turn_id = match local
+                .handle
+                .submit_peer_message(UserInput::from(framed), origin)
+                .await
+            {
+                Ok(SubmitReceipt::Started { turn_id, .. })
+                | Ok(SubmitReceipt::Steered { turn_id, .. }) => turn_id,
                 Err(err) => {
                     local.clear_hop_context();
-                    MeshResponse::Error {
+                    return MeshResponse::Error {
                         message: format!("target session `{session_id}` rejected submit: {err}"),
+                    };
+                }
+            };
+
+            if let Some(ref mut rx) = outcome_rx {
+                let wait_secs = timeout_secs
+                    .unwrap_or(DEFAULT_PEER_REPLY_TIMEOUT_SECS)
+                    .clamp(1, 300);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+                loop {
+                    let recv = tokio::time::timeout_at(deadline, rx.recv()).await;
+                    match recv {
+                        Ok(Ok(outcome)) if outcome.turn_id == turn_id => {
+                            if let Some(err) = outcome.error {
+                                return MeshResponse::Error {
+                                    message: format!(
+                                        "target session `{session_id}` turn {turn_id} failed: {err}"
+                                    ),
+                                };
+                            }
+                            return MeshResponse::Delivered {
+                                session_id,
+                                turn_id,
+                                steered,
+                                hop_depth: next_hop,
+                                same_repo,
+                                target_repo_root: target_repo,
+                                completed: true,
+                                stop_reason: Some(outcome.stop_reason),
+                                reply: Some(outcome.assistant_reply),
+                            };
+                        }
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
                     }
                 }
+            }
+
+            MeshResponse::Delivered {
+                session_id,
+                turn_id,
+                steered,
+                hop_depth: next_hop,
+                same_repo,
+                target_repo_root: target_repo,
+                completed: false,
+                stop_reason: None,
+                reply: None,
             }
         }
     }
@@ -595,34 +699,6 @@ fn resolve_snapshot_nonblocking(local: &MeshLocalState) -> Option<Arc<SessionSna
     mgr.load_native_session(&sid)
         .ok()
         .map(|loaded| Arc::new(loaded.snapshot))
-}
-
-fn format_snapshot_turns(snap: &SessionSnapshot, last_n: usize, max_chars: usize) -> String {
-    let real_msgs: Vec<_> = snap
-        .messages
-        .iter()
-        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
-        .collect();
-    if real_msgs.is_empty() {
-        return "(no user/assistant turns recorded yet)".to_string();
-    }
-    let start = real_msgs.len().saturating_sub(last_n);
-    let mut lines = Vec::new();
-    for (idx, msg) in real_msgs[start..].iter().enumerate() {
-        let role_label = match msg.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            _ => "other",
-        };
-        let mut body = msg.text.trim().to_string();
-        if body.is_empty() && !msg.tool_calls.is_empty() {
-            let tool_names: Vec<&str> = msg.tool_calls.iter().map(|t| t.name.as_str()).collect();
-            body = format!("[tool calls: {}]", tool_names.join(", "));
-        }
-        let clipped = truncate_chars(&body, 1200);
-        lines.push(format!("[{}] {}: {}", start + idx + 1, role_label, clipped));
-    }
-    truncate_chars(&lines.join("\n\n"), max_chars)
 }
 
 pub(crate) fn same_canonical_path(a: &Path, b: &Path) -> bool {
@@ -682,16 +758,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
 }
 
 fn now_ms() -> i64 {
