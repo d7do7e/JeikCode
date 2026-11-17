@@ -80,16 +80,10 @@ impl MemoryHook {
             project_name: project_name.into(),
         }
     }
-}
-
-#[async_trait]
-impl LifecycleHooks for MemoryHook {
-    async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
-        // Clean up legacy header formats if resuming
-        convo.reconcile_frozen_user_block("=== MEMORY ===", None);
-        convo.reconcile_system_block(MEMORY_HEADER, None);
-        convo.reconcile_system_block("=== MEMORY ===", None);
-
+    /// Render the combined `<memory>` frozen prefix block (legacy `memory.md` +
+    /// two-tier auto-memory `MEMORY.md` index) identically to [`MemoryHook::session_start`],
+    /// or `None` when both stores are empty.
+    pub fn render_block(&self) -> Option<String> {
         let merged_legacy =
             MemoryStore::merged_for_prompt(&self.global, &self.project, &self.project_name);
         let auto_index = self
@@ -98,7 +92,7 @@ impl LifecycleHooks for MemoryHook {
             .map(AutoMemoryStore::render_prompt_index)
             .unwrap_or_default();
 
-        let block = match (merged_legacy.is_empty(), auto_index.is_empty()) {
+        match (merged_legacy.is_empty(), auto_index.is_empty()) {
             (true, true) => None,
             (false, true) => Some(merged_legacy),
             (true, false) => Some(format!(
@@ -115,7 +109,19 @@ impl LifecycleHooks for MemoryHook {
                     self.project_name
                 ))
             }
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for MemoryHook {
+    async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
+        // Clean up legacy header formats if resuming
+        convo.reconcile_frozen_user_block("=== MEMORY ===", None);
+        convo.reconcile_system_block(MEMORY_HEADER, None);
+        convo.reconcile_system_block("=== MEMORY ===", None);
+
+        let block = self.render_block();
         convo.reconcile_frozen_user_block(MEMORY_HEADER, block);
     }
 }

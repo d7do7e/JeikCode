@@ -499,6 +499,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .ok()
                 .as_deref(),
         );
+        let include_memory_for_subagents = opts.memory;
+        let extra_append_for_subagents = cfg.extra_system_append.clone();
         let task_tool = Arc::new(
             TaskTool::new(
                 make_fast,
@@ -513,6 +515,20 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .with_worker_middleware(turn_execution_policy.clone())
             .with_project_context_loader(|wd| {
                 jeikcode_capabilities::session::instructions::render_project_instructions(wd)
+            })
+            .with_inherited_context_loader(move |wd| {
+                let ctx_hook = jeikcode_capabilities::session::SessionContextHook::new(wd)
+                    .with_extra_append(extra_append_for_subagents.clone());
+                let memory = if include_memory_for_subagents {
+                    jeikcode_capabilities::memory::MemoryHook::for_project(wd).render_block()
+                } else {
+                    None
+                };
+                jeikcode_capabilities::tools::InheritedSubagentContext {
+                    memory,
+                    user_preferences: ctx_hook.render_user_preferences_block(),
+                    project_instructions: ctx_hook.render_project_instructions_block(),
+                }
             }),
         );
         registry.register(task_tool.clone());
@@ -3736,5 +3752,152 @@ mod tests {
                 .any(|m| m.text.contains("## MEMORY:")),
             "parent persona must include MEMORY_USAGE when memory tool is mounted"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn task_inherit_context_injects_full_parent_blocks_in_exact_order_and_preserves_across_resume(
+    ) {
+        use jeikcode_kernel::agent::AutoRespond;
+        use jeikcode_kernel::message::Role;
+        use jeikcode_kernel::stream::StreamEvent;
+        use jeikcode_kernel::testkit::RecordingProvider;
+        use jeikcode_kernel::tool::ToolCall;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(home.path().join("AGENTS.md"), "GLOBAL_PREF_UV_ONLY").unwrap();
+        std::fs::write(home.path().join("memory.md"), "- global mem rule\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".jeikcode")).unwrap();
+        std::fs::write(
+            dir.path().join(".jeikcode/memory.md"),
+            "- project mem rule\n",
+        )
+        .unwrap();
+        // > 4 KiB AGENTS.md with a sentinel at the very tail to prove the 4 KiB cap is lifted.
+        let long_agents = format!("{}\nTAIL_SENTINEL_UNTRUNCATED_RULE", "line\n".repeat(1200));
+        assert!(long_agents.len() > 5000);
+        std::fs::write(dir.path().join("AGENTS.md"), &long_agents).unwrap();
+
+        let cfg = CodingAgentConfig::new("k", "http://unused", "test-model", dir.path());
+        let opts = PrepareOptions {
+            session: SessionMode::Disabled,
+            mcp: false,
+            memory: true,
+            web: false,
+            skill_dirs: Some(vec![dir.path().join("no_skills")]),
+            ..Default::default()
+        };
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            // Round 1 (parent): dispatch explore with inherit_context=true
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_inherit_1".into(),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{
+                            "description": "critique plan",
+                            "prompt": "Review plan v1",
+                            "subagent_type": "explore",
+                            "inherit_context": true
+                        }]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 1 (child)
+            vec![
+                StreamEvent::TextDelta("CRITIQUE v1".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2 (parent): resume the same child WITHOUT repeating inherit_context
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_inherit_2".into(),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{
+                            "description": "critique plan r2",
+                            "prompt": "Review plan v2",
+                            "resume_agent_id": "agent-explore-1"
+                        }]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2 (child resumed)
+            vec![
+                StreamEvent::TextDelta("CRITIQUE v2".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Parent final
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let calls = provider.calls();
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let outcome = agent
+            .run_to_completion("run tribunal", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(outcome.text, "done");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 5);
+
+        // Parent's synthetic user blocks (orders 50, 55, 60) vs child's synthetic user blocks:
+        let parent_frozen: Vec<&str> = recorded[0]
+            .0
+            .iter()
+            .filter(|m| m.role == Role::User && m.synthetic)
+            .map(|m| m.text.as_str())
+            .collect();
+        let child_r1_msgs = &recorded[1].0;
+        let child_frozen: Vec<&str> = child_r1_msgs
+            .iter()
+            .filter(|m| m.role == Role::User && m.synthetic)
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(
+            child_frozen.len(),
+            3,
+            "expected <memory>, <user_preferences>, <project_instructions>"
+        );
+        assert_eq!(
+            parent_frozen, child_frozen,
+            "child inherited blocks must match parent blocks byte-for-byte in exact 50->55->60 order"
+        );
+        assert!(child_frozen[0].starts_with("<memory>"));
+        assert!(child_frozen[1].starts_with("<user_preferences>"));
+        assert!(child_frozen[2].starts_with("<project_instructions>"));
+        assert!(child_frozen[2].contains("TAIL_SENTINEL_UNTRUNCATED_RULE"));
+
+        // Child's System prompt must NOT duplicate <project_instructions>
+        let child_sys: String = child_r1_msgs
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!child_sys.contains("<project_instructions>"));
+
+        // Child must NEVER mount memory mutation tool even with inherit_context=true
+        assert!(!recorded[1].1.iter().any(|d| d.name == "memory"));
+
+        // Round 2 resumed child preserves the exact same frozen prefix with zero duplication
+        let child_r2_frozen: Vec<&str> = recorded[3]
+            .0
+            .iter()
+            .filter(|m| m.role == Role::User && m.synthetic)
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(child_r2_frozen, child_frozen);
     }
 }

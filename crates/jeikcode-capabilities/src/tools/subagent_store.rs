@@ -29,6 +29,7 @@ pub(crate) struct SavedSubagentState {
     pub session_scope: String,
     pub role: SubagentRole,
     pub scope: Vec<String>,
+    pub inherit_context: bool,
     #[allow(dead_code)]
     pub working_dir: PathBuf,
     pub model: String,

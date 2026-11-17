@@ -370,6 +370,10 @@ struct SubTask {
     /// When true, spawn in the background and return an immediate `<task_spawned>` handle.
     #[serde(default)]
     run_in_background: bool,
+    /// When true, inject full uncapped `<project_instructions>`, `<user_preferences>`, and
+    /// read-only `<memory>` in exact parent block order before the subtask prompt.
+    #[serde(default)]
+    inherit_context: bool,
 }
 
 impl SubTask {
@@ -421,6 +425,7 @@ pub struct TaskTool {
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     project_context_loader: Option<Arc<super::subagent_context::ProjectContextLoader>>,
+    inherited_context_loader: Option<Arc<super::subagent_context::InheritedContextLoader>>,
     store: Arc<SubagentStore>,
 }
 
@@ -444,6 +449,7 @@ impl TaskTool {
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             project_context_loader: None,
+            inherited_context_loader: None,
             store: Arc::new(SubagentStore::new()),
         }
     }
@@ -513,6 +519,19 @@ impl TaskTool {
         self.project_context_loader = Some(Arc::new(loader));
         self
     }
+
+    /// Supply a custom full-context loader used when `inherit_context: true` is requested
+    /// on a subtask (`<memory>`, `<user_preferences>`, uncapped `<project_instructions>`).
+    pub fn with_inherited_context_loader(
+        mut self,
+        loader: impl Fn(&Path) -> super::subagent_context::InheritedSubagentContext
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.inherited_context_loader = Some(Arc::new(loader));
+        self
+    }
 }
 
 #[async_trait]
@@ -560,6 +579,10 @@ impl Tool for TaskTool {
                             "run_in_background": {
                                 "type": "boolean",
                                 "description": "Optional: run this subtask asynchronously in the background and return a task_id handle immediately."
+                            },
+                            "inherit_context": {
+                                "type": "boolean",
+                                "description": "Optional: inject full uncapped <project_instructions>, <user_preferences>, and read-only <memory> in parent block order (default false; useful for high-context plan review, critique, or judging)."
                             }
                         },
                         "required": ["description", "prompt"]
@@ -644,6 +667,9 @@ impl Tool for TaskTool {
             &ctx.working_dir,
             self.project_context_loader.as_ref(),
         );
+        let mut cached_inherited_context: Option<
+            super::subagent_context::InheritedSubagentContext,
+        > = None;
         let session_scope = self.store.current_session_scope();
         let mut set = tokio::task::JoinSet::new();
         let mut immediate_blocks: Vec<(String, String, bool)> = Vec::new();
@@ -670,34 +696,49 @@ impl Tool for TaskTool {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
 
-            let (role, scope, agent_id, resume_snapshot) = if let Some(rid) = resume_id {
-                match self.store.get_for_resume(&rid, requested_role, &t.scope) {
-                    Ok(saved) => (
-                        saved.role,
-                        saved.scope,
-                        saved.agent_id,
-                        Some(saved.snapshot),
-                    ),
-                    Err(err_msg) => {
-                        let role_guess = requested_role.unwrap_or(SubagentRole::Explore);
-                        let label = format!("{}#{}", role_guess.as_str(), idx + 1);
-                        let block = render_task_block(
-                            &label,
-                            &rid,
-                            &desc,
-                            "none",
-                            "error",
-                            "task_error",
-                            &err_msg,
-                        );
-                        immediate_blocks.push((label, block, true));
-                        continue;
+            let (role, scope, agent_id, resume_snapshot, inherit_context) =
+                if let Some(rid) = resume_id {
+                    match self.store.get_for_resume(&rid, requested_role, &t.scope) {
+                        Ok(saved) => (
+                            saved.role,
+                            saved.scope,
+                            saved.agent_id,
+                            Some(saved.snapshot),
+                            t.inherit_context || saved.inherit_context,
+                        ),
+                        Err(err_msg) => {
+                            let role_guess = requested_role.unwrap_or(SubagentRole::Explore);
+                            let label = format!("{}#{}", role_guess.as_str(), idx + 1);
+                            let block = render_task_block(
+                                &label,
+                                &rid,
+                                &desc,
+                                "none",
+                                "error",
+                                "task_error",
+                                &err_msg,
+                            );
+                            immediate_blocks.push((label, block, true));
+                            continue;
+                        }
                     }
+                } else {
+                    let role = requested_role.unwrap_or(SubagentRole::Explore);
+                    let agent_id = self.store.mint_agent_id(role);
+                    (role, t.scope.clone(), agent_id, None, t.inherit_context)
+                };
+
+            let inherited_ctx = if inherit_context {
+                if cached_inherited_context.is_none() {
+                    cached_inherited_context =
+                        Some(super::subagent_context::resolve_inherited_context(
+                            &ctx.working_dir,
+                            self.inherited_context_loader.as_ref(),
+                        ));
                 }
+                cached_inherited_context.clone()
             } else {
-                let role = requested_role.unwrap_or(SubagentRole::Explore);
-                let agent_id = self.store.mint_agent_id(role);
-                (role, t.scope.clone(), agent_id, None)
+                None
             };
 
             let provider = if is_hard {
@@ -723,7 +764,11 @@ impl Tool for TaskTool {
                 base_persona,
                 role,
                 &scope,
-                project_instructions.as_deref(),
+                if inherit_context {
+                    None
+                } else {
+                    project_instructions.as_deref()
+                },
             );
             let wd = ctx.working_dir.clone();
             let label = format!("{}#{}", role.as_str(), idx + 1);
@@ -795,6 +840,7 @@ impl Tool for TaskTool {
                         tools,
                         persona,
                         resume_snapshot,
+                        inherited_ctx,
                         wd.clone(),
                         child_cancel,
                         progress_hook,
@@ -813,6 +859,7 @@ impl Tool for TaskTool {
                                 session_scope,
                                 role,
                                 scope,
+                                inherit_context,
                                 working_dir: wd,
                                 model: model.clone(),
                                 snapshot: snap,
@@ -884,6 +931,7 @@ impl Tool for TaskTool {
                     tools,
                     persona,
                     resume_snapshot,
+                    inherited_ctx,
                     wd.clone(),
                     child_cancel,
                     progress_hook,
@@ -902,6 +950,7 @@ impl Tool for TaskTool {
                             session_scope,
                             role,
                             scope,
+                            inherit_context,
                             working_dir: wd,
                             model: model.clone(),
                             snapshot: snap,
@@ -956,6 +1005,7 @@ async fn spawn_and_run_child(
     tools: MountedTools,
     persona: String,
     resume_snapshot: Option<SessionSnapshot>,
+    inherited_context: Option<super::subagent_context::InheritedSubagentContext>,
     wd: PathBuf,
     child_cancel: tokio_util::sync::CancellationToken,
     progress_hook: Arc<SubtaskProgressHook>,
@@ -972,6 +1022,11 @@ async fn spawn_and_run_child(
         .working_dir(wd.clone())
         .cancel_token(child_cancel)
         .hook(progress_hook.clone());
+    if let Some(ctx) = inherited_context {
+        builder = builder.hook(Arc::new(
+            super::subagent_context::SubagentInheritedContextHook::new(ctx),
+        ));
+    }
     if let Some(snap) = resume_snapshot {
         builder = builder.resume(snap);
     } else {
@@ -2696,6 +2751,7 @@ mod tests {
             scope: scope.into_iter().map(String::from).collect(),
             resume_agent_id: None,
             run_in_background: false,
+            inherit_context: false,
         };
         let tasks = vec![
             mk("worker", vec!["src/a/**"]), // #1 ok
@@ -2780,6 +2836,7 @@ mod tests {
             scope: scope.into_iter().map(String::from).collect(),
             resume_agent_id: None,
             run_in_background: false,
+            inherit_context: false,
         };
         let tasks = vec![
             mk("Worker", vec!["src/**"]), // PascalCase ok

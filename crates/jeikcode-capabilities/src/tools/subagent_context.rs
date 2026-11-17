@@ -7,14 +7,29 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use jeikcode_config::config::instructions::PROJECT_INSTRUCTION_FILES;
+use async_trait::async_trait;
+use jeikcode_config::config::instructions::{GLOBAL_INSTRUCTION_FILES, PROJECT_INSTRUCTION_FILES};
+use jeikcode_kernel::hook::LifecycleHooks;
+use jeikcode_kernel::message::Conversation;
 
 use super::subagent_verifier::SubagentRole;
 
-/// Maximum inner byte budget for `<project_instructions>` passed to a subagent child.
+/// Maximum inner byte budget for `<project_instructions>` passed to a subagent child
+/// when `inherit_context` is `false` (the default lean mode).
 pub(crate) const SUBAGENT_PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 4096;
 
 pub(crate) type ProjectContextLoader = dyn Fn(&Path) -> Option<String> + Send + Sync;
+
+/// Full parent-aligned read-only context blocks injected into a subagent when
+/// `inherit_context: true` is passed to `TaskTool`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InheritedSubagentContext {
+    pub memory: Option<String>,
+    pub user_preferences: Option<String>,
+    pub project_instructions: Option<String>,
+}
+
+pub(crate) type InheritedContextLoader = dyn Fn(&Path) -> InheritedSubagentContext + Send + Sync;
 
 const EXPLORE_TOOL_GUIDANCE: &str = "\
 <explore_strategy>
@@ -74,6 +89,86 @@ pub(crate) fn resolve_project_instructions(
         }
     }
     None
+}
+
+/// Resolve full uncapped parent context blocks (`<memory>`, `<user_preferences>`,
+/// `<project_instructions>`) for `inherit_context: true`, preferring an embedder-supplied
+/// loader (e.g. `jeikcode-coding` with `SessionContextHook` + `MemoryHook`) and falling
+/// back to reading global/project instruction files and memory directly.
+pub(crate) fn resolve_inherited_context(
+    working_dir: &Path,
+    custom_loader: Option<&Arc<InheritedContextLoader>>,
+) -> InheritedSubagentContext {
+    if let Some(loader) = custom_loader {
+        return loader(working_dir);
+    }
+
+    let home = crate::paths::config_dir();
+    let user_preferences = GLOBAL_INSTRUCTION_FILES.iter().find_map(|name| {
+        let candidate = home.join(name);
+        if !candidate.is_file() {
+            return None;
+        }
+        let content = std::fs::read_to_string(&candidate).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "<user_preferences>\n\n# USER PREFERENCES ({name})\n{trimmed}\n</user_preferences>"
+        ))
+    });
+
+    let project_instructions = PROJECT_INSTRUCTION_FILES.iter().find_map(|name| {
+        let candidate = working_dir.join(name);
+        if !candidate.is_file() {
+            return None;
+        }
+        let content = std::fs::read_to_string(&candidate).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "<project_instructions>\n\n# PROJECT INSTRUCTIONS ({name})\n{trimmed}\n</project_instructions>"
+        ))
+    });
+
+    #[cfg(feature = "memory")]
+    let memory = crate::memory::MemoryHook::for_project(working_dir).render_block();
+    #[cfg(not(feature = "memory"))]
+    let memory = None;
+
+    InheritedSubagentContext {
+        memory,
+        user_preferences,
+        project_instructions,
+    }
+}
+
+/// Lifecycle hook mounted on `inherit_context: true` subagents so `<memory>` (50),
+/// `<user_preferences>` (55), and `<project_instructions>` (60) land as frozen
+/// synthetic-user blocks in the exact parent order before the task prompt.
+pub(crate) struct SubagentInheritedContextHook {
+    ctx: InheritedSubagentContext,
+}
+
+impl SubagentInheritedContextHook {
+    pub(crate) fn new(ctx: InheritedSubagentContext) -> Self {
+        Self { ctx }
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for SubagentInheritedContextHook {
+    async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
+        convo.reconcile_frozen_user_block("<memory>", self.ctx.memory.clone());
+        convo.reconcile_frozen_user_block("<user_preferences>", self.ctx.user_preferences.clone());
+        convo.reconcile_frozen_user_block(
+            "<project_instructions>",
+            self.ctx.project_instructions.clone(),
+        );
+    }
 }
 
 /// Assemble the child subagent system prompt from its base role persona, declared worker
@@ -198,5 +293,41 @@ mod tests {
         assert!(verifier.contains("<explore_strategy>"));
         assert!(verifier.contains("File mutations and output redirects are hard-blocked"));
         assert!(!verifier.contains("Declared writable scope"));
+    }
+
+    #[tokio::test]
+    async fn inherited_context_hook_injects_parent_ordered_frozen_blocks() {
+        use jeikcode_kernel::message::{Message, Role};
+
+        let hook = SubagentInheritedContextHook::new(InheritedSubagentContext {
+            memory: Some("<memory>\n- use uv\n</memory>".to_string()),
+            user_preferences: Some("<user_preferences>\n# global\n</user_preferences>".to_string()),
+            project_instructions: Some(
+                "<project_instructions>\n# project\n</project_instructions>".to_string(),
+            ),
+        });
+        let mut convo = Conversation::new();
+        convo.push(Message::system("EXPLORE_PERSONA"));
+        hook.session_start(&mut convo, false).await;
+        convo.push(Message::user("Critique this plan"));
+
+        assert_eq!(convo.messages.len(), 5);
+        assert_eq!(convo.messages[0].role, Role::System);
+        assert_eq!(convo.messages[1].role, Role::User);
+        assert!(convo.messages[1].synthetic);
+        assert!(convo.messages[1].text.starts_with("<memory>"));
+        assert_eq!(convo.messages[2].role, Role::User);
+        assert!(convo.messages[2].synthetic);
+        assert!(convo.messages[2].text.starts_with("<user_preferences>"));
+        assert_eq!(convo.messages[3].role, Role::User);
+        assert!(convo.messages[3].synthetic);
+        assert!(convo.messages[3].text.starts_with("<project_instructions>"));
+        assert_eq!(convo.messages[4].role, Role::User);
+        assert!(!convo.messages[4].synthetic);
+        assert_eq!(convo.messages[4].text, "Critique this plan");
+
+        // Idempotent on resume
+        hook.session_start(&mut convo, true).await;
+        assert_eq!(convo.messages.len(), 5);
     }
 }

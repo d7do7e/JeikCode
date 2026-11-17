@@ -512,3 +512,82 @@ async fn background_dispatch_runs_async_collects_via_task_output_and_cancels_on_
         .await
         .expect("dropping TaskTool must cancel detached background child");
 }
+
+#[tokio::test]
+async fn inherit_context_flag_defaults_lean_and_injects_full_ordered_blocks_when_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_agents = format!("{}\nTAIL_RULE_ABC", "rule line\n".repeat(700));
+    std::fs::write(dir.path().join("AGENTS.md"), &long_agents).unwrap();
+
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+    let seen_msgs = Arc::new(Mutex::new(Vec::new()));
+    let seen_msgs_p = seen_msgs.clone();
+    let seen_tools = Arc::new(Mutex::new(Vec::new()));
+    let make_p = move || {
+        Arc::new(ScriptedProvider::new(
+            vec![vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]],
+            seen_msgs_p.clone(),
+            seen_tools.clone(),
+        )) as Arc<dyn LlmProvider>
+    };
+    let tool = TaskTool::new(
+        make_p.clone(),
+        make_p,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    );
+
+    // Schema exposes inherit_context
+    let schema = tool.parameters_schema();
+    assert_eq!(
+        schema["properties"]["tasks"]["items"]["properties"]["inherit_context"]["type"],
+        "boolean"
+    );
+
+    // 1. Default (inherit_context omitted => false): capped in Role::System, zero synthetic user blocks
+    let out1 = tool
+        .execute(
+            r#"{"tasks":[{"description":"lean","prompt":"lean prompt","subagent_type":"explore"}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out1.is_error, "{}", out1.content);
+
+    // 2. inherit_context: true: uncapped <project_instructions> as frozen synthetic user block
+    let out2 = tool
+        .execute(
+            r#"{"tasks":[{"description":"full","prompt":"full prompt","subagent_type":"explore","inherit_context":true}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out2.is_error, "{}", out2.content);
+
+    let msgs = seen_msgs.lock().unwrap();
+    assert_eq!(msgs.len(), 2);
+
+    // Call 1 (lean): <project_instructions> is inside Role::System and truncated
+    let lean_sys = &msgs[0][0].text;
+    assert!(lean_sys.contains("<project_instructions>"));
+    assert!(!lean_sys.contains("TAIL_RULE_ABC"));
+    assert!(!msgs[0].iter().any(|m| m.role == Role::User && m.synthetic));
+
+    // Call 2 (inherit_context: true): Role::System has no <project_instructions>; synthetic User carries full uncapped body before prompt
+    assert!(!msgs[1][0].text.contains("<project_instructions>"));
+    let proj_idx = msgs[1]
+        .iter()
+        .position(|m| {
+            m.role == Role::User && m.synthetic && m.text.starts_with("<project_instructions>")
+        })
+        .expect("missing frozen <project_instructions>");
+    let prompt_idx = msgs[1]
+        .iter()
+        .position(|m| m.role == Role::User && !m.synthetic && m.text == "full prompt")
+        .expect("missing real prompt");
+    assert!(proj_idx < prompt_idx);
+    assert!(msgs[1][proj_idx].text.contains("TAIL_RULE_ABC"));
+}
