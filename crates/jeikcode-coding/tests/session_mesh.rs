@@ -600,3 +600,128 @@ async fn unified_session_name_persists_and_restores_on_resume() {
     rt_2.handle.shutdown().await.unwrap();
     rt_other.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jeikcode_home)]
+async fn large_mesh_reply_above_32k_and_truncation_footer_work_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+    let repo = tempfile::tempdir().unwrap();
+
+    // 40,000-char reply (exceeds old 6k reply cap AND 32 KiB ArtifactMiddleware threshold):
+    // default 32k returns 32,000 chars + footer, while max_reply_chars=64000 returns all 40,000 chars intact.
+    let long_reply = format!("HEAD-{}-TAIL", "x".repeat(39_990));
+    assert_eq!(long_reply.len(), 40_000);
+    let big_question = format!("Q-{}", "q".repeat(12_000));
+
+    let factory_b = Arc::new(ScriptedFactory::new(vec![
+        vec![
+            StreamEvent::TextDelta(long_reply.clone()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta(long_reply.clone()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let mut rt_b = CodingRuntime::start(start_cfg(repo.path(), factory_b, Some("responder")))
+        .await
+        .unwrap();
+
+    let factory_a = Arc::new(ScriptedFactory::new(vec![
+        // 1. Default max_reply_chars (32,000) truncates 40,000-char reply with explicit footer
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "m1".into(),
+                name: "send_to_session".into(),
+                arguments: serde_json::json!({
+                    "target": "responder",
+                    "message": big_question
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        // 2. Explicit max_reply_chars=64000 returns full 40,000-char reply without artifact folding or cutoff
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "m2".into(),
+                name: "send_to_session".into(),
+                arguments: serde_json::json!({
+                    "target": "responder",
+                    "message": "send full reply",
+                    "max_reply_chars": 64000
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        // 3. read_session_turns with default 16,000 cap preserves turns > 6,000 chars without artifact folding
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "m3".into(),
+                name: "read_session_turns".into(),
+                arguments: serde_json::json!({
+                    "target": "responder",
+                    "last_n": 4
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let a_messages = Arc::clone(&factory_a.seen_messages);
+    let mut rt_a = CodingRuntime::start(start_cfg(repo.path(), factory_a, Some("caller")))
+        .await
+        .unwrap();
+
+    rt_a.handle
+        .submit(UserInput::from("test large mesh exchange"))
+        .await
+        .unwrap();
+    let _ = wait_turn_finished(&mut rt_a).await;
+    let _ = wait_turn_finished(&mut rt_b).await;
+
+    let a_hist = a_messages.lock().unwrap().last().unwrap().clone();
+    let tool_outputs: Vec<String> = a_hist
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .collect();
+    assert_eq!(tool_outputs.len(), 3);
+
+    // 1. Default 32,000-char cap hit on 40,000-char reply -> explicit 8,000-char truncation footer, NO artifact folding
+    assert!(
+        tool_outputs[0].contains("[... truncated 8000 chars ...]"),
+        "expected explicit truncation footer: {}",
+        &tool_outputs[0][tool_outputs[0].len().saturating_sub(200)..]
+    );
+    assert!(
+        !tool_outputs[0].contains("section of output folded"),
+        "send_to_session must not be folded by ArtifactMiddleware"
+    );
+
+    // 2. max_reply_chars=64000 returns all 40,000 chars verbatim (HEAD through TAIL), NO artifact folding
+    assert!(
+        tool_outputs[1].contains(&long_reply),
+        "expected full 40k reply without truncation or artifact folding (len={})",
+        tool_outputs[1].len()
+    );
+    assert!(!tool_outputs[1].contains("[... truncated"));
+    assert!(!tool_outputs[1].contains("section of output folded"));
+
+    // 3. read_session_turns returns > 6000 chars with explicit truncation footer where clipped
+    assert!(
+        tool_outputs[2].len() > 8000,
+        "read_session_turns default 16k cap should exceed old 6k limit (got {})",
+        tool_outputs[2].len()
+    );
+    assert!(!tool_outputs[2].contains("section of output folded"));
+
+    rt_a.handle.shutdown().await.unwrap();
+    rt_b.handle.shutdown().await.unwrap();
+}

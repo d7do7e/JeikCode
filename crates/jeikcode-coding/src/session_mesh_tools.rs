@@ -20,7 +20,14 @@ use tokio::net::TcpStream;
 use crate::session_mesh::{
     IpcRequestEnvelope, LiveSessionDescriptor, LiveSessionView, MeshLocalState, MeshRequest,
     MeshResponse, DEFAULT_PEER_REPLY_TIMEOUT_SECS, IPC_CONNECT_TIMEOUT, IPC_IO_TIMEOUT,
+    MAX_IPC_FRAME_BYTES,
 };
+
+pub(crate) const DEFAULT_MESH_REPLY_CHARS: usize = 32_000;
+pub(crate) const MAX_MESH_REPLY_CHARS: usize = 64_000;
+pub(crate) const DEFAULT_READ_TURNS_MAX_CHARS: usize = 16_000;
+pub(crate) const MAX_READ_TURNS_MAX_CHARS: usize = 64_000;
+const PER_TURN_MAX_CHARS: usize = 8_000;
 use crate::session_mesh_naming::{
     default_display_name, display_clean_path, max_mesh_hops_from_mesh,
     read_live_descriptors_reaping_stale, resolve_live_target, same_canonical_path,
@@ -52,7 +59,7 @@ pub(crate) fn last_assistant_reply_text(snapshot: &SessionSnapshot) -> String {
         .find(|m| !m.synthetic && m.role == Role::Assistant && !m.text.trim().is_empty())
         .map(|m| m.text.trim().to_string())
         .unwrap_or_default();
-    truncate_chars(&text, 6000)
+    truncate_chars_with_footer(&text, MAX_MESH_REPLY_CHARS)
 }
 
 pub(crate) fn format_snapshot_turns(
@@ -81,20 +88,26 @@ pub(crate) fn format_snapshot_turns(
             let tool_names: Vec<&str> = msg.tool_calls.iter().map(|t| t.name.as_str()).collect();
             body = format!("[tool calls: {}]", tool_names.join(", "));
         }
-        let clipped = truncate_chars(&body, 1200);
+        let clipped = truncate_chars_with_footer(&body, PER_TURN_MAX_CHARS);
         lines.push(format!("[{}] {}: {}", start + idx + 1, role_label, clipped));
     }
-    truncate_chars(&lines.join("\n\n"), max_chars)
+    truncate_chars_with_footer(&lines.join("\n\n"), max_chars)
 }
 
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
+pub(crate) fn truncate_chars_with_footer(s: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    let mut end_byte = s.len();
+    for (idx, _) in s.char_indices() {
+        if count == max_chars {
+            end_byte = idx;
+        }
+        count += 1;
     }
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let dropped = count - max_chars;
+    format!("{}\n[... truncated {dropped} chars ...]", &s[..end_byte])
 }
 
 /// Discover all live, PID-verified peer sessions in `live_dir`, pruning stale descriptors.
@@ -211,6 +224,7 @@ async fn ipc_send_to_session(
     steer_if_busy: bool,
     wait_for_reply: Option<bool>,
     timeout_secs: Option<u64>,
+    max_reply_chars: Option<usize>,
 ) -> Result<PeerDeliveryOutcome, String> {
     let wait_budget = if wait_for_reply == Some(false) {
         IPC_IO_TIMEOUT
@@ -233,6 +247,7 @@ async fn ipc_send_to_session(
             steer_if_busy,
             wait_for_reply,
             timeout_secs,
+            max_reply_chars,
         },
         wait_budget,
     )
@@ -282,6 +297,13 @@ async fn send_ipc_request(
     };
     let mut bytes = serde_json::to_vec(&env).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
+    if bytes.len() > MAX_IPC_FRAME_BYTES {
+        return Err(format!(
+            "mesh IPC request exceeds {} bytes ({} bytes)",
+            MAX_IPC_FRAME_BYTES,
+            bytes.len()
+        ));
+    }
 
     tokio::time::timeout(IPC_IO_TIMEOUT, write_half.write_all(&bytes))
         .await
@@ -296,6 +318,13 @@ async fn send_ipc_request(
         .map_err(|e| format!("IPC read failed: {e}"))?;
     if n == 0 {
         return Err("empty IPC response from peer session".to_string());
+    }
+    if resp_line.len() > MAX_IPC_FRAME_BYTES {
+        return Err(format!(
+            "mesh IPC response exceeds {} bytes ({} bytes)",
+            MAX_IPC_FRAME_BYTES,
+            resp_line.len()
+        ));
     }
     serde_json::from_str::<MeshResponse>(&resp_line)
         .map_err(|e| format!("invalid IPC response: {e}"))
@@ -371,6 +400,10 @@ impl Tool for ReadSessionTurnsTool {
         true
     }
 
+    fn never_truncate_result(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Read recent user/assistant turns from a live peer session."
     }
@@ -389,7 +422,7 @@ impl Tool for ReadSessionTurnsTool {
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Max transcript chars (default 6000, max 32000)."
+                    "description": "Max transcript chars (default 16000, max 64000)."
                 }
             },
             "required": ["target"]
@@ -416,7 +449,10 @@ impl Tool for ReadSessionTurnsTool {
         };
 
         let last_n = parsed.last_n.unwrap_or(8).clamp(1, 50);
-        let max_chars = parsed.max_chars.unwrap_or(6000).clamp(256, 32_000);
+        let max_chars = parsed
+            .max_chars
+            .unwrap_or(DEFAULT_READ_TURNS_MAX_CHARS)
+            .clamp(256, MAX_READ_TURNS_MAX_CHARS);
         match ipc_read_session_turns(&desc, last_n, max_chars).await {
             Ok((live_name, phase, total_messages, rendered)) => {
                 let display = live_name.or(desc.name).unwrap_or_else(|| {
@@ -443,6 +479,8 @@ struct SendToSessionArgs {
     wait_for_reply: Option<bool>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_reply_chars: Option<usize>,
 }
 
 /// `send_to_session` — deliver a peer message to another live JeikCode session with guardrails.
@@ -454,6 +492,10 @@ pub(crate) struct SendToSessionTool {
 impl Tool for SendToSessionTool {
     fn name(&self) -> &str {
         "send_to_session"
+    }
+
+    fn never_truncate_result(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -483,6 +525,10 @@ impl Tool for SendToSessionTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Wait timeout in seconds (default 120, max 300)."
+                },
+                "max_reply_chars": {
+                    "type": "integer",
+                    "description": "Max reply chars to return (default 32000, max 64000)."
                 }
             },
             "required": ["target", "message"]
@@ -529,6 +575,10 @@ impl Tool for SendToSessionTool {
         let self_repo = self.local.current_repo_root();
         let self_name = self.local.current_name();
 
+        let max_reply_chars = parsed
+            .max_reply_chars
+            .map(|n| n.clamp(1_024, MAX_MESH_REPLY_CHARS));
+
         match ipc_send_to_session(
             &desc,
             &self_id,
@@ -541,6 +591,7 @@ impl Tool for SendToSessionTool {
             parsed.steer_if_busy.unwrap_or(false),
             parsed.wait_for_reply,
             parsed.timeout_secs,
+            max_reply_chars,
         )
         .await
         {
@@ -657,5 +708,15 @@ mod tests {
         let found = discover_live_sessions(dir.path(), None, None).await;
         assert!(found.is_empty());
         assert!(!path.exists(), "dead-PID descriptor should be reaped");
+    }
+
+    #[test]
+    fn truncate_chars_with_footer_preserves_under_cap_and_marks_exact_cutoff() {
+        assert_eq!(truncate_chars_with_footer("hello", 10), "hello");
+        assert_eq!(truncate_chars_with_footer("hello", 5), "hello");
+        assert_eq!(
+            truncate_chars_with_footer("abcdefghij", 4),
+            "abcd\n[... truncated 6 chars ...]"
+        );
     }
 }

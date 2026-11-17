@@ -28,7 +28,10 @@ use crate::session_mesh_naming::{
     default_display_name, display_clean_path, resolve_unique_live_name, same_canonical_path,
     sanitize_mesh_name,
 };
-use crate::session_mesh_tools::{format_snapshot_turns, last_assistant_reply_text};
+use crate::session_mesh_tools::{
+    format_snapshot_turns, last_assistant_reply_text, truncate_chars_with_footer,
+    DEFAULT_MESH_REPLY_CHARS, MAX_MESH_REPLY_CHARS, MAX_READ_TURNS_MAX_CHARS,
+};
 
 /// Default maximum cross-session peer message hop depth before rejecting forwarding.
 pub const DEFAULT_MESH_MAX_HOPS: u32 = 3;
@@ -36,8 +39,8 @@ pub const DEFAULT_MESH_MAX_HOPS: u32 = 3;
 pub const DEFAULT_PEER_REPLY_TIMEOUT_SECS: u64 = 120;
 /// Default timeout constants shared by IPC server and client.
 pub(crate) const IPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-pub(crate) const IPC_IO_TIMEOUT: Duration = Duration::from_millis(1500);
-const MAX_IPC_LINE_BYTES: usize = 512 * 1024;
+pub(crate) const IPC_IO_TIMEOUT: Duration = Duration::from_millis(3000);
+pub(crate) const MAX_IPC_FRAME_BYTES: usize = 512 * 1024;
 const TURN_OUTCOME_CHANNEL_CAP: usize = 32;
 
 /// Whether the cross-process session mesh is enabled (`JEIKCODE_SESSION_MESH`, default ON).
@@ -419,6 +422,8 @@ pub(crate) enum MeshRequest {
         steer_if_busy: bool,
         wait_for_reply: Option<bool>,
         timeout_secs: Option<u64>,
+        #[serde(default)]
+        max_reply_chars: Option<usize>,
     },
 }
 
@@ -489,7 +494,7 @@ async fn handle_ipc_connection(stream: TcpStream, host: Arc<SessionMeshHost>) {
     let Ok(Ok(n)) = read_res else {
         return;
     };
-    if n == 0 || line.len() > MAX_IPC_LINE_BYTES {
+    if n == 0 || line.len() > MAX_IPC_FRAME_BYTES {
         return;
     }
 
@@ -528,6 +533,17 @@ async fn write_ipc_response(
 ) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(resp).unwrap_or_else(|_| b"{}".to_vec());
     bytes.push(b'\n');
+    if bytes.len() > MAX_IPC_FRAME_BYTES {
+        let err = MeshResponse::Error {
+            message: format!(
+                "mesh IPC response exceeds {} bytes ({} bytes)",
+                MAX_IPC_FRAME_BYTES,
+                bytes.len()
+            ),
+        };
+        bytes = serde_json::to_vec(&err).unwrap_or_else(|_| b"{}".to_vec());
+        bytes.push(b'\n');
+    }
     tokio::time::timeout(IPC_IO_TIMEOUT, write_half.write_all(&bytes))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC write timeout"))?
@@ -565,8 +581,11 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                     rendered: "(session has no recorded turns yet)".to_string(),
                 };
             };
-            let rendered =
-                format_snapshot_turns(&snap, last_n.clamp(1, 50), max_chars.clamp(256, 32_000));
+            let rendered = format_snapshot_turns(
+                &snap,
+                last_n.clamp(1, 50),
+                max_chars.clamp(256, MAX_READ_TURNS_MAX_CHARS),
+            );
             MeshResponse::Turns {
                 session_id,
                 name: local_name,
@@ -586,6 +605,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             steer_if_busy,
             wait_for_reply,
             timeout_secs,
+            max_reply_chars,
         } => {
             if session_id == from_session_id {
                 return MeshResponse::Error {
@@ -707,6 +727,11 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                                     ),
                                 };
                             }
+                            let reply_limit = max_reply_chars
+                                .unwrap_or(DEFAULT_MESH_REPLY_CHARS)
+                                .clamp(1_024, MAX_MESH_REPLY_CHARS);
+                            let bounded_reply =
+                                truncate_chars_with_footer(&outcome.assistant_reply, reply_limit);
                             return MeshResponse::Delivered {
                                 session_id,
                                 name: local_name,
@@ -717,7 +742,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                                 target_repo_root: target_repo,
                                 completed: true,
                                 stop_reason: Some(outcome.stop_reason),
-                                reply: Some(outcome.assistant_reply),
+                                reply: Some(bounded_reply),
                             };
                         }
                         Ok(Ok(_)) => continue,
