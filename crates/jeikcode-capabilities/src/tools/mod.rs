@@ -105,7 +105,9 @@ pub use report_finding::{Finding, ReportFindingTool};
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
 pub use subagent_context::InheritedSubagentContext;
 pub use subagent_store::TaskOutputTool;
-pub use subagent_verifier::{parse_verifier_verdict, run_blind_verifier, VerifierVerdict};
+pub use subagent_verifier::{
+    parse_verifier_verdict, run_blind_verifier, run_blind_verifier_with_context, VerifierVerdict,
+};
 pub use task::TaskTool;
 pub use todo::{
     bind_todo_session, bind_todowrite, clear_todo_board, close_todo_board_if_complete,

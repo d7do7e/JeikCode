@@ -98,6 +98,10 @@ impl StubCompaction {
             {
                 continue;
             }
+            if tool == "code_explore" {
+                #[cfg(feature = "codeintel")]
+                crate::codeintel::clear_session_sent_spans();
+            }
             rewrites.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
         }
         rewrites

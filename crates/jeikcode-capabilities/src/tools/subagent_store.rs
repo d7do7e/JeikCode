@@ -6,7 +6,7 @@ use jeikcode_kernel::message::SessionSnapshot;
 use jeikcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -50,6 +50,7 @@ pub(crate) struct BackgroundCompletion {
 pub(crate) struct BackgroundTaskHandle {
     pub task_id: String,
     pub agent_id: String,
+    pub session_scope: String,
     #[allow(dead_code)]
     pub label: String,
     pub description: String,
@@ -90,7 +91,21 @@ pub(crate) struct SubagentStore {
     next_seq: AtomicU64,
     root_cancel: CancellationToken,
     saved: Mutex<HashMap<String, SavedSubagentState>>,
+    in_flight: Mutex<HashSet<String>>,
     background: Mutex<HashMap<String, Arc<BackgroundTaskHandle>>>,
+}
+
+pub(crate) struct ResumeInFlightGuard {
+    store: std::sync::Weak<SubagentStore>,
+    agent_id: String,
+}
+
+impl Drop for ResumeInFlightGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.upgrade() {
+            store.release_in_flight(&self.agent_id);
+        }
+    }
 }
 
 impl SubagentStore {
@@ -104,7 +119,26 @@ impl SubagentStore {
             next_seq: AtomicU64::new(1),
             root_cancel: CancellationToken::new(),
             saved: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashSet::new()),
             background: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn release_in_flight(&self, agent_id: &str) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(agent_id.trim());
+        }
+    }
+
+    pub(crate) fn inherit_saved_from(&self, other: &SubagentStore) {
+        let Ok(other_map) = other.saved.lock() else {
+            return;
+        };
+        let Ok(mut my_map) = self.saved.lock() else {
+            return;
+        };
+        for (k, v) in other_map.iter() {
+            my_map.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
@@ -165,11 +199,11 @@ impl SubagentStore {
     }
 
     pub(crate) fn get_for_resume(
-        &self,
+        self: &Arc<Self>,
         agent_id: &str,
         requested_role: Option<SubagentRole>,
         requested_scope: &[String],
-    ) -> Result<SavedSubagentState, String> {
+    ) -> Result<(SavedSubagentState, ResumeInFlightGuard), String> {
         let id = agent_id.trim();
         if id.is_empty() {
             return Err("`resume_agent_id` must be non-empty".to_string());
@@ -209,7 +243,21 @@ impl SubagentStore {
                 entry.scope.join(", ")
             ));
         }
-        Ok(entry.clone())
+        let mut inflight = self
+            .in_flight
+            .lock()
+            .map_err(|_| "subagent in-flight lock poisoned".to_string())?;
+        if !inflight.insert(entry.agent_id.clone()) {
+            return Err(format!(
+                "subagent `{}` is already running; wait for it to finish before resuming it again",
+                entry.agent_id
+            ));
+        }
+        let guard = ResumeInFlightGuard {
+            store: Arc::downgrade(self),
+            agent_id: entry.agent_id.clone(),
+        };
+        Ok((entry.clone(), guard))
     }
 
     pub(crate) fn register_background(
@@ -223,9 +271,11 @@ impl SubagentStore {
         cancel: CancellationToken,
     ) -> Arc<BackgroundTaskHandle> {
         let (tx, rx) = watch::channel(None);
+        let session_scope = self.current_session_scope();
         let handle = Arc::new(BackgroundTaskHandle {
             task_id: task_id.clone(),
             agent_id,
+            session_scope,
             label,
             description,
             role,
@@ -257,17 +307,24 @@ impl SubagentStore {
         if needle.is_empty() {
             return None;
         }
+        let scope = self.current_session_scope();
         let map = self.background.lock().ok()?;
         if let Some(direct) = map.get(needle) {
-            return Some(Arc::clone(direct));
+            if direct.session_scope == scope {
+                return Some(Arc::clone(direct));
+            }
+            return None;
         }
-        map.values().find(|h| h.agent_id == needle).map(Arc::clone)
+        map.values()
+            .find(|h| h.session_scope == scope && h.agent_id == needle)
+            .map(Arc::clone)
     }
 
     pub(crate) fn list_summary(&self) -> (Vec<String>, Vec<String>) {
+        let scope = self.current_session_scope();
         let mut bg_lines = Vec::new();
         if let Ok(map) = self.background.lock() {
-            let mut entries: Vec<_> = map.values().collect();
+            let mut entries: Vec<_> = map.values().filter(|h| h.session_scope == scope).collect();
             entries.sort_by_key(|h| h.started_at);
             for h in entries {
                 let status = match h.snapshot_completion() {
@@ -399,8 +456,14 @@ impl Tool for TaskOutputTool {
         RiskLevel::Safe
     }
 
+    fn never_truncate_result(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let parsed: TaskOutputArgs = match serde_json::from_str(args) {
+        let parsed: TaskOutputArgs = match serde_json::from_str(args)
+            .or_else(|_| serde_json::from_str(&super::repair::repair_json(args)))
+        {
             Ok(a) => a,
             Err(e) => {
                 return ToolResult {

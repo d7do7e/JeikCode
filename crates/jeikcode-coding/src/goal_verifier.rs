@@ -6,10 +6,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use jeikcode_capabilities::codeintel::{register_codeintel_tools_with_mode, CodeIntelMode};
+use jeikcode_capabilities::codeintel::{register_codeintel_tools_for_subagent, CodeIntelMode};
 use jeikcode_capabilities::session::instructions::render_project_instructions;
 use jeikcode_capabilities::tools::{
-    register_coding_tools_with_vision_and_bash_state, run_blind_verifier, BashRuntimeState,
+    register_coding_tools_with_vision_and_bash_state, run_blind_verifier_with_context,
+    BashRuntimeState, InheritedSubagentContext,
 };
 use jeikcode_kernel::message::{Message, SessionSnapshot};
 use jeikcode_kernel::provider::LlmProvider;
@@ -96,14 +97,24 @@ pub(crate) async fn evaluate_goal_with_harness(job: GoalEvalJob) -> EvalOutcome 
 
     let verifier_tools = build_verifier_tools(Arc::clone(&job.bash_runtime));
     let project_instructions = render_project_instructions(&job.working_dir);
+    let ctx_hook = jeikcode_capabilities::session::SessionContextHook::new(&job.working_dir);
+    let inherited_context = InheritedSubagentContext {
+        memory: jeikcode_capabilities::memory::MemoryHook::for_project(&job.working_dir)
+            .render_block(),
+        user_preferences: ctx_hook.render_user_preferences_block(),
+        project_instructions: ctx_hook
+            .render_project_instructions_block()
+            .or_else(|| project_instructions.clone()),
+    };
     let prompt = build_blind_verifier_prompt(&job.condition, &fp_before, &fast_reason);
 
-    let verdict = match run_blind_verifier(
+    let verdict = match run_blind_verifier_with_context(
         verifier_provider,
         verifier_tools,
         job.working_dir.clone(),
         prompt,
         project_instructions,
+        Some(inherited_context),
         BLIND_VERIFIER_MAX_ROUNDS,
         job.cancel,
     )
@@ -211,7 +222,7 @@ fn build_verifier_tools(bash_runtime: Arc<BashRuntimeState>) -> MountedTools {
         std::env::var("JEIKCODE_CODEINTEL_MODE").ok().as_deref(),
         None,
     );
-    register_codeintel_tools_with_mode(&mut reg, &codeintel_mode);
+    register_codeintel_tools_for_subagent(&mut reg, &codeintel_mode);
     reg.mount(&["read", "code_explore", "run_command", "grep", "glob"])
 }
 

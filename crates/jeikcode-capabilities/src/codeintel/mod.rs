@@ -20,7 +20,7 @@ pub mod lang;
 pub mod retrieval;
 pub mod symbols;
 
-pub use explore::CodeExploreTool;
+pub use explore::{clear_session_sent_spans, CodeExploreTool};
 pub use graph::{CodeGraph, Edge, EdgeKind, SymbolId, SymbolKind, SymbolNode, Visibility};
 pub use index::{
     build_graph, disk_cache_path, has_nonempty_codegraph, init_workspace_index, CodeIndex,
@@ -133,6 +133,14 @@ pub fn prewarm_code_index(root: &Path) {
 pub fn register_codeintel_tools_with_mode(reg: &mut ToolRegistry, _mode: &CodeIntelMode) {
     let index = shared_code_index();
     reg.register(Arc::new(CodeExploreTool::new(index)));
+}
+
+/// Register `code_explore` for an ephemeral subagent (`explore` / `verifier` / `worker`),
+/// disabling cross-call span deduplication so child subagents never suppress spans in the
+/// parent session or across sibling subagents.
+pub fn register_codeintel_tools_for_subagent(reg: &mut ToolRegistry, _mode: &CodeIntelMode) {
+    let index = shared_code_index();
+    reg.register(Arc::new(CodeExploreTool::new(index).without_span_dedup()));
 }
 
 /// Canonicalize a path (resolve symlinks / `.`/`..`), falling back to the original on

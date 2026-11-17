@@ -278,6 +278,7 @@ pub struct CodingParts {
     /// [`CodingAgentConfig`].
     /// `None` when the `JEIKCODE_SUBAGENT` env gate is off.
     pub subagent_provider: Option<SharedReviewProvider>,
+    pub(crate) subagent_tool: Option<Arc<jeikcode_capabilities::tools::TaskTool>>,
     /// User/project CC external hooks (`$JEIKCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](jeikcode_kernel::middleware::ToolMiddleware) (registered by
@@ -401,9 +402,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // `task` subagent tool (env-gated, default ON; opt out with JEIKCODE_SUBAGENT=0). Configured fast/capable tiers use
     // runtime-owned provider cells; missing/same-as-host tiers reuse the host slot.
     // Child tools: read-only `explore`, edit-capable `worker`, and read-only blind `verifier`.
-    let (subagent_provider, subagent_tool): (
+    let (subagent_provider, subagent_tool, subagent_child_registry): (
         Option<SharedReviewProvider>,
         Option<Arc<jeikcode_capabilities::tools::TaskTool>>,
+        Option<Arc<std::sync::RwLock<jeikcode_kernel::tool::ToolRegistry>>>,
     ) = if subagent_enabled_from_env(std::env::var("JEIKCODE_SUBAGENT").ok().as_deref()) {
         use jeikcode_capabilities::tools::TaskTool;
 
@@ -416,11 +418,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             false,
             Arc::clone(&bash_runtime),
         );
-        jeikcode_capabilities::codeintel::register_codeintel_tools_with_mode(
+        jeikcode_capabilities::codeintel::register_codeintel_tools_for_subagent(
             &mut child_reg,
             &codeintel_mode,
         );
-        let child_reg = Arc::new(child_reg);
+        let child_reg = Arc::new(std::sync::RwLock::new(child_reg));
 
         let explore_names: Vec<String> = ["read", "code_explore", "grep", "glob"]
             .iter()
@@ -448,15 +450,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         let reg_w = child_reg.clone();
         let make_explore_tools = move || {
             let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-            reg_e.mount(&refs)
+            reg_e.read().unwrap_or_else(|e| e.into_inner()).mount(&refs)
         };
         let make_verifier_tools = move || {
             let refs: Vec<&str> = verifier_names.iter().map(|s| s.as_str()).collect();
-            reg_v.mount(&refs)
+            reg_v.read().unwrap_or_else(|e| e.into_inner()).mount(&refs)
         };
         let make_worker_tools = move || {
             let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-            reg_w.mount(&refs)
+            reg_w.read().unwrap_or_else(|e| e.into_inner()).mount(&refs)
         };
 
         // Prefer a runtime-injected tier provider, else fall back to the host-provider
@@ -536,9 +538,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         registry.register(Arc::new(task_tool.output_tool()));
         names.push("task".to_string());
         names.push("task_output".to_string());
-        (Some(slot), Some(task_tool))
+        (Some(slot), Some(task_tool), Some(child_reg))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
@@ -698,8 +700,21 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // Bind the runtime state to this session so every live bash task it registers
         // is attributable to (and cancellable only by) this session.
         bash_runtime.bind_session(b.id.as_str());
+        let session_artifact_store = b
+            .manager
+            .artifacts_dir(&b.id)
+            .ok()
+            .map(|dir| Arc::new(ArtifactStore::new(dir)));
         if let Some(task_tool) = &subagent_tool {
             task_tool.bind_session(b.id.as_str());
+            task_tool.set_artifact_store(session_artifact_store.clone());
+        }
+        if let Some(child_reg) = &subagent_child_registry {
+            if let Ok(mut reg) = child_reg.write() {
+                reg.register(Arc::new(
+                    ReadFileTool::new(false).with_optional_artifact_store(session_artifact_store),
+                ));
+            }
         }
         let keywords = b.manager.load_bash_keywords(&b.id).unwrap_or_default();
         if let Ok(path) = b.manager.bashkw_path(&b.id) {
@@ -921,6 +936,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         session_mcp_registry,
         review_provider,
         subagent_provider,
+        subagent_tool,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
         git_branch: crate::custom_prompts::detect_git_branch(&cfg.working_dir)
@@ -1150,6 +1166,9 @@ impl CodingParts {
         self.write_approval_grants = Arc::clone(&previous.write_approval_grants);
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
+        if let (Some(curr), Some(prev)) = (&self.subagent_tool, &previous.subagent_tool) {
+            curr.inherit_store_from(prev);
+        }
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.

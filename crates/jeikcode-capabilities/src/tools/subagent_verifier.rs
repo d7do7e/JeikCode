@@ -126,9 +126,16 @@ pub(crate) fn validate_verifier_shell_command(command: &str) -> Result<(), Strin
         ));
     }
     if let Some(reason) = check_destructive_command(trimmed) {
-        return Err(format!(
-            "verifier subagent blocked potentially destructive command ({reason})"
-        ));
+        let false_positive_disk_format = reason == "disk format"
+            && !trimmed
+                .split_whitespace()
+                .next()
+                .is_some_and(|tok| tok.eq_ignore_ascii_case("format"));
+        if !false_positive_disk_format {
+            return Err(format!(
+                "verifier subagent blocked potentially destructive command ({reason})"
+            ));
+        }
     }
     let Some(invocations) = bash_invocations(trimmed) else {
         return Err(
@@ -179,6 +186,7 @@ fn validate_invocation(inv: &BashInvocation) -> Result<(), String> {
         }
         "cargo" => validate_cargo(&args),
         "git" => validate_git(&args),
+        "uv" => validate_uv(&args),
         "npm" | "pnpm" | "yarn" | "bun" => validate_node_pkg(&cmd, &args),
         "npx" => validate_npx(&args),
         "pytest" | "ruff" | "mypy" | "pyright" | "flake8" | "tsc" | "eslint" | "vitest"
@@ -212,8 +220,11 @@ fn has_inline_write_redirect_or_inplace_flag(cmd: &str, args: &[&str]) -> bool {
 fn validate_cargo(args: &[&str]) -> Result<(), String> {
     let sub = args.iter().copied().find(|a| !a.starts_with('-'));
     match sub {
-        Some("check" | "test" | "clippy" | "mutants" | "tree" | "metadata" | "verify-project"
-        | "doc") => Ok(()),
+        Some(
+            "check" | "test" | "nextest" | "clippy" | "mutants" | "tree" | "metadata"
+            | "verify-project" | "doc" | "llvm-cov" | "version",
+        ) => Ok(()),
+        Some("bench") if args.iter().any(|a| *a == "--no-run") => Ok(()),
         Some("fmt") => {
             if args.iter().any(|a| *a == "--check") {
                 Ok(())
@@ -222,7 +233,46 @@ fn validate_cargo(args: &[&str]) -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "verifier `cargo` subcommand `{}` is not permitted (use check/test/clippy/fmt --check/mutants)",
+            "verifier `cargo` subcommand `{}` is not permitted (use check/test/nextest/clippy/fmt --check/mutants/doc)",
+            other.unwrap_or("<none>")
+        )),
+    }
+}
+
+fn validate_uv(args: &[&str]) -> Result<(), String> {
+    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+        return Ok(());
+    }
+    let non_flags: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    match non_flags.first().copied() {
+        Some("version") => Ok(()),
+        Some("run") => {
+            let Some(&runner) = non_flags.get(1) else {
+                return Err("verifier `uv run` requires a target checker command".to_string());
+            };
+            let runner_name = std::path::Path::new(runner)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(runner)
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase();
+            let runner_pos = args.iter().position(|&a| a == runner).unwrap_or(0);
+            let tail = &args[runner_pos + 1..];
+            match runner_name.as_str() {
+                "pytest" | "mypy" | "pyright" | "flake8" => Ok(()),
+                "ruff" => validate_checker("ruff", tail),
+                "python" | "python3" | "py" => validate_python(tail),
+                _ => Err(format!(
+                    "verifier `uv run` only allows pytest/mypy/pyright/flake8/ruff/python -m, got `{runner}`"
+                )),
+            }
+        }
+        other => Err(format!(
+            "verifier `uv` subcommand `{}` is not permitted (use `uv run pytest|mypy|ruff check`)",
             other.unwrap_or("<none>")
         )),
     }
@@ -422,22 +472,57 @@ pub async fn run_blind_verifier(
     max_rounds: u32,
     cancel: CancellationToken,
 ) -> Result<VerifierVerdict, String> {
+    run_blind_verifier_with_context(
+        provider,
+        tools,
+        working_dir,
+        prompt,
+        project_instructions,
+        None,
+        max_rounds,
+        cancel,
+    )
+    .await
+}
+
+/// Like [`run_blind_verifier`], with optional full parent-ordered [`InheritedSubagentContext`]
+/// (`<memory>`, `<user_preferences>`, and uncapped `<project_instructions>`).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_blind_verifier_with_context(
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    working_dir: PathBuf,
+    prompt: String,
+    project_instructions: Option<String>,
+    inherited_context: Option<super::subagent_context::InheritedSubagentContext>,
+    max_rounds: u32,
+    cancel: CancellationToken,
+) -> Result<VerifierVerdict, String> {
     let persona = build_child_persona(
         VERIFIER_PERSONA,
         SubagentRole::Verifier,
         &[],
-        project_instructions.as_deref(),
+        if inherited_context.is_some() {
+            None
+        } else {
+            project_instructions.as_deref()
+        },
     );
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(tools)
         .persona(persona)
-        .working_dir(working_dir)
+        .working_dir(working_dir.clone())
         .cancel_token(cancel)
         .tool_loop_policy(ToolLoopPolicy::default())
-        .middleware(Arc::new(DenySensitivePaths))
+        .middleware(Arc::new(DenySensitivePaths::new(working_dir)))
         .middleware(Arc::new(DenyOfflineNetwork))
         .middleware(Arc::new(VerifierReadOnlyShellGuard));
+    if let Some(ctx) = inherited_context {
+        builder = builder.hook(Arc::new(
+            super::subagent_context::SubagentInheritedContextHook::new(ctx),
+        ));
+    }
     if max_rounds != 0 {
         builder = builder.max_rounds(max_rounds);
     }
@@ -467,11 +552,17 @@ mod tests {
     #[test]
     fn verifier_shell_guard_allows_checks_and_blocks_mutations() {
         assert!(validate_verifier_shell_command("cargo test -p jeikcode-coding --locked").is_ok());
+        assert!(validate_verifier_shell_command("cargo nextest run --workspace").is_ok());
         assert!(validate_verifier_shell_command("cargo fmt --all -- --check").is_ok());
         assert!(validate_verifier_shell_command("git diff --stat && git status --short").is_ok());
         assert!(validate_verifier_shell_command("python -m pytest tests/").is_ok());
+        assert!(validate_verifier_shell_command("uv run pytest tests/").is_ok());
+        assert!(validate_verifier_shell_command("uv run ruff check .").is_ok());
+        assert!(validate_verifier_shell_command("uv run ruff format --check .").is_ok());
         assert!(validate_verifier_shell_command("npm run typecheck").is_ok());
 
+        assert!(validate_verifier_shell_command("uv run ruff format .").is_err());
+        assert!(validate_verifier_shell_command("uv pip install requests").is_err());
         assert!(validate_verifier_shell_command("cargo fmt --all").is_err());
         assert!(validate_verifier_shell_command("rm -rf target").is_err());
         assert!(validate_verifier_shell_command("echo hi > out.txt").is_err());

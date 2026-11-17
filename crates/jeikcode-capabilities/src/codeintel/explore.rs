@@ -51,9 +51,19 @@ const INTENT_TOP_K: usize = 200;
 /// How many files each intent contributes to the grouped intent-hits table.
 const INTENT_TOP_FILES: usize = 5;
 
+static NEXT_EXPLORE_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Thread-safe session-level sent code ranges to avoid duplicate context bloat.
 static SESSION_SENT_SPANS: std::sync::LazyLock<RwLock<HashMap<String, Vec<(usize, usize)>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Clear all recorded session sent spans (e.g. when context compaction stubs an earlier
+/// `code_explore` result so the model can re-fetch those code spans if needed).
+pub fn clear_session_sent_spans() {
+    if let Ok(mut guard) = SESSION_SENT_SPANS.write() {
+        guard.clear();
+    }
+}
 
 pub struct CodeExploreTool {
     index: Arc<CodeIndex>,
@@ -61,6 +71,8 @@ pub struct CodeExploreTool {
     /// Directory signature used to make project/global thesaurus hot-reload
     /// idempotent. `u64::MAX` forces the first query to build a fresh snapshot.
     thesaurus_sig: Arc<RwLock<u64>>,
+    scope_id: u64,
+    dedup_spans: bool,
 }
 
 /// Process-wide query-result cache key.
@@ -216,7 +228,16 @@ impl CodeExploreTool {
             index,
             thesaurus: Arc::new(RwLock::new(dt)),
             thesaurus_sig: Arc::new(RwLock::new(u64::MAX)),
+            scope_id: NEXT_EXPLORE_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dedup_spans: true,
         }
+    }
+
+    /// Disable cross-call span deduplication for ephemeral subagents so child `explore` /
+    /// `verifier` runs never suppress spans for the parent session or sibling subagents.
+    pub fn without_span_dedup(mut self) -> Self {
+        self.dedup_spans = false;
+        self
     }
 }
 
@@ -867,7 +888,8 @@ impl Tool for CodeExploreTool {
         let dirindex = self.index.get_dirindex(&root);
         let cache_status = self.index.last_stats(&root);
         let t_render_start = std::time::Instant::now();
-        let body = render_explore_output(
+        let span_scope = self.dedup_spans.then_some(self.scope_id);
+        let (body, any_deduped) = render_explore_output_with_span_scope(
             &graph,
             &root,
             &a.query,
@@ -880,6 +902,7 @@ impl Tool for CodeExploreTool {
             dirindex.as_deref(),
             None,
             None,
+            span_scope,
         );
         let t_render = t_render_start.elapsed();
         let total_cost = t0.elapsed();
@@ -888,7 +911,9 @@ impl Tool for CodeExploreTool {
             (total_cost, t_index, t_retrieval, t_render),
             cache_status.as_ref(),
         );
-        query_cache_insert(cache_key, output.clone());
+        if !any_deduped {
+            query_cache_insert(cache_key, output.clone());
+        }
 
         log_explore_outcome(
             &root,
@@ -2917,6 +2942,7 @@ fn render_intent_hits(candidates: &[FileCandidate], root: &Path) -> Vec<String> 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_explore_output(
     graph: &CodeGraph,
     root: &Path,
@@ -2931,6 +2957,40 @@ fn render_explore_output(
     cache_status: Option<super::index::RefreshStats>,
     cost_breakdown: Option<(Duration, Duration, Duration, Duration)>,
 ) -> String {
+    render_explore_output_with_span_scope(
+        graph,
+        root,
+        query,
+        candidates,
+        flow_spine,
+        connected,
+        max_files,
+        scope,
+        tokens,
+        dirindex,
+        cache_status,
+        cost_breakdown,
+        Some(0),
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_explore_output_with_span_scope(
+    graph: &CodeGraph,
+    root: &Path,
+    query: &str,
+    candidates: &[FileCandidate],
+    flow_spine: &[(SymbolId, Option<SymbolId>, EdgeKind)],
+    connected: bool,
+    max_files: usize,
+    scope: Option<&Path>,
+    tokens: &SearchTokens,
+    dirindex: Option<&super::retrieval::DirIndex>,
+    cache_status: Option<super::index::RefreshStats>,
+    cost_breakdown: Option<(Duration, Duration, Duration, Duration)>,
+    span_scope: Option<u64>,
+) -> (String, bool) {
     let mut out = Vec::new();
     let top_files = &candidates[..candidates.len().min(max_files)];
     let evidence = auction_evidence(candidates, MAX_EVIDENCE_SPANS);
@@ -3256,6 +3316,7 @@ fn render_explore_output(
         })
         .collect();
     let mut session_spans = SESSION_SENT_SPANS.write().unwrap();
+    let mut any_span_deduped = false;
 
     out.push("### EVIDENCE (budgeted, layer-diverse)".to_string());
     for e in &evidence {
@@ -3286,17 +3347,28 @@ fn render_explore_output(
             let lines: Vec<&str> = content.lines().collect();
             let start = e.sym.node.start_line.saturating_sub(2).max(1);
             let end = (e.sym.node.end_line + 3).min(lines.len());
-            let sent_list = session_spans
-                .entry(format!("{}|{rel_path}", root.display()))
-                .or_default();
-            let already_sent = sent_list.iter().any(|(s, en)| *s <= start && end <= *en);
+            let already_sent = if let Some(scope_id) = span_scope {
+                let key = if scope_id == 0 {
+                    format!("{}|{rel_path}", root.display())
+                } else {
+                    format!("{scope_id}|{}|{rel_path}|{}", root.display(), content.len())
+                };
+                let sent_list = session_spans.entry(key).or_default();
+                let hit = sent_list.iter().any(|(s, en)| *s <= start && end <= *en);
+                if !hit {
+                    sent_list.push((start, end));
+                }
+                hit
+            } else {
+                false
+            };
             if already_sent {
+                any_span_deduped = true;
                 out.push(format!(
                     "> `[Same range already returned earlier this session (dedup): {rel_path} L{start}-L{end} (`{}`) — use read  {rel_path}  offset={start}]`\n",
                     e.sym.node.name
                 ));
             } else {
-                sent_list.push((start, end));
                 let (snippet, folded, folded_count) = fold_snippet(&lines, start, end, &rel_path);
                 if folded {
                     folded_spans += 1;
@@ -3463,7 +3535,7 @@ fn render_explore_output(
     out[coverage_idx] = coverage;
     let _ = remaining;
 
-    out.join("\n")
+    (out.join("\n"), any_span_deduped)
 }
 
 #[cfg(test)]

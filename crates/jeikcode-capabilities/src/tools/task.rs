@@ -20,9 +20,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::subagent_store::{
-    BackgroundCompletion, BackgroundTaskHandle, SavedSubagentState, SubagentStore, TaskOutputTool,
+    BackgroundCompletion, BackgroundTaskHandle, ResumeInFlightGuard, SavedSubagentState,
+    SubagentStore, TaskOutputTool,
 };
 use super::subagent_verifier::{SubagentRole, VerifierReadOnlyShellGuard, VERIFIER_PERSONA};
+use crate::tools::output_artifact::ArtifactStore;
 
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
@@ -37,7 +39,48 @@ pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// `AutoRespond::AllowAll`, so a prompt would just auto-approve itself. The generic credential
 /// bash gate runs immediately before this one; this guard terminates any remaining sensitive
 /// path access rather than letting a child repeatedly rephrase it.
-pub(crate) struct DenySensitivePaths;
+#[derive(Default)]
+pub(crate) struct DenySensitivePaths {
+    working_dir: Option<PathBuf>,
+}
+
+impl DenySensitivePaths {
+    pub(crate) fn new(working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            working_dir: Some(working_dir.into()),
+        }
+    }
+
+    fn references_resolved_sensitive_path(&self, args: &str) -> bool {
+        let Some(wd) = self.working_dir.as_deref() else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+            return false;
+        };
+        let mut raw_paths: Vec<&str> = Vec::new();
+        for key in ["path", "file_path", "target_file", "filePath", "filename"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                raw_paths.push(s);
+            }
+        }
+        if let Some(arr) = v.get("paths").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    raw_paths.push(s);
+                }
+            }
+        }
+        raw_paths.into_iter().any(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with("artifact://") {
+                return false;
+            }
+            let resolved = crate::tools::resolve_path(trimmed, wd);
+            crate::tools::path_is_sensitive(&resolved)
+        })
+    }
+}
 
 #[async_trait]
 impl ToolMiddleware for DenySensitivePaths {
@@ -47,7 +90,9 @@ impl ToolMiddleware for DenySensitivePaths {
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if crate::tools::references_sensitive_path(&call.arguments) {
+        if crate::tools::references_sensitive_path(&call.arguments)
+            || self.references_resolved_sensitive_path(&call.arguments)
+        {
             return BeforeOutcome::deny_turn(format!(
                 "subagent may not touch sensitive paths (credentials / ~/.ssh / .env): {}",
                 call.name
@@ -324,8 +369,10 @@ fn child_middlewares(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
-    let mut mw: Vec<Arc<dyn ToolMiddleware>> =
-        vec![Arc::new(DenySensitivePaths), Arc::new(DenyOfflineNetwork)];
+    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
+        Arc::new(DenySensitivePaths::new(working_dir)),
+        Arc::new(DenyOfflineNetwork),
+    ];
     match role {
         SubagentRole::Worker => {
             mw.extend(inherited_worker_middlewares.iter().cloned());
@@ -374,6 +421,9 @@ struct SubTask {
     /// read-only `<memory>` in exact parent block order before the subtask prompt.
     #[serde(default)]
     inherit_context: bool,
+    /// Optional per-subtask round limit override (clamped to `1..=64`; `0` or omitted uses default).
+    #[serde(default)]
+    max_rounds: Option<u32>,
 }
 
 impl SubTask {
@@ -438,6 +488,7 @@ pub struct TaskTool {
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     project_context_loader: Option<Arc<super::subagent_context::ProjectContextLoader>>,
     inherited_context_loader: Option<Arc<super::subagent_context::InheritedContextLoader>>,
+    artifact_store: Arc<std::sync::RwLock<Option<Arc<ArtifactStore>>>>,
     store: Arc<SubagentStore>,
 }
 
@@ -462,8 +513,29 @@ impl TaskTool {
             inherited_worker_middlewares: Vec::new(),
             project_context_loader: None,
             inherited_context_loader: None,
+            artifact_store: Arc::new(std::sync::RwLock::new(None)),
             store: Arc::new(SubagentStore::new()),
         }
+    }
+
+    /// Attach an optional session [`ArtifactStore`] so oversized (`>16 KB`) subagent outputs
+    /// spill their full text to `artifact://<id>` before head/tail compaction.
+    pub fn with_optional_artifact_store(mut self, store: Option<Arc<ArtifactStore>>) -> Self {
+        self.artifact_store = Arc::new(std::sync::RwLock::new(store));
+        self
+    }
+
+    /// Update the session [`ArtifactStore`] dynamically (e.g. during `parts::assemble`).
+    pub fn set_artifact_store(&self, store: Option<Arc<ArtifactStore>>) {
+        if let Ok(mut guard) = self.artifact_store.write() {
+            *guard = store;
+        }
+    }
+
+    /// Carry over saved `resume_agent_id` states from a previous `TaskTool` instance
+    /// across capability reloads (`/reload all`).
+    pub fn inherit_store_from(&self, previous: &TaskTool) {
+        self.store.inherit_saved_from(&previous.store);
     }
 
     /// Supply the toolset factory for read-only `verifier` subagents (read/search +
@@ -595,6 +667,12 @@ impl Tool for TaskTool {
                             "inherit_context": {
                                 "type": "boolean",
                                 "description": "Optional: inject full uncapped <project_instructions>, <user_preferences>, and read-only <memory> in parent block order (default false; useful for high-context plan review, critique, or judging)."
+                            },
+                            "max_rounds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 64,
+                                "description": "Optional: cap the maximum model rounds for this subtask (1..=64; useful for 1-round synthesis judges or bounded verification checks)."
                             }
                         },
                         "required": ["description", "prompt"]
@@ -603,6 +681,10 @@ impl Tool for TaskTool {
             },
             "required": ["tasks"]
         })
+    }
+
+    fn never_truncate_result(&self) -> bool {
+        true
     }
 
     fn risk(&self, args: &str) -> RiskLevel {
@@ -708,47 +790,62 @@ impl Tool for TaskTool {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
 
-            let (role, scope, agent_id, resume_snapshot, difficulty, inherit_context) =
-                if let Some(rid) = resume_id {
-                    match self.store.get_for_resume(&rid, requested_role, &t.scope) {
-                        Ok(saved) => (
-                            saved.role,
-                            saved.scope,
-                            saved.agent_id,
-                            Some(saved.snapshot),
-                            requested_difficulty.or(saved.difficulty),
-                            t.inherit_context || saved.inherit_context,
-                        ),
-                        Err(err_msg) => {
-                            let role_guess = requested_role.unwrap_or(SubagentRole::Explore);
-                            let label = format!("{}#{}", role_guess.as_str(), idx + 1);
-                            let block = render_task_block(
-                                &label,
-                                &rid,
-                                &desc,
-                                "none",
-                                "error",
-                                "task_error",
-                                &err_msg,
-                            );
-                            immediate_blocks.push((label, block, true));
-                            continue;
-                        }
+            let (
+                role,
+                scope,
+                agent_id,
+                resume_snapshot,
+                difficulty,
+                inherit_context,
+                inflight_guard,
+            ) = if let Some(rid) = resume_id {
+                match self.store.get_for_resume(&rid, requested_role, &t.scope) {
+                    Ok((saved, guard)) => (
+                        saved.role,
+                        saved.scope,
+                        saved.agent_id,
+                        Some(saved.snapshot),
+                        requested_difficulty.or(saved.difficulty),
+                        t.inherit_context || saved.inherit_context,
+                        Some(guard),
+                    ),
+                    Err(err_msg) => {
+                        let role_guess = requested_role.unwrap_or(SubagentRole::Explore);
+                        let label = format!("{}#{}", role_guess.as_str(), idx + 1);
+                        let block = render_task_block(
+                            &label,
+                            &rid,
+                            &desc,
+                            "none",
+                            "error",
+                            "task_error",
+                            &err_msg,
+                        );
+                        immediate_blocks.push((label, block, true));
+                        continue;
                     }
-                } else {
-                    let role = requested_role.unwrap_or(SubagentRole::Explore);
-                    let agent_id = self.store.mint_agent_id(role);
-                    (
-                        role,
-                        t.scope.clone(),
-                        agent_id,
-                        None,
-                        requested_difficulty,
-                        t.inherit_context,
-                    )
-                };
+                }
+            } else {
+                let role = requested_role.unwrap_or(SubagentRole::Explore);
+                let agent_id = self.store.mint_agent_id(role);
+                (
+                    role,
+                    t.scope.clone(),
+                    agent_id,
+                    None,
+                    requested_difficulty,
+                    t.inherit_context,
+                    None::<ResumeInFlightGuard>,
+                )
+            };
 
             let is_hard = difficulty.as_deref().is_some_and(is_hard_difficulty);
+            let child_max_rounds = t
+                .max_rounds
+                .filter(|&n| n > 0)
+                .map(|n| n.clamp(1, 64))
+                .or(max_rounds);
+            let artifact_store = self.artifact_store.read().ok().and_then(|g| g.clone());
 
             let inherited_ctx = if inherit_context {
                 if cached_inherited_context.is_none() {
@@ -837,6 +934,7 @@ impl Tool for TaskTool {
                 immediate_blocks.push((label.clone(), spawned_block, false));
                 let bg_handle_for_task = Arc::clone(&bg_handle);
                 tokio::spawn(async move {
+                    let _inflight_guard = inflight_guard;
                     let _permit = match &sem {
                         Some(sem) => Some(
                             sem.clone()
@@ -857,6 +955,7 @@ impl Tool for TaskTool {
                         )
                         .with_background_handle(Arc::clone(&bg_handle_for_task)),
                     );
+                    let telemetry_hook = Arc::clone(&progress_hook);
                     let (outcome, snapshot) = spawn_and_run_child(
                         provider,
                         tools,
@@ -867,7 +966,7 @@ impl Tool for TaskTool {
                         child_cancel,
                         progress_hook,
                         tool_loop_policy,
-                        max_rounds,
+                        child_max_rounds,
                         role,
                         &scope,
                         &inherited_worker_middlewares,
@@ -891,6 +990,7 @@ impl Tool for TaskTool {
                         }
                     }
                     let receipt_ledger = ledger.lock().map(|l| l.clone()).unwrap_or_default();
+                    let telemetry = telemetry_hook.snapshot_telemetry();
                     let (rendered_block, is_err) = render_subtask_outcome(
                         &label,
                         &agent_id,
@@ -899,6 +999,8 @@ impl Tool for TaskTool {
                         role,
                         outcome,
                         &receipt_ledger,
+                        artifact_store.as_deref(),
+                        Some(telemetry),
                     );
                     let status_label = if is_err {
                         if bg_handle_for_task.cancel.is_cancelled() {
@@ -927,6 +1029,7 @@ impl Tool for TaskTool {
             ));
 
             set.spawn(async move {
+                let _inflight_guard = inflight_guard;
                 let _permit = match &sem {
                     Some(sem) => Some(
                         sem.clone()
@@ -949,6 +1052,7 @@ impl Tool for TaskTool {
                     hook_cancel,
                     ledger.clone(),
                 ));
+                let telemetry_hook = Arc::clone(&progress_hook);
                 let (outcome, snapshot) = spawn_and_run_child(
                     provider,
                     tools,
@@ -959,7 +1063,7 @@ impl Tool for TaskTool {
                     child_cancel,
                     progress_hook,
                     tool_loop_policy,
-                    max_rounds,
+                    child_max_rounds,
                     role,
                     &scope,
                     &inherited_worker_middlewares,
@@ -983,6 +1087,7 @@ impl Tool for TaskTool {
                     }
                 }
                 let receipt_ledger = ledger.lock().map(|l| l.clone()).unwrap_or_default();
+                let telemetry = telemetry_hook.snapshot_telemetry();
                 let head = if outcome.stop == StopReason::Stopped {
                     format!("\u{2713} done \u{b7} {label}")
                 } else {
@@ -997,6 +1102,8 @@ impl Tool for TaskTool {
                     role,
                     outcome,
                     &receipt_ledger,
+                    artifact_store.as_deref(),
+                    Some(telemetry),
                 );
                 (label, block, is_err)
             });
@@ -1085,6 +1192,16 @@ async fn spawn_and_run_child(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SubtaskTelemetry {
+    rounds: u32,
+    duration_ms: u64,
+    input_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_subtask_outcome(
     label: &str,
     agent_id: &str,
@@ -1093,6 +1210,8 @@ fn render_subtask_outcome(
     role: SubagentRole,
     outcome: Outcome,
     ledger: &ActionReceiptLedger,
+    artifact_store: Option<&ArtifactStore>,
+    telemetry: Option<SubtaskTelemetry>,
 ) -> (String, bool) {
     let is_err = outcome.stop != StopReason::Stopped;
     let produced = if !outcome.text.is_empty() {
@@ -1105,7 +1224,7 @@ fn render_subtask_outcome(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let produced = compact_subtask_output(&produced);
+    let produced = compact_subtask_output_with_store(&produced, artifact_store);
     let receipt = if role.is_worker() {
         ledger.render_worker_receipt()
     } else {
@@ -1141,7 +1260,9 @@ fn render_subtask_outcome(
         ("completed", "task_result", b)
     };
     (
-        render_task_block(label, agent_id, desc, model, state, tag, &body),
+        render_task_block_with_telemetry(
+            label, agent_id, desc, model, state, tag, &body, telemetry,
+        ),
         is_err,
     )
 }
@@ -1618,6 +1739,13 @@ fn tail_boundary(s: &str, n: usize) -> usize {
 /// Compact oversized subtask output to protect the parent context window.
 /// Preserves UTF-8 char boundaries and keeps head + tail with a clear compaction banner.
 pub fn compact_subtask_output(raw: &str) -> String {
+    compact_subtask_output_with_store(raw, None)
+}
+
+/// Like [`compact_subtask_output`], spilling the full uncompacted output into `store`
+/// (`artifact://<id>`) when `raw.len() > MAX_SUBTASK_OUTPUT_BYTES` so omitted middle
+/// sections remain 100% recoverable via `read(path="artifact://<id>")`.
+pub fn compact_subtask_output_with_store(raw: &str, store: Option<&ArtifactStore>) -> String {
     if raw.len() <= MAX_SUBTASK_OUTPUT_BYTES {
         return raw.to_string();
     }
@@ -1634,8 +1762,17 @@ pub fn compact_subtask_output(raw: &str) -> String {
     let total_bytes = raw.len();
     let omitted_bytes = total_bytes.saturating_sub(head.len() + tail.len());
 
+    let artifact_note = store
+        .and_then(|s| s.put(raw.as_bytes()).ok())
+        .map(|id| {
+            format!(
+                " — full output saved to artifact://{id}; call read(path=\"artifact://{id}\", offset=1, limit=200) or read(path=\"artifact://{id}\", keyword=\"<term>\") to inspect"
+            )
+        })
+        .unwrap_or_default();
+
     format!(
-        "{head}\n\n[... subagent output compacted: {total_bytes} bytes total, {omitted_bytes} bytes omitted to protect context window ...]\n\n{tail}"
+        "{head}\n\n[... subagent output compacted: {total_bytes} bytes total, {omitted_bytes} bytes omitted to protect context window{artifact_note} ...]\n\n{tail}"
     )
 }
 
@@ -1651,6 +1788,7 @@ struct SubtaskProgressHook {
     /// so cancellation propagates through this token; gate emits on it so a
     /// non-cooperative child cannot resurrect stale activity after the parent moved on.
     cancel: tokio_util::sync::CancellationToken,
+    started_at: std::time::Instant,
     live: Mutex<SubtaskLiveState>,
     ledger: Arc<Mutex<ActionReceiptLedger>>,
     background_handle: Option<Arc<BackgroundTaskHandle>>,
@@ -1659,6 +1797,10 @@ struct SubtaskProgressHook {
 #[derive(Default)]
 struct SubtaskLiveState {
     activity: String,
+    rounds: u32,
+    input_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
     total_tokens: u64,
     round_chars: usize,
     text_tail: String,
@@ -1695,9 +1837,27 @@ impl SubtaskProgressHook {
             label,
             localized_zh,
             cancel,
+            started_at: std::time::Instant::now(),
             live: Mutex::new(SubtaskLiveState::default()),
             ledger,
             background_handle: None,
+        }
+    }
+
+    fn snapshot_telemetry(&self) -> SubtaskTelemetry {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        let Ok(live) = self.live.lock() else {
+            return SubtaskTelemetry {
+                duration_ms: elapsed_ms,
+                ..Default::default()
+            };
+        };
+        SubtaskTelemetry {
+            rounds: live.rounds,
+            duration_ms: elapsed_ms,
+            input_tokens: live.input_tokens,
+            cached_tokens: live.cached_tokens,
+            output_tokens: live.output_tokens.max(live.total_tokens),
         }
     }
 
@@ -1856,6 +2016,16 @@ impl SubtaskProgressHook {
                 return;
             };
             let estimated = (live.round_chars / 4) as u64;
+            live.rounds = live.rounds.saturating_add(1);
+            if let Some(meta) = response.meta.as_ref() {
+                live.input_tokens = live.input_tokens.saturating_add(meta.tokens.prompt as u64);
+                live.cached_tokens = live.cached_tokens.saturating_add(meta.tokens.cached as u64);
+                live.output_tokens = live
+                    .output_tokens
+                    .saturating_add((meta.tokens.completion as u64).max(estimated));
+            } else {
+                live.output_tokens = live.output_tokens.saturating_add(estimated);
+            }
             let reported = response
                 .meta
                 .as_ref()
@@ -2030,8 +2200,29 @@ fn render_task_block(
     tag: &str,
     body: &str,
 ) -> String {
+    render_task_block_with_telemetry(id, agent_id, summary, model, state, tag, body, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_task_block_with_telemetry(
+    id: &str,
+    agent_id: &str,
+    summary: &str,
+    model: &str,
+    state: &str,
+    tag: &str,
+    body: &str,
+    telemetry: Option<SubtaskTelemetry>,
+) -> String {
+    let telem_attrs = match telemetry {
+        Some(t) => format!(
+            " rounds=\"{}\" duration_ms=\"{}\" input_tokens=\"{}\" cached_tokens=\"{}\" output_tokens=\"{}\"",
+            t.rounds, t.duration_ms, t.input_tokens, t.cached_tokens, t.output_tokens
+        ),
+        None => String::new(),
+    };
     format!(
-        "<task id=\"{id}\" agent_id=\"{agent_id}\" model=\"{model}\" state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+        "<task id=\"{id}\" agent_id=\"{agent_id}\" model=\"{model}\"{telem_attrs} state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
     )
 }
 
@@ -2776,6 +2967,7 @@ mod tests {
             resume_agent_id: None,
             run_in_background: false,
             inherit_context: false,
+            max_rounds: None,
         };
         let tasks = vec![
             mk("worker", vec!["src/a/**"]), // #1 ok
@@ -2810,7 +3002,7 @@ mod tests {
             base + 1,
             "verifier receives VerifierReadOnlyShellGuard"
         );
-        let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+        let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths::default())];
         assert_eq!(
             child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &inherited).len(),
             base,
@@ -2831,7 +3023,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_sensitive_path_denial_is_terminal() {
-        let gate = DenySensitivePaths;
+        let gate = DenySensitivePaths::default();
         let tool: Arc<dyn Tool> = Arc::new(super::super::BashTool);
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(events, None);
@@ -2861,6 +3053,7 @@ mod tests {
             resume_agent_id: None,
             run_in_background: false,
             inherit_context: false,
+            max_rounds: None,
         };
         let tasks = vec![
             mk("Worker", vec!["src/**"]), // PascalCase ok

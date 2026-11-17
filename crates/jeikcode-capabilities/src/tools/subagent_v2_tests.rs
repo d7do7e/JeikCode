@@ -727,3 +727,91 @@ async fn resume_agent_id_preserves_hard_difficulty_when_omitted_and_allows_expli
     assert_eq!(decoded.difficulty, None);
     assert!(!decoded.inherit_context);
 }
+
+#[tokio::test]
+async fn subagent_spills_oversized_output_to_artifact_store_and_emits_telemetry_and_guards_concurrent_resume(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact_store = Arc::new(
+        crate::tools::output_artifact::ArtifactStore::new_standalone(dir.path().join("artifacts")),
+    );
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+
+    let huge_middle = "MIDDLE_CRITIQUE_EVIDENCE_TOKEN_".repeat(600);
+    let huge_reply = format!("HEAD_START\n{}\nTAIL_END", huge_middle);
+    let huge_reply_c = huge_reply.clone();
+
+    let make_provider = move || {
+        let reply = huge_reply_c.clone();
+        Arc::new(ScriptedProvider::new(
+            vec![vec![
+                StreamEvent::TextDelta(reply),
+                StreamEvent::Usage(jeikcode_kernel::stream::TokenUsage {
+                    prompt: 1200,
+                    completion: 450,
+                    cached: 900,
+                }),
+                StreamEvent::Done { truncated: false },
+            ]],
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        )) as Arc<dyn LlmProvider>
+    };
+
+    let tool = TaskTool::new(
+        make_provider.clone(),
+        make_provider,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    )
+    .with_optional_artifact_store(Some(artifact_store.clone()));
+    tool.bind_session("sess-main");
+
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"big critique","prompt":"audit","subagent_type":"explore","max_rounds":1}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("rounds=\"1\"")
+            && out.content.contains("input_tokens=\"1200\"")
+            && out.content.contains("cached_tokens=\"900\"")
+            && out.content.contains(" state=\"completed\">"),
+        "task header must carry telemetry attributes and end with state: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("full output saved to artifact://"),
+        "oversized subagent output must spill to artifact store: {}",
+        out.content
+    );
+
+    let agent_id = extract_attr(&out.content, "agent_id").expect("agent_id in header");
+
+    // Concurrent resume of the same agent_id in one batch must reject the second task cleanly
+    let batch_resume = serde_json::json!({
+        "tasks": [
+            {
+                "description": "r1",
+                "prompt": "first resume",
+                "resume_agent_id": agent_id
+            },
+            {
+                "description": "r2",
+                "prompt": "concurrent duplicate resume",
+                "resume_agent_id": agent_id
+            }
+        ]
+    })
+    .to_string();
+    let batch_out = tool.execute(&batch_resume, &tool_ctx(dir.path())).await;
+    assert!(
+        batch_out.content.contains("already running"),
+        "second concurrent resume of same agent_id must be rejected: {}",
+        batch_out.content
+    );
+}
