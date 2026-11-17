@@ -1098,16 +1098,17 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \
-             \u{20}\u{20}/goal <condition>     set a new goal; agent loops until the evaluator says met\n  \
-             \u{20}\u{20}/goal                 show current goal status\n  \
-             \u{20}\u{20}/goal status          same as above\n  \
-             \u{20}\u{20}/goal clear           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
-             \u{20}\u{20}/goal help            this help\n  \
+             \u{20}\u{20}/goal <condition>                     set a new goal; loops until verified met\n  \
+             \u{20}\u{20}/goal --until-stopped <condition>     continuous rollover with git milestone checkpoints\n  \
+             \u{20}\u{20}/goal --checkpoint <condition>        save non-destructive git checkpoint refs\n  \
+             \u{20}\u{20}/goal --verify|--no-verify <cond>     force or skip the blind read-only verifier\n  \
+             \u{20}\u{20}/goal                                 show current goal status\n  \
+             \u{20}\u{20}/goal status                          same as above\n  \
+             \u{20}\u{20}/goal clear                           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
+             \u{20}\u{20}/goal help                            this help\n  \
              Notes:\n  \
-             \u{20}\u{20}- A fast model evaluates each round; configure via [providers] +\n  \
-             \u{20}\u{20}\u{20}\u{20}evaluator_provider in ~/.jeikcode/config.toml.\n  \
-             \u{20}\u{20}- No built-in round / time cap — express budgets in the condition\n  \
-             \u{20}\u{20}\u{20}\u{20}text itself (e.g. \"or stop after 20 turns\"). CC's /goal works the same way.\n  \
+             \u{20}\u{20}- A fast model evaluates each round; workspace edits trigger the blind\n  \
+             \u{20}\u{20}\u{20}\u{20}read-only verifier and a no-progress circuit breaker guards stuck loops.\n  \
              \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n", condition, round, mins, secs).into(),

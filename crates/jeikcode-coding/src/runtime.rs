@@ -30,10 +30,14 @@ use jeikcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    classify_followup, evaluate_goal, goal_cap_stop_note, goal_continuation_message,
-    summarize_for_goal, EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState,
-    GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    classify_followup, goal_cap_stop_note, goal_continuation_message, summarize_for_goal,
+    EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal,
+    LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
+use crate::goal_harness::{
+    compute_workspace_fingerprint, goal_stall_limit_from_env, parse_goal_launch, GoalOptions,
+};
+use crate::goal_verifier::{evaluate_goal_with_harness, GoalEvalJob};
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
@@ -467,6 +471,10 @@ pub enum DriverCommand {
         correlation_id: u64,
     },
     StartGoal(String),
+    StartGoalWithOptions {
+        condition: String,
+        options: GoalOptions,
+    },
     StopGoal,
     StartLoop(String),
     StopLoop,
@@ -1270,10 +1278,22 @@ impl CodingRuntimeHandle {
                 }
             }
             DriverCommand::StartGoal(condition) => {
+                let (clean_condition, options) = parse_goal_launch(&condition);
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::StartGoal {
+                    generation,
+                    condition: clean_condition,
+                    options,
+                    done,
+                    recovery_tx: self.tx.clone(),
+                }
+            }
+            DriverCommand::StartGoalWithOptions { condition, options } => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::StartGoal {
                     generation,
                     condition,
+                    options,
                     done,
                     recovery_tx: self.tx.clone(),
                 }
@@ -1794,12 +1814,22 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn start_goal(&self, condition: impl Into<String>) -> Result<(), RuntimeError> {
+        let (clean_condition, options) = parse_goal_launch(&condition.into());
+        self.start_goal_with_options(clean_condition, options).await
+    }
+
+    pub async fn start_goal_with_options(
+        &self,
+        condition: impl Into<String>,
+        options: GoalOptions,
+    ) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::StartGoal {
                 generation: runtime_state_generation(state),
                 condition: condition.into(),
+                options,
                 done,
                 recovery_tx: self.tx.clone(),
             })
@@ -2286,6 +2316,7 @@ pub enum CodingRuntimeControl {
     StartGoal {
         generation: u64,
         condition: String,
+        options: GoalOptions,
         done: oneshot::Sender<Result<(), RuntimeError>>,
         /// Self-send channel so the owner loop can post an [`AdjustGoalRounds`] once
         /// the live per-plan round budget has been resolved off the loop.
@@ -3075,6 +3106,13 @@ fn spawn_runtime_owner_with_optional_agent(
                     match outcome.result {
                         GoalResult::Met(verdict) => {
                             if let Some(state) = goal.as_mut() {
+                                state.stall.reset_stalls();
+                                if let Some(fp) = outcome.verified_fingerprint {
+                                    state.stall.mark_verified(fp);
+                                }
+                                if let Some(cp_ref) = outcome.checkpoint_ref {
+                                    state.checkpoint_refs.push(cp_ref);
+                                }
                                 state.mark_satisfied(verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
@@ -3083,17 +3121,52 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         GoalResult::NotMet(verdict) => {
                             if let Some(state) = goal.as_mut() {
-                                state.round = state.round.saturating_add(1);
+                                state.bump_round();
                                 state.last_reason = Some(verdict.clone());
-                                if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
-                                    state.update_progress_recap(summarize_for_goal(
-                                        &snapshot.messages,
-                                        Some(&verdict),
+                                if let Some(cp_ref) = outcome.checkpoint_ref {
+                                    state.checkpoint_refs.push(cp_ref.clone());
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                        format!("goal milestone checkpoint saved: {cp_ref}"),
                                     ));
                                 }
-                                continuation =
-                                    Some(goal_continuation_message(&verdict, &state.condition));
-                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                let stall_limit = goal_stall_limit_from_env();
+                                let stalled = outcome.fingerprint.as_ref().is_some_and(|fp| {
+                                    state.stall.record_not_met(
+                                        fp,
+                                        &verdict,
+                                        outcome.had_snapshot_mutations,
+                                        stall_limit,
+                                    )
+                                });
+                                if stalled {
+                                    let note = format!(
+                                        "paused by no-progress circuit breaker after {stall_limit} identical rounds; send guidance to continue or /goal stop to end"
+                                    );
+                                    state.pause_at_cap(note.clone());
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
+                                    finish_reason = Some(StopReason::MaxRounds);
+                                    keep_goal_on_eval = true;
+                                } else {
+                                    if state.batch_rollover_due() {
+                                        state.rollover_batch();
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                            format!(
+                                                "goal continuous batch #{} rolled over (total rounds: {})",
+                                                state.rollovers, state.total_rounds
+                                            ),
+                                        ));
+                                    }
+                                    if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
+                                        state.update_progress_recap(summarize_for_goal(
+                                            &snapshot.messages,
+                                            Some(&verdict),
+                                        ));
+                                    }
+                                    continuation =
+                                        Some(goal_continuation_message(&verdict, &state.condition));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
                             }
                         }
                         GoalResult::Error(error) => {
@@ -5343,7 +5416,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done, recovery_tx }) => {
+                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, options, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -5378,12 +5451,21 @@ fn spawn_runtime_owner_with_optional_agent(
                             // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
                             // live request quota, resolved OFF the loop and applied via a self-sent
                             // AdjustGoalRounds; env override wins and any miss keeps the default.
-                            let next = GoalState::new(
+                            let mut next = GoalState::new_with_options(
                                 controller_id,
                                 condition,
                                 runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
+                                options,
                             );
+                            let wd = runtime
+                                .parts
+                                .shared_cwd
+                                .read()
+                                .map(|g| g.clone())
+                                .unwrap_or_else(|_| runtime.config.working_dir.clone());
+                            next.stall.baseline_fingerprint =
+                                Some(compute_workspace_fingerprint(&wd).hash);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
                             goal = Some(next);
                             let _ = done.send(Ok(()));
@@ -6053,25 +6135,94 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let condition = state.condition.clone();
                                             let controller_id = state.id;
                                             let cancel = state.cancel.clone();
-                                            let summary = summarize_for_goal(
-                                                &snapshot.messages,
-                                                state.last_reason.as_deref(),
-                                            );
-                                            let provider = resources.as_ref().and_then(|runtime| {
-                                                let session_id = runtime.parts.session.as_ref().map(|binding| binding.id.as_str());
-                                                build_goal_evaluator_provider(
-                                                    &runtime.provider_factory,
-                                                    &runtime.config,
-                                                    session_id,
-                                                )
-                                                .ok()
+                                            let previous_reason = state.last_reason.clone();
+                                            let baseline_fingerprint =
+                                                state.stall.baseline_fingerprint.clone();
+                                            let options = state.options.clone();
+                                            let eval_round = state.total_rounds.max(state.round);
+                                            let checkpoint_requested =
+                                                options.checkpoint_milestones
+                                                    && state.batch_rollover_due();
+                                            let eval_setup = resources.as_ref().and_then(|runtime| {
+                                                let session_id = runtime
+                                                    .parts
+                                                    .session
+                                                    .as_ref()
+                                                    .map(|binding| binding.id.as_str());
+                                                let evaluator_provider =
+                                                    build_goal_evaluator_provider(
+                                                        &runtime.provider_factory,
+                                                        &runtime.config,
+                                                        session_id,
+                                                    )
+                                                    .ok()?;
+                                                let verifier_factory =
+                                                    Arc::clone(&runtime.provider_factory);
+                                                let verifier_config = runtime.config.clone();
+                                                let verifier_session_id =
+                                                    session_id.map(str::to_string);
+                                                let make_verifier_provider: Box<
+                                                    dyn FnOnce() -> Option<Arc<dyn LlmProvider>>
+                                                        + Send,
+                                                > = Box::new(move || {
+                                                    verifier_config
+                                                        .subagent_capable_provider
+                                                        .as_ref()
+                                                        .and_then(|cell| cell.get())
+                                                        .or_else(|| {
+                                                            verifier_factory
+                                                                .build(
+                                                                    &verifier_config,
+                                                                    verifier_session_id.as_deref(),
+                                                                )
+                                                                .ok()
+                                                        })
+                                                });
+                                                let working_dir = runtime
+                                                    .parts
+                                                    .shared_cwd
+                                                    .read()
+                                                    .map(|g| g.clone())
+                                                    .unwrap_or_else(|_| {
+                                                        runtime.config.working_dir.clone()
+                                                    });
+                                                let bash_runtime =
+                                                    Arc::clone(&runtime.parts.bash_runtime);
+                                                Some((
+                                                    evaluator_provider,
+                                                    make_verifier_provider,
+                                                    working_dir,
+                                                    bash_runtime,
+                                                ))
                                             });
                                             held_turn = Some((turn_id, reason, snapshot.clone(), stats));
                                             let tx = goal_eval_tx.clone();
-                                            if let Some(provider) = provider {
+                                            if let Some((
+                                                evaluator_provider,
+                                                make_verifier_provider,
+                                                working_dir,
+                                                bash_runtime,
+                                            )) = eval_setup
+                                            {
+                                                let job = GoalEvalJob {
+                                                    generation,
+                                                    controller_id,
+                                                    condition,
+                                                    previous_reason,
+                                                    snapshot,
+                                                    working_dir,
+                                                    bash_runtime,
+                                                    evaluator_provider,
+                                                    make_verifier_provider,
+                                                    baseline_fingerprint,
+                                                    options,
+                                                    round: eval_round,
+                                                    checkpoint_requested,
+                                                    cancel,
+                                                };
                                                 tokio::spawn(async move {
                                                     let inner = tokio::spawn(async move {
-                                                        evaluate_goal(generation, controller_id, provider, condition, summary, cancel).await
+                                                        evaluate_goal_with_harness(job).await
                                                     });
                                                     let outcome = match inner.await {
                                                         Ok(outcome) => outcome,
@@ -6082,6 +6233,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                                                 "evaluator task failed".into(),
                                                             ),
                                                             usage: None,
+                                                            fingerprint: None,
+                                                            verified_fingerprint: None,
+                                                            had_snapshot_mutations: false,
+                                                            verifier_report: None,
+                                                            checkpoint_ref: None,
                                                         },
                                                     };
                                                     let _ = tx.send(outcome);
@@ -6093,12 +6249,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 controller_id,
                                                 result: GoalResult::Error("could not build evaluator provider".into()),
                                                 usage: None,
+                                                fingerprint: None,
+                                                verified_fingerprint: None,
+                                                had_snapshot_mutations: false,
+                                                verifier_report: None,
+                                                checkpoint_ref: None,
                                             });
                                             continue;
                                         } else if recoverable {
                                             state.unproductive = state.unproductive.saturating_add(1);
                                             if state.unproductive < MAX_UNPRODUCTIVE {
-                                                state.round = state.round.saturating_add(1);
+                                                state.bump_round();
                                                 state.last_reason = Some(format!("round ended: {reason:?}"));
                                                 let text = goal_continuation_message(
                                                     state.last_reason.as_deref().unwrap_or("round failed"),
@@ -14819,5 +14980,172 @@ mod tests {
         );
         let _ = agent.commands.send(AgentCommand::Shutdown);
         let _ = agent.task.await;
+    }
+
+    #[tokio::test]
+    async fn continuous_goal_rolls_over_batch_without_pausing_at_cap() {
+        #[derive(Default)]
+        struct DistinctNotMetFactory {
+            count: std::sync::atomic::AtomicUsize,
+        }
+        impl CodingProviderFactory for DistinctNotMetFactory {
+            fn build(
+                &self,
+                _config: &CodingAgentConfig,
+                _session_id: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                let n = self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(jeikcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        jeikcode_kernel::stream::StreamEvent::TextDelta(format!(
+                            "Verdict: no step {n} still remaining"
+                        )),
+                        jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ],
+                ])))
+            }
+        }
+
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(Arc::new(DistinctNotMetFactory::default()), config)
+            .await;
+
+        handle
+            .start_goal("--until-stopped keep polishing")
+            .await
+            .unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(Pursuing)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        // Drive 2 rounds across a goal_max_rounds=1 batch boundary: continuous mode
+        // must roll over and dispatch a 2nd continuation rather than pausing at cap.
+        for _ in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("working", vec![])]),
+                })
+                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                    .await
+                    .expect("continuous goal must dispatch continuation across batch boundary"),
+                Some(AgentCommand::SendSyntheticMessage { .. })
+            ));
+        }
+
+        let mut saw_rollover_notice = false;
+        while let Ok(ev) = runtime_events.try_recv() {
+            if let CodingRuntimeEvent::ControllerWarning(msg) = ev {
+                if msg.contains("rolled over") {
+                    saw_rollover_notice = true;
+                }
+            }
+        }
+        assert!(saw_rollover_notice, "expected continuous rollover warning");
+
+        handle.stop_goal().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_circuit_breaker_pauses_after_identical_stalled_rounds() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 10;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(Pursuing)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        for round in 0..3 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("stuck", vec![])]),
+                })
+                .unwrap();
+            if round < 2 {
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("continuation expected before stall limit"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        let mut saw_circuit_breaker = false;
+        let mut paused_at_cap = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::ControllerWarning(msg))
+                        if msg.contains("circuit breaker") =>
+                    {
+                        saw_circuit_breaker = true;
+                    }
+                    Some(CodingRuntimeEvent::GoalChanged(p))
+                        if p.phase == GoalPhase::PausedAtCap =>
+                    {
+                        paused_at_cap = true;
+                    }
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before circuit breaker terminal"),
+                }
+            }
+        })
+        .await
+        .expect("circuit breaker did not finish turn");
+
+        assert!(saw_circuit_breaker);
+        assert!(paused_at_cap);
+        handle.shutdown().await.unwrap();
     }
 }

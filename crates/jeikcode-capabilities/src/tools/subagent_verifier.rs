@@ -6,15 +6,22 @@
 //! shell commands).
 
 use async_trait::async_trait;
+use jeikcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
+use jeikcode_kernel::event::StopReason;
 use jeikcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
+use jeikcode_kernel::provider::LlmProvider;
 use jeikcode_kernel::request::RequestCtx;
-use jeikcode_kernel::tool::{Tool, ToolCall};
+use jeikcode_kernel::tool::{MountedTools, Tool, ToolCall};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::bash::{
     bash_invocations, check_destructive_command, is_read_only_bash, output_redirect_target,
     BashInvocation,
 };
+use super::subagent_context::build_child_persona;
+use super::task::{DenyOfflineNetwork, DenySensitivePaths};
 
 /// Subagent execution role parsed from `SubTask.subagent_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -354,6 +361,104 @@ fn validate_dart_flutter(cmd: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Structured verdict produced by a blind fresh-context `verifier` run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierVerdict {
+    pub passed: bool,
+    pub summary: String,
+    pub report: String,
+}
+
+/// Parse a `verifier` subagent report strictly: defaults to `passed: false` unless an
+/// explicit `VERDICT: PASS` line is present and no `VERDICT: NEEDS_WORK` overrides it.
+pub fn parse_verifier_verdict(text: &str) -> VerifierVerdict {
+    let mut verdict_pass: Option<bool> = None;
+    let mut summary: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("verdict:") {
+            let token = rest.trim();
+            if token.starts_with("pass") {
+                verdict_pass = Some(true);
+            } else if token.starts_with("needs_work")
+                || token.starts_with("needs work")
+                || token.starts_with("fail")
+            {
+                verdict_pass = Some(false);
+            }
+        } else if summary.is_none() && lower.starts_with("summary:") {
+            let s = line["summary:".len()..].trim();
+            if !s.is_empty() {
+                summary = Some(s.to_string());
+            }
+        }
+    }
+    let passed = verdict_pass.unwrap_or(false);
+    let summary = summary.unwrap_or_else(|| {
+        if passed {
+            "blind verifier confirmed PASS".to_string()
+        } else {
+            "blind verifier did not emit VERDICT: PASS".to_string()
+        }
+    });
+    VerifierVerdict {
+        passed,
+        summary,
+        report: text.trim().to_string(),
+    }
+}
+
+/// Run an isolated, fresh-context, read-only `verifier` agent against `working_dir`
+/// using the provided `MountedTools` (which must omit file-mutation tools; `VerifierReadOnlyShellGuard`,
+/// `DenySensitivePaths`, and `DenyOfflineNetwork` are always enforced).
+pub async fn run_blind_verifier(
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    working_dir: PathBuf,
+    prompt: String,
+    project_instructions: Option<String>,
+    max_rounds: u32,
+    cancel: CancellationToken,
+) -> Result<VerifierVerdict, String> {
+    let persona = build_child_persona(
+        VERIFIER_PERSONA,
+        SubagentRole::Verifier,
+        &[],
+        project_instructions.as_deref(),
+    );
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .persona(persona)
+        .working_dir(working_dir)
+        .cancel_token(cancel)
+        .tool_loop_policy(ToolLoopPolicy::default())
+        .middleware(Arc::new(DenySensitivePaths))
+        .middleware(Arc::new(DenyOfflineNetwork))
+        .middleware(Arc::new(VerifierReadOnlyShellGuard));
+    if max_rounds != 0 {
+        builder = builder.max_rounds(max_rounds);
+    }
+    let agent = builder.build();
+    let outcome =
+        tokio::spawn(async move { agent.run_to_completion(prompt, AutoRespond::AllowAll).await })
+            .await
+            .map_err(|e| format!("blind verifier task failed: {e}"))?;
+
+    if outcome.stop != StopReason::Stopped {
+        let err_detail = outcome
+            .error
+            .unwrap_or_else(|| format!("stopped with {:?}", outcome.stop));
+        return Ok(VerifierVerdict {
+            passed: false,
+            summary: format!("blind verifier did not complete cleanly ({err_detail})"),
+            report: outcome.text.trim().to_string(),
+        });
+    }
+    Ok(parse_verifier_verdict(&outcome.text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +498,23 @@ mod tests {
             SubagentRole::parse_opt("reviewer"),
             Some(SubagentRole::Verifier)
         );
+    }
+
+    #[test]
+    fn parse_verifier_verdict_defaults_fail_and_parses_structured_report() {
+        let pass = parse_verifier_verdict(
+            "VERDICT: PASS\nSUMMARY: All unit tests passed.\nCHECKS_RUN:\n- cargo test: PASS\nISSUES:\n- none",
+        );
+        assert!(pass.passed);
+        assert_eq!(pass.summary, "All unit tests passed.");
+
+        let fail = parse_verifier_verdict(
+            "VERDICT: NEEDS_WORK\nSUMMARY: 2 tests failing.\nCHECKS_RUN:\n- cargo test: FAIL\nISSUES:\n- src/lib.rs:10",
+        );
+        assert!(!fail.passed);
+        assert_eq!(fail.summary, "2 tests failing.");
+
+        let ambiguous = parse_verifier_verdict("Looks good to me!");
+        assert!(!ambiguous.passed);
     }
 }

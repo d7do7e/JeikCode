@@ -18,6 +18,10 @@ use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::goal_harness::{
+    GoalOptions, StallTracker, WorkspaceFingerprint, DEFAULT_CONTINUOUS_CHECKPOINT_INTERVAL,
+};
+
 pub(crate) const MAX_UNPRODUCTIVE: u32 = 5;
 const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -120,10 +124,31 @@ pub(crate) struct GoalState {
     /// failures. Hard round/time caps use the same public phase but must not rewrite
     /// an unrelated user `/compact` focus as a failure recovery request.
     recovery_pause: bool,
+    pub options: GoalOptions,
+    pub stall: StallTracker,
+    pub checkpoint_refs: Vec<String>,
+    pub total_rounds: u32,
+    pub rollovers: u32,
 }
 
 impl GoalState {
     pub fn new(id: u64, condition: String, max_rounds: u32, max_duration_secs: u64) -> Self {
+        Self::new_with_options(
+            id,
+            condition,
+            max_rounds,
+            max_duration_secs,
+            GoalOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        id: u64,
+        condition: String,
+        max_rounds: u32,
+        max_duration_secs: u64,
+        options: GoalOptions,
+    ) -> Self {
         let started_at = Instant::now();
         Self {
             id,
@@ -143,6 +168,11 @@ impl GoalState {
             max_duration_secs,
             progress_recap: None,
             recovery_pause: false,
+            options,
+            stall: StallTracker::default(),
+            checkpoint_refs: Vec::new(),
+            total_rounds: 0,
+            rollovers: 0,
         }
     }
 
@@ -155,7 +185,7 @@ impl GoalState {
                 Some(self.terminal.unwrap_or(GoalTerminal::Failed))
             },
             phase: self.phase,
-            round: self.round,
+            round: self.total_rounds.max(self.round),
             max_rounds: self.max_rounds,
             elapsed_secs: self.started_at.elapsed().as_secs(),
             condition: self.condition.clone(),
@@ -209,6 +239,7 @@ impl GoalState {
         self.active = true;
         self.phase = GoalPhase::Pursuing;
         self.round = 0;
+        self.total_rounds = 0;
         self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
         self.terminal = None;
         self.last_reason = None;
@@ -289,7 +320,7 @@ impl GoalState {
     }
 
     pub fn cap_reached(&self) -> Option<&'static str> {
-        if self.max_rounds.is_some_and(|max| self.round >= max) {
+        if !self.options.continuous && self.max_rounds.is_some_and(|max| self.round >= max) {
             return Some("round limit");
         }
         if self
@@ -299,6 +330,29 @@ impl GoalState {
             return Some("time limit");
         }
         None
+    }
+
+    pub fn batch_rollover_due(&self) -> bool {
+        if !self.options.continuous {
+            return false;
+        }
+        let interval = self
+            .max_rounds
+            .unwrap_or(DEFAULT_CONTINUOUS_CHECKPOINT_INTERVAL)
+            .max(1);
+        self.round >= interval
+    }
+
+    pub fn rollover_batch(&mut self) {
+        self.round = 0;
+        self.rollovers = self.rollovers.saturating_add(1);
+        self.deadline = (self.max_duration_secs != 0)
+            .then(|| Instant::now() + Duration::from_secs(self.max_duration_secs));
+    }
+
+    pub fn bump_round(&mut self) {
+        self.round = self.round.saturating_add(1);
+        self.total_rounds = self.total_rounds.saturating_add(1);
     }
 }
 
@@ -374,6 +428,11 @@ pub(crate) struct EvalOutcome {
     pub controller_id: u64,
     pub result: GoalResult,
     pub usage: Option<TokenUsage>,
+    pub fingerprint: Option<WorkspaceFingerprint>,
+    pub verified_fingerprint: Option<String>,
+    pub had_snapshot_mutations: bool,
+    pub verifier_report: Option<String>,
+    pub checkpoint_ref: Option<String>,
 }
 
 pub(crate) async fn evaluate_goal(
@@ -429,6 +488,11 @@ pub(crate) async fn evaluate_goal(
         controller_id,
         result: result.0,
         usage: result.1,
+        fingerprint: None,
+        verified_fingerprint: None,
+        had_snapshot_mutations: false,
+        verifier_report: None,
+        checkpoint_ref: None,
     }
 }
 

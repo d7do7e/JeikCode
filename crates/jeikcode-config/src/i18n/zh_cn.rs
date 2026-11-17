@@ -1078,16 +1078,17 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
              用法：\n  \
-             \u{20}\u{20}/goal <条件>          设定新目标；智能体循环执行直到评估器判定达成\n  \
-             \u{20}\u{20}/goal                 显示当前目标状态\n  \
-             \u{20}\u{20}/goal status          同上\n  \
-             \u{20}\u{20}/goal clear           停止当前目标（别名：stop、off、reset、none、cancel）\n  \
-             \u{20}\u{20}/goal help            显示本帮助\n  \
+             \u{20}\u{20}/goal <条件>                       设定新目标；循环执行直到验证达成\n  \
+             \u{20}\u{20}/goal --until-stopped <条件>       连续滚动推进并自动保存里程碑检查点\n  \
+             \u{20}\u{20}/goal --checkpoint <条件>          保存非破坏性检查点引用\n  \
+             \u{20}\u{20}/goal --verify|--no-verify <条件>  强制或跳过独立只读验证\n  \
+             \u{20}\u{20}/goal                              显示当前目标状态\n  \
+             \u{20}\u{20}/goal status                       同上\n  \
+             \u{20}\u{20}/goal clear                        停止当前目标（别名：stop、off、reset、none、cancel）\n  \
+             \u{20}\u{20}/goal help                         显示本帮助\n  \
              说明：\n  \
-             \u{20}\u{20}- 每轮由一个快速模型评估；通过 ~/.jeikcode/config.toml 中的 [providers] +\n  \
-             \u{20}\u{20}\u{20}\u{20}evaluator_provider 配置。\n  \
-             \u{20}\u{20}- 没有内置的轮次 / 时间上限——请在条件文本中自行表达预算\n  \
-             \u{20}\u{20}\u{20}\u{20}（例如 \"或在 20 轮后停止\"）。Claude Code 的 /goal 也是这样工作的。\n  \
+             \u{20}\u{20}- 每轮由快速模型评估；工作区发生变更时由独立只读验证器复核，\n  \
+             \u{20}\u{20}\u{20}\u{20}并由无进展熔断器拦截停滞循环。\n  \
              \u{20}\u{20}- 随时可用 Esc / Ctrl+C 停止目标。\n".into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ 目标：{}\n  轮次：{}\n  已用时：{}分 {}秒\n", condition, round, mins, secs).into(),

@@ -37,7 +37,7 @@ pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// `AutoRespond::AllowAll`, so a prompt would just auto-approve itself. The generic credential
 /// bash gate runs immediately before this one; this guard terminates any remaining sensitive
 /// path access rather than letting a child repeatedly rephrase it.
-struct DenySensitivePaths;
+pub(crate) struct DenySensitivePaths;
 
 #[async_trait]
 impl ToolMiddleware for DenySensitivePaths {

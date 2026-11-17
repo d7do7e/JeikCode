@@ -40,6 +40,8 @@ pub mod config_sync;
 pub mod context;
 mod controllers;
 pub mod custom_prompts;
+mod goal_harness;
+mod goal_verifier;
 pub mod parts;
 pub mod persona;
 pub mod plan_mode;
@@ -71,6 +73,7 @@ pub use config::{
     SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
+pub use goal_harness::{parse_goal_launch, GoalOptions};
 pub use init_prompt::INIT_PROMPT;
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `jeikcode_kernel`.

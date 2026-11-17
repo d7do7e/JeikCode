@@ -3702,13 +3702,15 @@ fn execute_slash_command_impl(
                     renderer.flush();
                 }
                 _ => {
-                    // Treat the entire trimmed input as the condition.
-                    // (Empty input is unreachable here — `head` would be ""
-                    // and the `"" | "status"` arm above would have matched.)
-                    let condition = trimmed.to_owned();
+                    // Parse optional leading flags (`--until-stopped`, `--checkpoint`, `--verify`, `--no-verify`)
+                    // while stripping them from the initial user prompt text sent to the agent.
+                    let (condition, options) = jeikcode_coding::parse_goal_launch(trimmed);
                     if ctx
                         .runtime
-                        .dispatch(jeikcode_coding::DriverCommand::StartGoal(condition.clone()))
+                        .dispatch(jeikcode_coding::DriverCommand::StartGoalWithOptions {
+                            condition: condition.clone(),
+                            options,
+                        })
                         .is_err()
                     {
                         renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
