@@ -535,3 +535,68 @@ async fn mesh_cycle_and_read_turns_enforce_guardrails_end_to_end() {
     rt_a.handle.shutdown().await.unwrap();
     rt_b.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jeikcode_home)]
+async fn unified_session_name_persists_and_restores_on_resume() {
+    let home = tempfile::tempdir().unwrap();
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+    let repo = tempfile::tempdir().unwrap();
+
+    // 1. Start a fresh session, run one turn, then rename via handle.set_mesh_name("planner").
+    let factory_1 = Arc::new(ScriptedFactory::new(vec![vec![
+        StreamEvent::TextDelta("initial turn done".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let mut rt_1 = CodingRuntime::start(start_cfg(repo.path(), factory_1, None))
+        .await
+        .unwrap();
+    let sid = rt_1.session.as_ref().unwrap().id.clone();
+
+    rt_1.handle.submit(UserInput::from("hello")).await.unwrap();
+    let _ = wait_turn_finished(&mut rt_1).await;
+
+    let assigned = rt_1
+        .handle
+        .set_mesh_name(Some("planner".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(assigned.as_deref(), Some("planner"));
+
+    // Persisted SessionMeta must have the unified title + user_renamed=true!
+    let mgr = jeikcode_capabilities::session::SessionManager::for_project(repo.path());
+    let meta = mgr.read_meta(&sid).unwrap();
+    assert_eq!(meta.name, "planner");
+    assert!(meta.user_renamed);
+
+    rt_1.handle.shutdown().await.unwrap();
+
+    // 2. Resume the saved session with NO --name: live mesh must automatically restore "planner".
+    let mut resume_cfg = start_cfg(repo.path(), Arc::new(ScriptedFactory::new(vec![])), None);
+    resume_cfg.prepare.session = SessionMode::Resume(sid.clone());
+    let rt_2 = CodingRuntime::start(resume_cfg).await.unwrap();
+    assert_eq!(
+        rt_2.session.as_ref().unwrap().mesh_name.as_deref(),
+        Some("planner")
+    );
+    let live = discover_live_sessions(&live_registry_dir(), None, Some(repo.path())).await;
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].session_id, sid);
+    assert_eq!(live[0].name.as_deref(), Some("planner"));
+
+    // 3. Another session started with --name "planner" while "planner" is live auto-suffixes cleanly.
+    let rt_other = CodingRuntime::start(start_cfg(
+        repo.path(),
+        Arc::new(ScriptedFactory::new(vec![])),
+        Some("planner"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        rt_other.session.as_ref().unwrap().mesh_name.as_deref(),
+        Some("planner-2")
+    );
+
+    rt_2.handle.shutdown().await.unwrap();
+    rt_other.handle.shutdown().await.unwrap();
+}

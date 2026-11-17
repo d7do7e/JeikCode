@@ -877,7 +877,7 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             "Use /sessions to list and switch sessions (running sessions show a badge).".into(),
         Msg::CmdDescResume => "List and switch between sessions (alias: use /sessions)".into(),
         Msg::CmdDescRename => "Rename current session".into(),
-        Msg::CmdDescName => "Show or set this session's live mesh nickname (/name <label>)".into(),
+        Msg::CmdDescName => "Show or set session name across /sessions & live mesh (/name [label])".into(),
         Msg::CmdDescModel =>
             "Set the default provider / model and switch this session".into(),
         Msg::CmdDescModelAdd =>

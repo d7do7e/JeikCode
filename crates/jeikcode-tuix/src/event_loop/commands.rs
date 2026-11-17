@@ -2243,11 +2243,13 @@ fn execute_slash_command_impl(
         "name" => {
             let trimmed = arg.trim();
             if trimmed.is_empty() {
-                let current_name = ctx
-                    .current_session
-                    .user_renamed
-                    .then(|| ctx.current_session.name.trim())
-                    .filter(|s| !s.is_empty());
+                let current_name = (!ctx.current_session.name.trim().is_empty()
+                    && (ctx.current_session.user_renamed
+                        || !jeikcode_capabilities::session::SessionMeta::name_needs_fallback(
+                            &ctx.current_session.name,
+                            &ctx.current_session.id,
+                        )))
+                .then(|| ctx.current_session.name.trim());
                 let clean_wd = jeikcode_coding::display_clean_path(&ctx.working_dir);
                 let repo_root =
                     jeikcode_capabilities::memory::resolve_canonical_repo_root(&ctx.working_dir);
@@ -2258,11 +2260,11 @@ fn execute_slash_command_impl(
                 );
                 let msg = match current_name {
                     Some(name) => format!(
-                        "  Session mesh name: {name}\n  Session ID:        {}\n  Working dir:       {clean_wd}\n",
+                        "  Session name:  {name}\n  Session ID:    {}\n  Working dir:   {clean_wd}\n",
                         ctx.current_session.id
                     ),
                     None => format!(
-                        "  Session mesh name: (unset — default `{default_label}`)\n  Session ID:        {}\n  Working dir:       {clean_wd}\n  Use `/name <label>` to set a live mesh nickname.\n",
+                        "  Session name:  (unset — mesh default `{default_label}`)\n  Session ID:    {}\n  Working dir:   {clean_wd}\n  Use `/name <label>` (or `/rename <label>`) to name this session across /sessions & live mesh.\n",
                         ctx.current_session.id
                     ),
                 };
@@ -2279,61 +2281,47 @@ fn execute_slash_command_impl(
                         if ctx
                             .runtime
                             .set_mesh_name(
-                                Some(valid_name),
+                                Some(valid_name.clone()),
                                 ctx.foreground_runtime_id,
                                 ctx.runtime_event_tx.clone(),
                             )
                             .is_err()
                         {
-                            renderer.render(UiLine::Error(
-                                "Runtime is still starting or unavailable; try `/name` again in a moment."
-                                    .to_string(),
-                            ));
-                            renderer.flush();
+                            let project_bucket = active_session_project_bucket(&ctx.working_dir);
+                            match perform_session_rename(
+                                &project_bucket,
+                                &ctx.current_session.id,
+                                &valid_name,
+                            ) {
+                                Ok((old_name, _)) => {
+                                    ctx.current_session.rename(valid_name.clone());
+                                    ctx.bg_manager.set_foreground_session(
+                                        ctx.current_session.clone(),
+                                        ctx.working_dir.clone(),
+                                    );
+                                    renderer.render(UiLine::CommandOutput(
+                                        t(Msg::SessionRenamed {
+                                            old: &old_name,
+                                            new: &valid_name,
+                                        })
+                                        .into_owned(),
+                                    ));
+                                    renderer.flush();
+                                }
+                                Err(e) => {
+                                    renderer.render(UiLine::Error(
+                                        t(Msg::SessionSaveFailed {
+                                            error: &e.to_string(),
+                                        })
+                                        .into_owned(),
+                                    ));
+                                    renderer.flush();
+                                }
+                            }
                         }
                     }
                     Err(err) => {
                         renderer.render(UiLine::Error(err));
-                        renderer.flush();
-                    }
-                }
-            }
-        }
-        "rename" => {
-            // Rename targets `ctx.current_session` (the in-flight conversation),
-            // not whichever id `/resume` last loaded — the user expects /rename
-            // to relabel the conversation they're currently typing into. The
-            // session is always initialised at startup, so we never need a
-            // "load a session first" fallback.
-            if let Some(err) = validate_session_name(arg) {
-                renderer.render(UiLine::Error(err));
-                renderer.flush();
-            } else {
-                let new_name = arg.trim().to_string();
-                let project_bucket = active_session_project_bucket(&ctx.working_dir);
-                match perform_session_rename(&project_bucket, &ctx.current_session.id, &new_name) {
-                    Ok((old_name, _)) => {
-                        ctx.current_session.rename(new_name.clone());
-                        ctx.bg_manager.set_foreground_session(
-                            ctx.current_session.clone(),
-                            ctx.working_dir.clone(),
-                        );
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::SessionRenamed {
-                                old: &old_name,
-                                new: &new_name,
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
-                    }
-                    Err(e) => {
-                        renderer.render(UiLine::Error(
-                            t(Msg::SessionSaveFailed {
-                                error: &e.to_string(),
-                            })
-                            .into_owned(),
-                        ));
                         renderer.flush();
                     }
                 }

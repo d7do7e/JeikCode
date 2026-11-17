@@ -90,6 +90,8 @@ const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("continue", "sessions"),
     // Keep `/exit` working while presenting one canonical quit command.
     ("exit", "quit"),
+    // `/rename <label>` is unified with `/name [label]`.
+    ("rename", "name"),
     // `/modelsadd`, `/model-add`, `/models-add` alias to `/modeladd`.
     ("modelsadd", "modeladd"),
     ("model-add", "modeladd"),
@@ -142,8 +144,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "app", desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true, hidden: false },
     Command { name: "sessions", desc: "List and switch between sessions", needs_args: false, hidden: false },
     Command { name: "setup",      desc: "Re-initialize JeikCode environment and configurations", needs_args: false, hidden: false },
-    Command { name: "rename",  desc: "Rename current session", needs_args: true, hidden: false },
-    Command { name: "name",    desc: "Show or set this session's live mesh nickname (/name <label>)", needs_args: false, hidden: false },
+    Command { name: "name",    desc: "Show or set session name (persisted in /sessions & live mesh): /name [label]", needs_args: false, hidden: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false },
     Command { name: "modeladd", desc: "Add a model; fetches upstream /models as a picker", needs_args: false, hidden: false },
     Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false },
@@ -467,6 +468,8 @@ mod tests {
 
         assert_eq!(reg.find("clear").unwrap().name, "clear");
         assert_eq!(reg.find("new").unwrap().name, "new");
+        assert_eq!(reg.find("rename").unwrap().name, "name");
+        assert_eq!(command_display_name("name"), "name (rename)");
     }
 
     #[test]

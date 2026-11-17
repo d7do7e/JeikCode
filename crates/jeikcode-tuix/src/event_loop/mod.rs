@@ -8764,8 +8764,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // when the source was busy, both values identify the independently
     // persisted fork instead. This mirrors `/resume` visually without ever
     // allowing two runtimes to own one session id.
-    if let Some(session) = ctx.replay_on_start.take() {
+    if let Some(mut session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
+            let live_mesh_name = ctx
+                .current_session
+                .user_renamed
+                .then(|| ctx.current_session.name.clone())
+                .filter(|n| !n.trim().is_empty());
+            if let Some(live_name) = live_mesh_name {
+                session.rename(live_name);
+            }
             crate::modals::session_picker::replay_session(
                 renderer,
                 &mut app.state,
@@ -13813,7 +13821,7 @@ mod streaming_slash_tests {
                 "cmd={cmd}"
             );
         }
-        // `/name` (show current) and `/name <label>` (set live mesh nickname) are safe mid-turn.
+        // `/name` (show current) and `/name <label>` / `/rename <label>` unify on `"name"`.
         assert_eq!(exec("/name"), Some(("name".to_string(), String::new())));
         assert_eq!(
             exec("/name backend"),
@@ -13822,7 +13830,7 @@ mod streaming_slash_tests {
         // `/rename <name>` runs mid-stream; a bare `/rename` (would only error) does not.
         assert_eq!(
             exec("/rename my session"),
-            Some(("rename".to_string(), "my session".to_string()))
+            Some(("name".to_string(), "my session".to_string()))
         );
         assert_eq!(exec("/rename"), None);
         assert_eq!(exec("/rename   "), None);
@@ -14754,10 +14762,9 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     //   can't clobber it, and the catalog write is independent of the turn's
     //   conversation persistence. A bare `/rename` (no name) is NOT run — it would just
     //   error, and errors mid-stream are noise.
-    if cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty() {
-        return Some(("rename".to_string(), arg.trim().to_string()));
-    }
-    if cmd.eq_ignore_ascii_case("name") {
+    if cmd.eq_ignore_ascii_case("name")
+        || (cmd.eq_ignore_ascii_case("rename") && !arg.trim().is_empty())
+    {
         return Some(("name".to_string(), arg.trim().to_string()));
     }
     None
@@ -19380,12 +19387,12 @@ fn handle_runtime_event(
                             ctx.working_dir.clone(),
                         );
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Session mesh name: {} (id={})\n",
+                            "  Session name: {} (saved to /sessions & live mesh; id={})\n",
                             assigned, ctx.current_session.id
                         )));
                     } else {
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Session mesh label: {} (id={})\n",
+                            "  Session label: {} (id={})\n",
                             display_name, ctx.current_session.id
                         )));
                     }

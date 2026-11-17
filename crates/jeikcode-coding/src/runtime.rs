@@ -2044,12 +2044,16 @@ impl CodingRuntime {
             Arc::clone(&loop_active),
         )));
         let (handle, controls) = coding_runtime_control_channel();
+        let startup_mesh_name = agent
+            .initial_mesh_name
+            .clone()
+            .or_else(|| parts.session_persisted_title());
         let mesh_host = if session_mesh_enabled() {
             parts.session.as_ref().and_then(|binding| {
                 SessionMeshHost::start(
                     live_registry_dir(),
                     binding.id.clone(),
-                    agent.initial_mesh_name.clone(),
+                    startup_mesh_name.clone(),
                     agent.working_dir.clone(),
                     agent.model.clone(),
                     handle.clone(),
@@ -2059,11 +2063,17 @@ impl CodingRuntime {
         } else {
             None
         };
-        register_mesh_tools(&mut parts, mesh_host.as_ref());
-        let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
         let initial_mesh_name = mesh_host
             .as_ref()
-            .and_then(|host| host.local.current_name());
+            .and_then(|host| host.local.current_name())
+            .or(startup_mesh_name);
+        if agent.initial_mesh_name.is_some() {
+            if let Some(ref resolved) = initial_mesh_name {
+                let _ = parts.set_session_title(resolved);
+            }
+        }
+        register_mesh_tools(&mut parts, mesh_host.as_ref());
+        let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
         let session = parts.session.as_ref().map(|binding| RuntimeSessionInfo {
             id: binding.id.clone(),
             resumed: binding.resume.is_some(),
@@ -4257,7 +4267,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         name,
                         done,
                     }) => {
-                        let Some(runtime) = resources.as_ref() else {
+                        let Some(runtime) = resources.as_mut() else {
                             let _ = done.send(Err("coding runtime unavailable".to_string()));
                             continue;
                         };
@@ -4265,16 +4275,32 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err("coding runtime busy reconfiguring".to_string()));
                             continue;
                         }
-                        let Some(host) = runtime.mesh_host.as_ref() else {
-                            let _ = done.send(Err(
-                                "session mesh is disabled or runtime has no active session"
-                                    .to_string(),
-                            ));
-                            continue;
+                        let outcome: Result<(Option<String>, String), String> = match runtime
+                            .mesh_host
+                            .as_ref()
+                        {
+                            Some(host) => host
+                                .set_name(name.as_deref(), false)
+                                .map(|assigned| (assigned, host.local.current_display_name())),
+                            None => match name.as_deref() {
+                                Some(raw) => crate::session_mesh_naming::sanitize_mesh_name(raw)
+                                    .map(|clean| (Some(clean.clone()), clean)),
+                                None => Ok((
+                                    None,
+                                    runtime
+                                        .parts
+                                        .session
+                                        .as_ref()
+                                        .map(|b| b.id.chars().take(8).collect())
+                                        .unwrap_or_else(|| "session".to_string()),
+                                )),
+                            },
                         };
-                        match host.set_name(name.as_deref(), false) {
-                            Ok(assigned) => {
-                                let display_name = host.local.current_display_name();
+                        match outcome {
+                            Ok((assigned, display_name)) => {
+                                if let Some(ref title) = assigned {
+                                    let _ = runtime.parts.set_session_title(title);
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::MeshNameChanged {
                                         name: assigned.clone(),
@@ -5149,11 +5175,20 @@ fn spawn_runtime_owner_with_optional_agent(
                         compaction_suspended = false;
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
+                        let next_mesh_name = if changes_session {
+                            runtime.parts.session_persisted_title()
+                        } else {
+                            runtime
+                                .mesh_host
+                                .as_ref()
+                                .and_then(|host| host.local.current_name())
+                        };
                         if let Some(host) = runtime.mesh_host.as_ref() {
                             host.reconfigure_session(
                                 changed.session_id.clone(),
                                 cwd.clone(),
                                 runtime.config.model.clone(),
+                                next_mesh_name,
                             );
                         }
                         resources = Some(runtime);

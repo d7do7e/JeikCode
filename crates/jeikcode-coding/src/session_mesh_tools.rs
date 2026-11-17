@@ -597,7 +597,7 @@ impl Tool for SetSessionNameTool {
     }
 
     fn description(&self) -> &str {
-        "Set or update this session's own live mesh nickname/role (e.g. `backend`, `frontend`, `coordinator`, max 48 chars). Updates only the current session and enforces live uniqueness."
+        "Set or update this session's own unified name (shown in `/sessions` history, TUI header/tab, and live mesh, e.g. `backend`, `frontend`; max 48 chars). Updates only the current session and enforces live uniqueness."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -620,7 +620,7 @@ impl Tool for SetSessionNameTool {
         };
         match self.local.handle.set_mesh_name(Some(parsed.name)).await {
             Ok(Some(assigned)) => tool_ok(format!(
-                "Session mesh name set to `{assigned}` (session_id={}).",
+                "Session name set to `{assigned}` (persisted in /sessions and live mesh; session_id={}).",
                 self.local.current_session_id()
             )),
             Ok(None) => tool_ok(format!(

@@ -844,7 +844,7 @@ Msg::CmdDescSetup =>
             "Dùng /sessions để liệt kê và chuyển phiên (phiên đang chạy có huy hiệu).".into(),
         Msg::CmdDescResume => "Liệt kê và chuyển giữa các phiên (bí danh: dùng /sessions)".into(),
         Msg::CmdDescRename => "Đổi tên phiên hiện tại".into(),
-        Msg::CmdDescName => "Xem hoặc đặt biệt danh mesh trực tiếp cho phiên này (/name <label>)".into(),
+        Msg::CmdDescName => "Xem hoặc đặt tên phiên (lưu trong /sessions & mesh trực tiếp: /name [tên])".into(),
         Msg::CmdDescModel =>
             "Đặt nhà cung cấp / mô hình mặc định và chuyển phiên này".into(),
         Msg::CmdDescModelAdd =>

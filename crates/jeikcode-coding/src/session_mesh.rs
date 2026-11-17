@@ -315,6 +315,7 @@ impl SessionMeshHost {
         new_session_id: Option<String>,
         new_working_dir: PathBuf,
         new_model: String,
+        next_name: Option<String>,
     ) {
         self.remove_descriptor_file();
         let Some(sid) = new_session_id else {
@@ -339,9 +340,12 @@ impl SessionMeshHost {
         self.local.update_snapshot(None);
         self.local.clear_hop_context();
 
-        let kept_name = self.local.current_name().and_then(|existing| {
-            resolve_unique_live_name(&self.local.live_dir, valid_id, &existing, true).ok()
-        });
+        let kept_name = next_name
+            .as_deref()
+            .and_then(|raw| sanitize_mesh_name(raw).ok())
+            .and_then(|clean| {
+                resolve_unique_live_name(&self.local.live_dir, valid_id, &clean, true).ok()
+            });
         if let Ok(mut g) = self.local.name.write() {
             *g = kept_name.clone();
         }

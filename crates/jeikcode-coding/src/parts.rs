@@ -583,7 +583,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             meta.owner = StorageOwner::Native;
             // OpenAI / Anthropic / compat `user` (or user_title): pin as
             // user_renamed so first-prompt seed and AI naming never overwrite.
-            apply_pinned_session_display_name(&mut meta, cfg.session_display_name.as_deref());
+            apply_pinned_session_display_name(
+                &mut meta,
+                cfg.session_display_name
+                    .as_deref()
+                    .or(cfg.initial_mesh_name.as_deref()),
+            );
             if !stage_fresh {
                 manager
                     .commit_native_import(
@@ -609,7 +614,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let now = jeikcode_capabilities::session::now_ms();
             let mut meta = SessionMeta::new(id, cfg.working_dir.to_string_lossy().as_ref(), now);
             meta.owner = StorageOwner::Native;
-            apply_pinned_session_display_name(&mut meta, cfg.session_display_name.as_deref());
+            apply_pinned_session_display_name(
+                &mut meta,
+                cfg.session_display_name
+                    .as_deref()
+                    .or(cfg.initial_mesh_name.as_deref()),
+            );
             // Drafts are always staged — never catalog-visible until first Submit.
             Some(SessionBinding {
                 id: id.clone(),
@@ -1061,6 +1071,49 @@ impl CodingParts {
         self.session
             .as_ref()
             .is_some_and(|binding| binding.staged_fresh.is_some())
+    }
+
+    /// Return the session's persisted human title if it is non-placeholder (`default` / `session-*` omitted).
+    pub(crate) fn session_persisted_title(&self) -> Option<String> {
+        let binding = self.session.as_ref()?;
+        let meta = match binding.staged_fresh.as_ref() {
+            Some(staged) => staged.clone(),
+            None => binding.manager.read_meta(&binding.id).ok()?,
+        };
+        let trimmed = meta.name.trim();
+        if trimmed.is_empty()
+            || trimmed == "default"
+            || SessionMeta::name_needs_fallback(trimmed, &binding.id)
+        {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    /// Persist a unified user-chosen session title onto staged or committed `SessionMeta`.
+    pub(crate) fn set_session_title(&mut self, title: &str) -> Result<String, String> {
+        let clean = title.trim();
+        if clean.is_empty() {
+            return Err("session name cannot be empty".to_string());
+        }
+        let Some(binding) = self.session.as_mut() else {
+            return Err("runtime has no active persistent session".to_string());
+        };
+        if let Some(staged) = binding.staged_fresh.as_mut() {
+            let old = std::mem::replace(&mut staged.name, clean.to_string());
+            staged.user_renamed = true;
+            staged.updated_at = jeikcode_capabilities::session::now_ms();
+            return Ok(old);
+        }
+        binding
+            .manager
+            .update_meta(&binding.id, |meta| {
+                let old = std::mem::replace(&mut meta.name, clean.to_string());
+                meta.user_renamed = true;
+                meta.updated_at = jeikcode_capabilities::session::now_ms();
+                old
+            })
+            .map_err(|e| format!("failed to persist session name: {e}"))
     }
 
     /// Carry session-scoped runtime decisions across a capability-graph rebuild.
