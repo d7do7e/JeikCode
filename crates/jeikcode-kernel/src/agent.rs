@@ -171,6 +171,14 @@ const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::
 /// than the generic error path (the empty body returns instantly; a long wait is
 /// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
 const EMPTY_RESPONSE_MAX_RETRIES: u32 = 6;
+/// Attempt duration (ms) above which a content-free/thinking-only 200 is treated
+/// as a slow upstream hang rather than an instant empty-200 blip.
+const SLOW_EMPTY_ATTEMPT_MS: u64 = 10_000;
+/// Cap slow empty/thinking-only 200s at 2 attempts total (1 initial + 1 retry)
+/// so a slow hanging upstream fails fast instead of stalling ~2.5-4.5 minutes.
+const SLOW_EMPTY_MAX_ATTEMPTS: u32 = 2;
+/// Cumulative ms spent in empty/thinking-only 200 attempts before failing fast.
+const SLOW_EMPTY_CUMULATIVE_MS: u64 = 45_000;
 
 /// How many times a turn may auto-continue after the model's output was cut off at
 /// the token limit (`finish_reason=length`) with no tool call. A truncated response
@@ -517,6 +525,28 @@ fn empty_retry_wait_secs(thinking_only: bool, empty_retries: u32) -> u64 {
         5 => 8,
         _ => 12,
     }
+}
+
+fn empty_retry_limit(
+    empty_retries: u32,
+    slow_empty_attempts: u32,
+    cumulative_empty_ms: u64,
+) -> Option<u32> {
+    if empty_retries >= EMPTY_RESPONSE_MAX_RETRIES {
+        return None;
+    }
+    if slow_empty_attempts >= SLOW_EMPTY_MAX_ATTEMPTS
+        || (empty_retries >= 1 && cumulative_empty_ms >= SLOW_EMPTY_CUMULATIVE_MS)
+    {
+        return None;
+    }
+    let effective_max = if slow_empty_attempts > 0 {
+        let remaining_slow = SLOW_EMPTY_MAX_ATTEMPTS.saturating_sub(slow_empty_attempts);
+        (empty_retries + remaining_slow).min(EMPTY_RESPONSE_MAX_RETRIES)
+    } else {
+        EMPTY_RESPONSE_MAX_RETRIES
+    };
+    Some(effective_max)
 }
 
 /// Build the user-facing message shown when the empty-response retry budget is
@@ -2540,6 +2570,8 @@ impl RunningAgent {
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
         // so a model that keeps returning empty across rounds can't spin forever.
         let mut empty_retries: u32 = 0;
+        let mut slow_empty_attempts: u32 = 0;
+        let mut empty_cumulative_ms: u64 = 0;
         // Whether the PRE-SEND over-window advisory has fired this turn. Gates it
         // to once per turn (robust to the empty-retry / provider-retry `round -= 1`
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
@@ -3664,7 +3696,15 @@ impl RunningAgent {
                 (!saw_stream_content || filler_only_reasoning || thinking_only || blank_text_only)
                     && !truncated;
             if empty_completion {
-                if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
+                let attempt_elapsed_ms =
+                    (self.clock.now_millis().saturating_sub(start)).max(0) as u64;
+                empty_cumulative_ms = empty_cumulative_ms.saturating_add(attempt_elapsed_ms);
+                if attempt_elapsed_ms >= SLOW_EMPTY_ATTEMPT_MS {
+                    slow_empty_attempts = slow_empty_attempts.saturating_add(1);
+                }
+                if let Some(effective_max) =
+                    empty_retry_limit(empty_retries, slow_empty_attempts, empty_cumulative_ms)
+                {
                     empty_retries += 1;
                     // Front-loaded short backoff (see `empty_retry_wait_secs`). The empty
                     // body returns instantly, so the generic 3/6/9s tier would be pure
@@ -3673,23 +3713,15 @@ impl RunningAgent {
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
                     let notice = if thinking_only {
-                        i18n::format_agent_retry_thinking(
-                            empty_retries as u32,
-                            EMPTY_RESPONSE_MAX_RETRIES as u32,
-                            wait,
-                        )
+                        i18n::format_agent_retry_thinking(empty_retries as u32, effective_max, wait)
                     } else if saw_malformed {
                         i18n::format_agent_retry_malformed(
                             empty_retries as u32,
-                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            effective_max,
                             wait,
                         )
                     } else {
-                        i18n::format_agent_retry_empty(
-                            empty_retries as u32,
-                            EMPTY_RESPONSE_MAX_RETRIES as u32,
-                            wait,
-                        )
+                        i18n::format_agent_retry_empty(empty_retries as u32, effective_max, wait)
                     };
                     self.rt.emit(AgentEvent::Warning(notice));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
@@ -3715,13 +3747,18 @@ impl RunningAgent {
                 // compare to the model window. An empty 200 at/over the window is
                 // very likely a too-large request, so don't assert it's
                 // context-independent — point at /compact instead.
+                let attempts_made = if empty_retries >= EMPTY_RESPONSE_MAX_RETRIES {
+                    EMPTY_RESPONSE_MAX_RETRIES
+                } else {
+                    empty_retries.saturating_add(1)
+                };
                 let est_prompt: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 let msg = empty_exhaustion_message(
                     saw_malformed,
                     thinking_only,
                     est_prompt,
                     self.provider.context_window(),
-                    EMPTY_RESPONSE_MAX_RETRIES,
+                    attempts_made,
                     over_window_warned,
                 );
                 self.hooks.on_error(&msg).await;
@@ -5217,6 +5254,114 @@ mod empty_retry_wait_tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 5, 8, 12]
         );
+    }
+
+    #[test]
+    fn slow_empty_retry_limit_caps_slow_attempts_while_preserving_fast_budget() {
+        use super::{empty_retry_limit, EMPTY_RESPONSE_MAX_RETRIES};
+        // Fast empty 200s (<10s, <45s cumulative) keep the full 6-retry budget.
+        for r in 0..EMPTY_RESPONSE_MAX_RETRIES {
+            assert_eq!(empty_retry_limit(r, 0, (r as u64) * 500), Some(6));
+        }
+        assert_eq!(empty_retry_limit(6, 0, 3_000), None);
+
+        // Slow attempts (>=10s each): allow 1 retry (max=1), then stop after 2nd slow attempt.
+        assert_eq!(empty_retry_limit(0, 1, 25_000), Some(1));
+        assert_eq!(empty_retry_limit(1, 2, 50_000), None);
+
+        // Even if slow attempt #1 took >=45s, allow 1 retry (empty_retries=0), then stop on retry.
+        assert_eq!(empty_retry_limit(0, 1, 48_000), Some(1));
+        assert_eq!(empty_retry_limit(1, 1, 50_000), None);
+
+        // Fast attempt #1 (2s) + slow attempt #2 (25s) allows 1 more slow retry (2/2), then stops.
+        assert_eq!(empty_retry_limit(1, 1, 27_000), Some(2));
+        assert_eq!(empty_retry_limit(2, 2, 52_000), None);
+    }
+
+    #[tokio::test]
+    async fn slow_thinking_only_attempts_stop_after_two_attempts_instead_of_six() {
+        use crate::clock::Clock;
+        use crate::event::{AgentCommand, AgentEvent, StopReason};
+        use crate::message::Message;
+        use crate::provider::{ChatOptions, LlmProvider};
+        use crate::stream::{ProviderError, StreamEvent};
+        use crate::tool::{ToolDef, ToolRegistry};
+        use async_trait::async_trait;
+        use futures::stream::BoxStream;
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        struct StepClock(AtomicU64);
+        impl Clock for StepClock {
+            fn now_millis(&self) -> u64 {
+                // Each call advances by 25s so `start` -> `attempt_elapsed_ms` = 25_000ms.
+                self.0.fetch_add(25_000, Ordering::SeqCst)
+            }
+        }
+
+        struct SlowThinkingOnlyProvider(AtomicU32);
+        #[async_trait]
+        impl LlmProvider for SlowThinkingOnlyProvider {
+            fn model_name(&self) -> &str {
+                "slow-thinking"
+            }
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDef],
+                _options: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::iter(vec![
+                    StreamEvent::ReasoningSignature {
+                        opaque: "sig-only".into(),
+                        provider: "anthropic".into(),
+                        id: None,
+                    },
+                    StreamEvent::Done { truncated: false },
+                ])))
+            }
+        }
+
+        let provider = Arc::new(SlowThinkingOnlyProvider(AtomicU32::new(0)));
+        let clock = Arc::new(StepClock(AtomicU64::new(1_000)));
+        let handle = crate::agent::Agent::builder()
+            .provider(provider.clone())
+            .tools(ToolRegistry::new().mount(&[]))
+            .clock(clock)
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut events = handle.events;
+        let mut warnings = Vec::new();
+        let mut error = None;
+        let mut stop = None;
+        while let Some(ev) = events.recv().await {
+            match ev {
+                AgentEvent::Warning(w) => warnings.push(w),
+                AgentEvent::Error { message, .. } => error = Some(message),
+                AgentEvent::TurnComplete { reason } => {
+                    stop = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            2,
+            "slow thinking-only attempts must fail fast after 2 attempts instead of 7"
+        );
+        assert_eq!(warnings.len(), 1, "expected 1 retry warning: {warnings:?}");
+        assert!(error.is_some(), "expected exhaustion error");
+        assert_eq!(stop, Some(StopReason::ProviderError));
     }
 }
 

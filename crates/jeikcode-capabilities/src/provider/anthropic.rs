@@ -249,6 +249,7 @@ impl LlmProvider for AnthropicProvider {
             'reopen: loop {
                 let mut dec = AnthropicSseDecoder::new();
                 let mut emitted_replay_sensitive = false;
+                let mut saw_usable_content = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
@@ -263,7 +264,30 @@ impl LlmProvider for AnthropicProvider {
                             return;
                         }
                         Ok(None) => {
-                            for ev in dec.finish() {
+                            let ended_without_stop = !dec.saw_message_stop();
+                            let trailing = dec.finish();
+                            if ended_without_stop && !saw_usable_content {
+                                // Upstream closed the HTTP 200 SSE stream before emitting
+                                // `message_stop` and without any text, reasoning text, or
+                                // tool call (e.g. a `thinking_signature`-only premature drop).
+                                // Surface an explicit error instead of fabricating `Done`.
+                                for metadata in pending_metadata.drain(..) {
+                                    if !matches!(metadata, StreamEvent::Usage(_)) {
+                                        yield metadata;
+                                    }
+                                }
+                                yield StreamEvent::Error(ProviderError {
+                                    retryable: !emitted_replay_sensitive,
+                                    message: if emitted_replay_sensitive {
+                                        "upstream stream ended prematurely before emitting content (thinking signature only, missing message_stop)".to_string()
+                                    } else {
+                                        "upstream stream ended prematurely before emitting content (missing message_stop)".to_string()
+                                    },
+                                    ..Default::default()
+                                });
+                                return;
+                            }
+                            for ev in trailing {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
                                     continue;
@@ -274,6 +298,7 @@ impl LlmProvider for AnthropicProvider {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                saw_usable_content |= is_usable_content_event(&ev);
                                 yield ev;
                             }
                             return;
@@ -321,6 +346,7 @@ impl LlmProvider for AnthropicProvider {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                saw_usable_content |= is_usable_content_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
                                 }
@@ -972,7 +998,17 @@ struct AnthropicSseDecoder {
     output_tokens: u32,
     truncated: bool,
     done: bool,
+    saw_message_stop: bool,
     response_id_seen: bool,
+}
+
+fn is_usable_content_event(ev: &StreamEvent) -> bool {
+    match ev {
+        StreamEvent::TextDelta(t) => !t.is_empty(),
+        StreamEvent::Reasoning(r) => !r.is_empty(),
+        StreamEvent::ToolCall(_) | StreamEvent::ToolCallDelta { .. } => true,
+        _ => false,
+    }
 }
 
 impl AnthropicSseDecoder {
@@ -986,8 +1022,13 @@ impl AnthropicSseDecoder {
             output_tokens: 0,
             truncated: false,
             done: false,
+            saw_message_stop: false,
             response_id_seen: false,
         }
+    }
+
+    fn saw_message_stop(&self) -> bool {
+        self.saw_message_stop
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
@@ -1277,6 +1318,7 @@ impl AnthropicSseDecoder {
                 }
             }
             "message_stop" => {
+                self.saw_message_stop = true;
                 out.push(StreamEvent::Usage(self.usage()));
                 out.push(StreamEvent::Done {
                     truncated: self.truncated,
@@ -2721,5 +2763,122 @@ mod tests {
             .contains("AUTHORITATIVE PROJECT INSTRUCTIONS"));
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn premature_eof_with_only_thinking_signature_errors_instead_of_done() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_http_request(&mut s);
+            let body = format!(
+                "{}{}{}",
+                line(
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                ),
+                line(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-only"}}),
+                ),
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                ),
+            );
+            s.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s.flush().unwrap();
+            drop(s);
+        });
+
+        let cfg = AnthropicConfig::new("k", format!("http://127.0.0.1:{port}"), "claude-test");
+        let provider = AnthropicProvider::new(cfg).unwrap();
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "premature EOF without message_stop or usable content must NOT emit Done: {events:?}"
+        );
+        let err = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Error(err) => Some(err),
+                _ => None,
+            })
+            .expect("must surface StreamEvent::Error on signature-only premature EOF");
+        assert!(
+            err.message.contains("missing message_stop")
+                && err.message.contains("thinking signature only"),
+            "unexpected error message: {}",
+            err.message
+        );
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn premature_eof_with_usable_text_preserves_done() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_http_request(&mut s);
+            let body = format!(
+                "{}{}",
+                line(
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                ),
+                line(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}),
+                ),
+            );
+            s.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s.flush().unwrap();
+            drop(s);
+        });
+
+        let cfg = AnthropicConfig::new("k", format!("http://127.0.0.1:{port}"), "claude-test");
+        let provider = AnthropicProvider::new(cfg).unwrap();
+        let stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .expect("open should succeed");
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "partial answer")),
+            "usable text must be delivered: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "usable text before EOF without message_stop should still emit Done: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "usable text before EOF should not emit Error: {events:?}"
+        );
+        let _ = handle.join();
     }
 }
