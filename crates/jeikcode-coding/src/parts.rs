@@ -491,7 +491,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_max_concurrent(max_concurrent)
                 .with_max_rounds(max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
-                .with_worker_middleware(turn_execution_policy.clone()),
+                .with_worker_middleware(turn_execution_policy.clone())
+                .with_project_context_loader(|wd| {
+                    jeikcode_capabilities::session::instructions::render_project_instructions(wd)
+                }),
             ));
             names.push("task".to_string());
             Some(slot)
@@ -3428,6 +3431,91 @@ mod tests {
         assert!(
             read_result.content.contains("1→Line 1: dummy text"),
             "read content must include line numbers"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_subagent_receives_project_instructions_and_glossary_through_prepare_assemble() {
+        use jeikcode_kernel::agent::AutoRespond;
+        use jeikcode_kernel::stream::StreamEvent;
+        use jeikcode_kernel::testkit::RecordingProvider;
+        use jeikcode_kernel::tool::ToolCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jeikcode")).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "PARTS_SUBAGENT_RULE_XYZ").unwrap();
+        std::fs::write(
+            dir.path().join(".jeikcode/glossary.md"),
+            "BillingTerm -> InvoiceLedgerService",
+        )
+        .unwrap();
+
+        let cfg = CodingAgentConfig::new("k", "http://unused", "test-model", dir.path());
+        let opts = PrepareOptions {
+            session: SessionMode::Disabled,
+            mcp: false,
+            memory: false,
+            web: false,
+            skill_dirs: Some(vec![dir.path().join("no_skills")]),
+            ..Default::default()
+        };
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            // Round 1 (parent): invoke task(explore)
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_task_1".into(),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{
+                            "description": "check glossary",
+                            "prompt": "report billing term",
+                            "subagent_type": "explore"
+                        }]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2 (child subagent using host slot)
+            vec![
+                StreamEvent::TextDelta("child ok".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 3 (parent final)
+            vec![
+                StreamEvent::TextDelta("parent done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let calls = provider.calls();
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let outcome = agent
+            .run_to_completion("run subagent", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(outcome.text, "parent done");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 3, "parent -> child -> parent");
+        let child_sys: String = recorded[1]
+            .0
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            child_sys.contains("PARTS_SUBAGENT_RULE_XYZ"),
+            "child missing AGENTS.md: {child_sys}"
+        );
+        assert!(
+            child_sys.contains("InvoiceLedgerService"),
+            "child missing glossary knowledge pack: {child_sys}"
+        );
+        assert!(
+            child_sys.contains("<explore_strategy>"),
+            "child missing <explore_strategy>: {child_sys}"
         );
     }
 }

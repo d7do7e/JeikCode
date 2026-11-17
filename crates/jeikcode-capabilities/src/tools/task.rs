@@ -400,6 +400,7 @@ pub struct TaskTool {
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    project_context_loader: Option<Arc<super::subagent_context::ProjectContextLoader>>,
 }
 
 impl TaskTool {
@@ -419,6 +420,7 @@ impl TaskTool {
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
+            project_context_loader: None,
         }
     }
 
@@ -449,6 +451,17 @@ impl TaskTool {
     /// no shell/write tools and deliberately remain unaffected.
     pub fn with_worker_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
         self.inherited_worker_middlewares.push(middleware);
+        self
+    }
+
+    /// Supply a custom `<project_instructions>` loader for child subagents (e.g. including
+    /// cached project knowledge packs). When unset, `TaskTool` falls back to loading
+    /// `PROJECT_INSTRUCTION_FILES` directly from `ctx.working_dir`.
+    pub fn with_project_context_loader(
+        mut self,
+        loader: impl Fn(&Path) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.project_context_loader = Some(Arc::new(loader));
         self
     }
 }
@@ -557,6 +570,10 @@ impl Tool for TaskTool {
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
+        let project_instructions = super::subagent_context::resolve_project_instructions(
+            &ctx.working_dir,
+            self.project_context_loader.as_ref(),
+        );
         let mut set = tokio::task::JoinSet::new();
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
@@ -588,12 +605,17 @@ impl Tool for TaskTool {
             } else {
                 (self.make_explore_tools)()
             };
-            let persona = if is_worker {
+            let base_persona = if is_worker {
                 WORKER_PERSONA
             } else {
                 EXPLORE_PERSONA
-            }
-            .to_string();
+            };
+            let persona = super::subagent_context::build_child_persona(
+                base_persona,
+                is_worker,
+                &scope,
+                project_instructions.as_deref(),
+            );
             let child_cancel = ctx.cancel.child_token();
             // A second handle for the progress hook to short-circuit emits once cancelled.
             let hook_cancel = child_cancel.clone();
@@ -3394,5 +3416,146 @@ mod tests {
         seed_offline_verdict(OfflineMode::Off, None);
         let outcome_restored = gate.before(&mut fetch_call, &mock_tool, &rt).await;
         assert!(matches!(outcome_restored, BeforeOutcome::Proceed));
+    }
+
+    #[tokio::test]
+    async fn child_subagent_receives_project_instructions_and_explore_strategy_while_gates_hold() {
+        use jeikcode_kernel::message::Role;
+        use std::sync::Mutex as StdMutex;
+
+        struct CaptureProvider {
+            seen_messages: Arc<StdMutex<Vec<Vec<Message>>>>,
+            rounds: StdMutex<Vec<Vec<StreamEvent>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CaptureProvider {
+            fn model_name(&self) -> &str {
+                "capture-mock"
+            }
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                _tools: &[ToolDef],
+                _opts: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                self.seen_messages.lock().unwrap().push(messages.to_vec());
+                let next = self.rounds.lock().unwrap().remove(0);
+                Ok(stream::iter(next).boxed())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "SUBAGENT_REPO_RULE_ABC").unwrap();
+        std::fs::write(dir.path().join("allowed.txt"), "before").unwrap();
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(crate::tools::ReadFileTool::new(false)));
+        reg.register(Arc::new(crate::tools::WriteFileTool));
+        let reg = Arc::new(reg);
+        let r_exp = reg.clone();
+        let r_wrk = reg.clone();
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let round_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let make_provider = move || {
+            let idx = round_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rounds = if idx == 0 {
+                // explore#1: simple answer
+                vec![vec![
+                    StreamEvent::TextDelta("explored ok".into()),
+                    StreamEvent::Done { truncated: false },
+                ]]
+            } else {
+                // worker#2: attempt out-of-scope write (must be denied by WorkerScopeGate),
+                // then attempt sensitive path read (must terminate via DenySensitivePaths).
+                vec![
+                    vec![
+                        StreamEvent::ToolCall(ToolCall {
+                            id: "w1".into(),
+                            name: "write".into(),
+                            arguments: r#"{"path":"outside.txt","content":"bad"}"#.into(),
+                        }),
+                        StreamEvent::Done { truncated: false },
+                    ],
+                    vec![
+                        StreamEvent::ToolCall(ToolCall {
+                            id: "w2".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":".env"}"#.into(),
+                        }),
+                        StreamEvent::Done { truncated: false },
+                    ],
+                ]
+            };
+            Arc::new(CaptureProvider {
+                seen_messages: seen_clone.clone(),
+                rounds: StdMutex::new(rounds),
+            }) as Arc<dyn LlmProvider>
+        };
+
+        let tool = TaskTool::new(
+            make_provider.clone(),
+            make_provider,
+            move || r_exp.mount(&["read"]),
+            move || r_wrk.mount(&["read", "write"]),
+        );
+
+        let args = r#"{
+            "tasks": [
+                {
+                    "description": "inspect rules",
+                    "prompt": "check project",
+                    "subagent_type": "explore"
+                },
+                {
+                    "description": "edit allowed",
+                    "prompt": "try edits",
+                    "subagent_type": "worker",
+                    "scope": ["allowed.txt"]
+                }
+            ]
+        }"#;
+
+        let tool_ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        let out = tool.execute(args, &tool_ctx).await;
+
+        let captured = seen.lock().unwrap();
+        assert!(captured.len() >= 2);
+        for req in captured.iter() {
+            let sys = req
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                sys.contains("SUBAGENT_REPO_RULE_ABC"),
+                "child system prompt missing AGENTS.md: {sys}"
+            );
+            assert!(
+                sys.contains("<explore_strategy>"),
+                "child system prompt missing <explore_strategy>: {sys}"
+            );
+            assert!(
+                sys.contains("<project_instructions>"),
+                "child system prompt missing <project_instructions>: {sys}"
+            );
+        }
+
+        // Verify worker out-of-scope write was blocked and sensitive path denial triggered.
+        assert!(!dir.path().join("outside.txt").exists());
+        assert!(
+            out.content.contains("PolicyDenied") || out.content.contains("sensitive paths"),
+            "DenySensitivePaths must remain active: {}",
+            out.content
+        );
     }
 }

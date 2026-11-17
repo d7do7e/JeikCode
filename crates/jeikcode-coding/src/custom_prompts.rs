@@ -79,6 +79,8 @@ pub struct CustomRulesConfig {
     pub code_review: Option<String>,
     pub skills: Option<String>,
     pub firm_execution_discipline: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled_sections: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -647,14 +649,101 @@ pub fn render_init_windows_platform() -> Option<String> {
     render_init_environment(None)
 }
 
+/// Policy extracted from a loaded `rules.yaml` controlling which compiled capability
+/// sections should be suppressed (either via explicit `disabled_sections` / empty field
+/// opt-outs or because `rules.yaml` already defines that section).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CustomRulesPolicy {
+    disabled: std::collections::HashSet<String>,
+}
+
+impl CustomRulesPolicy {
+    pub(crate) fn from_config(cfg: &CustomRulesConfig) -> Self {
+        let mut disabled = std::collections::HashSet::new();
+        if let Some(list) = &cfg.disabled_sections {
+            for item in list {
+                let norm = normalize_section_key(item);
+                if !norm.is_empty() {
+                    disabled.insert(norm);
+                }
+            }
+        }
+        if cfg
+            .asking_the_user
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            disabled.insert("asking_the_user".to_string());
+        }
+        if cfg
+            .delegation
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            disabled.insert("delegation".to_string());
+        }
+        if cfg
+            .code_review
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            disabled.insert("code_review".to_string());
+        }
+        if cfg.skills.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            disabled.insert("skills".to_string());
+        }
+        if cfg
+            .tools_discipline
+            .as_ref()
+            .and_then(|td| td.firm_tool_discipline.as_deref())
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            disabled.insert("firm_tool_discipline".to_string());
+        }
+        Self { disabled }
+    }
+
+    pub(crate) fn allows(&self, aliases: &[&str], rendered_rules: &str, headings: &[&str]) -> bool {
+        if self.disabled.contains("all") {
+            return false;
+        }
+        if aliases
+            .iter()
+            .any(|a| self.disabled.contains(&normalize_section_key(a)))
+        {
+            return false;
+        }
+        !rendered_has_heading(rendered_rules, headings)
+    }
+}
+
+fn normalize_section_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn rendered_has_heading(rendered: &str, headings: &[&str]) -> bool {
+    rendered.lines().any(|line| {
+        let trimmed = line.trim().to_ascii_lowercase();
+        trimmed.starts_with('#')
+            && headings
+                .iter()
+                .any(|h| trimmed.contains(&h.to_ascii_lowercase()))
+    })
+}
+
 /// Render rules from `rules.yaml` if available, formatted as markdown sections.
 pub fn render_custom_rules() -> Option<String> {
+    render_custom_rules_with_policy().map(|(out, _)| out)
+}
+
+/// Render rules from `rules.yaml` along with its explicit section opt-out policy.
+pub(crate) fn render_custom_rules_with_policy() -> Option<(String, CustomRulesPolicy)> {
     let cfg = get_custom_rules_config()?;
     let out = render_custom_rules_from(&cfg);
     if out.is_empty() {
         None
     } else {
-        Some(out)
+        Some((out, CustomRulesPolicy::from_config(&cfg)))
     }
 }
 
@@ -827,7 +916,39 @@ pub(crate) fn render_custom_rules_from(cfg: &CustomRulesConfig) -> String {
         out.push_str(&format!("## CHINESE CODE SUPPORT:\n{cs}\n\n"));
     }
 
-    if let Some(sk) = &cfg.skills {
+    if let Some(au) = cfg
+        .asking_the_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("## ASKING THE USER:\n{au}\n\n"));
+    }
+
+    if let Some(del) = cfg
+        .delegation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("## DELEGATING WITH `task`:\n{del}\n\n"));
+    }
+
+    if let Some(cr) = cfg
+        .code_review
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("## CODE REVIEW:\n{cr}\n\n"));
+    }
+
+    if let Some(sk) = cfg
+        .skills
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("## SKILLS:\n{sk}\n\n"));
     }
 

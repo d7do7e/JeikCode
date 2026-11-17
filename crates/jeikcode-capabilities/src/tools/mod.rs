@@ -57,6 +57,7 @@ pub use crate::argument_repair as repair;
 pub mod report_finding;
 pub mod request_user_input;
 pub mod sensitive_path;
+mod subagent_context;
 pub mod task;
 pub mod todo;
 /// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
