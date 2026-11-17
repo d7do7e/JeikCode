@@ -35,7 +35,7 @@ use crate::session::{Session, SessionId};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use jeikcode_capabilities::commands::ArgsRequirement;
-use jeikcode_capabilities::memory::MemoryStore;
+use jeikcode_capabilities::memory::{AutoMemoryStore, MemoryStore};
 use jeikcode_config::config::{
     sanitize_compact_max_tokens, sanitize_compact_threshold, Config, DEFAULT_COMPACT_THRESHOLD,
 };
@@ -2462,10 +2462,18 @@ fn execute_slash_command_impl(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".into());
             let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
-            let out = if merged.trim().is_empty() {
+            let auto_index = AutoMemoryStore::for_project(&ctx.working_dir).render_prompt_index();
+            let mut sections = Vec::new();
+            if !merged.trim().is_empty() {
+                sections.push(merged);
+            }
+            if !auto_index.trim().is_empty() {
+                sections.push(format!("[Auto-Memory Index: {name}]\n{auto_index}"));
+            }
+            let out = if sections.is_empty() {
                 "(memory is empty)".to_string()
             } else {
-                merged
+                sections.join("\n\n")
             };
             renderer.render(UiLine::CommandOutput(out));
             renderer.flush();

@@ -57,9 +57,10 @@ pub(crate) fn subagent_delegation_enabled() -> bool {
     crate::parts::subagent_enabled_from_env(std::env::var("JEIKCODE_SUBAGENT").ok().as_deref())
 }
 
-/// Whether the `memory` tool is mounted: false since memory tool is unmounted.
+/// Whether the `memory` tool is mounted on the primary parent agent.
+/// Env `JEIKCODE_MEMORY_TOOL`, default ON (opt out with `=0`/`false`/`off`).
 pub(crate) fn memory_tool_enabled() -> bool {
-    false
+    crate::parts::subagent_enabled_from_env(std::env::var("JEIKCODE_MEMORY_TOOL").ok().as_deref())
 }
 
 /// Injected only when `is_offline_active()`. States the ONE certain fact (no public
@@ -694,12 +695,10 @@ repetitions; honor that count or deadline, then report the outcome.";
 /// `memory` tool is actually mounted (see the `memory_tool_enabled()` gate in
 /// `coding_persona`).
 const MEMORY_USAGE: &str = "\n\n## MEMORY:\n\
-When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting \
-preference, a correction that should stick, a non-obvious convention or gotcha — persist it \
-with the `memory` tool (`action:\"remember\"`). Do NOT record obvious facts, standard \
-tool/language behavior, anything already in AGENTS.md, or session-specific one-offs. Keep \
-each entry to one concise line. This is a judgment call, not a requirement — only record \
-what a future session would genuinely benefit from.";
+Persistent auto-memory has two tiers: a compact `MEMORY.md` index (<= 150 lines / 8 KiB, injected at session start) and on-demand `topics/<slug>.md` files. \
+When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting preference, a correction that should stick, a non-obvious build/test gotcha, or architecture convention — persist it with the `memory` tool (`action:\"remember\"`, `\"recall\"`, `\"update\"`, `\"prune\"`). \
+Keep `MEMORY.md` entries to one concise line, move multi-line details into `topic:\"<slug>\"`, and prune stale entries instead of duplicating. \
+Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or session-specific one-offs.";
 
 /// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
 /// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak
@@ -1594,11 +1593,21 @@ mod tests {
     }
 
     #[test]
-    fn persona_omits_memory_guidance() {
-        let p = coding_persona("glm-5.2", true, false);
+    #[serial_test::serial(jeikcode_memory_tool_env)]
+    fn persona_gates_memory_guidance_by_env() {
+        std::env::remove_var("JEIKCODE_MEMORY_TOOL");
+        let p_on = coding_persona("glm-5.2", true, false);
         assert!(
-            !p.contains("## MEMORY"),
-            "no memory guidance when tool is unmounted"
+            p_on.contains("## MEMORY:"),
+            "memory guidance must inject when tool is enabled by default"
+        );
+
+        std::env::set_var("JEIKCODE_MEMORY_TOOL", "0");
+        let p_off = coding_persona("glm-5.2", true, false);
+        std::env::remove_var("JEIKCODE_MEMORY_TOOL");
+        assert!(
+            !p_off.contains("## MEMORY:"),
+            "no memory guidance when JEIKCODE_MEMORY_TOOL=0"
         );
     }
 

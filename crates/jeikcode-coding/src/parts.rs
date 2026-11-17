@@ -23,7 +23,7 @@ use std::sync::Arc;
 use jeikcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use jeikcode_capabilities::datalog::DatalogHook;
 use jeikcode_capabilities::mcp::{self, McpRegistry};
-use jeikcode_capabilities::memory::MemoryHook;
+use jeikcode_capabilities::memory::{MemoryHook, MemoryTool};
 
 use jeikcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use jeikcode_capabilities::session::{
@@ -385,6 +385,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         registry.register(Arc::new(web_search));
         names.push("web_fetch".into());
         names.push("web_search".into());
+    }
+
+    // Parent-only `memory` tool (never mounted in TaskTool subagent registries or
+    // goal_verifier): two-tier `MEMORY.md` index + on-demand `topics/<slug>.md`.
+    if opts.memory && crate::persona::memory_tool_enabled() {
+        registry.register(Arc::new(MemoryTool::for_project(&cfg.working_dir)));
+        names.push("memory".to_string());
     }
 
     // Review-as-capability: code_review tool mounting removed per requirement.
@@ -3534,6 +3541,83 @@ mod tests {
         assert!(
             child_sys.contains("<explore_strategy>"),
             "child missing <explore_strategy>: {child_sys}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_tool_is_parent_only_and_excluded_from_subagents() {
+        use jeikcode_kernel::agent::AutoRespond;
+        use jeikcode_kernel::message::Role;
+        use jeikcode_kernel::stream::StreamEvent;
+        use jeikcode_kernel::testkit::RecordingProvider;
+        use jeikcode_kernel::tool::ToolCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://unused", "test-model", dir.path());
+        let opts = PrepareOptions {
+            session: SessionMode::Disabled,
+            mcp: false,
+            memory: true,
+            web: false,
+            skill_dirs: Some(vec![dir.path().join("no_skills")]),
+            ..Default::default()
+        };
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+        assert!(
+            parts.tool_names.iter().any(|n| n == "memory"),
+            "parent parts must mount memory when opts.memory=true"
+        );
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_task_mem_iso".into(),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{
+                            "description": "check isolation",
+                            "prompt": "inspect workspace",
+                            "subagent_type": "worker",
+                            "scope": ["src/**"]
+                        }]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("worker done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("parent done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let calls = provider.calls();
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let outcome = agent
+            .run_to_completion("run worker", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(outcome.text, "parent done");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert!(
+            recorded[0].1.iter().any(|d| d.name == "memory"),
+            "parent call must expose memory tool"
+        );
+        assert!(
+            !recorded[1].1.iter().any(|d| d.name == "memory"),
+            "subagent child must NEVER mount memory tool"
+        );
+        assert!(
+            recorded[0]
+                .0
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .any(|m| m.text.contains("## MEMORY:")),
+            "parent persona must include MEMORY_USAGE when memory tool is mounted"
         );
     }
 }

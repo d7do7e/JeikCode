@@ -152,6 +152,7 @@ async fn full_assembly_lifecycle() {
             "use_skill",
             "task",
             "task_output",
+            "memory",
         ] {
             assert!(
                 defs.contains(&expected),
@@ -162,7 +163,6 @@ async fn full_assembly_lifecycle() {
             !defs.contains(&"code_review"),
             "code_review must not be mounted"
         );
-        assert!(!defs.contains(&"memory"), "memory must not be mounted");
         assert!(
             !defs.contains(&"list_skills"),
             "list_skills must not be mounted"

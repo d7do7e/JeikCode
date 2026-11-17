@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use jeikcode_kernel::hook::LifecycleHooks;
 use jeikcode_kernel::message::Conversation;
 
+use super::auto_store::AutoMemoryStore;
 use super::MemoryStore;
 
 /// The fixed first line of `MemoryStore::merged_for_prompt` output — how the hook
@@ -31,13 +32,13 @@ const MEMORY_HEADER: &str = "<memory>";
 pub struct MemoryHook {
     global: MemoryStore,
     project: MemoryStore,
+    auto: Option<AutoMemoryStore>,
     project_name: String,
 }
 
 impl MemoryHook {
     /// The standard wiring: the global `$JEIKCODE_HOME/memory.md` + the project's
-    /// `<root>/.jeikcode/memory.md`, labeled with the root's directory name (the
-    /// literal `"project"` when the root has none — e.g. `/` — same as production).
+    /// `<root>/.jeikcode/memory.md` + two-tier auto-memory `MEMORY.md` index.
     pub fn for_project(project_root: &Path) -> Self {
         let project_name = project_root
             .file_name()
@@ -46,6 +47,7 @@ impl MemoryHook {
         Self {
             global: MemoryStore::global(),
             project: MemoryStore::project(project_root),
+            auto: Some(AutoMemoryStore::for_project(project_root)),
             project_name,
         }
     }
@@ -59,6 +61,22 @@ impl MemoryHook {
         Self {
             global,
             project,
+            auto: None,
+            project_name: project_name.into(),
+        }
+    }
+
+    /// Caller-supplied stores including a two-tier [`AutoMemoryStore`].
+    pub fn with_auto_store(
+        global: MemoryStore,
+        project: MemoryStore,
+        auto: AutoMemoryStore,
+        project_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            global,
+            project,
+            auto: Some(auto),
             project_name: project_name.into(),
         }
     }
@@ -72,12 +90,31 @@ impl LifecycleHooks for MemoryHook {
         convo.reconcile_system_block(MEMORY_HEADER, None);
         convo.reconcile_system_block("=== MEMORY ===", None);
 
-        let merged =
+        let merged_legacy =
             MemoryStore::merged_for_prompt(&self.global, &self.project, &self.project_name);
-        let block = if merged.is_empty() {
-            None
-        } else {
-            Some(merged)
+        let auto_index = self
+            .auto
+            .as_ref()
+            .map(AutoMemoryStore::render_prompt_index)
+            .unwrap_or_default();
+
+        let block = match (merged_legacy.is_empty(), auto_index.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(merged_legacy),
+            (true, false) => Some(format!(
+                "{MEMORY_HEADER}\n\n[Auto-Memory Index: {}]\n{}\n</memory>",
+                self.project_name, auto_index
+            )),
+            (false, false) => {
+                let prefix = merged_legacy
+                    .strip_suffix("</memory>")
+                    .unwrap_or(&merged_legacy)
+                    .trim_end();
+                Some(format!(
+                    "{prefix}\n\n[Auto-Memory Index: {}]\n{auto_index}\n</memory>",
+                    self.project_name
+                ))
+            }
         };
         convo.reconcile_frozen_user_block(MEMORY_HEADER, block);
     }
@@ -260,5 +297,37 @@ mod tests {
     fn for_project_root_without_name_falls_back_to_project_like_production() {
         let h = MemoryHook::for_project(Path::new("/"));
         assert_eq!(h.project_name, "project");
+    }
+
+    #[tokio::test]
+    async fn auto_store_merges_with_legacy_and_stays_idempotent_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (g, p) = stores(dir.path(), "global pref", "");
+        let auto = AutoMemoryStore::with_root(dir.path().join("auto"));
+        auto.remember_index_entry("Use cargo fmt").unwrap();
+        auto.write_topic(
+            "ci_notes",
+            "Run cargo check --workspace --locked",
+            Some("CI flags"),
+            false,
+        )
+        .unwrap();
+
+        let h = MemoryHook::with_auto_store(g, p, auto, "myproj");
+        let mut convo = Conversation::new();
+        convo.push(Message::system("persona"));
+        h.session_start(&mut convo, false).await;
+        assert_eq!(convo.messages.len(), 2);
+        let first_text = convo.messages[1].text.clone();
+        assert!(first_text.starts_with(MEMORY_HEADER));
+        assert!(first_text.contains("- global pref"));
+        assert!(first_text.contains("[Auto-Memory Index: myproj]"));
+        assert!(first_text.contains("- Use cargo fmt"));
+        assert!(first_text.contains("Available topic files: ci_notes"));
+
+        // Resume with unchanged files stays byte-identical.
+        h.session_start(&mut convo, true).await;
+        assert_eq!(convo.messages.len(), 2);
+        assert_eq!(convo.messages[1].text, first_text);
     }
 }

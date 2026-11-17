@@ -22,10 +22,17 @@
 
 use std::path::PathBuf;
 
+pub mod auto_store;
 pub mod hook;
 pub mod store;
+pub mod tool;
+pub use auto_store::{
+    project_memory_bucket, resolve_canonical_repo_root, validate_topic_slug, AutoMemoryStore,
+    MEMORY_INDEX_MAX_BYTES, MEMORY_INDEX_MAX_LINES,
+};
 pub use hook::MemoryHook;
 pub use store::MemoryStore;
+pub use tool::MemoryTool;
 
 /// The jeikcode config/data root — delegates to the crate-shared
 /// [`crate::paths::config_dir`] (one home for the rule + its documented `sudo`
