@@ -94,7 +94,7 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 }
 
 /// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
-static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
+static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Auto);
 
 /// 按 session_id 隔离记录的审批模式表；未单独配置的会话回退到 `LIVE_APPROVAL_MODE`。
 static SESSION_APPROVAL_MODES: StdMutex<Option<HashMap<String, ApprovalMode>>> =
@@ -654,7 +654,7 @@ impl ScopedApprovalModeForTest {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         live_set_global_mode_enabled(false, None);
-        live_set_mode(ApprovalMode::Build);
+        live_set_mode(ApprovalMode::Auto);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
         }
@@ -666,7 +666,7 @@ impl ScopedApprovalModeForTest {
 impl Drop for ScopedApprovalModeForTest {
     fn drop(&mut self) {
         live_set_global_mode_enabled(false, None);
-        live_set_mode(ApprovalMode::Build);
+        live_set_mode(ApprovalMode::Auto);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
         }
@@ -925,6 +925,7 @@ pub(crate) fn chat_runtime_config(
         supports_vision: p.map(|provider| provider.accepts_images()).unwrap_or(false),
         extra_system_append: None,
         initial_mesh_name: None,
+        initial_mode: jeikcode_coding::RuntimeMode::default(),
         session_display_name: None,
         // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
         // Mirrors `CodingRuntimeConfig::from_config` so the daemon path honors the
@@ -4713,8 +4714,8 @@ mod tests {
             let back: ApprovalMode = serde_json::from_value(serde_json::json!(wire)).unwrap();
             assert_eq!(back, mode);
         }
-        // Default is Build (the safe interactive-approval mode).
-        assert_eq!(ApprovalMode::default(), ApprovalMode::Build);
+        // Default is Auto (auto-approve without stalling; `--mode ask`/`plan` override).
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Auto);
     }
 
     #[test]

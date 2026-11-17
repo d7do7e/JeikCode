@@ -1053,6 +1053,10 @@ struct Cli {
     #[arg(long, value_name = "LABEL")]
     name: Option<String>,
 
+    /// Permission/execution mode override (`auto` [default], `ask`/`build`, `accept-edits`, `plan`)
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
+
     /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
     #[arg(short = 'p', long)]
     prompt: Option<String>,
@@ -1432,7 +1436,7 @@ fn is_completion_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) 
             | "--dangerously-skip-permissions" => {}
             // Root options that consume the following argv item.
             "--provider" | "--model" | "--lang" | "--config" | "--seed-config" | "-C" | "--dir"
-            | "-p" | "--prompt" | "--prompt-file" => {
+            | "--name" | "--mode" | "-p" | "--prompt" | "--prompt-file" => {
                 if args.next().is_none() {
                     return false;
                 }
@@ -1446,6 +1450,8 @@ fn is_completion_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) 
                     "--config=",
                     "--seed-config=",
                     "--dir=",
+                    "--name=",
+                    "--mode=",
                     "--prompt=",
                     "--prompt-file=",
                 ]
@@ -2660,6 +2666,16 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.next_prompt_suggestions = false;
+    let startup_mode = if cli.dangerously_skip_permissions {
+        jeikcode_coding::RuntimeMode::Auto
+    } else if let Some(raw_mode) = cli.mode.as_deref() {
+        jeikcode_coding::RuntimeMode::parse(raw_mode).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else if let Some(raw_mode) = config.default_mode.as_deref() {
+        jeikcode_coding::RuntimeMode::parse(raw_mode).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        jeikcode_coding::RuntimeMode::default()
+    };
+    runtime_cfg.initial_mode = startup_mode;
     if let Some(raw_name) = cli.name.as_deref() {
         match jeikcode_coding::sanitize_mesh_name(raw_name) {
             Ok(clean) => runtime_cfg.initial_mesh_name = Some(clean),
@@ -2936,6 +2952,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 startup_notice,
                 telemetry.clone(),
                 cli.dangerously_skip_permissions,
+                startup_mode,
                 is_admin,
             )
             .await

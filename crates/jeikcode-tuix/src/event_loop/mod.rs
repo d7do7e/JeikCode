@@ -59,15 +59,19 @@ fn runtime_mode(mode: crate::state::AgentMode) -> jeikcode_coding::RuntimeMode {
     }
 }
 
-fn apply_startup_bypass(
+fn apply_startup_mode(
+    initial_mode: crate::state::AgentMode,
     dangerously_skip_permissions: bool,
     ui_mode: &mut crate::state::AgentMode,
     mut set_runtime_mode: impl FnMut(jeikcode_coding::RuntimeMode),
 ) {
-    if dangerously_skip_permissions {
-        *ui_mode = crate::state::AgentMode::Auto;
-        set_runtime_mode(jeikcode_coding::RuntimeMode::Auto);
-    }
+    let effective = if dangerously_skip_permissions {
+        crate::state::AgentMode::Auto
+    } else {
+        initial_mode
+    };
+    *ui_mode = effective;
+    set_runtime_mode(runtime_mode(effective));
 }
 
 fn runtime_user_input(text: String, images: Vec<ImageContent>) -> jeikcode_coding::UserInput {
@@ -3919,6 +3923,8 @@ pub struct LoopCtx {
     /// Shown as a red "⚠ BYPASS" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
+    /// Startup permission/execution mode (defaults to `AgentMode::Auto`; overridden by `--mode` / `-y`).
+    pub initial_mode: crate::state::AgentMode,
     /// When true, JeikCode is running with administrator/root privileges.
     /// A warning banner is shown in scrollback on startup.
     pub is_admin: bool,
@@ -8587,7 +8593,8 @@ fn refresh_streaming_or_modal(app: &mut App, ctx: &LoopCtx, renderer: &mut dyn R
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
-    apply_startup_bypass(
+    apply_startup_mode(
+        ctx.initial_mode,
         ctx.dangerously_skip_permissions,
         &mut app.state.agent_mode,
         |runtime_mode| {
@@ -8598,7 +8605,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 .ok();
             // Keep the daemon projection used by shared TUI/WebUI sessions in
             // lockstep with the UI and runtime-owned permission policy.
-            jeikcode_daemon::live_set_mode(crate::state::AgentMode::Auto);
+            let ui_mode = match runtime_mode {
+                jeikcode_coding::RuntimeMode::Build => crate::state::AgentMode::Build,
+                jeikcode_coding::RuntimeMode::AcceptEdits => crate::state::AgentMode::AcceptEdits,
+                jeikcode_coding::RuntimeMode::Auto => crate::state::AgentMode::Auto,
+                jeikcode_coding::RuntimeMode::Plan => crate::state::AgentMode::Plan,
+            };
+            jeikcode_daemon::live_set_mode(ui_mode);
         },
     );
 
@@ -15681,7 +15694,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{
-        apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice, ApprovalChoice,
+        apply_startup_mode, approval_choice_to_decision, bypass_approval_choice, ApprovalChoice,
     };
     use jeikcode_capabilities::tools::approval::PermissionDecision;
 
@@ -15706,18 +15719,35 @@ mod bypass_approval_tests {
     fn startup_y_applies_auto_to_ui_and_runtime_once() {
         let mut ui_mode = crate::state::AgentMode::Build;
         let mut runtime_modes = Vec::new();
-        apply_startup_bypass(true, &mut ui_mode, |mode| runtime_modes.push(mode));
+        apply_startup_mode(crate::state::AgentMode::Build, true, &mut ui_mode, |mode| {
+            runtime_modes.push(mode)
+        });
         assert_eq!(ui_mode, crate::state::AgentMode::Auto);
         assert_eq!(runtime_modes, vec![jeikcode_coding::RuntimeMode::Auto]);
     }
 
     #[test]
-    fn startup_without_y_leaves_ui_and_runtime_unchanged() {
-        let mut ui_mode = crate::state::AgentMode::Build;
+    fn startup_without_y_applies_initial_mode_default_auto_or_explicit_override() {
+        let mut ui_mode = crate::state::AgentMode::default();
         let mut runtime_modes = Vec::new();
-        apply_startup_bypass(false, &mut ui_mode, |mode| runtime_modes.push(mode));
+        apply_startup_mode(
+            crate::state::AgentMode::default(),
+            false,
+            &mut ui_mode,
+            |mode| runtime_modes.push(mode),
+        );
+        assert_eq!(ui_mode, crate::state::AgentMode::Auto);
+        assert_eq!(runtime_modes, vec![jeikcode_coding::RuntimeMode::Auto]);
+
+        let mut explicit_modes = Vec::new();
+        apply_startup_mode(
+            crate::state::AgentMode::Build,
+            false,
+            &mut ui_mode,
+            |mode| explicit_modes.push(mode),
+        );
         assert_eq!(ui_mode, crate::state::AgentMode::Build);
-        assert!(runtime_modes.is_empty());
+        assert_eq!(explicit_modes, vec![jeikcode_coding::RuntimeMode::Build]);
     }
 
     // The full command↔decision contract used by sync-mode `deliver_approval`.

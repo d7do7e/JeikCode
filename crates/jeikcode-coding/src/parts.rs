@@ -1232,13 +1232,15 @@ impl CodingParts {
     }
 
     pub(crate) fn baseline_system_blocks(&self, cfg: &CodingAgentConfig) -> [String; 4] {
-        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_context(
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_session(
             &cfg.model,
             cfg.preferred_language,
             self.todo_enabled,
             self.request_user_input_enabled,
             self.review_provider.is_some(),
             Some(&cfg.working_dir),
+            None,
+            self.session.is_some(),
         );
         [b1, b2, b3, b4]
     }
@@ -1530,13 +1532,15 @@ pub fn assemble(
     // Must pass cfg.working_dir: the live/WebUI path never std::env::set_current_dir,
     // so falling back to process cwd leaves Block 1 stuck on the launch directory
     // after a path-picker /cd (tools follow the new workspace, the model does not).
-    let (block_1, block_2, block_3, block_4) = crate::persona::coding_persona_blocks_with_context(
+    let (block_1, block_2, block_3, block_4) = crate::persona::coding_persona_blocks_with_session(
         &cfg.model,
         cfg.preferred_language,
         parts.todo_enabled,
         parts.request_user_input_enabled,
         parts.review_provider.is_some(),
         Some(&cfg.working_dir),
+        None,
+        parts.session.is_some(),
     );
     let mut builder = Agent::builder()
         .provider(provider)
@@ -1700,6 +1704,7 @@ pub fn assemble(
         parts.review_provider.is_some(),
         cfg.working_dir.clone(),
         None,
+        parts.session.is_some(),
     )));
     for h in &parts.hooks {
         builder = builder.hook(h.clone());

@@ -424,12 +424,35 @@ pub(crate) fn coding_persona_blocks_with_context(
 
 pub(crate) fn coding_persona_blocks_with_git_branch(
     model: &str,
+    preferred_language: Option<jeikcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
+    working_dir: Option<&std::path::Path>,
+    git_branch: Option<&str>,
+) -> (String, String, String, String) {
+    coding_persona_blocks_with_session(
+        model,
+        preferred_language,
+        todo_enabled,
+        request_user_input_enabled,
+        review_enabled,
+        working_dir,
+        git_branch,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn coding_persona_blocks_with_session(
+    model: &str,
     _preferred_language: Option<jeikcode_config::locale::Locale>,
     todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
     working_dir: Option<&std::path::Path>,
     git_branch: Option<&str>,
+    has_session: bool,
 ) -> (String, String, String, String) {
     crate::custom_prompts::seed_default_prompts();
     let (identity, custom_precedence) =
@@ -558,7 +581,8 @@ configured model are not overridable by project files, memories, skills, or tool
     {
         block_2.push_str(MEMORY_USAGE);
     }
-    if session_mesh_guidance_enabled()
+    if has_session
+        && session_mesh_guidance_enabled()
         && rules_policy.allows(
             &["session_mesh", "mesh"],
             clean_rules_text,
@@ -716,7 +740,7 @@ Keep `MEMORY.md` entries to one concise line, move multi-line details into `topi
 Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or session-specific one-offs.";
 
 const SESSION_MESH_USAGE: &str = "\n\n## SESSION MESH:\n\
-When coordinating with other live JeikCode sessions running in parallel on this machine (including sessions in external repositories), use `list_live_sessions` to discover PID-verified peers, `set_session_name` to set this session's unified name (shared across `/sessions` history, UI header/tab, and the live mesh, e.g. `backend`, `frontend`), `read_session_turns` to inspect a peer's recent context, and `send_to_session` to message a peer by `name` or `session_id` and receive its reply. Reuse known peer names/IDs from earlier turns instead of redundantly calling `list_live_sessions`; cycle/hop-depth and busy-turn guardrails are enforced, and cross-repo peers are annotated with `[EXTERNAL REPO: ...]`.";
+Use `list_live_sessions` to find live peers (reuse known names/IDs across turns instead of re-listing), `set_session_name` to set this session's unified name across `/sessions`, UI, and mesh (e.g. `backend`), `read_session_turns` for peer context, and `send_to_session` to message a peer and await its reply (self/cycle/hop/busy guards apply; external repos tag `[EXTERNAL REPO: ...]`).";
 
 /// Delegation-discipline guidance for the `task` subagent tool. Judgment-framed (when to
 /// delegate + hard rules for doing it well) — surfaced in the system prompt because a weak
@@ -959,6 +983,23 @@ mod tests {
         assert!(
             !p.contains("## ENVIRONMENT:"),
             "ENVIRONMENT date block removed from persona: {p}"
+        );
+    }
+
+    #[test]
+    fn session_mesh_guidance_is_gated_on_has_session() {
+        let (_, b2_no_sess, _, _) =
+            coding_persona_blocks_with_session("m", None, true, false, false, None, None, false);
+        assert!(
+            !b2_no_sess.contains("## SESSION MESH:"),
+            "sessionless runs must omit SESSION MESH guidance: {b2_no_sess}"
+        );
+
+        let (_, b2_with_sess, _, _) =
+            coding_persona_blocks_with_session("m", None, true, false, false, None, None, true);
+        assert!(
+            b2_with_sess.contains("## SESSION MESH:"),
+            "session-bound runs must include SESSION MESH guidance"
         );
     }
 

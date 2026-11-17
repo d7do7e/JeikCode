@@ -991,6 +991,14 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
         },
         Msg::StreamStalled,
         Msg::ConhostScrollHint,
+        Msg::RateLimitedAutoResuming { secs: 37 },
+        Msg::RateLimitedRetryAfter {
+            duration: "THAM_SO",
+        },
+        Msg::RateLimitedPaused {
+            reason: "THAM_SO",
+            retry_after: "THAM_SO",
+        },
     ];
     for msg in messages {
         let en = t_with(Locale::En, msg);

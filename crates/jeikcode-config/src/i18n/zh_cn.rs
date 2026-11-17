@@ -1382,5 +1382,16 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::StreamReadResetHint =>
             "此错误常见于公司网络或代理环境,请检查代理/VPN/防火墙设置后重试。".into(),
         Msg::StreamReadDetailsPrefix => "详情: ".into(),
+        Msg::RateLimitedAutoResuming { secs } => {
+            format!("⏳ 限流，{secs}s 后自动继续…").into()
+        }
+        Msg::RateLimitedRetryAfter { duration } => format!("（约 {duration} 后可重试）").into(),
+        Msg::RateLimitedPaused {
+            reason,
+            retry_after,
+        } => format!(
+            "⏸ 限流（HTTP 429）{reason}{retry_after} · 已保留已完成内容 · 稍后重试或换模型"
+        )
+        .into(),
     }
 }

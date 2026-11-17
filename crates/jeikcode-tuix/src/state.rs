@@ -2887,8 +2887,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_default_is_build() {
-        assert_eq!(AgentMode::default(), AgentMode::Build);
+    fn agent_mode_default_is_auto() {
+        assert_eq!(AgentMode::default(), AgentMode::Auto);
     }
 
     fn task_info(path: &str, dedup: &str) -> crate::event_loop::ui_event::SubAgentTaskInfo {

@@ -6344,18 +6344,32 @@ pub(crate) fn format_rate_limited_line(
     server_message: Option<&str>,
 ) -> String {
     if auto_resuming {
-        let n = secs_until_reset.unwrap_or(0);
-        return format!("⏳ 限流，{n}s 后自动继续…");
+        let secs = secs_until_reset.unwrap_or(0);
+        return t(Msg::RateLimitedAutoResuming { secs }).into_owned();
     }
-    let tail = match secs_until_reset {
-        Some(s) => format!("（约 {} 后可重试）", fmt_dur(s)),
+    let retry_after = match secs_until_reset {
+        Some(s) => {
+            let dur = fmt_dur(s);
+            t(Msg::RateLimitedRetryAfter { duration: &dur }).into_owned()
+        }
         None => String::new(),
     };
     let reason = match server_message {
-        Some(m) if !m.trim().is_empty() => format!("：{}", m.trim()),
+        Some(m) if !m.trim().is_empty() => {
+            let sep = if matches!(crate::i18n::current_locale(), crate::i18n::Locale::ZhCn) {
+                "："
+            } else {
+                ": "
+            };
+            format!("{sep}{}", m.trim())
+        }
         _ => String::new(),
     };
-    format!("⏸ 限流（HTTP 429）{reason}{tail} · 已保留已完成内容 · 稍后重试或换模型")
+    t(Msg::RateLimitedPaused {
+        reason: &reason,
+        retry_after: &retry_after,
+    })
+    .into_owned()
 }
 
 /// Format a duration in seconds as a compact human string: "2h11m" / "45m" / "30s".
@@ -6458,39 +6472,52 @@ mod status_assemble_tests {
 #[cfg(test)]
 mod rate_limited_tests {
     use super::*;
+    use crate::i18n::Locale;
 
     #[test]
     fn rate_limited_wait_shows_countdown() {
-        let line = format_rate_limited_line("", "", Some(45), true, None);
-        assert!(line.contains("45"));
-        assert!(line.contains("自动继续"));
-        assert!(line.contains('⏳'));
-        assert!(!line.contains('⏸'));
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
+        let en = format_rate_limited_line("", "", Some(45), true, None);
+        assert!(en.contains("45"));
+        assert!(en.contains("auto-resuming in 45s"));
+        assert!(en.contains('⏳'));
+        assert!(!en.contains('⏸'));
+
+        crate::i18n::set_locale(Locale::ZhCn);
+        let zh = format_rate_limited_line("", "", Some(45), true, None);
+        assert!(zh.contains("45"));
+        assert!(zh.contains("自动继续"));
     }
 
     #[test]
     fn rate_limited_pause_is_generic() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
         let line = format_rate_limited_line("18:09", "window", Some(7200), false, None);
         assert!(line.contains('⏸'));
-        assert!(line.contains("HTTP 429") || line.contains("限流"));
+        assert!(line.contains("Rate limited (HTTP 429)"));
+        assert!(line.contains("Completed content preserved"));
         assert!(line.contains("2h0m"));
-        assert!(!line.contains("5小时窗口"));
-        assert!(!line.contains("自动继续"));
+        assert!(!line.contains("auto-resuming"));
     }
 
     #[test]
     fn rate_limited_generic_surfaces_provider_reason() {
-        let line =
-            format_rate_limited_line("", "", None, false, Some("余额不足或无可用资源包,请充值"));
-        assert!(line.contains("余额不足或无可用资源包,请充值"));
-        assert!(line.contains("HTTP 429") || line.contains("限流"));
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
+        let line = format_rate_limited_line("", "", None, false, Some("insufficient quota"));
+        assert!(line.contains(": insufficient quota"));
+        assert!(line.contains("HTTP 429"));
     }
 
     #[test]
     fn rate_limited_no_secs_shows_no_duration() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
         let line = format_rate_limited_line("23:59", "", None, false, None);
-        assert!(!line.contains("后可重试"));
-        assert!(!line.contains("还有"));
+        assert!(!line.contains("retry in"));
+        assert!(!line.contains('~'));
     }
 
     #[test]

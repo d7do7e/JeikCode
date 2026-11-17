@@ -308,16 +308,31 @@ pub struct SnapshotUndoResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeMode {
-    #[default]
+    #[serde(rename = "build")]
     Build,
     #[serde(rename = "accept_edits")]
     AcceptEdits,
+    #[default]
     #[serde(rename = "bypass")]
     Auto,
     Plan,
 }
 
 impl RuntimeMode {
+    /// Parse a CLI or config permission mode name (`auto`/`bypass`, `ask`/`build`,
+    /// `accept_edits`/`accept-edits`, `plan`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" | "bypass" => Ok(Self::Auto),
+            "ask" | "build" => Ok(Self::Build),
+            "accept_edits" | "accept-edits" | "accept" => Ok(Self::AcceptEdits),
+            "plan" => Ok(Self::Plan),
+            other => Err(format!(
+                "invalid permission mode `{other}` (expected one of: auto, ask, build, accept-edits, plan)"
+            )),
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Build => Self::AcceptEdits,
@@ -2039,6 +2054,10 @@ impl CodingRuntime {
         )
         .await
         .map_err(runtime_start_prepare_error)?;
+        let (plan_flag, bypass_flag, accept_flag) = agent.initial_mode.to_flags();
+        parts.plan_mode.store(plan_flag, Ordering::Release);
+        parts.bypass_mode.store(bypass_flag, Ordering::Release);
+        parts.accept_edits.store(accept_flag, Ordering::Release);
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),

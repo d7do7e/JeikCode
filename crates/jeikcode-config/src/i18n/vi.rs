@@ -1302,5 +1302,18 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         | Msg::StreamReadPartialResponse
         | Msg::StreamReadResetHint
         | Msg::StreamReadDetailsPrefix => super::en::en(msg),
+        Msg::RateLimitedAutoResuming { secs } => {
+            format!("⏳ Bị giới hạn tốc độ, tự động tiếp tục sau {secs}s...").into()
+        }
+        Msg::RateLimitedRetryAfter { duration } => {
+            format!(" (có thể thử lại sau ~{duration})").into()
+        }
+        Msg::RateLimitedPaused {
+            reason,
+            retry_after,
+        } => format!(
+            "⏸ Bị giới hạn tốc độ (HTTP 429){reason}{retry_after} · Đã giữ nội dung hoàn tất · Thử lại sau hoặc đổi mô hình"
+        )
+        .into(),
     }
 }

@@ -1866,4 +1866,17 @@ pub enum Msg<'a> {
     StreamReadResetHint,
     /// Details prefix.
     StreamReadDetailsPrefix,
+    /// HTTP 429 WaitAndRetry auto-resume countdown line.
+    RateLimitedAutoResuming {
+        secs: u64,
+    },
+    /// Optional retry-after duration fragment inside `RateLimitedPaused`.
+    RateLimitedRetryAfter {
+        duration: &'a str,
+    },
+    /// HTTP 429 pause line (non-CodingPlan / generic rate limit).
+    RateLimitedPaused {
+        reason: &'a str,
+        retry_after: &'a str,
+    },
 }

@@ -595,6 +595,14 @@ pub struct Config {
     /// so legacy configs (`default_provider` only) keep working unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Optional default permission/execution mode (`"auto"` [default], `"ask"`/`"build"`,
+    /// `"accept_edits"`, or `"plan"`). Overridden at launch by `--mode` or `-y`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "permission_mode"
+    )]
+    pub default_mode: Option<String>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
     /// enabled=false, dir="$JEIKCODE_HOME/datalog" (project slug appended underneath).
     ///
@@ -989,6 +997,7 @@ impl Default for Config {
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            default_mode: None,
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -2655,6 +2664,7 @@ model = "missing-type"
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            default_mode: None,
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),

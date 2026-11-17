@@ -341,6 +341,7 @@ pub async fn run(
     startup_notice: Option<String>,
     telemetry: std::sync::Arc<jeikcode_telemetry::Telemetry>,
     dangerously_skip_permissions: bool,
+    initial_mode: crate::state::AgentMode,
     is_admin: bool,
 ) -> Result<()> {
     let tui_start = std::time::Instant::now();
@@ -859,6 +860,7 @@ pub async fn run(
         )),
         is_plain_renderer,
         dangerously_skip_permissions,
+        initial_mode,
         is_admin,
         pending_guide_topic: None,
         live_binding: None,

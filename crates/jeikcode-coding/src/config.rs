@@ -261,6 +261,8 @@ pub struct CodingAgentConfig {
     pub extra_system_append: Option<String>,
     /// Optional initial nickname/role for the live session mesh (`--name`).
     pub initial_mesh_name: Option<String>,
+    /// Startup permission/execution mode (defaults to `RuntimeMode::Auto`).
+    pub initial_mode: crate::RuntimeMode,
     /// Optional display name for a freshly created session (e.g. OpenAI `user` /
     /// user_title). Pinned with `user_renamed=true` so first-prompt seeding and
     /// AI session naming never overwrite it.
@@ -349,6 +351,8 @@ pub struct CodingRuntimeConfig {
     pub extra_system_append: Option<String>,
     /// Optional initial nickname/role for the live session mesh (`--name`).
     pub initial_mesh_name: Option<String>,
+    /// Startup permission/execution mode (defaults to `RuntimeMode::Auto`, or `config.default_mode`).
+    pub initial_mode: crate::RuntimeMode,
     /// Optional display name for a freshly created session (e.g. OpenAI `user` /
     /// user_title). Applied only when the native runtime creates the session meta;
     /// existing sessions keep their stored name.
@@ -397,6 +401,15 @@ impl CodingRuntimeConfig {
         });
         let pricing = resolved.as_ref().and_then(resolve_resolved_pricing);
         let r = resolved.as_ref();
+        let initial_mode = if dangerously_skip_permissions {
+            crate::RuntimeMode::Auto
+        } else {
+            config
+                .default_mode
+                .as_deref()
+                .and_then(|raw| crate::RuntimeMode::parse(raw).ok())
+                .unwrap_or_default()
+        };
         Self {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
@@ -461,6 +474,7 @@ impl CodingRuntimeConfig {
             supports_vision: r.map(|r| r.accepts_images()).unwrap_or(false),
             extra_system_append: None,
             initial_mesh_name: None,
+            initial_mode,
             session_display_name: None,
             // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
             tool_output_max_bytes: std::env::var("JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES")
@@ -513,6 +527,7 @@ impl CodingRuntimeConfig {
         config.supports_vision = self.supports_vision;
         config.extra_system_append = self.extra_system_append.clone();
         config.initial_mesh_name = self.initial_mesh_name.clone();
+        config.initial_mode = self.initial_mode;
         config.session_display_name = self.session_display_name.clone();
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
@@ -899,6 +914,7 @@ impl CodingAgentConfig {
             supports_vision: false,
             extra_system_append: None,
             initial_mesh_name: None,
+            initial_mode: crate::RuntimeMode::default(),
             session_display_name: None,
             subagent_config: None,
             subagent_fast_provider: None,
@@ -1008,6 +1024,48 @@ mod tests {
             runtime.agent_config().preferred_language,
             Some(Locale::ZhCn)
         );
+        assert_eq!(runtime.initial_mode, crate::RuntimeMode::Auto);
+    }
+
+    #[test]
+    fn runtime_config_honors_default_mode_override_and_bypass_flag() {
+        let mut source = jeikcode_config::config::Config::default();
+        source.default_mode = Some("ask".to_string());
+        let ask_rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(ask_rt.initial_mode, crate::RuntimeMode::Build);
+        assert_eq!(
+            ask_rt.agent_config().initial_mode,
+            crate::RuntimeMode::Build
+        );
+
+        source.default_mode = Some("plan".to_string());
+        let plan_rt = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(plan_rt.initial_mode, crate::RuntimeMode::Plan);
+
+        // -y / dangerously_skip_permissions still forces Auto over config default_mode.
+        let forced_auto = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            true,
+            true,
+        );
+        assert_eq!(forced_auto.initial_mode, crate::RuntimeMode::Auto);
     }
 
     #[test]

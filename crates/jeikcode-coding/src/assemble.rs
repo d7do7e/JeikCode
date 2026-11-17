@@ -127,6 +127,7 @@ fn build_coding_agent_from_tools(
             true,
             cfg.working_dir.clone(),
             startup_warning,
+            false,
         )))
         // Env / project-instructions / git context at session start (after persona).
         // Optional client system append (OpenAI/Anthropic compat) after AGENTS/glossary/db.
@@ -237,9 +238,11 @@ pub(crate) struct CodingPersonaHook {
     startup_warning: Option<String>,
     /// Frozen at assemble (`/cd` respawns). Avoids a git subprocess on every turn.
     git_branch: String,
+    has_session: bool,
 }
 
 impl CodingPersonaHook {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: impl Into<String>,
         preferred_language: Option<jeikcode_config::locale::Locale>,
@@ -248,6 +251,7 @@ impl CodingPersonaHook {
         review_enabled: bool,
         working_dir: impl Into<PathBuf>,
         startup_warning: Option<String>,
+        has_session: bool,
     ) -> Self {
         let working_dir = working_dir.into();
         let git_branch = crate::custom_prompts::detect_git_branch(&working_dir)
@@ -261,12 +265,13 @@ impl CodingPersonaHook {
             working_dir,
             startup_warning,
             git_branch,
+            has_session,
         }
     }
 
     fn reconcile_persona(&self, convo: &mut Conversation) {
         let (mut block_1, block_2, block_3, block_4) =
-            crate::persona::coding_persona_blocks_with_git_branch(
+            crate::persona::coding_persona_blocks_with_session(
                 &self.model,
                 self.preferred_language,
                 self.todo_enabled,
@@ -274,6 +279,7 @@ impl CodingPersonaHook {
                 self.review_enabled,
                 Some(&self.working_dir),
                 Some(&self.git_branch),
+                self.has_session,
             );
         if let Some(warning) = &self.startup_warning {
             block_1.push_str("\n\n<system-reminder>");

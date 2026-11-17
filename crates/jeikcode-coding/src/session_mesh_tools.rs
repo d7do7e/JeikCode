@@ -317,7 +317,7 @@ impl Tool for ListLiveSessionsTool {
     }
 
     fn description(&self) -> &str {
-        "Discover live JeikCode sessions across local OS processes with PID verification, nicknames (`name`/`display_name`), repo scope (`same_repo` or `EXTERNAL REPO`), clean paths, and busy status. Reuse known session names or IDs from earlier turns instead of calling this repeatedly."
+        "Discover PID-verified live JeikCode sessions with nicknames, repo scope (`same_repo` or `EXTERNAL REPO`), clean paths, and busy status."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -372,7 +372,7 @@ impl Tool for ReadSessionTurnsTool {
     }
 
     fn description(&self) -> &str {
-        "Read recent user/assistant turns from another live JeikCode session by `target` (accepts either a session `name` or `session_id`; reuse known names/IDs from earlier turns). External repositories are clearly annotated."
+        "Read recent user/assistant turns from a live peer session."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -381,15 +381,15 @@ impl Tool for ReadSessionTurnsTool {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Target live session `name` or `session_id` (alias: `session_id`). Reuse known values from earlier turns."
+                    "description": "Peer `name` or `session_id`."
                 },
                 "last_n": {
                     "type": "integer",
-                    "description": "Number of recent real messages to return (default 8, max 50)."
+                    "description": "Recent real messages to return (default 8, max 50)."
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Character cap on returned transcript snippet (default 6000, max 32000)."
+                    "description": "Max transcript chars (default 6000, max 32000)."
                 }
             },
             "required": ["target"]
@@ -457,7 +457,7 @@ impl Tool for SendToSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Send a peer message to another live JeikCode session by `target` (accepts either a session `name` or `session_id`; reuse known names/IDs from earlier turns) and wait for its reply by default. Enforces self/cycle prevention, max hop-depth, and busy-turn admission."
+        "Send a peer message to another live JeikCode session and wait for its reply by default."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -466,23 +466,23 @@ impl Tool for SendToSessionTool {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Target live session `name` or `session_id` (alias: `session_id`). Reuse known values from earlier turns."
+                    "description": "Peer `name` or `session_id`."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Instruction or question to send to the peer session."
+                    "description": "Instruction or question for the peer session."
                 },
                 "steer_if_busy": {
                     "type": "boolean",
-                    "description": "When true, steer the message into an active InTurn session instead of rejecting busy targets (default false)."
+                    "description": "Steer into an active InTurn peer instead of rejecting (default false)."
                 },
                 "wait_for_reply": {
                     "type": "boolean",
-                    "description": "Wait for the peer turn to finish and return its response (default true when target is Ready, false when steered)."
+                    "description": "Await reply (default true when Ready, false if steered)."
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Seconds to wait for the peer reply before returning a pending delivery status (default 120, max 300)."
+                    "description": "Wait timeout in seconds (default 120, max 300)."
                 }
             },
             "required": ["target", "message"]
@@ -597,7 +597,7 @@ impl Tool for SetSessionNameTool {
     }
 
     fn description(&self) -> &str {
-        "Set or update this session's own unified name (shown in `/sessions` history, TUI header/tab, and live mesh, e.g. `backend`, `frontend`; max 48 chars). Updates only the current session and enforces live uniqueness."
+        "Set this session's unified name across `/sessions`, UI, and live mesh (self-owned, live-unique)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -606,7 +606,7 @@ impl Tool for SetSessionNameTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Nickname/role label for this session (1..=48 characters, no control characters)."
+                    "description": "Nickname (1..=48 chars, no control chars)."
                 }
             },
             "required": ["name"]

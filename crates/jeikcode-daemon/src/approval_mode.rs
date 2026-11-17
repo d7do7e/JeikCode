@@ -22,6 +22,6 @@ mod tests {
             assert_eq!(mode.wire(), wire);
         }
 
-        assert_eq!(ApprovalMode::default(), ApprovalMode::Build);
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Auto);
     }
 }

@@ -1409,5 +1409,16 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::StreamReadResetHint =>
             "This error is common in corporate network or proxy environments; please check proxy/VPN/firewall settings.".into(),
         Msg::StreamReadDetailsPrefix => "Details: ".into(),
+        Msg::RateLimitedAutoResuming { secs } => {
+            format!("⏳ Rate limited, auto-resuming in {secs}s...").into()
+        }
+        Msg::RateLimitedRetryAfter { duration } => format!(" (retry in ~{duration})").into(),
+        Msg::RateLimitedPaused {
+            reason,
+            retry_after,
+        } => format!(
+            "⏸ Rate limited (HTTP 429){reason}{retry_after} · Completed content preserved · Retry later or switch model"
+        )
+        .into(),
     }
 }
