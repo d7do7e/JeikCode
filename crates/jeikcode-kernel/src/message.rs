@@ -1078,35 +1078,8 @@ impl Conversation {
         plan: CompactionPlan,
         sacred_floor: usize,
     ) -> PreparedCompaction {
-        // Deterministic size proxy: the bytes that ride the wire for a message — NOT just
-        // `text`. Dropping a text-light, TOOL-CALL-heavy message (big JSON arguments) must
-        // count as a reduction, else the strictly-smaller net-loss guard below would
-        // REFUSE a genuinely shrinking plan and tool-heavy histories could never compact.
-        fn size(m: &Message) -> usize {
-            // Token-equivalent image weight (~1600 tokens * 4 bytes/token = 6400 bytes),
-            // matching `Message::estimate_tokens()`. Using raw base64 bytes (1-3 MB) would
-            // distort the post-compaction `used_tokens` pressure scaling ratio below.
-            const IMAGE_TOKEN_EQUIV_BYTES: usize = 6_400;
-            let tool_calls: usize = m
-                .tool_calls
-                .iter()
-                .map(|c| c.id.len() + c.name.len() + c.arguments.len())
-                .sum();
-            let reasoning_blocks: usize = m
-                .reasoning_blocks
-                .iter()
-                .map(|b| b.text.len() + b.opaque.as_deref().map_or(0, str::len))
-                .sum();
-            let images_equiv = m.images.len().saturating_mul(IMAGE_TOKEN_EQUIV_BYTES);
-            m.text.len()
-                + m.reasoning.as_ref().map_or(0, |r| r.len())
-                + reasoning_blocks
-                + images_equiv
-                + tool_calls
-                + m.tool_call_id.as_ref().map_or(0, |id| id.len())
-        }
         let epoch_before = self.cache_epoch;
-        let bytes_before: usize = self.messages.iter().map(size).sum();
+        let bytes_before = snapshot_byte_size(&self.messages);
         let len_before = self.messages.len();
 
         // 1. Clamp the drain range against the protected prefix and current bounds.
@@ -1176,7 +1149,7 @@ impl Conversation {
         // original, which was valid).
         Self::repair_pairing(&mut candidate);
 
-        let bytes_after: usize = candidate.iter().map(size).sum();
+        let bytes_after = snapshot_byte_size(&candidate);
 
         // 3. Decide commit FIRST; prepare the next epoch only for a real commit.
         let committed = bytes_after < bytes_before;
@@ -1252,6 +1225,49 @@ impl Conversation {
         let prepared = self.prepare_plan(plan, sacred_floor);
         self.commit_prepared(prepared)
     }
+}
+
+/// Authoritative byte-size proxy for a single message during compaction net-loss
+/// and token-scaling calculations.
+pub fn message_byte_size(m: &Message) -> usize {
+    // Token-equivalent image weight (~1600 tokens * 4 bytes/token = 6400 bytes),
+    // matching `Message::estimate_tokens()`. Using raw base64 bytes (1-3 MB) would
+    // distort the post-compaction `used_tokens` pressure scaling ratio.
+    const IMAGE_TOKEN_EQUIV_BYTES: usize = 6_400;
+    let tool_calls: usize = m
+        .tool_calls
+        .iter()
+        .map(|c| c.id.len() + c.name.len() + c.arguments.len())
+        .sum();
+    let reasoning_blocks: usize = m
+        .reasoning_blocks
+        .iter()
+        .map(|b| b.text.len() + b.opaque.as_deref().map_or(0, str::len))
+        .sum();
+    let images_equiv = m.images.len().saturating_mul(IMAGE_TOKEN_EQUIV_BYTES);
+    m.text.len()
+        + m.reasoning.as_ref().map_or(0, |r| r.len())
+        + reasoning_blocks
+        + images_equiv
+        + tool_calls
+        + m.tool_call_id.as_ref().map_or(0, |id| id.len())
+}
+
+/// Authoritative total byte-size proxy across a conversation slice.
+pub fn snapshot_byte_size(messages: &[Message]) -> usize {
+    messages.iter().map(message_byte_size).sum()
+}
+
+/// Scale a pre-compaction token count by the authoritative kernel byte ratio.
+pub fn scale_tokens_by_bytes(
+    tokens_before: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+) -> usize {
+    if bytes_before == 0 {
+        return tokens_before;
+    }
+    ((tokens_before as u128 * bytes_after as u128) / bytes_before as u128) as usize
 }
 
 /// A compaction candidate that passed every kernel invariant but is not live yet.

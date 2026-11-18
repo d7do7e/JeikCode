@@ -2958,7 +2958,7 @@ impl SessionManager {
         })
     }
 
-    fn validate_lease(&self, lease: &SessionLease) -> SessionResult<()> {
+    pub(crate) fn validate_lease(&self, lease: &SessionLease) -> SessionResult<()> {
         let expected = self.lease_path(lease.id())?;
         if lease.inner.path == expected {
             Ok(())

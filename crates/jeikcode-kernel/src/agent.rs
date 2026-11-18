@@ -1656,7 +1656,7 @@ impl RunningAgent {
     /// `<memory>`), bump `cache_epoch`, and seed a bounded fresh-epoch handoff note.
     async fn reset_to_fresh_epoch(&self, convo: &mut Conversation, handoff_summary: String) {
         let len_before = convo.messages.len();
-        let bytes_before: usize = convo.messages.iter().map(|m| m.text.len()).sum();
+        let bytes_before = crate::message::snapshot_byte_size(&convo.messages);
         let prefix_len = convo
             .messages
             .iter()
@@ -1675,7 +1675,7 @@ impl RunningAgent {
             convo.push(Message::synthetic_user(handoff.to_string()));
         }
         convo.cache_epoch = convo.cache_epoch.saturating_add(1);
-        let bytes_after: usize = convo.messages.iter().map(|m| m.text.len()).sum();
+        let bytes_after = crate::message::snapshot_byte_size(&convo.messages);
         let removed = len_before.saturating_sub(convo.messages.len());
         let trigger = CompactTrigger::Manual {
             focus: Some("fresh-epoch".to_string()),

@@ -10,7 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use jeikcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
+use jeikcode_capabilities::session::snapshot::{SnapshotHook, SnapshotPersistenceStatus};
 use jeikcode_capabilities::session::{
     DisplayAnchor, PendingPermission, PresentationEntry, RewindPoint, RewindTransactionReceipt,
     SessionLease, SessionStoreError, TurnStat,
@@ -1124,11 +1124,7 @@ impl CompactionOutcome {
 }
 
 fn estimate_after_tokens(tokens_before: usize, bytes_before: usize, bytes_after: usize) -> usize {
-    if bytes_before == 0 {
-        return tokens_before;
-    }
-
-    ((tokens_before as u128 * bytes_after as u128) / bytes_before as u128) as usize
+    jeikcode_kernel::message::scale_tokens_by_bytes(tokens_before, bytes_before, bytes_after)
 }
 
 /// Cloneable, stable control handle held by a driver.
@@ -2958,7 +2954,7 @@ fn spawn_runtime_owner_with_optional_agent(
         // that do not mount the runtime-owned schedule_wakeup tool.
         let _wakeup_guard = _closed_wakeup_tx;
         let mut agent = initial;
-        let mut observed_tokens = None;
+        let mut observed_tokens = initial_observed_tokens(resources.as_ref());
         let mut latest_snapshot: Option<Arc<SessionSnapshot>> = None;
         let mut controls_open = true;
         let mut compaction_suspended = false;
@@ -3070,6 +3066,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                         )
                         .await;
                         if fail_close_after_stopped_persistence(
@@ -3140,6 +3140,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                         )
                         .await;
                         if fail_close_after_stopped_persistence(
@@ -3209,6 +3213,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                         )
                         .await;
                         forced_shutdown = stop_report.forced;
@@ -4947,6 +4955,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
                             runtime.parts.snapshot_persistence_status(),
+                            runtime.parts.snapshot_hook().as_deref(),
                         )
                         .await;
                         if stop_report.forced
@@ -5176,6 +5185,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                         )
                         .await;
                         finish_stopped_native_turn(
@@ -5469,6 +5482,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
                             runtime.parts.snapshot_persistence_status(),
+                            runtime.parts.snapshot_hook().as_deref(),
                         )
                         .await;
                         if controller_interrupted {
@@ -5686,6 +5700,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
                             runtime.parts.snapshot_persistence_status(),
+                            runtime.parts.snapshot_hook().as_deref(),
                         )
                         .await;
                         if let Some(error) = fail_close_after_stopped_persistence(
@@ -5845,6 +5860,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
                             runtime.parts.snapshot_persistence_status(),
+                            runtime.parts.snapshot_hook().as_deref(),
                         )
                         .await;
                         finish_stopped_native_turn(
@@ -6259,6 +6275,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                         )
                         .await;
                         forced_shutdown = stop_report.forced;
@@ -6357,6 +6377,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut compactions,
                             &mut observed_tokens,
                             Some(&mut latest_snapshot),
+                            resources
+                                .as_ref()
+                                .and_then(|runtime| runtime.parts.snapshot_hook())
+                                .as_deref(),
                             &runtime_event_tx,
                         );
                         if let Some(error) = uncertain_compaction {
@@ -7267,6 +7291,10 @@ fn spawn_runtime_owner_with_optional_agent(
                 resources
                     .as_ref()
                     .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
+                resources
+                    .as_ref()
+                    .and_then(|runtime| runtime.parts.snapshot_hook())
+                    .as_deref(),
             )
             .await;
             forced_shutdown = stop_report.forced;
@@ -8183,11 +8211,48 @@ fn compute_runtime_undo(
     })
 }
 
+fn initial_observed_tokens(resources: Option<&RuntimeResources>) -> Option<usize> {
+    let binding = resources?.parts.session.as_ref()?;
+    let meta = binding.manager.read_meta(&binding.id).ok();
+    if let Some(tokens) = meta
+        .as_ref()
+        .and_then(|m| m.compacted_context_tokens)
+        .filter(|&v| v > 0)
+        .and_then(|v| usize::try_from(v).ok())
+    {
+        return Some(tokens);
+    }
+    let from_snapshot = binding.resume.as_ref().and_then(|snap| {
+        snap.messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.role == jeikcode_kernel::message::Role::Assistant
+                    && m.internal_origin.as_deref()
+                        != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
+                    && m.meta.is_some()
+            })
+            .and_then(|m| m.meta.as_ref())
+            .map(|m| m.used_tokens as usize)
+            .filter(|&v| v > 0)
+    });
+    from_snapshot.or_else(|| {
+        meta.as_ref().and_then(|m| {
+            m.turn_stats
+                .iter()
+                .rev()
+                .find(|s| s.position_valid && s.used_tokens > 0)
+                .map(|s| s.used_tokens as usize)
+        })
+    })
+}
+
 fn handle_compaction_event(
     event: AgentEvent,
     compactions: &mut CompactionTracker,
     observed_tokens: &mut Option<usize>,
     latest_snapshot: Option<&mut Option<Arc<SessionSnapshot>>>,
+    snapshot_hook: Option<&SnapshotHook>,
     runtime_event_tx: &RuntimeEventEmitter,
 ) -> Option<AgentEvent> {
     match event {
@@ -8218,6 +8283,12 @@ fn handle_compaction_event(
             outcome.committed_snapshot = snapshot.map(Arc::new);
             if committed {
                 *observed_tokens = Some(outcome.estimated_tokens_after);
+                if outcome.estimated_tokens_after > 0 {
+                    if let Some(hook) = snapshot_hook {
+                        let _ = hook
+                            .record_compacted_context_tokens(outcome.estimated_tokens_after as u64);
+                    }
+                }
                 if let (Some(slot), Some(committed_snap)) =
                     (latest_snapshot, outcome.committed_snapshot.as_ref())
                 {
@@ -8280,6 +8351,7 @@ async fn stop_current_agent(
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
     persistence_status: Option<SnapshotPersistenceStatus>,
+    snapshot_hook: Option<&SnapshotHook>,
 ) -> StopReport {
     let Some(mut agent) = agent.take() else {
         compactions.interrupt_all(reason, runtime_event_tx);
@@ -8309,6 +8381,7 @@ async fn stop_current_agent(
                         compactions,
                         observed_tokens,
                         None,
+                        snapshot_hook,
                         runtime_event_tx,
                     ) {
                         Some(AgentEvent::Usage(meta)) => {
@@ -8337,7 +8410,14 @@ async fn stop_current_agent(
 
     while let Ok(event) = agent.events.try_recv() {
         record_stopped_conversation_event(&mut report, &event);
-        match handle_compaction_event(event, compactions, observed_tokens, None, runtime_event_tx) {
+        match handle_compaction_event(
+            event,
+            compactions,
+            observed_tokens,
+            None,
+            snapshot_hook,
+            runtime_event_tx,
+        ) {
             Some(AgentEvent::Usage(meta)) => {
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
@@ -11605,6 +11685,7 @@ mod tests {
             &mut observed_tokens,
             &emitter,
             CompactionInterruption::RuntimeReconfigured,
+            None,
             None,
         )
         .await;
@@ -16248,5 +16329,174 @@ mod tests {
         assert_eq!(runtime.handle.status().phase, RuntimePhase::InTurn);
 
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn manual_compact_persists_exact_compaction_finished_tokens_for_session_resume() {
+        use jeikcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+        use jeikcode_kernel::message::{MessageMeta, ReasoningBlock};
+        use jeikcode_kernel::stream::TokenUsage;
+
+        struct CompactFlowFactory;
+        impl CodingProviderFactory for CompactFlowFactory {
+            fn build(
+                &self,
+                config: &CodingAgentConfig,
+                _session_id: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                struct FlowProvider {
+                    model: String,
+                    calls: std::sync::atomic::AtomicUsize,
+                }
+                #[async_trait::async_trait]
+                impl LlmProvider for FlowProvider {
+                    fn model_name(&self) -> &str {
+                        &self.model
+                    }
+                    fn context_window(&self) -> u32 {
+                        1_000_000
+                    }
+                    async fn chat_stream(
+                        &self,
+                        _messages: &[Message],
+                        _tools: &[jeikcode_kernel::tool::ToolDef],
+                        _options: &jeikcode_kernel::provider::ChatOptions,
+                    ) -> Result<
+                        futures::stream::BoxStream<'static, jeikcode_kernel::stream::StreamEvent>,
+                        jeikcode_kernel::stream::ProviderError,
+                    > {
+                        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            Ok(Box::pin(futures::stream::iter(vec![
+                                jeikcode_kernel::stream::StreamEvent::TextDelta("done".into()),
+                                jeikcode_kernel::stream::StreamEvent::Usage(TokenUsage {
+                                    prompt: 191_400,
+                                    completion: 150,
+                                    cached: 0,
+                                }),
+                                jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                            ])))
+                        } else {
+                            Ok(Box::pin(futures::stream::iter(vec![
+                                jeikcode_kernel::stream::StreamEvent::TextDelta(
+                                    "short summary".into(),
+                                ),
+                                jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                            ])))
+                        }
+                    }
+                }
+                Ok(Arc::new(FlowProvider {
+                    model: config.model.clone(),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        let mgr = SessionManager::for_project(project.path());
+        let sid = "compact-exact-parity";
+
+        let mut old_a1 = Message::assistant(&"a".repeat(12_000), Vec::new());
+        old_a1.reasoning_blocks = vec![ReasoningBlock {
+            text: "t".repeat(30_000),
+            opaque: Some("o".repeat(5_000)),
+            provider: Some("p".into()),
+            id: None,
+        }];
+        old_a1.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 150_000,
+                completion: 100,
+                cached: 0,
+            },
+            elapsed_ms: 10,
+            reasoning_elapsed_ms: 0,
+            used_tokens: 150_000,
+            utilization: 0.15,
+            ctx_window: 1_000_000,
+            round: 1,
+            turn_id: 1,
+            request_id: 1,
+            provider_response_id: None,
+            provider_model: None,
+            session_id: Some(sid.into()),
+            finish_reason: "stop".into(),
+        });
+        let seed = SessionSnapshot::new(vec![
+            Message::system("sys"),
+            Message::user("first task"),
+            old_a1,
+            Message::user("second task"),
+            Message::assistant(&"b".repeat(8_000), Vec::new()),
+            Message::user("third task"),
+            Message::assistant(&"c".repeat(8_000), Vec::new()),
+        ]);
+        mgr.save_snapshot(sid, &seed).unwrap();
+        let mut meta = SessionMeta::new(sid, project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        mgr.write_meta(&meta).unwrap();
+        mgr.write_presentation(sid, &PresentationFile::default())
+            .unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.context_window = 1_000_000;
+        start.prepare.session = crate::SessionMode::Resume(sid.to_string());
+        start.provider_factory = Arc::new(CompactFlowFactory);
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        runtime
+            .handle
+            .submit(UserInput::from("run latest turn"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+
+        runtime.handle.compact(None).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match runtime.events.recv().await {
+                    Some(seq) => {
+                        if let CodingRuntimeEvent::CompactionFinished {
+                            completion: CompactionCompletion::Completed(outcome),
+                        } = seq.event
+                        {
+                            break outcome;
+                        }
+                    }
+                    None => panic!("runtime events closed before CompactionFinished"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for CompactionFinished");
+
+        assert!(outcome.committed);
+        assert_eq!(outcome.estimated_tokens_before, 191_400);
+        let persisted = mgr.read_meta(sid).unwrap();
+        assert_eq!(
+            persisted.compacted_context_tokens,
+            Some(outcome.estimated_tokens_after as u64),
+            "persisted SessionMeta.compacted_context_tokens must strictly equal CompactionFinished.estimated_tokens_after"
+        );
+
+        runtime.handle.shutdown().await.unwrap();
+
+        // Re-opening the same session seeds observed_tokens from persisted compacted_context_tokens.
+        let mut resume_start = native_start(false);
+        resume_start.agent.working_dir = project.path().to_path_buf();
+        resume_start.agent.context_window = 1_000_000;
+        resume_start.prepare.session = crate::SessionMode::Resume(sid.to_string());
+        resume_start.provider_factory = Arc::new(CompactFlowFactory);
+        let resumed = CodingRuntime::start(resume_start).await.unwrap();
+        let stats = resumed.handle.context_stats().await.unwrap();
+        assert_eq!(stats.used_tokens as usize, outcome.estimated_tokens_after);
+        resumed.handle.shutdown().await.unwrap();
     }
 }

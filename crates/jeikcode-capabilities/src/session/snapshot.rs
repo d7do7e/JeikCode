@@ -765,21 +765,29 @@ impl SnapshotHook {
         self.record_persistence_error(&error);
         CompactionCheckpointError::new(error.to_string())
     }
+
+    /// Persist the exact post-compaction token estimate reported by
+    /// `CompactionFinished` so `SessionMeta.compacted_context_tokens` on disk
+    /// stays identical to the live post-compaction status bar counter.
+    pub fn record_compacted_context_tokens(&self, tokens: u64) -> Result<(), SessionStoreError> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        if let Some(lease) = &self.lease {
+            self.mgr.validate_lease(lease)?;
+        }
+        match self.mgr.update_meta(&self.session_id, |meta| {
+            meta.compacted_context_tokens = Some(tokens);
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn snapshot_bytes(snapshot: &SessionSnapshot) -> usize {
-    snapshot
-        .messages
-        .iter()
-        .map(|m| {
-            m.text.len()
-                + m.reasoning.as_deref().map_or(0, str::len)
-                + m.tool_calls
-                    .iter()
-                    .map(|c| c.name.len() + c.arguments.len())
-                    .sum::<usize>()
-        })
-        .sum()
+    jeikcode_kernel::message::snapshot_byte_size(&snapshot.messages)
 }
 
 fn estimate_post_compaction_tokens(
@@ -787,22 +795,25 @@ fn estimate_post_compaction_tokens(
     after: &SessionSnapshot,
     meta: &SessionMeta,
 ) -> u64 {
-    let before_used = before
-        .and_then(|snap| {
-            snap.messages
-                .iter()
-                .rev()
-                .find(|m| {
-                    m.role == jeikcode_kernel::message::Role::Assistant
-                        && m.internal_origin.as_deref()
-                            != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
-                        && m.meta.is_some()
-                })
-                .and_then(|m| m.meta.as_ref())
-                .map(|m| u64::from(m.used_tokens))
-                .filter(|&v| v > 0)
+    let before_used = meta
+        .compacted_context_tokens
+        .filter(|&v| v > 0)
+        .or_else(|| {
+            before.and_then(|snap| {
+                snap.messages
+                    .iter()
+                    .rev()
+                    .find(|m| {
+                        m.role == jeikcode_kernel::message::Role::Assistant
+                            && m.internal_origin.as_deref()
+                                != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
+                            && m.meta.is_some()
+                    })
+                    .and_then(|m| m.meta.as_ref())
+                    .map(|m| u64::from(m.used_tokens))
+                    .filter(|&v| v > 0)
+            })
         })
-        .or_else(|| meta.compacted_context_tokens.filter(|&v| v > 0))
         .or_else(|| {
             meta.turn_stats
                 .iter()
@@ -814,7 +825,11 @@ fn estimate_post_compaction_tokens(
     if let (Some(before_snap), Some(before_used)) = (before, before_used) {
         let before_bytes = snapshot_bytes(before_snap);
         if before_bytes > 0 {
-            return ((before_used as u128 * after_bytes as u128) / before_bytes as u128) as u64;
+            return jeikcode_kernel::message::scale_tokens_by_bytes(
+                before_used as usize,
+                before_bytes,
+                after_bytes,
+            ) as u64;
         }
     }
     let after_assistant_used = after
@@ -2366,6 +2381,82 @@ mod tests {
                 .is_some_and(|t| t > 0 && t < 200_000),
             "unleased save must also persist compacted_context_tokens: {:?}",
             unleased_meta.compacted_context_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_tokens_match_kernel_bytes_with_reasoning_blocks_and_record_override() {
+        use jeikcode_kernel::message::{scale_tokens_by_bytes, snapshot_byte_size, ReasoningBlock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-reasoning-drift";
+
+        let mut pre = Conversation::new();
+        pre.push(Message::user("diagnose issue"));
+        let mut a1 = Message::assistant("first pass", Vec::new());
+        a1.reasoning_blocks = vec![ReasoningBlock {
+            text: "r".repeat(20_000),
+            opaque: Some("sig".repeat(1_000)),
+            provider: Some("p".into()),
+            id: None,
+        }];
+        a1.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 191_400,
+                completion: 200,
+                cached: 0,
+            },
+            elapsed_ms: 10,
+            reasoning_elapsed_ms: 0,
+            used_tokens: 191_400,
+            utilization: 0.19,
+            ctx_window: 1_000_000,
+            round: 1,
+            turn_id: 1,
+            request_id: 1,
+            provider_response_id: None,
+            provider_model: None,
+            session_id: Some(id.into()),
+            finish_reason: "stop".into(),
+        });
+        pre.push(a1);
+
+        let pre_snap = SessionSnapshot::from_conversation(&pre);
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        manager.save_snapshot(id, &pre_snap).unwrap();
+        manager.write_meta(&meta).unwrap();
+        manager
+            .write_presentation(id, &PresentationFile::default())
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook = SnapshotHook::new(manager.clone(), id, "/proj").with_lease(lease);
+
+        let mut post = Conversation::new();
+        post.push(Message::synthetic_user(
+            "<!-- jeikcode:anchor v1 -->\ncompacted summary",
+        ));
+        post.push(Message::user("next"));
+        post.cache_epoch = 1;
+        let post_snap = SessionSnapshot::from_conversation(&post);
+
+        hook.save(&post_snap).unwrap();
+        let expected_from_kernel_bytes = scale_tokens_by_bytes(
+            191_400,
+            snapshot_byte_size(&pre_snap.messages),
+            snapshot_byte_size(&post_snap.messages),
+        ) as u64;
+        assert_eq!(
+            manager.read_meta(id).unwrap().compacted_context_tokens,
+            Some(expected_from_kernel_bytes)
+        );
+
+        // Authoritative CompactionFinished value from runtime reconciles any live override.
+        hook.record_compacted_context_tokens(101_234).unwrap();
+        assert_eq!(
+            manager.read_meta(id).unwrap().compacted_context_tokens,
+            Some(101_234)
         );
     }
 }

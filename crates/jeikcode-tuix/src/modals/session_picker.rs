@@ -2093,6 +2093,121 @@ mod tests {
         assert_eq!(payload.items[5].0, "↳ feature-login-retry");
         assert!(payload.items[5].1.contains(&format!("· {branch_label}")));
     }
+
+    #[test]
+    fn compaction_finished_tokens_match_restored_session_context_on_resume() {
+        use jeikcode_capabilities::session::{
+            PresentationFile, SessionMeta, StorageOwner, TurnStat as NativeTurnStat,
+        };
+        use jeikcode_coding::runtime::CompactionOutcome;
+        use jeikcode_daemon::legacy_convert::CatalogSessionView;
+        use jeikcode_kernel::message::{CompactTrigger, Message, MessageMeta, SessionSnapshot};
+        use jeikcode_kernel::stream::TokenUsage;
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        // Simulate kernel compaction output (191.4k -> 101.2k) where the surviving
+        // assistant message meta and conservative estimate differ from outcome.estimated_tokens_after.
+        let outcome = CompactionOutcome::from_kernel(
+            CompactTrigger::Manual { focus: None },
+            1,
+            49,
+            191_400,
+            101_200,
+            true,
+            Some(191_400),
+        );
+        assert_eq!(outcome.estimated_tokens_after, 101_200);
+
+        let mut live_state = UiState::with_unicode(true);
+        live_state.on_token_usage(191_400, 1_000_000);
+        live_state.on_compaction_committed(outcome.estimated_tokens_after);
+        let live_tokens = live_state
+            .last_context
+            .as_ref()
+            .expect("live context")
+            .footer_used_tokens();
+
+        let mut surviving_asst = Message::assistant("surviving response", vec![]);
+        surviving_asst.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 117_500,
+                completion: 50,
+                cached: 0,
+            },
+            elapsed_ms: 10,
+            reasoning_elapsed_ms: 0,
+            used_tokens: 117_500,
+            utilization: 0.1175,
+            ctx_window: 1_000_000,
+            round: 1,
+            turn_id: 1,
+            request_id: 1,
+            provider_response_id: None,
+            provider_model: None,
+            session_id: Some("47de3e09".into()),
+            finish_reason: "stop".into(),
+        });
+        let snapshot = SessionSnapshot::new(vec![
+            Message::synthetic_user("<!-- jeikcode:anchor v1 -->\nsummary"),
+            Message::user("follow up"),
+            surviving_asst,
+        ]);
+        let mut meta = SessionMeta::new("47de3e09", "/tmp/proj", 1);
+        meta.owner = StorageOwner::Native;
+        meta.compacted_context_tokens = Some(outcome.estimated_tokens_after as u64);
+        meta.turn_stats.push(NativeTurnStat {
+            after_message: 3,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 100,
+            total_tokens: 191_400,
+            errored: false,
+            used_tokens: 191_400,
+            ctx_window: 1_000_000,
+            model_usage: Vec::new(),
+        });
+
+        let session = Session::from_catalog_view(CatalogSessionView {
+            meta,
+            snapshot,
+            presentation: PresentationFile::default(),
+        })
+        .expect("hydrate catalog view");
+
+        let (restored_tokens, restored_window) = restored_session_context(&session);
+        assert_eq!(restored_tokens, outcome.estimated_tokens_after);
+        assert_eq!(restored_window, 1_000_000);
+
+        let mut resumed_state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut resumed_state, &session, false);
+        let resumed_tokens = resumed_state
+            .last_context
+            .as_ref()
+            .expect("resumed context")
+            .footer_used_tokens();
+
+        assert_eq!(live_tokens, outcome.estimated_tokens_after);
+        assert_eq!(resumed_tokens, live_tokens);
+    }
 }
 #[tokio::test]
 async fn preparation_join_failure_becomes_an_error_terminal() {
