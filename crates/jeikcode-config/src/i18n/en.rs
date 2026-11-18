@@ -943,7 +943,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescView => "View file content in an overlay modal".into(),
         Msg::CmdDescApp => "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)".into(),
         Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
-        Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
+        Msg::CmdDescGoal => "Autonomous loop until met (subcommands: shift, status, pause, resume, stop, clear, rounds)".into(),
         Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
         Msg::CmdDescTodo => "Show the current todo list; `/todo add <task>` appends one, `/todo clear` wipes it".into(),
         Msg::CmdDescSchedule => "List scheduled tasks and next run times".into(),
@@ -1106,23 +1106,109 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             .into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
-             Usage:\n  \
-             \u{20}\u{20}/goal <condition>                     set a new goal; loops until verified met\n  \
-             \u{20}\u{20}/goal --until-stopped <condition>     continuous rollover with git milestone checkpoints\n  \
-             \u{20}\u{20}/goal --checkpoint <condition>        save non-destructive git checkpoint refs\n  \
-             \u{20}\u{20}/goal --verify|--no-verify <cond>     force or skip the blind read-only verifier\n  \
-             \u{20}\u{20}/goal                                 show current goal status\n  \
-             \u{20}\u{20}/goal status                          same as above\n  \
-             \u{20}\u{20}/goal clear                           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
-             \u{20}\u{20}/goal help                            this help\n  \
+             Subcommands:\n  \
+             \u{20}\u{20}/goal <prompt>                        run until verified met\n  \
+             \u{20}\u{20}/goal shift <prompt>                  continuous multi-epoch shift (--until-stopped --fresh-epoch --rollback-on-stall)\n  \
+             \u{20}\u{20}/goal status                          show progress, rounds, tokens, and active flags\n  \
+             \u{20}\u{20}/goal pause | resume                  pause or resume the active goal\n  \
+             \u{20}\u{20}/goal stop  | clear                   stop active goal or dismiss banner\n  \
+             \u{20}\u{20}/goal rounds <+N|N>                   adjust max_rounds budget on the fly (0 = unbounded)\n  \
+             \u{20}\u{20}/goal help                            show this help\n  \
+             Flags:\n  \
+             \u{20}\u{20}--max-rounds <N>                      override round cap for this goal\n  \
+             \u{20}\u{20}--until-stopped                       roll over continuously across epochs (defaults fresh-epoch=on)\n  \
+             \u{20}\u{20}--fresh-epoch / --no-fresh-epoch      reset context to frozen prefix on batch rollovers\n  \
+             \u{20}\u{20}--rollback-on-stall / --no-rollback-on-stall  restore last checkpoint if stalled\n  \
+             \u{20}\u{20}--max-tokens <N>                      stop once cumulative tokens reach N\n  \
+             \u{20}\u{20}--verify | --no-verify                force or skip the blind read-only verifier\n  \
+             \u{20}\u{20}--checkpoint                          save non-destructive git milestone checkpoint refs\n  \
              Notes:\n  \
-             \u{20}\u{20}- A fast model evaluates each round; workspace edits trigger the blind\n  \
-             \u{20}\u{20}\u{20}\u{20}read-only verifier and a no-progress circuit breaker guards stuck loops.\n  \
-             \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
+             \u{20}\u{20}- Defaults are configurable under [coding] or [goal] in config.toml.\n  \
+             \u{20}\u{20}- Esc pauses a pursuing goal; Ctrl+C stops it.\n".into(),
+        Msg::GoalCheatSheet {
+            max_rounds,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ /goal — no active goal.\n  \
+             Subcommands:\n  \
+             \u{20}\u{20}/goal <prompt>        run until verified met\n  \
+             \u{20}\u{20}/goal shift <prompt>  continuous multi-epoch shift (--until-stopped --fresh-epoch --rollback-on-stall)\n  \
+             \u{20}\u{20}/goal status          show active goal progress & flags\n  \
+             \u{20}\u{20}/goal pause | resume  pause or resume the active goal\n  \
+             \u{20}\u{20}/goal stop  | clear   stop active goal or dismiss banner\n  \
+             \u{20}\u{20}/goal rounds <+N|N>   adjust max_rounds budget on the fly\n  \
+             Flags:\n  \
+             \u{20}\u{20}--max-rounds <N>  --until-stopped  --fresh-epoch  --rollback-on-stall  --max-tokens <N>  --verify  --no-verify\n  \
+             Current defaults (config.toml):\n  \
+             \u{20}\u{20}max_rounds: {max_rounds}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}\n"
+        )
+        .into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n", condition, round, mins, secs).into(),
+        Msg::GoalStatusDetailed {
+            condition,
+            phase,
+            round,
+            max_rounds,
+            tokens_used,
+            max_tokens,
+            mins,
+            secs,
+            flags,
+        } => format!(
+            "  ◎ Goal ({phase}): {condition}\n  \
+             Round: {round} / {max_rounds} · Tokens: {tokens_used} / {max_tokens} · Elapsed: {mins}m {secs}s\n  \
+             Flags: {flags}\n"
+        )
+        .into(),
+        Msg::GoalStartedSummary {
+            max_rounds,
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ Goal started (max_rounds: {max_rounds}, stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch})\n"
+        )
+        .into(),
         Msg::GoalNoActive =>
-            "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n".into(),
+            "  No active goal.\n  Usage: /goal <prompt>  |  /goal shift <prompt>  |  /goal help\n".into(),
+        Msg::GoalNoPaused => "  No paused goal to resume.\n".into(),
+        Msg::GoalAlreadyRunning => "  Goal is already running.\n".into(),
+        Msg::GoalRoundsUsage =>
+            "  Usage: /goal rounds <+N|N>  (e.g. /goal rounds +10 or /goal rounds 50)\n".into(),
+        Msg::GoalRoundsUpdated { max_rounds } =>
+            format!("  ◎ Goal round budget updated: max_rounds = {max_rounds}\n").into(),
+        Msg::GoalShiftUsage =>
+            "  Usage: /goal shift <prompt>  (runs --until-stopped --fresh-epoch --rollback-on-stall)\n".into(),
+        Msg::GoalPromptRequired =>
+            "  Please provide a goal prompt after the flags (e.g. /goal --max-rounds 20 fix tests).\n".into(),
+        Msg::GoalLabelOn => "on".into(),
+        Msg::GoalLabelOff => "off".into(),
+        Msg::GoalLabelAuto => "auto".into(),
+        Msg::GoalLabelAutoContinuous => "auto (on for --until-stopped)".into(),
+        Msg::GoalLabelUnbounded => "unbounded".into(),
+        Msg::GoalLabelDefaultRoundsAuto => "300 (auto)".into(),
+        Msg::GoalLabelVerifyForced => "forced".into(),
+        Msg::GoalStopModeUntilStopped => "until-stopped".into(),
+        Msg::GoalStopModeWhenMet => "when-met".into(),
+        Msg::GoalPhasePursuing => "pursuing".into(),
+        Msg::GoalPhasePaused => "paused".into(),
+        Msg::GoalPhasePausedAtCap => "paused at cap".into(),
+        Msg::GoalPhaseSatisfied => "satisfied".into(),
+        Msg::GoalPhaseEnded => "ended".into(),
+        Msg::GoalStatusFlags {
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+            verify_mode,
+            checkpoint,
+        } => format!(
+            "stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}, verify: {verify_mode}, checkpoint: {checkpoint}"
+        )
+        .into(),
+        Msg::GoalPausedBanner =>
+            "  ⏸ Goal paused; use /goal resume (or continue the conversation) to resume, or /goal stop to end.\n".into(),
         Msg::GoalCleared => "  Goal cleared.\n".into(),
 
         // ── /loop ──

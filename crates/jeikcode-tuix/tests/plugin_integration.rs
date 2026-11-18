@@ -1,7 +1,7 @@
 // crates/jeikcode-core/tests/plugin_integration.rs
 //
 // End-to-end smoke test for the plugin marketplace pipeline:
-// add_marketplace → install → SkillRegistry::reload + CustomCommandRegistry::load.
+// add_marketplace → install → SkillRegistry::reload + UserCommandRegistry::load.
 // Verifies that newly-installed plugin assets are visible to the in-process
 // registries that the TUI consults on `/plugin` reload.
 //
@@ -88,8 +88,8 @@ fn add_install_reload_flow() {
     jeikcode_capabilities::plugin::loader::reload_skill_registry(&mut reg, working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
-    // Verify the TUI-owned CustomCommandRegistry sees `e2e:c`; plugin install
-    // and skill discovery are provided by jeikcode-capabilities.
-    let creg = jeikcode_tuix::custom_commands::CustomCommandRegistry::load(working.path());
+    // Verify UserCommandRegistry sees `e2e:c`; plugin install, skill
+    // discovery, and user command loading are provided by jeikcode-capabilities.
+    let creg = jeikcode_capabilities::commands::UserCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }

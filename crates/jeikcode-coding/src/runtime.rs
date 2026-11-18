@@ -31,12 +31,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
     classify_followup, goal_cap_stop_note, goal_continuation_message, summarize_for_goal,
-    EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal,
-    LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalRoundAdjustment,
+    GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
+    MAX_UNPRODUCTIVE,
 };
 use crate::goal_harness::{
     compute_workspace_fingerprint_async, goal_stall_limit_from_env, parse_goal_launch,
-    restore_milestone_checkpoint_async, GoalOptions,
+    restore_milestone_checkpoint_async, GoalLaunchDefaults, GoalOptions,
 };
 use crate::goal_verifier::{evaluate_goal_with_harness, GoalEvalJob};
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
@@ -499,6 +500,8 @@ pub enum DriverCommand {
         message_id: Option<String>,
     },
     PauseGoal,
+    ResumeGoal,
+    AdjustGoalRounds(GoalRoundAdjustment),
     Compact(Option<String>),
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
@@ -1270,6 +1273,18 @@ impl CodingRuntimeHandle {
             DriverCommand::PauseGoal => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::PauseGoal { generation, done }
+            }
+            DriverCommand::ResumeGoal => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::ResumeGoal { generation, done }
+            }
+            DriverCommand::AdjustGoalRounds(adjustment) => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::UpdateGoalRounds {
+                    generation,
+                    adjustment,
+                    done,
+                }
             }
             DriverCommand::Compact(focus) => CodingRuntimeControl::Compact { generation, focus },
             DriverCommand::SetMode(mode) => {
@@ -2418,6 +2433,15 @@ pub enum CodingRuntimeControl {
     PauseGoal {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ResumeGoal {
+        generation: u64,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    UpdateGoalRounds {
+        generation: u64,
+        adjustment: GoalRoundAdjustment,
+        done: oneshot::Sender<Result<Option<u32>, RuntimeError>>,
     },
     SetMode {
         generation: u64,
@@ -4509,6 +4533,89 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
+                    Some(CodingRuntimeControl::ResumeGoal {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if !native_protocol
+                            || request_generation != generation
+                            || !agent_available
+                            || compaction_suspended
+                        {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        if active_turn.is_some() && held_turn.is_none() {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(state) = goal.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        if !matches!(state.phase, GoalPhase::Paused | GoalPhase::PausedAtCap) {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let recovery_context = state.recovery_context();
+                        if state.phase == GoalPhase::Paused {
+                            state.resume_paused();
+                        } else {
+                            let keep = state.max_rounds.unwrap_or(0);
+                            state.resume(keep);
+                        }
+                        let mut text =
+                            goal_continuation_message("resumed by user", &state.condition);
+                        if let Some(recovery) = recovery_context {
+                            text = format!("{recovery}\n\n{text}");
+                        }
+                        if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
+                            held_turn = None;
+                            terminal_reason = None;
+                            next_turn_id = next_turn_id.wrapping_add(1);
+                            active_turn = Some(next_turn_id);
+                            turn_stats = RuntimeTurnStats::default();
+                            turn_started_at = Some(std::time::Instant::now());
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::InTurn),
+                                Ordering::Release,
+                            );
+                            let _ = runtime_event_tx
+                                .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            let _ = done.send(Ok(()));
+                        } else {
+                            agent_available = false;
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Failed),
+                                Ordering::Release,
+                            );
+                            let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                        }
+                    }
+                    Some(CodingRuntimeControl::UpdateGoalRounds {
+                        generation: request_generation,
+                        adjustment,
+                        done,
+                    }) => {
+                        if !native_protocol || request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        let Some(state) = goal.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let updated = state.apply_round_adjustment(adjustment);
+                        let _ = runtime_event_tx
+                            .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        let cap_label = updated
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unbounded".to_string());
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                            format!("goal round budget updated: max_rounds = {cap_label}"),
+                        ));
+                        let _ = done.send(Ok(updated));
+                    }
                     Some(CodingRuntimeControl::SetMeshName {
                         generation: request_generation,
                         name,
@@ -5892,7 +5999,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, options, done, recovery_tx }) => {
+                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, mut options, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -5922,15 +6029,22 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
                             let controller_id = next_controller_id;
-                            // Start immediately on the configured default so goal start never
-                            // blocks the owner loop on a network round-trip. The round budget
-                            // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
-                            // live request quota, resolved OFF the loop and applied via a self-sent
-                            // AdjustGoalRounds; env override wins and any miss keeps the default.
+                            options.resolve_defaults(GoalLaunchDefaults {
+                                rollback_on_stall: runtime.config.goal_rollback_on_stall,
+                                fresh_epoch: runtime.config.goal_fresh_epoch,
+                            });
+                            let options_max_rounds = options.max_rounds;
+                            let effective_max_rounds =
+                                options_max_rounds.unwrap_or(runtime.config.goal_max_rounds);
+                            // Start immediately on the configured/flagged default so goal start
+                            // never blocks the owner loop on a network round-trip. When neither
+                            // `--max-rounds`, `config.toml`, nor `JEIKCODE_GOAL_MAX_ROUNDS`
+                            // explicitly pinned the cap, scale per plan (Pro 1000 → 300,
+                            // Lite 800 → 240) OFF the loop via AdjustGoalRounds.
                             let mut next = GoalState::new_with_options(
                                 controller_id,
                                 condition,
-                                runtime.config.goal_max_rounds,
+                                effective_max_rounds,
                                 runtime.config.goal_max_duration_secs,
                                 options,
                             );
@@ -5964,9 +6078,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 });
                             }
                             // Only spawn the quota fetch when it could actually change the cap:
-                            // an env override short-circuits to the default, and with no live
+                            // `--max-rounds`, explicit `config.toml` `goal_max_rounds`, or env
+                            // override all short-circuit to the configured value, and with no live
                             // rate-limit source there is nothing to derive from.
-                            if crate::config::goal_max_rounds_env().is_none() {
+                            if options_max_rounds.is_none()
+                                && !runtime.config.goal_max_rounds_explicit
+                                && crate::config::goal_max_rounds_env().is_none()
+                            {
                                 if let Some(source) = runtime.parts.rate_limit_source().cloned() {
                                     let default = runtime.config.goal_max_rounds;
                                     let tx = recovery_tx.clone();
@@ -7235,6 +7353,7 @@ fn reject_runtime_control(
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::CancelSteer { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
+        | CodingRuntimeControl::ResumeGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
@@ -7286,6 +7405,9 @@ fn reject_runtime_control(
         | CodingRuntimeControl::StopGoal { done, .. }
         | CodingRuntimeControl::StartLoop { done, .. }
         | CodingRuntimeControl::StopLoop { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::UpdateGoalRounds { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
     }
@@ -15759,7 +15881,8 @@ mod tests {
         let _ = kernel_commands.recv().await;
 
         // Drive 2 rounds across a goal_max_rounds=1 batch boundary: continuous mode
-        // must roll over and dispatch a 2nd continuation rather than pausing at cap.
+        // must roll over with a fresh-epoch reset (smart default for `--until-stopped`)
+        // and dispatch a 2nd continuation rather than pausing at cap.
         for _ in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
@@ -15775,12 +15898,25 @@ mod tests {
                     snapshot: SessionSnapshot::new(vec![Message::assistant("working", vec![])]),
                 })
                 .unwrap();
-            assert!(matches!(
+            let first =
                 tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
                     .await
-                    .expect("continuous goal must dispatch continuation across batch boundary"),
-                Some(AgentCommand::SendSyntheticMessage { .. })
-            ));
+                    .expect("continuous goal must dispatch rollover commands");
+            if matches!(first, Some(AgentCommand::ResetToFreshEpoch { .. })) {
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect(
+                            "continuous goal must dispatch continuation after fresh-epoch reset"
+                        ),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            } else {
+                assert!(
+                    matches!(first, Some(AgentCommand::SendSyntheticMessage { .. })),
+                    "expected SendSyntheticMessage, got {first:?}"
+                );
+            }
         }
 
         let mut saw_rollover_notice = false;

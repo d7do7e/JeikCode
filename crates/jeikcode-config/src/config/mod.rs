@@ -86,6 +86,18 @@ pub struct CodingConfig {
     /// When set, the effective trigger is the stricter of this ceiling and `compact_threshold`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_max_tokens: Option<u32>,
+    /// Optional default `/goal` round budget (`0` = unbounded). When unset (`None`),
+    /// runtime derives it from `JEIKCODE_GOAL_MAX_ROUNDS` / live quota / fallback (`300`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_max_rounds: Option<u32>,
+    /// Whether `/goal` automatically rolls back to the latest verified milestone
+    /// checkpoint when the no-progress stall breaker trips. Default `true`.
+    #[serde(default = "default_true")]
+    pub goal_rollback_on_stall: bool,
+    /// Optional `/goal` fresh-epoch default on continuous batch rollovers (`None` = auto:
+    /// `true` when `--until-stopped` / `/goal shift` is active, `false` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_fresh_epoch: Option<bool>,
 }
 
 /// How aggressively the coding agent should start a structured todo list.
@@ -502,6 +514,9 @@ impl Default for CodingConfig {
             first_token_timeout_retries: 6,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             compact_max_tokens: None,
+            goal_max_rounds: None,
+            goal_rollback_on_stall: true,
+            goal_fresh_epoch: None,
         }
     }
 }
@@ -1930,6 +1945,82 @@ fn normalize_compaction_config(document: &toml::Value, config: &mut Config) -> V
     warnings
 }
 
+/// Normalize `/goal` settings (`goal_max_rounds`, `goal_rollback_on_stall`,
+/// `goal_fresh_epoch`) across `[coding]`, `[goal]`, and top-level root keys with
+/// explicit precedence `[coding]` > `[goal]` > root.
+fn normalize_goal_config(document: &toml::Value, config: &mut Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let coding_tbl = document.get("coding").and_then(toml::Value::as_table);
+    let goal_tbl = document.get("goal").and_then(toml::Value::as_table);
+    let root_tbl = document.as_table();
+
+    let coding_rounds = coding_tbl.and_then(|t| t.get("goal_max_rounds"));
+    let goal_rounds =
+        goal_tbl.and_then(|t| t.get("goal_max_rounds").or_else(|| t.get("max_rounds")));
+    let root_rounds = root_tbl.and_then(|t| t.get("goal_max_rounds"));
+    for (source, raw) in [
+        ("[coding].goal_max_rounds", coding_rounds),
+        ("[goal].max_rounds", goal_rounds),
+        ("goal_max_rounds", root_rounds),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(rounds) = toml_integer_as_u32(raw) {
+            config.coding.goal_max_rounds = Some(rounds);
+            break;
+        } else {
+            warnings.push(format!(
+                "{source} was invalid ({raw}); expected non-negative integer"
+            ));
+        }
+    }
+
+    let coding_rollback = coding_tbl.and_then(|t| t.get("goal_rollback_on_stall"));
+    let goal_rollback = goal_tbl.and_then(|t| {
+        t.get("goal_rollback_on_stall")
+            .or_else(|| t.get("rollback_on_stall"))
+    });
+    let root_rollback = root_tbl.and_then(|t| t.get("goal_rollback_on_stall"));
+    for (source, raw) in [
+        ("[coding].goal_rollback_on_stall", coding_rollback),
+        ("[goal].rollback_on_stall", goal_rollback),
+        ("goal_rollback_on_stall", root_rollback),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(flag) = raw.as_bool() {
+            config.coding.goal_rollback_on_stall = flag;
+            break;
+        } else {
+            warnings.push(format!("{source} was invalid ({raw}); expected boolean"));
+        }
+    }
+
+    let coding_fresh = coding_tbl.and_then(|t| t.get("goal_fresh_epoch"));
+    let goal_fresh =
+        goal_tbl.and_then(|t| t.get("goal_fresh_epoch").or_else(|| t.get("fresh_epoch")));
+    let root_fresh = root_tbl.and_then(|t| t.get("goal_fresh_epoch"));
+    for (source, raw) in [
+        ("[coding].goal_fresh_epoch", coding_fresh),
+        ("[goal].fresh_epoch", goal_fresh),
+        ("goal_fresh_epoch", root_fresh),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(flag) = raw.as_bool() {
+            config.coding.goal_fresh_epoch = Some(flag);
+            break;
+        } else {
+            warnings.push(format!("{source} was invalid ({raw}); expected boolean"));
+        }
+    }
+
+    warnings
+}
+
 impl Config {
     /// Context window of the active selection, resolved through the single
     /// [`Self::resolve_model`] boundary (§14.1) so the displayed window can never
@@ -1976,6 +2067,7 @@ impl Config {
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", path.display()))?;
         let _ = normalize_compaction_config(&document, &mut config);
+        let _ = normalize_goal_config(&document, &mut config);
         Ok(config)
     }
 
@@ -2013,6 +2105,7 @@ impl Config {
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", path.display()))?;
         warnings.extend(normalize_compaction_config(&document, &mut config));
+        warnings.extend(normalize_goal_config(&document, &mut config));
         config.quarantined_providers = quarantined;
         if config
             .quarantined_providers
@@ -3123,6 +3216,45 @@ model = "missing-type"
                 .unwrap();
         assert_eq!(bad_cfg.coding.compact_threshold, 0.02);
         assert!(!warnings.is_empty(), "invalid compact_threshold must warn");
+    }
+
+    #[test]
+    fn goal_config_parses_from_coding_goal_and_root_with_precedence() {
+        let path = std::path::Path::new("config.toml");
+
+        let (default_cfg, warnings) = Config::parse_disk_content_tolerant("", path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(default_cfg.coding.goal_max_rounds, None);
+        assert!(default_cfg.coding.goal_rollback_on_stall);
+        assert_eq!(default_cfg.coding.goal_fresh_epoch, None);
+
+        let (goal_sec_cfg, warnings) = Config::parse_disk_content_tolerant(
+            "goal_max_rounds = 50\n[goal]\nmax_rounds = 25\nrollback_on_stall = false\nfresh_epoch = true\n",
+            path,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(goal_sec_cfg.coding.goal_max_rounds, Some(25));
+        assert!(!goal_sec_cfg.coding.goal_rollback_on_stall);
+        assert_eq!(goal_sec_cfg.coding.goal_fresh_epoch, Some(true));
+
+        let combined = "\
+            goal_max_rounds = 50\n\
+            goal_rollback_on_stall = true\n\
+            [goal]\n\
+            max_rounds = 25\n\
+            rollback_on_stall = true\n\
+            fresh_epoch = false\n\
+            [coding]\n\
+            goal_max_rounds = 15\n\
+            goal_rollback_on_stall = false\n\
+            goal_fresh_epoch = true\n\
+        ";
+        let (coding_cfg, warnings) = Config::parse_disk_content_tolerant(combined, path).unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(coding_cfg.coding.goal_max_rounds, Some(15));
+        assert!(!coding_cfg.coding.goal_rollback_on_stall);
+        assert_eq!(coding_cfg.coding.goal_fresh_epoch, Some(true));
     }
 
     #[test]

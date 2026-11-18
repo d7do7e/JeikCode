@@ -55,6 +55,15 @@ const EVALUATOR_USER_TEMPLATE: &str = r#"<<<GOAL>>>
 
 Reply with the single Verdict line now."#;
 
+/// Adjustment to an active or paused `/goal` round cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalRoundAdjustment {
+    /// Set `max_rounds` explicitly (`0` = unbounded).
+    Set(u32),
+    /// Increase `max_rounds` by `N` rounds (`+N`).
+    Add(u32),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoalProgress {
     pub active: bool,
@@ -67,6 +76,7 @@ pub struct GoalProgress {
     pub max_tokens: Option<u64>,
     pub condition: String,
     pub last_reason: Option<String>,
+    pub options: GoalOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +217,7 @@ impl GoalState {
             max_tokens: self.max_tokens,
             condition: self.condition.clone(),
             last_reason: self.last_reason.clone(),
+            options: self.options.clone(),
         }
     }
 
@@ -311,6 +322,21 @@ impl GoalState {
     /// start never blocks the owner loop on a network round-trip.
     pub fn set_round_cap(&mut self, new_max_rounds: u32) {
         self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
+    }
+
+    /// Apply a live `/goal rounds <+N|N>` adjustment and return the resulting cap.
+    pub fn apply_round_adjustment(&mut self, adjustment: GoalRoundAdjustment) -> Option<u32> {
+        match adjustment {
+            GoalRoundAdjustment::Set(n) => {
+                self.set_round_cap(n);
+            }
+            GoalRoundAdjustment::Add(delta) => {
+                if let Some(current) = self.max_rounds {
+                    self.max_rounds = Some(current.saturating_add(delta));
+                }
+            }
+        }
+        self.max_rounds
     }
 
     pub fn update_progress_recap(&mut self, recap: String) {

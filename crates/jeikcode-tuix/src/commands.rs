@@ -192,7 +192,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // immediately (a bare `/goal` would just print status). Setting a goal
     // requires the condition text; `/goal status` / `/goal clear` still work by
     // typing the sub-command + Enter.
-    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true, hidden: false },
+    Command { name: "goal",    desc: "Autonomous loop until met (subcommands: shift, status, pause, resume, stop, clear, rounds)", needs_args: true, hidden: false },
     Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true, hidden: false },
     Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false },
     Command { name: "guide",   desc: "Ask JeikCode how to use", needs_args: true, hidden: false },

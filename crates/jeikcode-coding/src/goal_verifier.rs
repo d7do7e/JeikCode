@@ -290,7 +290,7 @@ pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutc
         return outcome;
     }
 
-    if job.options.checkpoint_milestones {
+    if job.options.checkpoint_milestones || job.options.rollback_on_stall {
         if let Ok(Some(cp_ref)) = create_milestone_checkpoint_async(
             job.working_dir,
             job.controller_id,

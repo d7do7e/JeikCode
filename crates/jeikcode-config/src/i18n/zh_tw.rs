@@ -109,6 +109,7 @@ pub(super) fn zh_tw(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescModel => "選擇或切換目前模型".into(),
         Msg::CmdDescProvider => "管理模型提供商與 API 帳號".into(),
         Msg::CmdDescQuit => "結束 JeikCode 對話".into(),
+        Msg::CmdDescGoal => "設定完成目標（支援 shift、status、pause、resume、stop、clear、rounds）".into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::CompactNothingShort => "（無需壓縮 — 對話較短）\n".into(),
         Msg::CompactStarting => "（正在使用 LLM 摘要進行壓縮...）\n".into(),
@@ -147,6 +148,112 @@ pub(super) fn zh_tw(msg: Msg<'_>) -> Cow<'static, str> {
                 "無效的自動壓縮閾值「{input}」。請使用百分比（10%-100% 或 0.1-1.0）、Token 數（>= 8000，例如 350k）、'off' 或 'default'。"
             )
             .into(),
+        Msg::GoalHelp =>
+            "  /goal — 朝著設定的條件自主進行多輪工作。\n  \
+             子命令：\n  \
+             \u{20}\u{20}/goal <條件>                          設定新目標；循環執行直到驗證達成\n  \
+             \u{20}\u{20}/goal shift <條件>                    連續多輪次班次模式（--until-stopped --fresh-epoch --rollback-on-stall）\n  \
+             \u{20}\u{20}/goal status                          檢視進度、輪次、Token 用量與啟用標誌\n  \
+             \u{20}\u{20}/goal pause | resume                  暫停或恢復目前目標\n  \
+             \u{20}\u{20}/goal stop  | clear                   停止目前目標或清除完成橫幅\n  \
+             \u{20}\u{20}/goal rounds <+N|N>                   動態調整 max_rounds 輪次上限（0 = 無限制）\n  \
+             \u{20}\u{20}/goal help                            顯示本說明\n  \
+             參數標誌：\n  \
+             \u{20}\u{20}--max-rounds <N>                      覆蓋本次目標的輪次上限\n  \
+             \u{20}\u{20}--until-stopped                       連續滾動推進並自動開啟 fresh-epoch\n  \
+             \u{20}\u{20}--fresh-epoch / --no-fresh-epoch      跨批次滾動時是否重設上下文至凍結前綴\n  \
+             \u{20}\u{20}--rollback-on-stall / --no-rollback-on-stall  停滯熔斷時是否自動回滾檢查點\n  \
+             \u{20}\u{20}--max-tokens <N>                      累計 Token 達到 N 時自動停止\n  \
+             \u{20}\u{20}--verify | --no-verify                強制或略過獨立唯讀驗證\n  \
+             \u{20}\u{20}--checkpoint                          儲存非破壞性檢查點參照\n  \
+             說明：\n  \
+             \u{20}\u{20}- 預設值可在 config.toml 的 [coding] 或 [goal] 下設定。\n  \
+             \u{20}\u{20}- 按 Esc 可暫停執行中的目標；按 Ctrl+C 停止。\n".into(),
+        Msg::GoalCheatSheet {
+            max_rounds,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ /goal — 目前沒有進行中的目標。\n  \
+             子命令：\n  \
+             \u{20}\u{20}/goal <條件>        循環執行直到驗證達成\n  \
+             \u{20}\u{20}/goal shift <條件>  連續多輪次班次模式（--until-stopped --fresh-epoch --rollback-on-stall）\n  \
+             \u{20}\u{20}/goal status        檢視目標進度與參數\n  \
+             \u{20}\u{20}/goal pause | resume  暫停或恢復目標\n  \
+             \u{20}\u{20}/goal stop  | clear   停止目標或清除橫幅\n  \
+             \u{20}\u{20}/goal rounds <+N|N>   動態調整輪次上限\n  \
+             標誌：\n  \
+             \u{20}\u{20}--max-rounds <N>  --until-stopped  --fresh-epoch  --rollback-on-stall  --max-tokens <N>  --verify  --no-verify\n  \
+             目前預設設定（config.toml）：\n  \
+             \u{20}\u{20}max_rounds: {max_rounds}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}\n"
+        )
+        .into(),
+        Msg::GoalStatus { condition, round, mins, secs } =>
+            format!("  ◎ 目標：{}\n  輪次：{}\n  已用時：{}分 {}秒\n", condition, round, mins, secs).into(),
+        Msg::GoalStatusDetailed {
+            condition,
+            phase,
+            round,
+            max_rounds,
+            tokens_used,
+            max_tokens,
+            mins,
+            secs,
+            flags,
+        } => format!(
+            "  ◎ 目標（{phase}）：{condition}\n  \
+             輪次：{round} / {max_rounds} · Token：{tokens_used} / {max_tokens} · 已用時：{mins}分 {secs}秒\n  \
+             標誌：{flags}\n"
+        )
+        .into(),
+        Msg::GoalStartedSummary {
+            max_rounds,
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ 目標已啟動（max_rounds: {max_rounds}, stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}）\n"
+        )
+        .into(),
+        Msg::GoalNoActive =>
+            "  目前沒有進行中的目標。\n  用法：/goal <條件>  |  /goal shift <條件>  |  /goal help\n".into(),
+        Msg::GoalNoPaused => "  目前沒有可恢復的已暫停目標。\n".into(),
+        Msg::GoalAlreadyRunning => "  目標已在執行中。\n".into(),
+        Msg::GoalRoundsUsage =>
+            "  用法：/goal rounds <+N|N>（例如 /goal rounds +10 或 /goal rounds 50）\n".into(),
+        Msg::GoalRoundsUpdated { max_rounds } =>
+            format!("  ◎ 已更新目標輪次上限：max_rounds = {max_rounds}\n").into(),
+        Msg::GoalShiftUsage =>
+            "  用法：/goal shift <條件>（啟用 --until-stopped --fresh-epoch --rollback-on-stall）\n".into(),
+        Msg::GoalPromptRequired =>
+            "  請在參數標誌後輸入目標描述（例如 /goal --max-rounds 20 修復測試）。\n".into(),
+        Msg::GoalLabelOn => "開啟".into(),
+        Msg::GoalLabelOff => "關閉".into(),
+        Msg::GoalLabelAuto => "自動".into(),
+        Msg::GoalLabelAutoContinuous => "自動（--until-stopped 時開啟）".into(),
+        Msg::GoalLabelUnbounded => "無限制".into(),
+        Msg::GoalLabelDefaultRoundsAuto => "300（自動）".into(),
+        Msg::GoalLabelVerifyForced => "強制".into(),
+        Msg::GoalStopModeUntilStopped => "直至手動停止".into(),
+        Msg::GoalStopModeWhenMet => "達成即停".into(),
+        Msg::GoalPhasePursuing => "執行中".into(),
+        Msg::GoalPhasePaused => "已暫停".into(),
+        Msg::GoalPhasePausedAtCap => "已達上限暫停".into(),
+        Msg::GoalPhaseSatisfied => "已達成".into(),
+        Msg::GoalPhaseEnded => "已結束".into(),
+        Msg::GoalStatusFlags {
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+            verify_mode,
+            checkpoint,
+        } => format!(
+            "stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}, verify: {verify_mode}, checkpoint: {checkpoint}"
+        )
+        .into(),
+        Msg::GoalPausedBanner =>
+            "  ⏸ 目標已暫停；輸入 /goal resume（或繼續對話）恢復，輸入 /goal stop 結束。\n".into(),
+        Msg::GoalCleared => "  已清除目標。\n".into(),
         Msg::GoalFooterPausedBody => "goal 已暫停".into(),
         Msg::GoalFooterPausedMeta => " · 繼續對話即恢復 · /goal stop 結束".into(),
         Msg::GoalFooterPausedAtCapBody => "goal 暫停".into(),

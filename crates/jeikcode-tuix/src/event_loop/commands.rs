@@ -3768,25 +3768,35 @@ fn execute_slash_command_impl(
             }
         }
         "goal" => {
-            // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
-            //   /goal <condition>             → set a new goal
-            //   /goal                         → show status (or hint if none)
-            //   /goal status                  → explicit status (same)
-            //   /goal clear|stop|off|reset|none|cancel  → halt the active goal
-            //   /goal help|?|-h|--help        → usage
-            //
-            // CC has no `--max-rounds` flag and no wall-clock cap. Users
-            // express budgets in the condition text instead (e.g. "or stop
-            // after 20 turns"). Esc / Ctrl+C also halts at any time.
             let trimmed = arg.trim();
-            let (head, _rest) = trimmed
+            let (head, rest) = trimmed
                 .split_once(char::is_whitespace)
                 .map(|(h, r)| (h, r.trim()))
                 .unwrap_or((trimmed, ""));
-            match head {
+            let head_lower = head.to_ascii_lowercase();
+            let goal_default_rounds_label = || -> String {
+                match ctx
+                    .config
+                    .coding
+                    .goal_max_rounds
+                    .or_else(jeikcode_coding::config::goal_max_rounds_env)
+                {
+                    Some(0) => t(Msg::GoalLabelUnbounded).into_owned(),
+                    Some(n) => n.to_string(),
+                    None => t(Msg::GoalLabelDefaultRoundsAuto).into_owned(),
+                }
+            };
+            let on_off = |flag: bool| -> String {
+                if flag {
+                    t(Msg::GoalLabelOn).into_owned()
+                } else {
+                    t(Msg::GoalLabelOff).into_owned()
+                }
+            };
+            match head_lower.as_str() {
                 "" | "status" => {
                     if let Some(ref cond) = state.goal_condition {
-                        // Display 1-based, consistent with the footer goal row.
+                        // Display 1-based while pursuing, consistent with the footer goal row.
                         let round = state.goal_round + 1;
                         let elapsed = state
                             .goal_started_at
@@ -3794,12 +3804,75 @@ fn execute_slash_command_impl(
                             .unwrap_or(0);
                         let mins = elapsed / 60;
                         let secs = elapsed % 60;
+                        let max_rounds_str = match state.goal_max_rounds {
+                            Some(0) | None => t(Msg::GoalLabelUnbounded).into_owned(),
+                            Some(n) => n.to_string(),
+                        };
+                        let max_tokens_str = state
+                            .goal_max_tokens
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| t(Msg::GoalLabelUnbounded).into_owned());
+                        let phase_str = match state.goal_phase {
+                            jeikcode_coding::GoalPhase::Pursuing => t(Msg::GoalPhasePursuing),
+                            jeikcode_coding::GoalPhase::Paused => t(Msg::GoalPhasePaused),
+                            jeikcode_coding::GoalPhase::PausedAtCap => t(Msg::GoalPhasePausedAtCap),
+                            jeikcode_coding::GoalPhase::Satisfied => t(Msg::GoalPhaseSatisfied),
+                            jeikcode_coding::GoalPhase::Ended => t(Msg::GoalPhaseEnded),
+                        };
+                        let flags_str = if let Some(opts) = &state.goal_options {
+                            let stop_mode = if opts.continuous {
+                                t(Msg::GoalStopModeUntilStopped)
+                            } else {
+                                t(Msg::GoalStopModeWhenMet)
+                            };
+                            let verify_mode = if opts.force_verifier {
+                                t(Msg::GoalLabelVerifyForced)
+                            } else if opts.skip_verifier {
+                                t(Msg::GoalLabelOff)
+                            } else {
+                                t(Msg::GoalLabelAuto)
+                            };
+                            let rb = on_off(opts.rollback_on_stall);
+                            let fe = on_off(opts.fresh_epoch);
+                            let cp = on_off(opts.checkpoint_milestones);
+                            t(Msg::GoalStatusFlags {
+                                stop_mode: stop_mode.as_ref(),
+                                rollback_on_stall: rb.as_str(),
+                                fresh_epoch: fe.as_str(),
+                                verify_mode: verify_mode.as_ref(),
+                                checkpoint: cp.as_str(),
+                            })
+                            .into_owned()
+                        } else {
+                            t(Msg::GoalLabelAuto).into_owned()
+                        };
                         renderer.render(UiLine::CommandOutput(
-                            crate::i18n::t(crate::i18n::Msg::GoalStatus {
+                            crate::i18n::t(crate::i18n::Msg::GoalStatusDetailed {
                                 condition: cond.as_str(),
+                                phase: phase_str.as_ref(),
                                 round,
+                                max_rounds: max_rounds_str.as_str(),
+                                tokens_used: state.goal_tokens_used,
+                                max_tokens: max_tokens_str.as_str(),
                                 mins,
                                 secs,
+                                flags: flags_str.as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                    } else if head_lower.is_empty() {
+                        let max_rounds = goal_default_rounds_label();
+                        let rb = on_off(ctx.config.coding.goal_rollback_on_stall);
+                        let fe = match ctx.config.coding.goal_fresh_epoch {
+                            Some(true) => t(Msg::GoalLabelOn),
+                            Some(false) => t(Msg::GoalLabelOff),
+                            None => t(Msg::GoalLabelAutoContinuous),
+                        };
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalCheatSheet {
+                                max_rounds: max_rounds.as_str(),
+                                rollback_on_stall: rb.as_str(),
+                                fresh_epoch: fe.as_ref(),
                             })
                             .into_owned(),
                         ));
@@ -3810,12 +3883,110 @@ fn execute_slash_command_impl(
                     }
                     renderer.flush();
                 }
+                "pause" => {
+                    if state.goal_condition.is_none() {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoActive).into_owned(),
+                        ));
+                    } else if ctx
+                        .runtime
+                        .dispatch(jeikcode_coding::DriverCommand::PauseGoal)
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                    }
+                    renderer.flush();
+                }
+                "resume" => {
+                    if state.goal_condition.is_none() {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoPaused).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if state.goal_phase == jeikcode_coding::GoalPhase::Pursuing {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalAlreadyRunning).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if !matches!(
+                        state.goal_phase,
+                        jeikcode_coding::GoalPhase::Paused
+                            | jeikcode_coding::GoalPhase::PausedAtCap
+                    ) {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoPaused).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if ctx
+                        .runtime
+                        .dispatch(jeikcode_coding::DriverCommand::ResumeGoal)
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if matches!(state.phase, UiPhase::Idle) {
+                        state.on_submit();
+                    }
+                }
+                "rounds" => {
+                    let Some(adj) = parse_goal_rounds_arg(rest) else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalRoundsUsage).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
+                    if state.goal_condition.is_none() {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalNoActive).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if ctx
+                        .runtime
+                        .dispatch(jeikcode_coding::DriverCommand::AdjustGoalRounds(adj))
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                    } else {
+                        let new_cap = match adj {
+                            jeikcode_coding::GoalRoundAdjustment::Set(n) => (n != 0).then_some(n),
+                            jeikcode_coding::GoalRoundAdjustment::Add(delta) => {
+                                state.goal_max_rounds.map(|c| c.saturating_add(delta))
+                            }
+                        };
+                        state.goal_max_rounds = new_cap;
+                        let cap_label = new_cap
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| t(Msg::GoalLabelUnbounded).into_owned());
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalRoundsUpdated {
+                                max_rounds: cap_label.as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
                     ctx.runtime
                         .dispatch(jeikcode_coding::DriverCommand::StopGoal)
                         .ok();
                     state.goal_condition = None;
                     state.goal_round = 0;
+                    state.goal_max_rounds = None;
+                    state.goal_tokens_used = 0;
+                    state.goal_max_tokens = None;
+                    state.goal_options = None;
                     state.goal_started_at = None;
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
@@ -3828,15 +3999,58 @@ fn execute_slash_command_impl(
                     ));
                     renderer.flush();
                 }
+                "shift" if rest.is_empty() => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalShiftUsage).into_owned(),
+                    ));
+                    renderer.flush();
+                }
                 _ => {
-                    // Parse optional leading flags (`--until-stopped`, `--checkpoint`, `--verify`, `--no-verify`)
-                    // while stripping them from the initial user prompt text sent to the agent.
-                    let (condition, options) = jeikcode_coding::parse_goal_launch(trimmed);
+                    let defaults = jeikcode_coding::GoalLaunchDefaults {
+                        rollback_on_stall: ctx.config.coding.goal_rollback_on_stall,
+                        fresh_epoch: ctx.config.coding.goal_fresh_epoch,
+                    };
+                    let (condition, options) =
+                        jeikcode_coding::parse_goal_launch_with_defaults(trimmed, defaults);
+                    if goal_launch_missing_prompt(&condition) {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::GoalPromptRequired).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let effective_rounds = options
+                        .max_rounds
+                        .or(ctx.config.coding.goal_max_rounds)
+                        .or_else(jeikcode_coding::config::goal_max_rounds_env);
+                    let max_rounds_label = match effective_rounds {
+                        Some(0) => t(Msg::GoalLabelUnbounded).into_owned(),
+                        Some(n) => n.to_string(),
+                        None => "300".to_string(),
+                    };
+                    let stop_mode = if options.continuous {
+                        t(Msg::GoalStopModeUntilStopped)
+                    } else {
+                        t(Msg::GoalStopModeWhenMet)
+                    };
+                    let rb_label = on_off(options.rollback_on_stall);
+                    let fe_label = on_off(options.fresh_epoch);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::GoalStartedSummary {
+                            max_rounds: max_rounds_label.as_str(),
+                            stop_mode: stop_mode.as_ref(),
+                            rollback_on_stall: rb_label.as_str(),
+                            fresh_epoch: fe_label.as_str(),
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+
                     if ctx
                         .runtime
                         .dispatch(jeikcode_coding::DriverCommand::StartGoalWithOptions {
                             condition: condition.clone(),
-                            options,
+                            options: options.clone(),
                         })
                         .is_err()
                     {
@@ -3846,6 +4060,10 @@ fn execute_slash_command_impl(
                     }
                     state.goal_condition = Some(condition.clone());
                     state.goal_round = 0;
+                    state.goal_max_rounds = effective_rounds.filter(|&n| n > 0);
+                    state.goal_tokens_used = 0;
+                    state.goal_max_tokens = options.max_tokens;
+                    state.goal_options = Some(options);
                     state.goal_started_at = Some(std::time::Instant::now());
                     if submit_agent_text(ctx, condition) {
                         state.on_submit();
@@ -5129,6 +5347,32 @@ fn format_effective_compact_threshold(
         (effective * 100.0).round(),
         format_tok(budget as usize),
     )
+}
+
+/// Returns true when the remaining condition after flag parsing is empty or an
+/// incomplete flag-only fragment (e.g. `--max-rounds` with no prompt).
+fn goal_launch_missing_prompt(condition: &str) -> bool {
+    let trimmed = condition.trim();
+    trimmed.is_empty() || (trimmed.starts_with("--") && !trimmed.contains(char::is_whitespace))
+}
+
+/// Parse `/goal rounds <+N|N>` argument into a [`jeikcode_coding::GoalRoundAdjustment`].
+fn parse_goal_rounds_arg(raw: &str) -> Option<jeikcode_coding::GoalRoundAdjustment> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(delta_str) = trimmed.strip_prefix('+') {
+        let delta = delta_str
+            .trim()
+            .replace(['_', ','], "")
+            .parse::<u32>()
+            .ok()?;
+        (delta > 0).then_some(jeikcode_coding::GoalRoundAdjustment::Add(delta))
+    } else {
+        let total = trimmed.replace(['_', ','], "").parse::<u32>().ok()?;
+        Some(jeikcode_coding::GoalRoundAdjustment::Set(total))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -8562,5 +8806,46 @@ mod compact_threshold_tests {
             classify_compact_subcommand(""),
             CompactSubcommand::Manual(None)
         );
+    }
+
+    #[test]
+    fn parse_goal_rounds_arg_accepts_plus_delta_and_explicit_caps() {
+        assert_eq!(
+            parse_goal_rounds_arg("+10"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Add(10))
+        );
+        assert_eq!(
+            parse_goal_rounds_arg("50"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Set(50))
+        );
+        assert_eq!(
+            parse_goal_rounds_arg("0"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Set(0))
+        );
+        assert_eq!(parse_goal_rounds_arg("+0"), None);
+        assert_eq!(parse_goal_rounds_arg(""), None);
+        assert_eq!(parse_goal_rounds_arg("-5"), None);
+        assert_eq!(parse_goal_rounds_arg("abc"), None);
+    }
+
+    #[test]
+    fn goal_launch_missing_prompt_rejects_flag_only_inputs() {
+        for raw in [
+            "--max-rounds 20",
+            "--max-tokens 5000",
+            "shift --max-rounds 15",
+            "--until-stopped",
+            "--max-rounds",
+        ] {
+            let (cond, _) = jeikcode_coding::parse_goal_launch(raw);
+            assert!(
+                goal_launch_missing_prompt(&cond),
+                "expected missing-prompt rejection for `{raw}`, got `{cond}`"
+            );
+        }
+        let (valid_cond, opts) = jeikcode_coding::parse_goal_launch("--max-rounds 20 fix tests");
+        assert!(!goal_launch_missing_prompt(&valid_cond));
+        assert_eq!(valid_cond, "fix tests");
+        assert_eq!(opts.max_rounds, Some(20));
     }
 }

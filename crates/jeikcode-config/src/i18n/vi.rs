@@ -910,7 +910,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::CmdDescView => "Xem nội dung tệp trong hộp thoại nổi".into(),
         Msg::CmdDescApp => "Chia sẻ phiên này với ứng dụng di động qua chuyển tiếp (ghép đôi QR; /app stop để ngắt)".into(),
         Msg::CmdDescReview => "Rà soát mã của thay đổi hiện tại (/review · /review staged · /review <base>)".into(),
-        Msg::CmdDescGoal => "Đặt mục tiêu hoàn thành (tự lặp đến khi đạt)".into(),
+        Msg::CmdDescGoal => "Vòng lặp tự động đến khi đạt mục tiêu (lệnh con: shift, status, pause, resume, stop, clear, rounds)".into(),
         Msg::CmdDescProxy => "Chuyển chế độ proxy gửi ra".into(),
         Msg::CmdDescTodo => "Hiển thị việc cần làm; `/todo add <task>` để thêm, `/todo clear` để xóa hết".into(),
         Msg::CmdDescSchedule => "Liệt kê tác vụ định kỳ và thời gian chạy tiếp".into(),
@@ -1064,11 +1064,110 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
             )
             .into(),
         Msg::GoalHelp =>
-            "  /goal — tự làm việc nhiều vòng để đạt điều kiện đã nêu.\n  Cách dùng:\n    /goal <condition>                     đặt mục tiêu mới; lặp đến khi xác minh đạt\n    /goal --until-stopped <condition>     chạy liên tục qua các đợt và lưu mốc kiểm tra\n    /goal --checkpoint <condition>        lưu tham chiếu mốc kiểm tra an toàn\n    /goal --verify|--no-verify <cond>     bắt buộc hoặc bỏ qua trình xác minh chỉ đọc\n    /goal                                 xem trạng thái mục tiêu hiện tại\n    /goal status                          như trên\n    /goal clear                           dừng mục tiêu (bí danh: stop, off, reset, none, cancel)\n    /goal help                            trợ giúp này\n  Lưu ý:\n    - Mô hình nhanh đánh giá từng vòng; khi tệp thay đổi sẽ chạy trình xác minh chỉ đọc\n      và bộ ngắt vòng lặp khi không có tiến triển.\n    - Esc / Ctrl+C dừng mục tiêu bất cứ lúc nào.\n".into(),
+            "  /goal — tự làm việc nhiều vòng để đạt điều kiện đã nêu.\n  \
+             Lệnh con:\n    \
+             /goal <prompt>                        chạy đến khi xác minh đạt\n    \
+             /goal shift <prompt>                  ca chạy liên tục đa epoch (--until-stopped --fresh-epoch --rollback-on-stall)\n    \
+             /goal status                          xem tiến độ, số vòng, token và cờ đang bật\n    \
+             /goal pause | resume                  tạm dừng hoặc tiếp tục mục tiêu\n    \
+             /goal stop  | clear                   dừng mục tiêu hoặc ẩn biểu ngữ hoàn thành\n    \
+             /goal rounds <+N|N>                   điều chỉnh giới hạn max_rounds trực tiếp\n    \
+             /goal help                            trợ giúp này\n  \
+             Cờ tùy chọn:\n    \
+             --max-rounds <N>                      ghi đè giới hạn vòng cho mục tiêu này\n    \
+             --until-stopped                       chạy liên tục qua các epoch (mặc định fresh-epoch=bật)\n    \
+             --fresh-epoch / --no-fresh-epoch      đặt lại ngữ cảnh về tiền tố cố định khi chuyển batch\n    \
+             --rollback-on-stall / --no-rollback-on-stall  khôi phục mốc kiểm tra nếu bị kẹt\n    \
+             --max-tokens <N>                      dừng khi tổng token đạt N\n    \
+             --verify | --no-verify                bắt buộc hoặc bỏ qua trình xác minh chỉ đọc\n    \
+             --checkpoint                          lưu tham chiếu mốc kiểm tra an toàn\n  \
+             Lưu ý:\n    \
+             - Giá trị mặc định có thể cấu hình tại [coding] hoặc [goal] trong config.toml.\n    \
+             - Esc tạm dừng mục tiêu; Ctrl+C dừng hẳn.\n".into(),
+        Msg::GoalCheatSheet {
+            max_rounds,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ /goal — chưa có mục tiêu hoạt động.\n  \
+             Lệnh con:\n    \
+             /goal <prompt>        chạy đến khi xác minh đạt\n    \
+             /goal shift <prompt>  ca chạy liên tục đa epoch (--until-stopped --fresh-epoch --rollback-on-stall)\n    \
+             /goal status          xem tiến độ và cờ đang bật\n    \
+             /goal pause | resume  tạm dừng hoặc tiếp tục mục tiêu\n    \
+             /goal stop  | clear   dừng mục tiêu hoặc ẩn biểu ngữ\n    \
+             /goal rounds <+N|N>   điều chỉnh giới hạn max_rounds trực tiếp\n  \
+             Cờ:\n    \
+             --max-rounds <N>  --until-stopped  --fresh-epoch  --rollback-on-stall  --max-tokens <N>  --verify  --no-verify\n  \
+             Mặc định hiện tại (config.toml):\n    \
+             max_rounds: {max_rounds}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}\n"
+        )
+        .into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ Mục tiêu: {}\n  Vòng: {}\n  Đã qua: {} phút {} giây\n", condition, round, mins, secs).into(),
+        Msg::GoalStatusDetailed {
+            condition,
+            phase,
+            round,
+            max_rounds,
+            tokens_used,
+            max_tokens,
+            mins,
+            secs,
+            flags,
+        } => format!(
+            "  ◎ Mục tiêu ({phase}): {condition}\n  \
+             Vòng: {round} / {max_rounds} · Token: {tokens_used} / {max_tokens} · Đã qua: {mins} phút {secs} giây\n  \
+             Cờ: {flags}\n"
+        )
+        .into(),
+        Msg::GoalStartedSummary {
+            max_rounds,
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ Đã bắt đầu mục tiêu (max_rounds: {max_rounds}, stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch})\n"
+        )
+        .into(),
         Msg::GoalNoActive =>
-            "  Chưa có mục tiêu hoạt động.\n  Cách dùng: /goal <condition> | /goal help\n".into(),
+            "  Chưa có mục tiêu hoạt động.\n  Cách dùng: /goal <prompt> | /goal shift <prompt> | /goal help\n".into(),
+        Msg::GoalNoPaused => "  Không có mục tiêu tạm dừng nào để tiếp tục.\n".into(),
+        Msg::GoalAlreadyRunning => "  Mục tiêu đang chạy.\n".into(),
+        Msg::GoalRoundsUsage =>
+            "  Cách dùng: /goal rounds <+N|N> (ví dụ /goal rounds +10 hoặc /goal rounds 50)\n".into(),
+        Msg::GoalRoundsUpdated { max_rounds } =>
+            format!("  ◎ Đã cập nhật giới hạn vòng mục tiêu: max_rounds = {max_rounds}\n").into(),
+        Msg::GoalShiftUsage =>
+            "  Cách dùng: /goal shift <prompt> (chạy --until-stopped --fresh-epoch --rollback-on-stall)\n".into(),
+        Msg::GoalPromptRequired =>
+            "  Vui lòng nhập nội dung mục tiêu sau các cờ (ví dụ /goal --max-rounds 20 sửa lỗi).\n".into(),
+        Msg::GoalLabelOn => "bật".into(),
+        Msg::GoalLabelOff => "tắt".into(),
+        Msg::GoalLabelAuto => "tự động".into(),
+        Msg::GoalLabelAutoContinuous => "tự động (bật khi dùng --until-stopped)".into(),
+        Msg::GoalLabelUnbounded => "không giới hạn".into(),
+        Msg::GoalLabelDefaultRoundsAuto => "300 (tự động)".into(),
+        Msg::GoalLabelVerifyForced => "bắt buộc".into(),
+        Msg::GoalStopModeUntilStopped => "đến khi dừng".into(),
+        Msg::GoalStopModeWhenMet => "khi đạt".into(),
+        Msg::GoalPhasePursuing => "đang chạy".into(),
+        Msg::GoalPhasePaused => "tạm dừng".into(),
+        Msg::GoalPhasePausedAtCap => "tạm dừng do chạm ngưỡng".into(),
+        Msg::GoalPhaseSatisfied => "đã đạt".into(),
+        Msg::GoalPhaseEnded => "đã kết thúc".into(),
+        Msg::GoalStatusFlags {
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+            verify_mode,
+            checkpoint,
+        } => format!(
+            "stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}, verify: {verify_mode}, checkpoint: {checkpoint}"
+        )
+        .into(),
+        Msg::GoalPausedBanner =>
+            "  ⏸ Mục tiêu đã tạm dừng; dùng /goal resume (hoặc tiếp tục hội thoại) để chạy tiếp, hoặc /goal stop để kết thúc.\n".into(),
         Msg::GoalCleared => "  Đã xóa mục tiêu.\n".into(),
 
         Msg::LoopStatus { label, round, mins, secs } =>

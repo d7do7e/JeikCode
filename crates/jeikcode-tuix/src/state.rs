@@ -1184,6 +1184,14 @@ pub struct UiState {
     pub goal_condition: Option<String>,
     /// Current round number of the running goal loop.
     pub goal_round: u32,
+    /// Configured/effective max_rounds cap for the active goal, if bounded.
+    pub goal_max_rounds: Option<u32>,
+    /// Cumulative tokens used by the active goal (agent + evaluator).
+    pub goal_tokens_used: u64,
+    /// Optional cumulative token ceiling for the active goal.
+    pub goal_max_tokens: Option<u64>,
+    /// Active `/goal` options (continuous, rollback_on_stall, fresh_epoch, verify, checkpoint).
+    pub goal_options: Option<jeikcode_coding::GoalOptions>,
     /// When the goal was started, for elapsed-time display.
     pub goal_started_at: Option<std::time::Instant>,
     /// Current phase of the goal loop — Pursuing / PausedAtCap / Satisfied.
@@ -1386,6 +1394,10 @@ impl UiState {
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
+            goal_max_rounds: None,
+            goal_tokens_used: 0,
+            goal_max_tokens: None,
+            goal_options: None,
             goal_started_at: None,
             goal_phase: jeikcode_coding::GoalPhase::Pursuing,
             loop_label: None,

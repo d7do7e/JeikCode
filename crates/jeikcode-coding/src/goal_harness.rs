@@ -3,7 +3,8 @@
 //! - Non-destructive, worktree- & Windows-safe milestone git checkpoints (`refs/jeikcode/goal-checkpoints/...`)
 //! - Identical-state & oscillation (`A -> B -> A`) no-progress circuit breaker with opt-in rollback
 //! - `/goal` flag parsing (`--until-stopped` / `--continuous`, `--checkpoint`, `--verify`,
-//!   `--no-verify`, `--fresh-epoch`, `--rollback-on-stall`, `--max-tokens <N>`)
+//!   `--no-verify`, `--fresh-epoch`, `--no-fresh-epoch`, `--rollback-on-stall`,
+//!   `--no-rollback-on-stall`, `--max-rounds <N>`, `--max-tokens <N>`, `shift` preset)
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,22 @@ const MAX_DIFF_STAT_LINES: usize = 60;
 /// Ring-buffer depth for oscillation (`A -> B -> A`) detection.
 const STALL_FINGERPRINT_RING_CAP: usize = 8;
 
+/// Configurable `/goal` defaults supplied by `[coding]` / `[goal]` in `config.toml`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoalLaunchDefaults {
+    pub rollback_on_stall: bool,
+    pub fresh_epoch: Option<bool>,
+}
+
+impl Default for GoalLaunchDefaults {
+    fn default() -> Self {
+        Self {
+            rollback_on_stall: true,
+            fresh_epoch: None,
+        }
+    }
+}
+
 /// Parsed `/goal` launch options and stripped condition text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GoalOptions {
@@ -40,31 +57,67 @@ pub struct GoalOptions {
     pub fresh_epoch: bool,
     pub rollback_on_stall: bool,
     pub max_tokens: Option<u64>,
+    pub max_rounds: Option<u32>,
+    /// Tracks explicit `--fresh-epoch` / `--no-fresh-epoch` user override.
+    pub fresh_epoch_override: Option<bool>,
+    /// Tracks explicit `--rollback-on-stall` / `--no-rollback-on-stall` user override.
+    pub rollback_on_stall_override: Option<bool>,
 }
 
-/// Parse optional leading flags from `/goal <flags> <condition>`.
-///
-/// Supported flags:
+impl GoalOptions {
+    /// Apply smart defaults (`rollback_on_stall = true` by default; `fresh_epoch = true`
+    /// automatically when `--until-stopped` / `shift` is active unless disabled).
+    pub fn resolve_defaults(&mut self, defaults: GoalLaunchDefaults) {
+        self.fresh_epoch = self
+            .fresh_epoch_override
+            .unwrap_or_else(|| defaults.fresh_epoch.unwrap_or(self.continuous));
+        self.rollback_on_stall = self
+            .rollback_on_stall_override
+            .unwrap_or(defaults.rollback_on_stall);
+        if self.rollback_on_stall {
+            self.checkpoint_milestones = true;
+        }
+    }
+}
+
+/// Parse optional leading flags (or `shift` preset) from `/goal <flags> <condition>`
+/// using default launch settings.
+pub fn parse_goal_launch(raw: &str) -> (String, GoalOptions) {
+    parse_goal_launch_with_defaults(raw, GoalLaunchDefaults::default())
+}
+
+/// Parse optional leading flags (or `shift` preset) from `/goal <flags> <condition>`
+/// and resolve unset flags against `defaults`:
+/// - `shift <prompt>` — preset for `--until-stopped --fresh-epoch --rollback-on-stall`
 /// - `--until-stopped` / `--continuous` — roll over round budgets continuously with checkpoints
 /// - `--checkpoint` / `--checkpoints` — record non-destructive git checkpoint refs at milestones
-/// - `--verify` — require the blind `verifier` subagent even when no file edits are detected
-/// - `--no-verify` — skip the blind `verifier` subagent (text-only evaluator)
-/// - `--fresh-epoch` — reset conversation context to the frozen prefix on continuous batch rollovers
-/// - `--rollback-on-stall` — restore the latest verified milestone checkpoint when the stall breaker trips
-/// - `--max-tokens <N>` — stop the goal once cumulative prompt+completion tokens reach `N`
-pub fn parse_goal_launch(raw: &str) -> (String, GoalOptions) {
+/// - `--verify` / `--no-verify` — force or skip the blind `verifier` subagent
+/// - `--fresh-epoch` / `--no-fresh-epoch` — reset context to frozen prefix on rollovers
+/// - `--rollback-on-stall` / `--no-rollback-on-stall` — restore milestone checkpoint on stall
+/// - `--max-rounds <N>` / `--max-rounds=<N>` — override the round budget (`0` = unbounded)
+/// - `--max-tokens <N>` / `--max-tokens=<N>` — stop once cumulative prompt+completion tokens reach `N`
+pub fn parse_goal_launch_with_defaults(
+    raw: &str,
+    defaults: GoalLaunchDefaults,
+) -> (String, GoalOptions) {
     let mut opts = GoalOptions::default();
     let mut rest = raw.trim();
+
+    if let Some((first, after)) = split_first_token(rest) {
+        if first.eq_ignore_ascii_case("shift") {
+            opts.continuous = true;
+            opts.checkpoint_milestones = true;
+            opts.fresh_epoch_override = Some(true);
+            opts.rollback_on_stall_override = Some(true);
+            rest = after;
+        }
+    }
 
     loop {
         let trimmed = rest.trim_start();
         let Some((token, after)) = split_first_token(trimmed) else {
             break;
         };
-        if after.trim().is_empty() {
-            // Do not consume the final word as a flag if it would leave an empty condition.
-            break;
-        }
         match token {
             "--until-stopped" | "--continuous" => {
                 opts.continuous = true;
@@ -87,23 +140,54 @@ pub fn parse_goal_launch(raw: &str) -> (String, GoalOptions) {
             }
             "--fresh-epoch" => {
                 opts.fresh_epoch = true;
+                opts.fresh_epoch_override = Some(true);
+                rest = after;
+            }
+            "--no-fresh-epoch" => {
+                opts.fresh_epoch = false;
+                opts.fresh_epoch_override = Some(false);
                 rest = after;
             }
             "--rollback-on-stall" => {
                 opts.rollback_on_stall = true;
+                opts.rollback_on_stall_override = Some(true);
                 opts.checkpoint_milestones = true;
                 rest = after;
             }
+            "--no-rollback-on-stall" => {
+                opts.rollback_on_stall = false;
+                opts.rollback_on_stall_override = Some(false);
+                rest = after;
+            }
+            "--max-rounds" => {
+                if let Some((num_tok, after_num)) = split_first_token(after) {
+                    if let Ok(rounds) = num_tok.replace(['_', ','], "").parse::<u32>() {
+                        opts.max_rounds = Some(rounds);
+                        rest = after_num;
+                        continue;
+                    }
+                }
+                break;
+            }
+            other if other.starts_with("--max-rounds=") => {
+                if let Ok(rounds) = other["--max-rounds=".len()..]
+                    .replace(['_', ','], "")
+                    .parse::<u32>()
+                {
+                    opts.max_rounds = Some(rounds);
+                    rest = after;
+                } else {
+                    break;
+                }
+            }
             "--max-tokens" => {
                 if let Some((num_tok, after_num)) = split_first_token(after) {
-                    if !after_num.trim().is_empty() {
-                        if let Ok(limit) = num_tok.replace(['_', ','], "").parse::<u64>() {
-                            if limit > 0 {
-                                opts.max_tokens = Some(limit);
-                            }
-                            rest = after_num;
-                            continue;
+                    if let Ok(limit) = num_tok.replace(['_', ','], "").parse::<u64>() {
+                        if limit > 0 {
+                            opts.max_tokens = Some(limit);
                         }
+                        rest = after_num;
+                        continue;
                     }
                 }
                 break;
@@ -125,6 +209,7 @@ pub fn parse_goal_launch(raw: &str) -> (String, GoalOptions) {
         }
     }
 
+    opts.resolve_defaults(defaults);
     (rest.trim().to_string(), opts)
 }
 
@@ -993,17 +1078,64 @@ mod tests {
         let (cond, opts) = parse_goal_launch("make all tests pass");
         assert_eq!(cond, "make all tests pass");
         assert!(!opts.continuous);
-        assert!(!opts.checkpoint_milestones);
+        assert!(opts.rollback_on_stall);
+        assert!(opts.checkpoint_milestones);
+        assert!(!opts.fresh_epoch);
+        assert_eq!(opts.max_rounds, None);
 
         let (cond2, opts2) = parse_goal_launch("--until-stopped fix remaining bugs");
         assert_eq!(cond2, "fix remaining bugs");
         assert!(opts2.continuous);
         assert!(opts2.checkpoint_milestones);
+        assert!(opts2.fresh_epoch);
+        assert!(opts2.rollback_on_stall);
 
         let (cond3, opts3) = parse_goal_launch("--verify --checkpoint check auth flow");
         assert_eq!(cond3, "check auth flow");
         assert!(opts3.force_verifier);
         assert!(opts3.checkpoint_milestones);
+
+        let (cond4, opts4) = parse_goal_launch("shift --max-rounds 20 harden persistence");
+        assert_eq!(cond4, "harden persistence");
+        assert!(opts4.continuous);
+        assert!(opts4.fresh_epoch);
+        assert!(opts4.rollback_on_stall);
+        assert_eq!(opts4.max_rounds, Some(20));
+
+        let (cond5, opts5) = parse_goal_launch(
+            "--until-stopped --no-fresh-epoch --no-rollback-on-stall --max-rounds=15 keep context",
+        );
+        assert_eq!(cond5, "keep context");
+        assert!(opts5.continuous);
+        assert!(!opts5.fresh_epoch);
+        assert!(!opts5.rollback_on_stall);
+        assert_eq!(opts5.max_rounds, Some(15));
+
+        let (cond6, opts6) = parse_goal_launch_with_defaults(
+            "audit codebase",
+            GoalLaunchDefaults {
+                rollback_on_stall: false,
+                fresh_epoch: Some(true),
+            },
+        );
+        assert_eq!(cond6, "audit codebase");
+        assert!(!opts6.rollback_on_stall);
+        assert!(opts6.fresh_epoch);
+
+        // Flag-only inputs without a trailing prompt must consume all valid flags
+        // and leave condition empty so callers reject them with GoalPromptRequired.
+        let (empty_mr, opts_mr) = parse_goal_launch("--max-rounds 20");
+        assert!(empty_mr.is_empty());
+        assert_eq!(opts_mr.max_rounds, Some(20));
+
+        let (empty_mt, opts_mt) = parse_goal_launch("--max-tokens 5000");
+        assert!(empty_mt.is_empty());
+        assert_eq!(opts_mt.max_tokens, Some(5000));
+
+        let (empty_shift, opts_shift) = parse_goal_launch("shift --max-rounds 12");
+        assert!(empty_shift.is_empty());
+        assert!(opts_shift.continuous);
+        assert_eq!(opts_shift.max_rounds, Some(12));
     }
 
     #[test]

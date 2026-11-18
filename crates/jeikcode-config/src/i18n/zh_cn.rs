@@ -930,7 +930,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
         Msg::CmdDescApp => "通过中继将当前会话暴露给手机 App（扫码配对；/app stop 断开）".into(),
         Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
-        Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
+        Msg::CmdDescGoal => "设定完成目标（支持 shift、status、pause、resume、stop、clear、rounds）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
         Msg::CmdDescTodo => "显示当前任务清单；`/todo add <任务>` 追加一条，`/todo clear` 清空".into(),
         Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
@@ -1086,23 +1086,109 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             .into(),
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
-             用法：\n  \
-             \u{20}\u{20}/goal <条件>                       设定新目标；循环执行直到验证达成\n  \
-             \u{20}\u{20}/goal --until-stopped <条件>       连续滚动推进并自动保存里程碑检查点\n  \
-             \u{20}\u{20}/goal --checkpoint <条件>          保存非破坏性检查点引用\n  \
-             \u{20}\u{20}/goal --verify|--no-verify <条件>  强制或跳过独立只读验证\n  \
-             \u{20}\u{20}/goal                              显示当前目标状态\n  \
-             \u{20}\u{20}/goal status                       同上\n  \
-             \u{20}\u{20}/goal clear                        停止当前目标（别名：stop、off、reset、none、cancel）\n  \
-             \u{20}\u{20}/goal help                         显示本帮助\n  \
+             子命令：\n  \
+             \u{20}\u{20}/goal <条件>                          设定新目标；循环执行直到验证达成\n  \
+             \u{20}\u{20}/goal shift <条件>                    连续多轮次班次模式（--until-stopped --fresh-epoch --rollback-on-stall）\n  \
+             \u{20}\u{20}/goal status                          查看进度、轮次、Token 用量与启用标志\n  \
+             \u{20}\u{20}/goal pause | resume                  暂停或恢复当前目标\n  \
+             \u{20}\u{20}/goal stop  | clear                   停止当前目标或清除完成横幅\n  \
+             \u{20}\u{20}/goal rounds <+N|N>                   动态调整 max_rounds 轮次上限（0 = 无限制）\n  \
+             \u{20}\u{20}/goal help                            显示本帮助\n  \
+             参数标志：\n  \
+             \u{20}\u{20}--max-rounds <N>                      覆盖本次目标的轮次上限\n  \
+             \u{20}\u{20}--until-stopped                       连续滚动推进并自动开启 fresh-epoch\n  \
+             \u{20}\u{20}--fresh-epoch / --no-fresh-epoch      跨批次滚动时是否重置上下文至冻结前缀\n  \
+             \u{20}\u{20}--rollback-on-stall / --no-rollback-on-stall  停滞熔断时是否自动回滚检查点\n  \
+             \u{20}\u{20}--max-tokens <N>                      累计 Token 达到 N 时自动停止\n  \
+             \u{20}\u{20}--verify | --no-verify                强制或跳过独立只读验证\n  \
+             \u{20}\u{20}--checkpoint                          保存非破坏性检查点引用\n  \
              说明：\n  \
-             \u{20}\u{20}- 每轮由快速模型评估；工作区发生变更时由独立只读验证器复核，\n  \
-             \u{20}\u{20}\u{20}\u{20}并由无进展熔断器拦截停滞循环。\n  \
-             \u{20}\u{20}- 随时可用 Esc / Ctrl+C 停止目标。\n".into(),
+             \u{20}\u{20}- 默认值可在 config.toml 的 [coding] 或 [goal] 下配置。\n  \
+             \u{20}\u{20}- 按 Esc 可暂停执行中的目标；按 Ctrl+C 停止。\n".into(),
+        Msg::GoalCheatSheet {
+            max_rounds,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ /goal — 当前没有进行中的目标。\n  \
+             子命令：\n  \
+             \u{20}\u{20}/goal <条件>        循环执行直到验证达成\n  \
+             \u{20}\u{20}/goal shift <条件>  连续多轮次班次模式（--until-stopped --fresh-epoch --rollback-on-stall）\n  \
+             \u{20}\u{20}/goal status        查看目标进度与参数\n  \
+             \u{20}\u{20}/goal pause | resume  暂停或恢复目标\n  \
+             \u{20}\u{20}/goal stop  | clear   停止目标或清除横幅\n  \
+             \u{20}\u{20}/goal rounds <+N|N>   动态调整轮次上限\n  \
+             标志：\n  \
+             \u{20}\u{20}--max-rounds <N>  --until-stopped  --fresh-epoch  --rollback-on-stall  --max-tokens <N>  --verify  --no-verify\n  \
+             当前默认配置（config.toml）：\n  \
+             \u{20}\u{20}max_rounds: {max_rounds}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}\n"
+        )
+        .into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ 目标：{}\n  轮次：{}\n  已用时：{}分 {}秒\n", condition, round, mins, secs).into(),
+        Msg::GoalStatusDetailed {
+            condition,
+            phase,
+            round,
+            max_rounds,
+            tokens_used,
+            max_tokens,
+            mins,
+            secs,
+            flags,
+        } => format!(
+            "  ◎ 目标（{phase}）：{condition}\n  \
+             轮次：{round} / {max_rounds} · Token：{tokens_used} / {max_tokens} · 已用时：{mins}分 {secs}秒\n  \
+             标志：{flags}\n"
+        )
+        .into(),
+        Msg::GoalStartedSummary {
+            max_rounds,
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+        } => format!(
+            "  ◎ 目标已启动（max_rounds: {max_rounds}, stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}）\n"
+        )
+        .into(),
         Msg::GoalNoActive =>
-            "  当前没有进行中的目标。\n  用法：/goal <条件>   |   /goal help\n".into(),
+            "  当前没有进行中的目标。\n  用法：/goal <条件>  |  /goal shift <条件>  |  /goal help\n".into(),
+        Msg::GoalNoPaused => "  当前没有可恢复的已暂停目标。\n".into(),
+        Msg::GoalAlreadyRunning => "  目标已在运行中。\n".into(),
+        Msg::GoalRoundsUsage =>
+            "  用法：/goal rounds <+N|N>（例如 /goal rounds +10 或 /goal rounds 50）\n".into(),
+        Msg::GoalRoundsUpdated { max_rounds } =>
+            format!("  ◎ 已更新目标轮次上限：max_rounds = {max_rounds}\n").into(),
+        Msg::GoalShiftUsage =>
+            "  用法：/goal shift <条件>（启用 --until-stopped --fresh-epoch --rollback-on-stall）\n".into(),
+        Msg::GoalPromptRequired =>
+            "  请在参数标志后输入目标描述（例如 /goal --max-rounds 20 修复测试）。\n".into(),
+        Msg::GoalLabelOn => "开启".into(),
+        Msg::GoalLabelOff => "关闭".into(),
+        Msg::GoalLabelAuto => "自动".into(),
+        Msg::GoalLabelAutoContinuous => "自动（--until-stopped 时开启）".into(),
+        Msg::GoalLabelUnbounded => "无限制".into(),
+        Msg::GoalLabelDefaultRoundsAuto => "300（自动）".into(),
+        Msg::GoalLabelVerifyForced => "强制".into(),
+        Msg::GoalStopModeUntilStopped => "直至手动停止".into(),
+        Msg::GoalStopModeWhenMet => "达成即停".into(),
+        Msg::GoalPhasePursuing => "执行中".into(),
+        Msg::GoalPhasePaused => "已暂停".into(),
+        Msg::GoalPhasePausedAtCap => "已达上限暂停".into(),
+        Msg::GoalPhaseSatisfied => "已达成".into(),
+        Msg::GoalPhaseEnded => "已结束".into(),
+        Msg::GoalStatusFlags {
+            stop_mode,
+            rollback_on_stall,
+            fresh_epoch,
+            verify_mode,
+            checkpoint,
+        } => format!(
+            "stop: {stop_mode}, rollback_on_stall: {rollback_on_stall}, fresh_epoch: {fresh_epoch}, verify: {verify_mode}, checkpoint: {checkpoint}"
+        )
+        .into(),
+        Msg::GoalPausedBanner =>
+            "  ⏸ 目标已暂停；输入 /goal resume（或继续对话）恢复，输入 /goal stop 结束。\n".into(),
         Msg::GoalCleared => "  已清除目标。\n".into(),
 
         // ── /loop ──

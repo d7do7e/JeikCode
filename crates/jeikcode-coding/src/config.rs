@@ -179,6 +179,13 @@ pub struct CodingAgentConfig {
     pub tool_loop_policy: Option<ToolLoopPolicy>,
     /// Goal-mode round cap (0 = unbounded). Override via `JEIKCODE_GOAL_MAX_ROUNDS`.
     pub goal_max_rounds: u32,
+    /// True when `goal_max_rounds` was explicitly configured in `config.toml` or env,
+    /// so async CodingPlan quota resolution does not overwrite the user's cap.
+    pub goal_max_rounds_explicit: bool,
+    /// Default `rollback_on_stall` setting for `/goal` launches.
+    pub goal_rollback_on_stall: bool,
+    /// Optional default `fresh_epoch` override for `/goal` launches (`None` = auto).
+    pub goal_fresh_epoch: Option<bool>,
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
     /// `JEIKCODE_GOAL_MAX_DURATION_SECS`.
     pub goal_max_duration_secs: u64,
@@ -331,6 +338,10 @@ pub struct CodingRuntimeConfig {
     pub turn_max_rounds: u32,
     pub compact_threshold: f32,
     pub compact_max_tokens: Option<u32>,
+    pub goal_max_rounds: u32,
+    pub goal_max_rounds_explicit: bool,
+    pub goal_rollback_on_stall: bool,
+    pub goal_fresh_epoch: Option<bool>,
     /// Unified transport + three-phase content clocks.
     pub timeouts: jeikcode_kernel::timeouts::TimeoutPolicy,
     /// How many times the round is re-issued after a first-token timeout.
@@ -461,6 +472,13 @@ impl CodingRuntimeConfig {
                 .coding
                 .compact_max_tokens
                 .and_then(jeikcode_config::config::sanitize_compact_max_tokens),
+            goal_max_rounds: goal_max_rounds_env()
+                .or(config.coding.goal_max_rounds)
+                .unwrap_or_else(default_goal_max_rounds),
+            goal_max_rounds_explicit: goal_max_rounds_env().is_some()
+                || config.coding.goal_max_rounds.is_some(),
+            goal_rollback_on_stall: config.coding.goal_rollback_on_stall,
+            goal_fresh_epoch: config.coding.goal_fresh_epoch,
             timeouts: resolve_timeout_policy(&config.coding),
             first_token_timeout_retries: {
                 std::env::var("JEIKCODE_FIRST_TOKEN_RETRIES")
@@ -536,6 +554,10 @@ impl CodingRuntimeConfig {
         config.max_rounds = self.turn_max_rounds;
         config.compact_threshold = self.compact_threshold;
         config.compact_max_tokens = self.compact_max_tokens;
+        config.goal_max_rounds = self.goal_max_rounds;
+        config.goal_max_rounds_explicit = self.goal_max_rounds_explicit;
+        config.goal_rollback_on_stall = self.goal_rollback_on_stall;
+        config.goal_fresh_epoch = self.goal_fresh_epoch;
         config.timeouts = self.timeouts;
         config.first_token_timeout_retries = self.first_token_timeout_retries;
         config.subagent_config = self.subagent_config.clone();
@@ -725,7 +747,7 @@ pub fn derive_goal_max_rounds(env_override: Option<u32>, call_limit: Option<i64>
     }
 }
 
-fn default_goal_max_rounds() -> u32 {
+pub fn default_goal_max_rounds() -> u32 {
     // Construction happens before CodingPlan `call_limit` is known; the host
     // re-derives with the real limit after login via `derive_goal_max_rounds`.
     derive_goal_max_rounds(goal_max_rounds_env(), None)
@@ -915,6 +937,9 @@ impl CodingAgentConfig {
             pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
+            goal_max_rounds_explicit: goal_max_rounds_env().is_some(),
+            goal_rollback_on_stall: true,
+            goal_fresh_epoch: None,
             goal_max_duration_secs: default_goal_max_duration_secs(),
             goal_max_tokens: default_goal_max_tokens(),
             loop_max_rounds: default_loop_max_rounds(),

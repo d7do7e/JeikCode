@@ -6294,6 +6294,97 @@ mod menu_tests {
     }
 
     #[test]
+    fn goal_sub_mode_lists_subcommands_flags_and_closes_on_prose() {
+        let reg = CommandRegistry::builtin();
+        let custom = UserCommandRegistry::empty();
+
+        // `/goal ` lists both subcommands and flags.
+        let root_items =
+            build_menu_items("/goal ", 0, &reg, &custom, None, None).expect("/goal  menu");
+        assert!(root_items.iter().any(|(n, _)| n == "shift "));
+        assert!(root_items.iter().any(|(n, _)| n == "status"));
+        assert!(root_items.iter().any(|(n, _)| n == "pause"));
+        assert!(root_items.iter().any(|(n, _)| n == "resume"));
+        assert!(root_items.iter().any(|(n, _)| n == "rounds "));
+        assert!(root_items.iter().any(|(n, _)| n == "--max-rounds "));
+        assert!(root_items.iter().any(|(n, _)| n == "--until-stopped"));
+
+        // `/goal --` narrows to flags only.
+        let flag_items =
+            build_menu_items("/goal --", 0, &reg, &custom, None, None).expect("/goal -- menu");
+        assert!(flag_items.iter().all(|(n, _)| n.starts_with("--")));
+        assert!(flag_items.iter().any(|(n, _)| n == "--fresh-epoch"));
+        assert!(flag_items.iter().any(|(n, _)| n == "--no-fresh-epoch"));
+        assert!(flag_items
+            .iter()
+            .any(|(n, _)| n == "--no-rollback-on-stall"));
+
+        // `/goal st` narrows to status and stop.
+        let st_items =
+            build_menu_items("/goal st", 0, &reg, &custom, None, None).expect("/goal st menu");
+        assert_eq!(st_items.len(), 2);
+        assert!(st_items.iter().any(|(n, _)| n == "status"));
+        assert!(st_items.iter().any(|(n, _)| n == "stop"));
+
+        // `/goal shift --max-r` narrows to `--max-rounds `.
+        let shift_flag = build_menu_items("/goal shift --max-r", 0, &reg, &custom, None, None)
+            .expect("/goal shift --max-r menu");
+        assert_eq!(shift_flag.len(), 1);
+        assert_eq!(shift_flag[0].0, "--max-rounds ");
+
+        // Once free-form prompt prose starts, the menu hides.
+        assert!(build_menu_items("/goal fix all bugs", 0, &reg, &custom, None, None).is_none());
+        assert!(
+            build_menu_items("/goal shift harden tests", 0, &reg, &custom, None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn goal_menu_selection_handles_tab_and_enter_for_flags_and_subcommands() {
+        let mut buf = Buffer::new();
+        buf.text = "/goal --max".to_string();
+        buf.cursor = buf.text.len();
+        assert_eq!(
+            apply_goal_menu_selection(&mut buf, "--max-rounds ", KeyCode::Enter),
+            None
+        );
+        assert_eq!(buf.text, "/goal --max-rounds ");
+
+        buf.text = "/goal st".to_string();
+        buf.cursor = buf.text.len();
+        assert_eq!(
+            apply_goal_menu_selection(&mut buf, "status", KeyCode::Tab),
+            None
+        );
+        assert_eq!(buf.text, "/goal status ");
+
+        buf.text = "/goal st".to_string();
+        buf.cursor = buf.text.len();
+        assert_eq!(
+            apply_goal_menu_selection(&mut buf, "status", KeyCode::Enter),
+            Some("/goal status".to_string())
+        );
+        assert!(buf.text.is_empty());
+    }
+
+    #[test]
+    fn streaming_executable_slash_allows_goal_pause_status_and_rounds() {
+        assert_eq!(
+            streaming_executable_slash("/goal pause"),
+            Some(("goal".to_string(), "pause".to_string()))
+        );
+        assert_eq!(
+            streaming_executable_slash("/goal status"),
+            Some(("goal".to_string(), "status".to_string()))
+        );
+        assert_eq!(
+            streaming_executable_slash("/goal rounds +10"),
+            Some(("goal".to_string(), "rounds +10".to_string()))
+        );
+        assert_eq!(streaming_executable_slash("/goal fix tests"), None);
+    }
+
+    #[test]
     fn build_skill_menu_items_multi_fragment_and_filter() {
         // Multiple space-separated fragments must ALL match (AND), so a long
         // hyphenated name is reachable by typing loose fragments of it.
@@ -12333,6 +12424,187 @@ fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
     }
 }
 
+/// Build the second-level `/goal ` subcommand, preset, and `--flag` completion items.
+///
+/// Behavior:
+/// - `/goal ` (trailing space) or `/goal <subcommand-prefix>` surfaces subcommands
+///   (`shift`, `status`, `pause`, `resume`, `stop`, `clear`, `rounds`) and presets.
+/// - `/goal --` (or `/goal <flags...> --<prefix>` when cursor is on a `--flag` token)
+///   surfaces all supported `/goal` flags with concise defaults and descriptions.
+/// - Once the user moves past subcommands/flags into free-form prompt prose, returns
+///   empty so the menu closes cleanly and Enter submits the goal.
+fn build_goal_menu_items(after_goal_space: &str) -> Vec<(String, String)> {
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        (
+            "shift ",
+            "Continuous multi-epoch shift (--until-stopped --fresh-epoch --rollback-on-stall)",
+        ),
+        (
+            "status",
+            "Show active goal progress, rounds, tokens & flags",
+        ),
+        ("pause", "Pause active goal cleanly"),
+        ("resume", "Resume paused goal"),
+        ("stop", "Stop active goal"),
+        ("clear", "Stop goal and dismiss banner"),
+        (
+            "rounds ",
+            "Adjust round cap on the fly: /goal rounds <+N|N>",
+        ),
+        ("help", "Show full /goal subcommands, flags & defaults"),
+    ];
+    const FLAGS: &[(&str, &str)] = &[
+        (
+            "--max-rounds ",
+            "Override round cap for this goal (default: config/300)",
+        ),
+        (
+            "--until-stopped",
+            "Roll over continuously across epochs (defaults fresh-epoch=on)",
+        ),
+        (
+            "--fresh-epoch",
+            "Reset context to frozen prefix on batch rollovers",
+        ),
+        (
+            "--no-fresh-epoch",
+            "Keep full context across batch rollovers",
+        ),
+        (
+            "--rollback-on-stall",
+            "Restore last verified checkpoint on stall (default: on)",
+        ),
+        (
+            "--no-rollback-on-stall",
+            "Keep working tree changes if stall breaker trips",
+        ),
+        ("--max-tokens ", "Stop once cumulative tokens reach N"),
+        ("--verify", "Force blind read-only verifier subagent"),
+        ("--no-verify", "Skip blind read-only verifier subagent"),
+        (
+            "--checkpoint",
+            "Save non-destructive git milestone checkpoints",
+        ),
+    ];
+
+    let trailing_space = after_goal_space.ends_with(char::is_whitespace);
+    let tokens: Vec<&str> = after_goal_space.split_whitespace().collect();
+
+    if tokens.is_empty() {
+        let mut items: Vec<(String, String)> = SUBCOMMANDS
+            .iter()
+            .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+            .collect();
+        items.extend(
+            FLAGS
+                .iter()
+                .map(|(n, d)| ((*n).to_string(), (*d).to_string())),
+        );
+        return items;
+    }
+
+    let last = *tokens.last().unwrap_or(&"");
+    let last_lower = last.to_ascii_lowercase();
+
+    // Active `--flag` token being typed (no trailing space yet): show matching flags.
+    if !trailing_space && last_lower.starts_with('-') {
+        return FLAGS
+            .iter()
+            .filter(|(flag, _)| flag.trim_end().starts_with(&last_lower))
+            .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+            .collect();
+    }
+
+    // Single token without trailing space: match subcommand prefix (e.g. `/goal st`).
+    if tokens.len() == 1 && !trailing_space {
+        let head_lower = tokens[0].to_ascii_lowercase();
+        return SUBCOMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.trim_end().starts_with(&head_lower))
+            .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+            .collect();
+    }
+
+    // After `shift ` or trailing flags + space: only keep showing flags if the user
+    // hasn't started typing natural-language prompt words yet (all preceding tokens
+    // are `shift` or `--flag` / flag numeric values).
+    if trailing_space && tokens.iter().all(|tok| is_goal_prefix_or_flag_token(tok)) {
+        // After `--max-rounds ` or `--max-tokens `, wait for the user's number.
+        if matches!(last_lower.as_str(), "--max-rounds" | "--max-tokens") {
+            return Vec::new();
+        }
+        return FLAGS
+            .iter()
+            .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn is_goal_prefix_or_flag_token(tok: &str) -> bool {
+    tok.eq_ignore_ascii_case("shift")
+        || tok.starts_with("--")
+        || tok
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '_' || c == ',')
+}
+
+/// Apply a `/goal` sub-mode selection (`Tab` or `Enter`) onto `buf`.
+/// Returns `Some(committed_line)` when `Enter` selected an immediate standalone
+/// subcommand (`status`, `pause`, `resume`, `stop`, `clear`, `help`); returns
+/// `None` when the buffer was updated in-place for further typing (flags,
+/// `shift `, `rounds `, or `Tab` completion).
+fn apply_goal_menu_selection(
+    buf: &mut Buffer,
+    selected_item: &str,
+    code: KeyCode,
+) -> Option<String> {
+    let trimmed_item = selected_item.trim_end();
+    let needs_arg = selected_item.ends_with(' ');
+    let after = buf.text.strip_prefix("/goal ").unwrap_or("");
+    let trailing_space = after.ends_with(char::is_whitespace);
+
+    let new_after = if trimmed_item.starts_with("--") {
+        // Replace partial `--...` token if typing one, otherwise append after space.
+        if !trailing_space {
+            if let Some(last_ws) = after.rfind(char::is_whitespace) {
+                format!("{} {} ", &after[..last_ws], trimmed_item)
+            } else {
+                format!("{trimmed_item} ")
+            }
+        } else {
+            format!("{after}{trimmed_item} ")
+        }
+    } else if !trailing_space && after.split_whitespace().count() <= 1 {
+        if needs_arg {
+            format!("{trimmed_item} ")
+        } else {
+            trimmed_item.to_string()
+        }
+    } else if needs_arg {
+        format!("{trimmed_item} ")
+    } else {
+        trimmed_item.to_string()
+    };
+
+    if code == KeyCode::Enter && !needs_arg && !trimmed_item.starts_with("--") {
+        let committed = format!("/goal {}", new_after.trim());
+        buf.text.clear();
+        buf.cursor = 0;
+        Some(committed)
+    } else {
+        let final_after = if new_after.ends_with(' ') {
+            new_after
+        } else {
+            format!("{new_after} ")
+        };
+        buf.text = format!("/goal {final_after}");
+        buf.cursor = buf.text.len();
+        None
+    }
+}
+
 /// Build the second-level skills palette: user-invocable skills whose bare
 /// name or fully-qualified `<ns>:<name>` starts with `prefix_lower`. A bare
 /// name is shown when it is unique across the registry; otherwise the
@@ -12484,6 +12756,14 @@ fn build_menu_items(
         .filter(|(n, _)| n.starts_with(prefix.as_str()))
         .map(|(n, d)| (n.to_string(), d.to_string()))
         .collect();
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
+    // Two-level palette for `/goal`: surfaces subcommands (`shift`, `status`,
+    // `pause`, `resume`, `stop`, `clear`, `rounds`, `help`) and `--flag`
+    // completions with defaults, hiding automatically once prompt prose begins.
+    if let Some(after) = buf.strip_prefix("/goal ") {
+        let items = build_goal_menu_items(after);
         return if items.is_empty() { None } else { Some(items) };
     }
 
@@ -12826,9 +13106,9 @@ fn handle_idle_key(
                         ));
                     }
 
-                    // `/effort` gateway: render the high/max/off sub-menu
-                    // immediately so it doesn't blink out and reappear.
-                    if name == "effort" {
+                    // `/effort` or `/goal` gateway: render the sub-menu immediately
+                    // so it doesn't blink out and reappear.
+                    if matches!(name.as_str(), "effort" | "goal") {
                         if let Some(items) = build_menu_items(
                             &app.buf.text,
                             app.buf.cursor,
@@ -12908,6 +13188,52 @@ fn handle_idle_key(
                     app.buf.text = format!("/skills {} ", name);
                     app.buf.cursor = app.buf.text.len();
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                let in_goal_sub_mode = app.buf.text.starts_with("/goal ");
+                if in_goal_sub_mode {
+                    if let Some(committed) = apply_goal_menu_selection(&mut app.buf, &name, code) {
+                        renderer.render(UiLine::ClearTransient);
+                        renderer.render(UiLine::User(committed.clone()));
+                        ctx.history.push(crate::input::history::HistoryEntry {
+                            text: committed.clone(),
+                            images: Vec::new(),
+                            pastes: Vec::new(),
+                        });
+                        if let Some((cmd, arg)) = parse_slash_line(&committed) {
+                            execute_slash_command(
+                                cmd,
+                                arg,
+                                &mut app.state,
+                                ctx,
+                                renderer,
+                                &mut app.active_modal,
+                                &mut app.setup_pending,
+                            )?;
+                            if matches!(app.state.phase, UiPhase::Idle) {
+                                redraw_after_slash(
+                                    &app.buf,
+                                    &app.state,
+                                    ctx,
+                                    &app.active_modal,
+                                    renderer,
+                                );
+                            }
+                        }
+                    } else if let Some(items) = build_menu_items(
+                        &app.buf.text,
+                        app.buf.cursor,
+                        &ctx.commands,
+                        &ctx.custom_commands,
+                        Some(&ctx.skill_registry),
+                        Some(&ctx.file_index),
+                    ) {
+                        app.menu.selected = 0;
+                        redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    }
                     return Ok(());
                 }
 
@@ -13569,6 +13895,8 @@ fn redraw_with_menu(
         crate::render::MenuKind::AtMention
     } else if buf.text.starts_with('$') {
         crate::render::MenuKind::Skill
+    } else if buf.text.starts_with("/goal ") {
+        crate::render::MenuKind::Action
     } else {
         crate::render::MenuKind::SlashCommand
     };
@@ -14982,7 +15310,7 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
         let head = arg.trim().split_whitespace().next().unwrap_or("");
         if matches!(
             head.to_ascii_lowercase().as_str(),
-            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel" | "pause" | "rounds" | "status"
         ) {
             return Some(("goal".to_string(), arg.trim().to_string()));
         }
@@ -15444,10 +15772,17 @@ fn handle_streaming_key(
                 // type-ahead queue, in-flight tools, thinking/reasoning buffers). Framed
                 // as "read-only is the safe default" so a future allowlisted report can't
                 // silently corrupt a running turn by being forgotten in this list.
-                let readonly = !matches!(
-                    cmd.as_str(),
-                    "bg" | "quit" | "exit" | "goal" | "loop" | "new"
-                );
+                let readonly = !matches!(cmd.as_str(), "bg" | "quit" | "exit" | "loop" | "new")
+                    && !(cmd == "goal"
+                        && matches!(
+                            arg.trim()
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("")
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+                        ));
                 if matches!(cmd.as_str(), "quit" | "exit") {
                     cancel_active_turn(ctx);
                     clear_capturing_modal_on_cancel(app);
@@ -19583,9 +19918,13 @@ fn handle_runtime_event(
                             terminal: progress.terminal,
                             phase: progress.phase,
                             round: progress.round,
+                            max_rounds: progress.max_rounds,
+                            tokens_used: progress.tokens_used,
+                            max_tokens: progress.max_tokens,
                             elapsed_secs: progress.elapsed_secs,
                             condition: progress.condition,
                             last_reason: progress.last_reason,
+                            options: progress.options,
                         },
                         state,
                         think,
@@ -23004,8 +23343,12 @@ fn handle_agent_event(
             terminal,
             phase,
             round,
+            max_rounds,
+            tokens_used,
+            max_tokens,
             condition,
             last_reason,
+            options,
             ..
         } => {
             if active {
@@ -23018,6 +23361,10 @@ fn handle_agent_event(
                 // Pursuing: update live badge state.
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
+                state.goal_max_rounds = max_rounds;
+                state.goal_tokens_used = tokens_used;
+                state.goal_max_tokens = max_tokens;
+                state.goal_options = Some(options);
                 state.goal_phase = jeikcode_coding::GoalPhase::Pursuing;
                 // Reset the elapsed clock only when (re-)entering Pursuing from a
                 // non-Pursuing state (fresh /goal, or re-engaging a Satisfied/PausedAtCap
@@ -23064,7 +23411,7 @@ fn handle_agent_event(
                     jeikcode_coding::GoalPhase::Paused => {
                         if state.goal_condition.is_some() {
                             renderer.render(UiLine::CommandOutput(
-                                "  ⏸ Goal paused; continue the conversation to resume, or use /goal stop to end.\n".into(),
+                                crate::i18n::t(crate::i18n::Msg::GoalPausedBanner).into_owned(),
                             ));
                             renderer.flush();
                         }
@@ -23101,6 +23448,10 @@ fn handle_agent_event(
                         }
                         state.goal_condition = None;
                         state.goal_round = 0;
+                        state.goal_max_rounds = None;
+                        state.goal_tokens_used = 0;
+                        state.goal_max_tokens = None;
+                        state.goal_options = None;
                         state.goal_started_at = None;
                         // Reflect the true terminal state (not a lying "Pursuing").
                         // The next goal's active=true update resets this to Pursuing;
@@ -24497,6 +24848,8 @@ fn draw_spinner_now(
             crate::render::MenuKind::AtMention
         } else if buf.text.starts_with('$') {
             crate::render::MenuKind::Skill
+        } else if buf.text.starts_with("/goal ") {
+            crate::render::MenuKind::Action
         } else {
             crate::render::MenuKind::SlashCommand
         };

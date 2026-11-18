@@ -75,8 +75,10 @@ pub use config::{
     resolve_turn_max_rounds, watermark_input_budget, CodingAgentConfig, CodingRuntimeConfig,
     SubagentProvider, TierProvider,
 };
-pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
-pub use goal_harness::{parse_goal_launch, GoalOptions};
+pub use controllers::{GoalPhase, GoalProgress, GoalRoundAdjustment, GoalTerminal, LoopProgress};
+pub use goal_harness::{
+    parse_goal_launch, parse_goal_launch_with_defaults, GoalLaunchDefaults, GoalOptions,
+};
 pub use init_prompt::INIT_PROMPT;
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `jeikcode_kernel`.

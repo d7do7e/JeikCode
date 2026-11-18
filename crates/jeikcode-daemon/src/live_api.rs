@@ -906,6 +906,13 @@ pub(crate) fn chat_runtime_config(
             .coding
             .compact_max_tokens
             .and_then(jeikcode_config::config::sanitize_compact_max_tokens),
+        goal_max_rounds: jeikcode_coding::config::goal_max_rounds_env()
+            .or(config.coding.goal_max_rounds)
+            .unwrap_or_else(jeikcode_coding::config::default_goal_max_rounds),
+        goal_max_rounds_explicit: jeikcode_coding::config::goal_max_rounds_env().is_some()
+            || config.coding.goal_max_rounds.is_some(),
+        goal_rollback_on_stall: config.coding.goal_rollback_on_stall,
+        goal_fresh_epoch: config.coding.goal_fresh_epoch,
         timeouts: jeikcode_coding::resolve_timeout_policy(&config.coding),
         first_token_timeout_retries: {
             std::env::var("JEIKCODE_FIRST_TOKEN_RETRIES")

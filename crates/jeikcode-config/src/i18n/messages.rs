@@ -1384,6 +1384,12 @@ pub enum Msg<'a> {
     // ── /goal ──
     /// The full `/goal help` usage block (header + Usage + Notes).
     GoalHelp,
+    /// Concise `/goal` cheat-sheet shown when bare `/goal` is run with no active goal.
+    GoalCheatSheet {
+        max_rounds: &'a str,
+        rollback_on_stall: &'a str,
+        fresh_epoch: &'a str,
+    },
     /// `/goal` / `/goal status` while a goal is active. `condition` is the goal
     /// text; `round`/`mins`/`secs` are the live progress counters.
     GoalStatus {
@@ -1392,8 +1398,64 @@ pub enum Msg<'a> {
         mins: u64,
         secs: u64,
     },
-    /// `/goal status` (or bare `/goal`) when no goal is active.
+    /// Rich `/goal status` report including round budget, token usage, phase, and flags.
+    GoalStatusDetailed {
+        condition: &'a str,
+        phase: &'a str,
+        round: u32,
+        max_rounds: &'a str,
+        tokens_used: u64,
+        max_tokens: &'a str,
+        mins: u64,
+        secs: u64,
+        flags: &'a str,
+    },
+    /// Startup notice emitted when a `/goal` launches, showing active resolved options.
+    GoalStartedSummary {
+        max_rounds: &'a str,
+        stop_mode: &'a str,
+        rollback_on_stall: &'a str,
+        fresh_epoch: &'a str,
+    },
+    /// `/goal status` when no goal is active.
     GoalNoActive,
+    /// `/goal resume` when no paused goal is available to resume.
+    GoalNoPaused,
+    /// `/goal resume` when the goal is already actively pursuing.
+    GoalAlreadyRunning,
+    /// `/goal rounds` usage hint when argument is invalid or missing.
+    GoalRoundsUsage,
+    /// Confirmation line after `/goal rounds <+N|N>`.
+    GoalRoundsUpdated {
+        max_rounds: &'a str,
+    },
+    /// `/goal shift` usage hint when no prompt was supplied.
+    GoalShiftUsage,
+    /// Prompt-required hint when flags are passed without a goal condition.
+    GoalPromptRequired,
+    /// Localized `/goal` boolean/mode/phase labels and paused banner.
+    GoalLabelOn,
+    GoalLabelOff,
+    GoalLabelAuto,
+    GoalLabelAutoContinuous,
+    GoalLabelUnbounded,
+    GoalLabelDefaultRoundsAuto,
+    GoalLabelVerifyForced,
+    GoalStopModeUntilStopped,
+    GoalStopModeWhenMet,
+    GoalPhasePursuing,
+    GoalPhasePaused,
+    GoalPhasePausedAtCap,
+    GoalPhaseSatisfied,
+    GoalPhaseEnded,
+    GoalStatusFlags {
+        stop_mode: &'a str,
+        rollback_on_stall: &'a str,
+        fresh_epoch: &'a str,
+        verify_mode: &'a str,
+        checkpoint: &'a str,
+    },
+    GoalPausedBanner,
     /// Confirmation line after `/goal clear` (and its aliases).
     GoalCleared,
 

@@ -2203,10 +2203,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             super::MenuKind::Skill | super::MenuKind::Action => {
                 // Bare `<name>  <desc>` — no command prefix. Selection arrow
-                // only. Pad by display width so CJK names align (same logic
-                // as SlashCommand).
+                // only. Pad by display width so names align cleanly.
                 let name_width = unicode_width::UnicodeWidthStr::width(name);
-                let pad = 12usize.saturating_sub(name_width);
+                let col_width = if matches!(kind, super::MenuKind::Action) {
+                    24usize
+                } else {
+                    12usize
+                };
+                let pad = col_width.saturating_sub(name_width);
                 let padded = format!("{}{}", name, " ".repeat(pad));
                 if selected {
                     format!("▸ {}  {}", padded, desc)

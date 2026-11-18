@@ -139,9 +139,13 @@ pub enum UiEvent {
         terminal: Option<jeikcode_coding::GoalTerminal>,
         phase: jeikcode_coding::GoalPhase,
         round: u32,
+        max_rounds: Option<u32>,
+        tokens_used: u64,
+        max_tokens: Option<u64>,
         elapsed_secs: u64,
         condition: String,
         last_reason: Option<String>,
+        options: jeikcode_coding::GoalOptions,
     },
     LoopUpdate {
         active: bool,
