@@ -1861,6 +1861,75 @@ fn render_hooks_json_section() -> String {
     out
 }
 
+fn toml_numeric_as_f64(value: &toml::Value) -> Option<f64> {
+    value
+        .as_float()
+        .or_else(|| value.as_integer().map(|i| i as f64))
+}
+
+fn toml_integer_as_u32(value: &toml::Value) -> Option<u32> {
+    value.as_integer().and_then(|i| u32::try_from(i).ok())
+}
+
+/// Normalize `compact_threshold` and `compact_max_tokens` across `[coding]`,
+/// `[compaction]` (including `threshold`), and top-level root keys with
+/// explicit precedence `[coding]` > `[compaction]` > root.
+fn normalize_compaction_config(document: &toml::Value, config: &mut Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let coding_tbl = document.get("coding").and_then(toml::Value::as_table);
+    let compaction_tbl = document.get("compaction").and_then(toml::Value::as_table);
+    let root_tbl = document.as_table();
+
+    let coding_threshold = coding_tbl.and_then(|t| t.get("compact_threshold"));
+    let compaction_threshold =
+        compaction_tbl.and_then(|t| t.get("compact_threshold").or_else(|| t.get("threshold")));
+    let root_threshold = root_tbl.and_then(|t| t.get("compact_threshold"));
+
+    let mut chosen_threshold = false;
+    for (source, raw) in [
+        ("[coding].compact_threshold", coding_threshold),
+        ("[compaction].compact_threshold", compaction_threshold),
+        ("compact_threshold", root_threshold),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(sanitized) = toml_numeric_as_f64(raw).and_then(sanitize_compact_threshold) {
+            if !chosen_threshold {
+                chosen_threshold = true;
+                config.coding.compact_threshold = sanitized;
+            }
+        } else {
+            warnings.push(format!(
+                "{source} was invalid ({raw}); expected finite value >= {MIN_COMPACT_THRESHOLD}"
+            ));
+        }
+    }
+
+    let coding_max = coding_tbl.and_then(|t| t.get("compact_max_tokens"));
+    let compaction_max = compaction_tbl.and_then(|t| t.get("compact_max_tokens"));
+    let root_max = root_tbl.and_then(|t| t.get("compact_max_tokens"));
+    for (source, raw) in [
+        ("[coding].compact_max_tokens", coding_max),
+        ("[compaction].compact_max_tokens", compaction_max),
+        ("compact_max_tokens", root_max),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(sanitized) = toml_integer_as_u32(raw).and_then(sanitize_compact_max_tokens) {
+            config.coding.compact_max_tokens = Some(sanitized);
+            break;
+        } else {
+            warnings.push(format!(
+                "{source} was invalid ({raw}); expected integer >= {MIN_COMPACT_MAX_TOKENS}"
+            ));
+        }
+    }
+
+    warnings
+}
+
 impl Config {
     /// Context window of the active selection, resolved through the single
     /// [`Self::resolve_model`] boundary (§14.1) so the displayed window can never
@@ -1900,8 +1969,13 @@ impl Config {
     }
 
     pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
-        let config: Config = toml::from_str(content)
+        let document: toml::Value = toml::from_str(content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", path.display()))?;
+        let mut config: Config = document
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", path.display()))?;
+        let _ = normalize_compaction_config(&document, &mut config);
         Ok(config)
     }
 
@@ -1935,8 +2009,10 @@ impl Config {
         }
 
         let mut config: Config = document
+            .clone()
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", path.display()))?;
+        warnings.extend(normalize_compaction_config(&document, &mut config));
         config.quarantined_providers = quarantined;
         if config
             .quarantined_providers
@@ -3003,6 +3079,50 @@ model = "missing-type"
         assert_eq!(parsed.coding.compact_max_tokens, Some(350_000));
         assert_eq!(sanitize_compact_threshold(0.05), None);
         assert_eq!(sanitize_compact_max_tokens(4_000), None);
+    }
+
+    #[test]
+    fn compact_threshold_parses_from_coding_compaction_and_root_with_precedence() {
+        let path = std::path::Path::new("config.toml");
+
+        let (root_cfg, warnings) = Config::parse_disk_content_tolerant(
+            "compact_threshold = 0.35\ncompact_max_tokens = 350000\n",
+            path,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!((root_cfg.coding.compact_threshold - 0.35).abs() < 1e-9);
+        assert_eq!(root_cfg.coding.compact_max_tokens, Some(350_000));
+
+        let (sec_cfg, warnings) = Config::parse_disk_content_tolerant(
+            "compact_threshold = 0.6\n\n[compaction]\nthreshold = 0.35\ncompact_max_tokens = 300000\n",
+            path,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!((sec_cfg.coding.compact_threshold - 0.35).abs() < 1e-9);
+        assert_eq!(sec_cfg.coding.compact_max_tokens, Some(300_000));
+
+        let combined = "\
+            compact_threshold = 0.7\n\
+            [compaction]\n\
+            compact_threshold = 0.5\n\
+            [coding]\n\
+            compact_threshold = 0.35\n\
+            compact_max_tokens = 250000\n\
+        ";
+        let (coding_cfg, warnings) = Config::parse_disk_content_tolerant(combined, path).unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!((coding_cfg.coding.compact_threshold - 0.35).abs() < 1e-9);
+        assert_eq!(coding_cfg.coding.compact_max_tokens, Some(250_000));
+        let strict_cfg = Config::parse_disk_content(combined, path).unwrap();
+        assert!((strict_cfg.coding.compact_threshold - 0.35).abs() < 1e-9);
+
+        let (bad_cfg, warnings) =
+            Config::parse_disk_content_tolerant("[coding]\ncompact_threshold = 0.02\n", path)
+                .unwrap();
+        assert_eq!(bad_cfg.coding.compact_threshold, 0.02);
+        assert!(!warnings.is_empty(), "invalid compact_threshold must warn");
     }
 
     #[test]

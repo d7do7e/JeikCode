@@ -1401,5 +1401,105 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "⏸ 限流（HTTP 429）{reason}{retry_after} · 已保留已完成内容 · 稍后重试或换模型"
         )
         .into(),
+        Msg::GoalFooterPausedBody => "goal 已暂停".into(),
+        Msg::GoalFooterPausedMeta => " · 继续对话即恢复 · /goal stop 结束".into(),
+        Msg::GoalFooterPausedAtCapBody => "goal 暂停".into(),
+        Msg::GoalFooterPausedAtCapMeta { round } => {
+            format!(" · 已达 {round} 轮 · 继续对话即推进").into()
+        }
+        Msg::GoalFooterSatisfiedBody => "goal 已达成".into(),
+        Msg::GoalFooterSatisfiedMeta => " · /goal clear 结束".into(),
+        Msg::RoundCapHeader => "轮次上限".into(),
+        Msg::RoundCapQuestion { cap } => format!("已运行 {cap} 轮，继续吗？").into(),
+        Msg::RoundCapQuestionWithStats { cap, stats } => {
+            format!("已运行 {cap} 轮（{stats}），继续吗？").into()
+        }
+        Msg::RoundCapContinue => "继续".into(),
+        Msg::RoundCapContinueDesc { base } => format!("再跑 {base} 轮后重新确认").into(),
+        Msg::RoundCapStop => "停止".into(),
+        Msg::RoundCapStopDesc => "结束本回合".into(),
+        Msg::CustomAnswerPlaceholder => "输入自己的答案\u{2026}".into(),
+        Msg::MenuSearchSessions => "搜索会话\u{2026}".into(),
+        Msg::MenuSearchDirectories => "搜索历史目录或输入路径\u{2026}".into(),
+        Msg::MenuTypeToFilter => "输入以筛选\u{2026}".into(),
+        Msg::RelayShareRuntimeFailed { error } => {
+            format!("共享当前 runtime 失败：{error}").into()
+        }
+        Msg::RelayStopShareFailed { error } => {
+            format!("停止共享当前 runtime 失败：{error}").into()
+        }
+        Msg::SlashSyncOutputFailed { error } => {
+            format!("斜杠命令输出同步失败：{error}").into()
+        }
+        Msg::RelayClientSkipDownload { dir } => format!(
+            "自动下载已禁用（JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），请手动将 relay-client 放入 {dir} 目录"
+        )
+        .into(),
+        Msg::RelayClientUnsupportedPlatform { os, arch, dir } => format!(
+            "不支持的平台：{os}/{arch}。请手动编译 relay-client 并放到 {dir} 中"
+        )
+        .into(),
+        Msg::RelayClientVersionUnsupportedPlatform { version, target } => {
+            format!("版本 {version} 不支持当前平台 {target}").into()
+        }
+        Msg::RelayClientAutoDownloadFailed { error, cache } => format!(
+            "自动下载 relay-client 失败：{error}\n\
+             \n\
+             安全下载：\n\
+             1. 打开浏览器访问\n\
+                https://github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/releases\n\
+             2. 下载对应平台的 binary\n\
+             3. 保存到 {cache}/jeikcode-relay-client\n\
+             4. chmod +x {cache}/jeikcode-relay-client\n\
+             5. /app 重试\n\
+             \n\
+             快速安装：\n\
+             curl -fsSL https://raw.github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/raw/main/scripts/install.sh | sh\n\
+             && /app 重试"
+        )
+        .into(),
+        Msg::RelayClientCreateCacheDirFailed { error } => {
+            format!("创建缓存目录失败：{error}").into()
+        }
+        Msg::RelayClientCreateHttpFailed { error } => {
+            format!("创建 HTTP 客户端失败：{error}").into()
+        }
+        Msg::RelayClientFetchManifestFailed { error } => {
+            format!("获取版本清单失败：{error}").into()
+        }
+        Msg::RelayClientManifestHttpError { status } => {
+            format!("获取版本清单返回 HTTP {status}").into()
+        }
+        Msg::RelayClientReadManifestFailed { error } => {
+            format!("读取版本清单失败：{error}").into()
+        }
+        Msg::RelayClientParseManifestFailed { error } => {
+            format!("解析版本清单失败：{error}").into()
+        }
+        Msg::RelayClientDownloadRequestFailed { error } => {
+            format!("下载请求失败：{error}（请检查网络连接）").into()
+        }
+        Msg::RelayClientDownloadUnauthorized => {
+            "下载鉴权失败（HTTP 401），请检查 Release 是否公开可访问".into()
+        }
+        Msg::RelayClientDownloadHttpError { status } => {
+            format!("下载返回 HTTP {status}（Release 可能不存在或无权访问）").into()
+        }
+        Msg::RelayClientCreateFileFailed { error } => {
+            format!("创建文件失败：{error}").into()
+        }
+        Msg::RelayClientReadStreamFailed { error } => {
+            format!("读取下载流失败：{error}").into()
+        }
+        Msg::RelayClientWriteFileFailed { error } => {
+            format!("写入文件失败：{error}").into()
+        }
+        Msg::RelayClientFlushFileFailed { error } => format!("刷盘失败：{error}").into(),
+        Msg::RelayClientSizeMismatch { expected, actual } => {
+            format!("文件大小不匹配：预期 {expected} 字节，实际下载 {actual} 字节").into()
+        }
+        Msg::RelayClientSha256Mismatch { expected, actual } => {
+            format!("SHA256 校验失败：\n  预期: {expected}\n  实际: {actual}").into()
+        }
     }
 }

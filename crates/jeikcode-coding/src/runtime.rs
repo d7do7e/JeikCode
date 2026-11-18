@@ -3305,6 +3305,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     let mut finish_reason = None;
                     let mut continuation = None;
                     let mut fresh_epoch_handoff: Option<String> = None;
+                    let mut rollover_compact_focus: Option<String> = None;
                     // Only GoalResult::Met keeps the goal registered after the turn ends.
                     // All other finish_reason paths (e.g. evaluator Error) must still clear it.
                     let mut keep_goal_on_eval = false;
@@ -3416,6 +3417,46 @@ fn spawn_runtime_owner_with_optional_agent(
                                             state.tokens_used,
                                             state.condition
                                         ));
+                                    } else if rolled_over {
+                                        if let Some(rt) = resources.as_ref() {
+                                            let watermark = crate::config::watermark_input_budget(
+                                                rt.config.context_window,
+                                            );
+                                            let trigger_tokens = (watermark as f32
+                                                * rt.config.effective_compact_threshold())
+                                                as usize;
+                                            let current_tokens = observed_tokens
+                                                .or_else(|| {
+                                                    held_turn.as_ref().and_then(|(_, _, snap, _)| {
+                                                        snap.messages
+                                                            .iter()
+                                                            .rev()
+                                                            .find(|m| {
+                                                                m.role
+                                                                    == jeikcode_kernel::message::Role::Assistant
+                                                            })
+                                                            .and_then(|m| m.meta.as_ref())
+                                                            .map(|m| m.used_tokens as usize)
+                                                            .filter(|&v| v > 0)
+                                                            .or_else(|| {
+                                                                Some(
+                                                                    snap.messages
+                                                                        .iter()
+                                                                        .map(|m| {
+                                                                            m.estimate_tokens_conservative()
+                                                                                as usize
+                                                                        })
+                                                                        .sum(),
+                                                                )
+                                                            })
+                                                    })
+                                                })
+                                                .unwrap_or(0);
+                                            if trigger_tokens > 0 && current_tokens >= trigger_tokens {
+                                                rollover_compact_focus =
+                                                    Some("goal batch rollover".to_string());
+                                            }
+                                        }
                                     }
                                     continuation =
                                         Some(goal_continuation_message(&verdict, &state.condition));
@@ -3452,6 +3493,11 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = send_agent_command(
                                 &agent,
                                 AgentCommand::ResetToFreshEpoch { handoff_summary },
+                            );
+                        } else if let Some(focus) = rollover_compact_focus {
+                            let _ = send_agent_command(
+                                &agent,
+                                AgentCommand::Compact { focus: Some(focus) },
                             );
                         }
                         if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {

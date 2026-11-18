@@ -1781,6 +1781,8 @@ pub fn assemble(
             Arc::new(strategy)
         })
         .compact_threshold(cfg.effective_stub_compact_threshold())
+        .auto_drain_threshold(cfg.effective_compact_threshold())
+        .compact_on_turn_end(true)
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)

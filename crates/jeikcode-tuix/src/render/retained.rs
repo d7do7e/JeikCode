@@ -257,21 +257,21 @@ fn goal_row_parts_phase(
         }
         jeikcode_coding::GoalPhase::Paused => {
             let marker = if unicode { "⏸ " } else { "* " };
-            fit_fixed_goal_row(
-                marker,
-                "goal 已暂停",
-                " · 继续对话即恢复 · /goal stop 结束",
-                max_cols,
-            )
+            let body = crate::i18n::t(crate::i18n::Msg::GoalFooterPausedBody);
+            let meta = crate::i18n::t(crate::i18n::Msg::GoalFooterPausedMeta);
+            fit_fixed_goal_row(marker, &body, &meta, max_cols)
         }
         jeikcode_coding::GoalPhase::PausedAtCap => {
             let marker = if unicode { "⏸ " } else { "* " };
-            let meta = format!(" · 已达 {round} 轮 · 继续对话即推进");
-            fit_fixed_goal_row(marker, "goal 暂停", &meta, max_cols)
+            let body = crate::i18n::t(crate::i18n::Msg::GoalFooterPausedAtCapBody);
+            let meta = crate::i18n::t(crate::i18n::Msg::GoalFooterPausedAtCapMeta { round });
+            fit_fixed_goal_row(marker, &body, &meta, max_cols)
         }
         jeikcode_coding::GoalPhase::Satisfied => {
             let marker = if unicode { "✓ " } else { "* " };
-            fit_fixed_goal_row(marker, "goal 已达成", " · /goal clear 结束", max_cols)
+            let body = crate::i18n::t(crate::i18n::Msg::GoalFooterSatisfiedBody);
+            let meta = crate::i18n::t(crate::i18n::Msg::GoalFooterSatisfiedMeta);
+            fit_fixed_goal_row(marker, &body, &meta, max_cols)
         }
         jeikcode_coding::GoalPhase::Ended => {
             // Ended rows are never constructed (goal_condition is cleared first),
@@ -3768,9 +3768,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         } else {
                             budget
                         };
-                        let placeholder = "输入自己的答案\u{2026}"; // 输入自己的答案…
+                        let placeholder = crate::i18n::t(crate::i18n::Msg::CustomAnswerPlaceholder);
                         let ph = crate::width::truncate_with_ellipsis(
-                            &scrub_controls(placeholder),
+                            &scrub_controls(&placeholder),
                             ph_budget,
                         );
                         let ph_style = self.style_faint(Role::Muted);
@@ -4660,33 +4660,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // Locale-aware, menu-neutral: `Plugin` is shared by the plugin
                     // manager AND the provider panel, so the placeholder must not
                     // say "plugins". Both are type-to-filter boxes.
-                    let zh = matches!(crate::i18n::current_locale(), crate::i18n::Locale::ZhCn);
-                    let placeholder = if crate::i18n::current_locale() == crate::i18n::Locale::Vi {
-                        match menu_kind {
-                            super::MenuKind::SessionList => "Tìm phiên…",
-                            super::MenuKind::DirectoryList => {
-                                "Tìm thư mục đã lưu hoặc nhập đường dẫn…"
-                            }
-                            _ => "Gõ để lọc…",
+                    let placeholder = match menu_kind {
+                        super::MenuKind::SessionList => {
+                            crate::i18n::t(crate::i18n::Msg::MenuSearchSessions)
                         }
-                    } else if menu_kind == super::MenuKind::SessionList {
-                        if zh {
-                            "搜索会话…"
-                        } else {
-                            "Search sessions..."
+                        super::MenuKind::DirectoryList => {
+                            crate::i18n::t(crate::i18n::Msg::MenuSearchDirectories)
                         }
-                    } else if menu_kind == super::MenuKind::DirectoryList {
-                        if zh {
-                            "搜索历史目录或输入路径…"
-                        } else {
-                            "Search saved directories or enter a path..."
-                        }
-                    } else if zh {
-                        "输入以筛选…"
-                    } else {
-                        "Type to filter..."
+                        _ => crate::i18n::t(crate::i18n::Msg::MenuTypeToFilter),
                     };
-                    push_str_cells(&mut content_row, placeholder, &muted);
+                    push_str_cells(&mut content_row, &placeholder, &muted);
                 } else {
                     push_str_cells(&mut content_row, name, &CellStyle::default());
                     if box_focused {
@@ -9493,8 +9476,9 @@ mod tests {
 
     #[test]
     fn goal_row_paused_at_cap_shows_pause_text_non_empty() {
-        // PausedAtCap phase: shows 暂停 and 继续对话即推进.
-        let row = format_goal_row_phase(
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let en_row = format_goal_row_phase(
             "fix all tests",
             5,
             60,
@@ -9502,18 +9486,34 @@ mod tests {
             true,
             jeikcode_coding::GoalPhase::PausedAtCap,
         );
-        assert!(!row.is_empty(), "paused row must be non-empty: {row}");
-        assert!(row.contains("暂停"), "pause text present: {row}");
-        assert!(row.contains("继续对话即推进"), "resume hint present: {row}");
+        assert!(en_row.contains("goal paused"), "en pause text: {en_row}");
+        assert!(en_row.contains("reached 5 rounds"), "en round: {en_row}");
+
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let zh_row = format_goal_row_phase(
+            "fix all tests",
+            5,
+            60,
+            80,
+            true,
+            jeikcode_coding::GoalPhase::PausedAtCap,
+        );
+        assert!(zh_row.contains("暂停"), "zh pause text present: {zh_row}");
         assert!(
-            row.contains("已达 5 轮"),
-            "round substitution locked: {row}"
+            zh_row.contains("继续对话即推进"),
+            "zh resume hint present: {zh_row}"
+        );
+        assert!(
+            zh_row.contains("已达 5 轮"),
+            "zh round substitution locked: {zh_row}"
         );
     }
 
     #[test]
     fn goal_row_user_paused_shows_resume_and_stop_actions() {
-        let row = format_goal_row_phase(
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let en_row = format_goal_row_phase(
             "fix all tests",
             2,
             12,
@@ -9521,9 +9521,34 @@ mod tests {
             true,
             jeikcode_coding::GoalPhase::Paused,
         );
-        assert!(row.contains("已暂停"), "pause state present: {row}");
-        assert!(row.contains("继续对话即恢复"), "resume hint present: {row}");
-        assert!(row.contains("/goal stop"), "stop action present: {row}");
+        assert!(en_row.contains("goal paused"), "en pause: {en_row}");
+        assert!(
+            en_row.contains("send a message to resume"),
+            "en resume: {en_row}"
+        );
+        assert!(en_row.contains("/goal stop"), "stop action: {en_row}");
+
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let zh_row = format_goal_row_phase(
+            "fix all tests",
+            2,
+            12,
+            100,
+            true,
+            jeikcode_coding::GoalPhase::Paused,
+        );
+        assert!(
+            zh_row.contains("已暂停"),
+            "zh pause state present: {zh_row}"
+        );
+        assert!(
+            zh_row.contains("继续对话即恢复"),
+            "zh resume hint present: {zh_row}"
+        );
+        assert!(
+            zh_row.contains("/goal stop"),
+            "stop action present: {zh_row}"
+        );
     }
 
     #[test]
@@ -9543,8 +9568,9 @@ mod tests {
 
     #[test]
     fn goal_row_satisfied_shows_achieved_text_non_empty() {
-        // Satisfied phase: shows 已达成.
-        let row = format_goal_row_phase(
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let en_row = format_goal_row_phase(
             "fix all tests",
             7,
             120,
@@ -9552,11 +9578,28 @@ mod tests {
             true,
             jeikcode_coding::GoalPhase::Satisfied,
         );
-        assert!(!row.is_empty(), "satisfied row must be non-empty: {row}");
-        assert!(row.contains("已达成"), "achieved text present: {row}");
         assert!(
-            row.contains("/goal clear 结束"),
-            "actionable hint locked: {row}"
+            en_row.contains("✓ goal achieved · /goal clear to dismiss"),
+            "en satisfied row: {en_row}"
+        );
+
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let zh_row = format_goal_row_phase(
+            "fix all tests",
+            7,
+            120,
+            80,
+            true,
+            jeikcode_coding::GoalPhase::Satisfied,
+        );
+        assert!(
+            !zh_row.is_empty(),
+            "satisfied row must be non-empty: {zh_row}"
+        );
+        assert!(zh_row.contains("已达成"), "achieved text present: {zh_row}");
+        assert!(
+            zh_row.contains("/goal clear 结束"),
+            "actionable hint locked: {zh_row}"
         );
     }
 
@@ -17042,9 +17085,10 @@ mod tests {
                 vterm.any_row(|r| r.contains("\u{276f}") && r.contains("date-fns")),
                 "cursor marker on option 1\n{dump}"
             );
+            let placeholder = crate::i18n::t(crate::i18n::Msg::CustomAnswerPlaceholder);
             assert!(
-                vterm.any_row(|r| r.contains("3.") && r.contains("输")),
-                "custom-answer row: number + faint placeholder (输入自己的答案…)\n{dump}"
+                vterm.any_row(|r| r.contains("3.") && r.contains(placeholder.as_ref())),
+                "custom-answer row: number + faint placeholder ({placeholder})\n{dump}"
             );
             assert!(
                 !vterm.any_row(|r| r.contains("Other") || r.contains("Type a custom answer")),
@@ -17208,17 +17252,22 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         let dump = vterm.dump();
 
+        let placeholder_text = crate::i18n::t(crate::i18n::Msg::CustomAnswerPlaceholder);
+        let first_char = placeholder_text
+            .chars()
+            .next()
+            .expect("non-empty placeholder");
         let row = (0..24)
             .map(|y| vterm.row_text(y))
-            .find(|s| s.contains('输'))
+            .find(|s| s.contains(placeholder_text.as_ref()))
             .unwrap_or_else(|| panic!("custom-answer row not found\n{dump}"));
         let caret = row
             .find('\u{258f}')
             .unwrap_or_else(|| panic!("caret ▏ not rendered\nrow={row:?}\n{dump}"));
-        let placeholder = row.find('输').expect("placeholder present");
+        let placeholder = row.find(first_char).expect("placeholder present");
         assert!(
             caret < placeholder,
-            "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+            "caret ▏ must render BEFORE the placeholder ({placeholder_text})\nrow={row:?}\n{dump}"
         );
     }
 
@@ -17397,6 +17446,15 @@ mod tests {
     /// `UserInputPanelView` with the correct header, question, and two options.
     #[test]
     fn round_cap_view_renders_header_and_two_options() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let en_view = crate::render::round_cap_view(400, 200, 0, "2h0m0s · 305.00K tokens");
+        assert_eq!(en_view.header, "Round limit");
+        assert!(en_view.question.contains("Completed 400 rounds"));
+        assert_eq!(en_view.options[0].0, "Continue");
+        assert_eq!(en_view.options[1].0, "Stop");
+
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
         // cap=400 (after one continuation) but base=200 (the re-arm step): the
         // question shows the grown cap, the "continue" description must show base.
         let view = crate::render::round_cap_view(400, 200, 0, "2h0m0s · 305.00K tokens");

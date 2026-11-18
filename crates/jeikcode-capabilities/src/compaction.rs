@@ -232,7 +232,7 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
-    "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
+    "[System] AI summarization for /compact timed out (>180s; the model may have reasoned too long over a large context). Fell back to fast compaction: conversation turns were preserved and large tool outputs were folded. You can run /compact again or switch to a faster model for full summarization.";
 
 /// System prompt for the anchored compaction summary LLM call.
 ///
@@ -1138,7 +1138,9 @@ fn emergency_keep_boundary(msgs: &[Message], floor: usize) -> usize {
     if turn_start > floor {
         return turn_start;
     }
-    intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS).unwrap_or(floor)
+    intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS)
+        .or_else(|| intra_turn_round_boundary(msgs, floor, 1))
+        .unwrap_or(floor)
 }
 
 /// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
@@ -1189,22 +1191,27 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
 
     // Intra-turn round-pair slicing: when the current active turn alone exceeds
     // `keep_budget_tokens` (or is the only turn after `floor`) and has accumulated
-    // more than `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds, slice at a completed
-    // `Role::Assistant` tool-round boundary inside the active turn so a single 40-round
-    // turn cannot balloon to 800K unhindered!
-    if (active <= floor || (keep_budget_tokens > 0 && active_tokens > keep_budget_tokens))
-        && msgs[active..]
-            .iter()
-            .filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
-            .count()
-            > MIN_INTRA_TURN_RECENT_ROUNDS
-    {
+    // more than `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds (or exceeds 2x a positive
+    // `keep_budget_tokens` across 2..=4 oversized rounds), slice at a completed
+    // `Role::Assistant` tool-round boundary inside the active turn so a single
+    // turn cannot balloon past the configured threshold unhindered.
+    if active <= floor || (keep_budget_tokens > 0 && active_tokens > keep_budget_tokens) {
         let min_search_start = (active + 1).max(floor);
         let round_starts: Vec<usize> = (min_search_start..msgs.len())
             .filter(|&i| msgs[i].role == Role::Assistant && !msgs[i].tool_calls.is_empty())
             .collect();
-        if round_starts.len() > MIN_INTRA_TURN_RECENT_ROUNDS {
-            let max_cut_idx = round_starts.len() - MIN_INTRA_TURN_RECENT_ROUNDS;
+        let keep_rounds = if round_starts.len() > MIN_INTRA_TURN_RECENT_ROUNDS {
+            Some(MIN_INTRA_TURN_RECENT_ROUNDS)
+        } else if keep_budget_tokens > 0
+            && round_starts.len() > 1
+            && active_tokens > keep_budget_tokens.saturating_mul(2)
+        {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(keep_rounds) = keep_rounds {
+            let max_cut_idx = round_starts.len() - keep_rounds;
             let mut boundary = round_starts[max_cut_idx];
             let mut kept: usize = msgs[boundary..]
                 .iter()
@@ -2196,7 +2203,7 @@ Dependencies verified.
             .resume_note
             .expect("timeout must surface a user-facing notice");
         assert!(
-            note.contains("超时"),
+            note.contains("timed out") && note.contains("/compact"),
             "notice should explain the timeout: {note:?}"
         );
     }
@@ -3584,6 +3591,37 @@ Dependencies verified.
         ];
         let extracted = extract_active_skills_in_span(&msgs2);
         assert_eq!(extracted, vec!["plan-tribunal", "exec-inquisitor"]);
+    }
+
+    #[test]
+    fn recent_keep_boundary_slices_oversized_few_round_active_turn_without_breaking_zero_budget() {
+        let mut msgs = vec![Message::system("sys"), Message::user("big active turn")];
+        for i in 1..=3 {
+            msgs.push(Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: format!("c{i}"),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            ));
+            msgs.push(Message::tool_result(
+                format!("c{i}"),
+                &"x".repeat(40_000),
+                false,
+            ));
+        }
+
+        // 3 rounds (~30K conservative tokens total > 2 * 10K keep_budget): slices down to last round.
+        let boundary = recent_keep_boundary(&msgs, 10_000, 1);
+        assert!(
+            boundary > 2,
+            "oversized 3-round turn above 2x keep_budget must drain earlier rounds, got {boundary}"
+        );
+
+        // keep_budget == 0 with <= 4 rounds keeps the full active turn intact (zero-budget invariant).
+        let zero_boundary = recent_keep_boundary(&msgs, 0, 1);
+        assert_eq!(zero_boundary, 1);
     }
 }
 

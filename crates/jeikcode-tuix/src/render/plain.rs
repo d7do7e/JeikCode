@@ -580,7 +580,8 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                             {
                                 let other_no = panel.options.len() + 1;
                                 let custom = if panel.custom_text.trim().is_empty() {
-                                    "输入自己的答案\u{2026}".to_string()
+                                    crate::i18n::t(crate::i18n::Msg::CustomAnswerPlaceholder)
+                                        .into_owned()
                                 } else {
                                     scrub_controls(&panel.custom_text)
                                 };

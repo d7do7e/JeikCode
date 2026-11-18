@@ -937,18 +937,65 @@ pub(crate) fn replay_session(
     // `0/0` when the target has no completed turns) so a session SWITCH resets
     // the gauge to THIS session and never leaves the previous session's count on
     // screen; `restore_context` no-ops only when there's nothing to show or clear.
-    let (used, window) = session
-        .turn_stats
-        .iter()
-        .rev()
-        .find(|stat| stat.position_valid)
-        .map(|s| (s.used_tokens, s.ctx_window))
-        .unwrap_or((0, 0));
+    let (used, window) = restored_session_context(session);
     state.restore_context(used, window);
 
     // The persistent todo panel + id→title cache were seeded BEFORE the render
     // loop (so rebuilt batch children could enrich `todo update #N` titles); no
     // second seeding is needed here.
+}
+
+fn restored_session_context(session: &Session) -> (usize, usize) {
+    use jeikcode_kernel::message::{Role, TURN_DIAGNOSTIC_ORIGIN};
+    let last_asst_meta = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == Role::Assistant
+                && m.internal_origin.as_deref() != Some(TURN_DIAGNOSTIC_ORIGIN)
+                && m.meta.is_some()
+        })
+        .and_then(|m| m.meta.as_ref());
+    let last_valid_stat = session
+        .turn_stats
+        .iter()
+        .rev()
+        .find(|stat| stat.position_valid);
+    let window = last_valid_stat
+        .map(|s| s.ctx_window)
+        .filter(|&w| w > 0)
+        .or_else(|| {
+            last_asst_meta
+                .map(|m| m.ctx_window as usize)
+                .filter(|&w| w > 0)
+        })
+        .unwrap_or(0);
+    let used = session
+        .compacted_context_tokens
+        .filter(|&t| t > 0)
+        .or_else(|| {
+            last_asst_meta
+                .map(|m| m.used_tokens as usize)
+                .filter(|&t| t > 0)
+        })
+        .or_else(|| {
+            let has_compacted_anchor = !session.cold_summaries.is_empty()
+                || session.messages.iter().any(|m| {
+                    m.synthetic
+                        && jeikcode_capabilities::compaction::is_compaction_anchor_text(&m.text)
+                });
+            has_compacted_anchor.then(|| {
+                session
+                    .messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative() as usize)
+                    .sum()
+            })
+        })
+        .or_else(|| last_valid_stat.map(|s| s.used_tokens))
+        .unwrap_or(0);
+    (used, window)
 }
 
 #[cfg(test)]
@@ -1877,6 +1924,71 @@ mod tests {
         let context = state.last_context.as_ref().expect("valid context restored");
         assert_eq!(context.sent_tokens, 77);
         assert_eq!(context.ctx_window, 100);
+    }
+
+    #[test]
+    fn replay_prefers_post_compaction_token_count_over_stale_turn_stats() {
+        use jeikcode_kernel::message::Message;
+
+        #[derive(Default)]
+        struct Rec(Vec<UiLine>);
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.0.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message::synthetic_user(
+                "<!-- jeikcode:anchor v1 -->\n## 1. Primary Request & Intent\n- test",
+            ),
+            Message::user("continue"),
+            Message::assistant("ok", vec![]),
+        ];
+        session.turn_stats.push(TurnStat {
+            after_message: 3,
+            position_valid: true,
+            turn_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 400_000,
+            errored: false,
+            used_tokens: 400_000,
+            ctx_window: 1_000_000,
+        });
+        session.compacted_context_tokens = Some(100_000);
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let context = state.last_context.as_ref().expect("valid context restored");
+        assert_eq!(context.footer_used_tokens(), 100_000);
+        assert_eq!(context.ctx_window, 1_000_000);
+
+        // Even when compacted_context_tokens is unset, an anchored snapshot must not
+        // fall back to stale pre-compaction turn_stats (400_000).
+        session.compacted_context_tokens = None;
+        let mut state2 = UiState::with_unicode(true);
+        replay_session(&mut rec, &mut state2, &session, false);
+        let context2 = state2
+            .last_context
+            .as_ref()
+            .expect("valid context restored");
+        assert!(
+            context2.footer_used_tokens() < 400_000,
+            "must not revert to stale 400_000 turn_stats: {}",
+            context2.footer_used_tokens()
+        );
+        assert_eq!(context2.ctx_window, 1_000_000);
     }
 
     #[test]

@@ -1268,3 +1268,143 @@ async fn mid_turn_compact_is_queued_and_runs_at_turn_boundary() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 }
+
+// ── BUG 1 REGRESSION: multi-pass mid-turn compaction & turn-end enforcement ───
+#[tokio::test]
+async fn midturn_stub_noop_does_not_latch_against_later_high_pressure_and_turn_end_compacts() {
+    use jeikcode_kernel::tool::ToolCall;
+    let huge_arg = format!("{{\"text\":\"{}\"}}", "x".repeat(600));
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            // Round 1: emits echo tool call
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: huge_arg.clone(),
+                }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 300,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2: emits another echo tool call with higher pressure (still below summary,
+            // or stub no-op in round 2 followed by high pressure in round 3)
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c2".into(),
+                    name: "echo".into(),
+                    arguments: huge_arg.clone(),
+                }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 700,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 3: final response ending at 850/1000 (>= 0.35), testing turn-end enforcement
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 850,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])
+        .with_ctx_window(1000),
+    );
+
+    let mut handle = jeikcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 1 }))
+        .compact_threshold(0.26)
+        .auto_drain_threshold(0.35)
+        .compact_on_turn_end(true)
+        .build()
+        .spawn();
+
+    let events = drive_turn_collect(&mut handle, "run multi-round task").await;
+    let compactions = compacted_events(&events);
+    assert!(
+        compactions.iter().any(|c| c.4),
+        "expected at least one committed compaction across mid-turn + turn-end: {compactions:?}"
+    );
+    let snap = snapshot(&mut handle).await;
+    assert!(
+        snap.cache_epoch >= 1,
+        "cache_epoch must advance on committed compaction"
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
+#[tokio::test]
+async fn turn_end_compaction_still_fires_after_max_rounds_diagnostic() {
+    use jeikcode_kernel::tool::ToolCall;
+    let huge_arg = format!("{{\"text\":\"{}\"}}", "y".repeat(600));
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            // Round 1: tool call with moderate usage
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: huge_arg.clone(),
+                }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 300,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            // Round 2: hits max_rounds(2), persists TURN_DIAGNOSTIC_ORIGIN assistant row after this
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c2".into(),
+                    name: "echo".into(),
+                    arguments: huge_arg,
+                }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 850,
+                    completion: 10,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])
+        .with_ctx_window(1000),
+    );
+
+    let mut handle = jeikcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(registry().mount(&["echo"]))
+        .persona(PERSONA)
+        .max_rounds(2)
+        .compaction(Arc::new(SummarizeOldestStrategy { keep_recent: 1 }))
+        .compact_threshold(0.95) // mid-turn stays silent at 850/1000
+        .auto_drain_threshold(0.35) // turn-end enforces 0.35 even after persist_turn_diagnostic
+        .compact_on_turn_end(true)
+        .build()
+        .spawn();
+
+    let events = drive_turn_collect(&mut handle, "hit max rounds with high pressure").await;
+    let compactions = compacted_events(&events);
+    assert!(
+        compactions.iter().any(|c| c.4),
+        "turn-end compaction must fire on MaxRounds even after persist_turn_diagnostic: {compactions:?}"
+    );
+    let snap = snapshot(&mut handle).await;
+    assert!(snap.cache_epoch >= 1);
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}

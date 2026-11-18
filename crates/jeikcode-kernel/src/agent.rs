@@ -1236,6 +1236,8 @@ pub struct Agent {
     /// thresholds (5K/13K, coding-mode, etc.) are policy, NOT a kernel default —
     /// the neutral default is OFF.
     compact_threshold: Option<f32>,
+    auto_drain_threshold: Option<f32>,
+    compact_on_turn_end: bool,
     /// Optional durable writer for committed manual compactions. `None` is an
     /// explicitly ephemeral agent; session-bound production assembly injects one.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
@@ -1350,6 +1352,8 @@ impl Agent {
             max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            auto_drain_threshold: self.auto_drain_threshold,
+            compact_on_turn_end: self.compact_on_turn_end,
             compaction_checkpoint: self.compaction_checkpoint,
             timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,
@@ -1463,6 +1467,8 @@ struct RunningAgent {
     max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    auto_drain_threshold: Option<f32>,
+    compact_on_turn_end: bool,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// LIVENESS: three-phase content clocks + transport defaults.
     timeouts: crate::timeouts::TimeoutPolicy,
@@ -1529,7 +1535,15 @@ impl RunningAgent {
     /// `None` if no threshold (default → never), no assistant turn yet, or below the
     /// threshold. Pure read — never mutates the conversation.
     fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
-        let thresh = self.compact_threshold?;
+        self.should_compact_at(convo, self.compact_threshold)
+    }
+
+    fn should_compact_at(
+        &self,
+        convo: &Conversation,
+        threshold: Option<f32>,
+    ) -> Option<CompactTrigger> {
+        let thresh = threshold?;
         // Measure the context the NEXT request will carry: the provider's prompt
         // PLUS that response's completion (the assistant output is now part of the
         // history). `meta.used_tokens` alone is the prompt side, so a 20K response
@@ -1539,7 +1553,11 @@ impl RunningAgent {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == crate::message::Role::Assistant)
+            .find(|m| {
+                m.role == crate::message::Role::Assistant
+                    && m.internal_origin.as_deref() != Some(TURN_DIAGNOSTIC_ORIGIN)
+                    && m.meta.is_some()
+            })
             .and_then(|m| m.meta.as_ref())
             .map(|meta| {
                 let used = if meta.used_tokens > 0 {
@@ -1585,7 +1603,11 @@ impl RunningAgent {
             .messages
             .iter()
             .rev()
-            .find(|message| message.role == crate::message::Role::Assistant)
+            .find(|message| {
+                message.role == crate::message::Role::Assistant
+                    && message.internal_origin.as_deref() != Some(TURN_DIAGNOSTIC_ORIGIN)
+                    && message.meta.is_some()
+            })
             .and_then(|message| message.meta.as_ref())
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
@@ -1681,7 +1703,11 @@ impl RunningAgent {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == crate::message::Role::Assistant)
+            .find(|m| {
+                m.role == crate::message::Role::Assistant
+                    && m.internal_origin.as_deref() != Some(TURN_DIAGNOSTIC_ORIGIN)
+                    && m.meta.is_some()
+            })
             .and_then(|m| m.meta.as_ref())
             .map(|meta| {
                 let used = if meta.used_tokens > 0 {
@@ -2088,8 +2114,10 @@ impl RunningAgent {
         // compaction opens a NEW epoch, then the fresh user message + turn run
         // append-only on the compacted history. NEVER fired inside run_turn's round
         // loop (that would reopen the within-turn cache break).
+        let mut boundary_compacted = false;
         if let Some(trigger) = self.should_compact(convo) {
             self.run_compaction(convo, trigger).await;
+            boundary_compacted = true;
         }
         // CANCEL = UNDO: remember the history length BEFORE this turn's user
         // message is pushed, so a cancelled turn can roll all the way back to here —
@@ -2151,6 +2179,7 @@ impl RunningAgent {
             rollback_len,
             steer.clone(),
             tool_loop_state.as_mut(),
+            boundary_compacted,
         ));
         let mut shutdown = false;
         loop {
@@ -2465,6 +2494,23 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnComplete { reason });
     }
 
+    /// Enforce configured `compact_threshold` at turn-end before `finish_turn`
+    /// saves the final snapshot when `compact_on_turn_end` is enabled.
+    async fn finish_turn_with_compaction(
+        &self,
+        convo: &mut Conversation,
+        reason: StopReason,
+        ctx: &TurnCtx,
+    ) {
+        if self.compact_on_turn_end {
+            let threshold = self.auto_drain_threshold.or(self.compact_threshold);
+            if let Some(trigger) = self.should_compact_at(convo, threshold) {
+                self.run_compaction(convo, trigger).await;
+            }
+        }
+        self.finish_turn(convo, reason, ctx).await;
+    }
+
     /// Persist only the replay-safe, fully assembled portion of a failed stream.
     /// `ToolCallDelta` is display-only and never enters `pending_calls`; complete calls
     /// are retained but paired with synthetic error results so resume cannot execute
@@ -2610,6 +2656,7 @@ impl RunningAgent {
         rollback_len: usize,
         steer: SteerBuf,
         mut tool_loop_state: Option<&mut ToolLoopState>,
+        boundary_compacted: bool,
     ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
@@ -2686,11 +2733,12 @@ impl RunningAgent {
         // both in one round (the observed q2 -> q3 -> assistant bug).
         let mut initial_prompt_round = true;
         let mut over_window_warned = false;
-        // Whether the mid-turn AUTO compaction pass has run this turn. Mainstream
-        // agents check the context threshold before every model call; we do the
-        // same, but at most ONCE per turn so a no-op pass cannot thrash. The
-        // 100%-watermark emergency block below remains the hard backstop.
-        let mut midturn_auto_attempted = false;
+        // Multi-pass mid-turn auto-compaction state: tracks the last NO-OP
+        // `(was_summarize, msg_len, estimated_prompt)` so a committed pass
+        // allows subsequent passes in 60+ round turns whenever pressure climbs
+        // back above threshold, and a low-pressure stub no-op never blocks
+        // later drain+summarize escalation.
+        let mut midturn_noop_gate: Option<(bool, usize, u32)> = None;
         // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
         // session-owned streak, this only describes consecutive rounds of this
         // running turn.
@@ -2782,8 +2830,12 @@ impl RunningAgent {
                                 convo,
                                 &format!("max rounds ({cap}) reached"),
                             );
-                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
-                                .await;
+                            self.finish_turn_with_compaction(
+                                convo,
+                                StopReason::MaxRounds,
+                                &turn_ctx,
+                            )
+                            .await;
                             return;
                         }
                     } else {
@@ -2796,7 +2848,7 @@ impl RunningAgent {
                             convo,
                             &format!("max rounds ({cap}) reached"),
                         );
-                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                        self.finish_turn_with_compaction(convo, StopReason::MaxRounds, &turn_ctx)
                             .await;
                         return;
                     }
@@ -2845,6 +2897,7 @@ impl RunningAgent {
                 last_echo_sig = None;
                 echo_rounds = 0;
                 echo_nudged = false;
+                midturn_noop_gate = None;
                 // 用户成功转换 steer 转向状态：刷新重置轮次计数与上限，开启全新轮次预算！
                 round = 1;
                 round_cap = self.max_rounds;
@@ -2890,7 +2943,7 @@ impl RunningAgent {
             // instead of waiting for the 100% overflow ladder. Runs at most once
             // per turn: if it cannot shrink (single huge input), the emergency
             // block below still owns the hard backstop.
-            if !midturn_auto_attempted && active_internal_continuation.is_none() {
+            if active_internal_continuation.is_none() && !(round == 1 && boundary_compacted) {
                 let window = self.provider.context_window();
                 let messages_tokens: u64 = messages
                     .iter()
@@ -2939,15 +2992,23 @@ impl RunningAgent {
                         utilization,
                         sacred_floor: convo.sacred_floor(),
                     };
-                    if self.compaction.will_summarize(&view) || round > 1 {
+                    let will_summarize = self.compaction.will_summarize(&view);
+                    let gated_by_noop =
+                        midturn_noop_gate.is_some_and(|(prev_summarize, prev_len, prev_prompt)| {
+                            let escalated_to_summary = !prev_summarize && will_summarize;
+                            let grew_materially = convo.messages.len() > prev_len
+                                && estimated_prompt >= prev_prompt.saturating_add(16_384);
+                            !(escalated_to_summary || grew_materially)
+                        });
+                    if !gated_by_noop && (will_summarize || round > 1) {
                         let epoch_before = convo.cache_epoch;
                         self.run_compaction(convo, CompactTrigger::Auto { utilization })
                             .await;
-                        // Latch only when compaction could not commit; when a
-                        // committed pass relieved pressure, allow subsequent rounds
-                        // in a very long turn to compact again if history regrows.
-                        if convo.cache_epoch == epoch_before {
-                            midturn_auto_attempted = true;
+                        if convo.cache_epoch != epoch_before {
+                            midturn_noop_gate = None;
+                        } else {
+                            midturn_noop_gate =
+                                Some((will_summarize, convo.messages.len(), estimated_prompt));
                         }
                         messages = convo.model_history();
                         self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -3868,7 +3929,7 @@ impl RunningAgent {
                     code: None,
                 });
                 Self::persist_turn_diagnostic(convo, &format!("max rounds ({cap}) reached"));
-                self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                self.finish_turn_with_compaction(convo, StopReason::MaxRounds, &turn_ctx)
                     .await;
                 return;
             }
@@ -4080,7 +4141,7 @@ impl RunningAgent {
             initial_prompt_round = false;
             self.hooks.on_turn_progress(convo).await;
             if in_final_synthesis {
-                self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                self.finish_turn_with_compaction(convo, StopReason::MaxRounds, &turn_ctx)
                     .await;
                 return;
             }
@@ -4138,8 +4199,12 @@ impl RunningAgent {
                                 convo,
                                 &format!("max offer_continuation continuations ({max}) reached"),
                             );
-                            self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx)
-                                .await;
+                            self.finish_turn_with_compaction(
+                                convo,
+                                StopReason::MaxContinuations,
+                                &turn_ctx,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -4173,7 +4238,7 @@ impl RunningAgent {
                         "response truncated: finish_reason=length".into(),
                     ));
                 }
-                self.finish_turn(convo, StopReason::Stopped, &turn_ctx)
+                self.finish_turn_with_compaction(convo, StopReason::Stopped, &turn_ctx)
                     .await;
                 return;
             }
@@ -4996,6 +5061,8 @@ pub struct AgentBuilder {
     max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    auto_drain_threshold: Option<f32>,
+    compact_on_turn_end: bool,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     timeouts: crate::timeouts::TimeoutPolicy,
     /// Max re-issues after a first-token timeout before failing the turn.
@@ -5057,6 +5124,8 @@ impl Default for AgentBuilder {
             // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
+            auto_drain_threshold: None,
+            compact_on_turn_end: false,
             compaction_checkpoint: None,
             // NEUTRAL default: content clocks off. Production fills TimeoutPolicy
             // so a stalled provider cannot park a turn forever.
@@ -5229,6 +5298,17 @@ impl AgentBuilder {
         self.compact_threshold = Some(frac);
         self
     }
+    /// Set the high-water drain threshold enforced at turn-end when
+    /// [`Self::compact_on_turn_end`] is enabled.
+    pub fn auto_drain_threshold(mut self, frac: f32) -> Self {
+        self.auto_drain_threshold = Some(frac);
+        self
+    }
+    /// Enforce auto-compaction at normal turn-end before persisting snapshots.
+    pub fn compact_on_turn_end(mut self, yes: bool) -> Self {
+        self.compact_on_turn_end = yes;
+        self
+    }
     /// Install the full transport + three-phase content policy. Production
     /// assembly uses [`crate::timeouts::TimeoutPolicy::production`] (or the
     /// config-resolved equivalent). Tests that only need a single idle bound
@@ -5374,6 +5454,8 @@ impl AgentBuilder {
             max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            auto_drain_threshold: self.auto_drain_threshold,
+            compact_on_turn_end: self.compact_on_turn_end,
             compaction_checkpoint: self.compaction_checkpoint,
             timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,

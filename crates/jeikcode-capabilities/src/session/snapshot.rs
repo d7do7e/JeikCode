@@ -38,6 +38,7 @@ struct TurnAccum {
     used_tokens: u32,
     ctx_window: u32,
     tokens: TokenBreakdown,
+    compacted_since_last_response: bool,
 }
 
 /// One-shot signal from the persistence hook to its owning runtime. A normal
@@ -766,38 +767,112 @@ impl SnapshotHook {
     }
 }
 
+fn snapshot_bytes(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .messages
+        .iter()
+        .map(|m| {
+            m.text.len()
+                + m.reasoning.as_deref().map_or(0, str::len)
+                + m.tool_calls
+                    .iter()
+                    .map(|c| c.name.len() + c.arguments.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn estimate_post_compaction_tokens(
+    before: Option<&SessionSnapshot>,
+    after: &SessionSnapshot,
+    meta: &SessionMeta,
+) -> u64 {
+    let before_used = before
+        .and_then(|snap| {
+            snap.messages
+                .iter()
+                .rev()
+                .find(|m| {
+                    m.role == jeikcode_kernel::message::Role::Assistant
+                        && m.internal_origin.as_deref()
+                            != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
+                        && m.meta.is_some()
+                })
+                .and_then(|m| m.meta.as_ref())
+                .map(|m| u64::from(m.used_tokens))
+                .filter(|&v| v > 0)
+        })
+        .or_else(|| meta.compacted_context_tokens.filter(|&v| v > 0))
+        .or_else(|| {
+            meta.turn_stats
+                .iter()
+                .rev()
+                .find(|s| s.position_valid && s.used_tokens > 0)
+                .map(|s| u64::from(s.used_tokens))
+        });
+    let after_bytes = snapshot_bytes(after);
+    if let (Some(before_snap), Some(before_used)) = (before, before_used) {
+        let before_bytes = snapshot_bytes(before_snap);
+        if before_bytes > 0 {
+            return ((before_used as u128 * after_bytes as u128) / before_bytes as u128) as u64;
+        }
+    }
+    let after_assistant_used = after
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == jeikcode_kernel::message::Role::Assistant)
+        .and_then(|m| m.meta.as_ref())
+        .map(|m| u64::from(m.used_tokens))
+        .filter(|&v| v > 0);
+    if let Some(used) = after_assistant_used {
+        return used;
+    }
+    after
+        .messages
+        .iter()
+        .map(|m| u64::from(m.estimate_tokens_conservative()))
+        .sum()
+}
+
 fn reindex_compacted_sidecars(
-    before: &SessionSnapshot,
+    before: Option<&SessionSnapshot>,
     after: &SessionSnapshot,
     meta: &mut SessionMeta,
     presentation: &mut PresentationFile,
 ) {
-    if before.messages.len() != after.messages.len() {
-        let prefix = before
-            .messages
-            .iter()
-            .zip(&after.messages)
-            .take_while(|(left, right)| left == right)
-            .count();
-        let suffix = before.messages[prefix..]
-            .iter()
-            .rev()
-            .zip(after.messages[prefix..].iter().rev())
-            .take_while(|(left, right)| left == right)
-            .count();
-        let old_end = before.messages.len().saturating_sub(suffix);
-        let new_end = after.messages.len().saturating_sub(suffix);
-        let _ = meta.archive_turn_stats_where(|stat| {
-            stat.position_valid && stat.after_message > prefix && stat.after_message < old_end
-        });
-        for stat in &mut meta.turn_stats {
-            if !stat.position_valid {
-                continue;
-            }
-            if stat.after_message >= old_end {
-                stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+    if let Some(before) = before {
+        if before.messages.len() != after.messages.len() {
+            let prefix = before
+                .messages
+                .iter()
+                .zip(&after.messages)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let suffix = before.messages[prefix..]
+                .iter()
+                .rev()
+                .zip(after.messages[prefix..].iter().rev())
+                .take_while(|(left, right)| left == right)
+                .count();
+            let old_end = before.messages.len().saturating_sub(suffix);
+            let new_end = after.messages.len().saturating_sub(suffix);
+            let _ = meta.archive_turn_stats_where(|stat| {
+                stat.position_valid && stat.after_message > prefix && stat.after_message < old_end
+            });
+            for stat in &mut meta.turn_stats {
+                if !stat.position_valid {
+                    continue;
+                }
+                if stat.after_message >= old_end {
+                    stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
+                }
             }
         }
+    }
+    if before.is_none_or(|prev| prev.messages != after.messages) {
+        let post_tokens = estimate_post_compaction_tokens(before, after, meta);
+        meta.compacted_context_tokens = Some(post_tokens);
     }
     let surviving_turn_ids: std::collections::BTreeSet<_> = meta
         .turn_stats
@@ -812,22 +887,52 @@ fn reindex_compacted_sidecars(
 
 impl CompactionCheckpoint for SnapshotHook {
     fn save(&self, snapshot: &SessionSnapshot) -> Result<(), CompactionCheckpointError> {
-        if let Some(lease) = &self.lease {
-            return self
-                .mgr
+        let res = if let Some(lease) = &self.lease {
+            self.mgr
                 .commit_native_runtime_mutation(
                     lease,
                     snapshot,
                     |current_snapshot, meta, presentation| {
-                        reindex_compacted_sidecars(current_snapshot, snapshot, meta, presentation);
+                        reindex_compacted_sidecars(
+                            Some(current_snapshot),
+                            snapshot,
+                            meta,
+                            presentation,
+                        );
                         Ok(())
                     },
                 )
-                .map_err(|error| self.compaction_error(error));
+                .map_err(|error| self.compaction_error(error))
+        } else {
+            let before = self.mgr.load_snapshot(&self.session_id).ok();
+            self.mgr
+                .save_snapshot(&self.session_id, snapshot)
+                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
+            let fresh = SessionMeta::new(&self.session_id, &self.working_dir, now_ms());
+            let presentation = self.mgr.read_presentation(&self.session_id).ok();
+            let mut scratch_presentation = presentation.clone().unwrap_or_default();
+            self.mgr
+                .update_meta_or_insert(&self.session_id, fresh, |meta| {
+                    reindex_compacted_sidecars(
+                        before.as_ref(),
+                        snapshot,
+                        meta,
+                        &mut scratch_presentation,
+                    );
+                })
+                .map_err(|error| CompactionCheckpointError::new(error.to_string()))?;
+            if presentation.is_some() {
+                self.mgr
+                    .write_presentation(&self.session_id, &scratch_presentation)
+                    .map_err(|error| CompactionCheckpointError::new(error.to_string()))
+            } else {
+                Ok(())
+            }
+        };
+        if res.is_ok() {
+            self.lock().compacted_since_last_response = true;
         }
-        self.mgr
-            .save_snapshot(&self.session_id, snapshot)
-            .map_err(|error| CompactionCheckpointError::new(error.to_string()))
+        res
     }
 }
 
@@ -939,6 +1044,7 @@ impl LifecycleHooks for SnapshotHook {
     /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
         let mut a = self.lock();
+        a.compacted_since_last_response = false;
         a.round_count = a.round_count.saturating_add(1);
         a.tool_calls = a
             .tool_calls
@@ -1036,6 +1142,7 @@ impl LifecycleHooks for SnapshotHook {
             used_tokens,
             ctx_window,
             tokens,
+            compacted_since_last_response,
         ) = {
             let a = self.lock();
             (
@@ -1046,6 +1153,7 @@ impl LifecycleHooks for SnapshotHook {
                 a.used_tokens,
                 a.ctx_window,
                 a.tokens,
+                a.compacted_since_last_response,
             )
         };
         if let Some(root_start_ms) = root_user_start_ms_for_steered_chain(convo) {
@@ -1078,8 +1186,11 @@ impl LifecycleHooks for SnapshotHook {
             meta.updated_at = now;
             meta.turn_count = meta.turn_count.saturating_add(1);
             meta.message_count = msg_count as u32;
-            // 真实 usage 入场：压缩估算的占用到此作废，后续以本次 turn stat 为准。
-            meta.compacted_context_tokens = None;
+            // Only clear post-compaction estimate when a post-compaction model
+            // response reported fresh provider usage (`used_tokens > 0`).
+            if used_tokens > 0 && !compacted_since_last_response {
+                meta.compacted_context_tokens = None;
+            }
             if let Some(attr) = attribution.as_ref() {
                 if !attr.provider_id.is_empty() {
                     meta.preferred_model = Some(attr.provider_id.clone());
@@ -2152,6 +2263,104 @@ mod tests {
         assert!(
             manager.has_inflight_snapshot("inflight-save-failure"),
             "the recovery checkpoint must survive a failed canonical save"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_persists_post_compaction_tokens_on_disk_and_survives_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let id = "compact-persist-test";
+
+        // 1. Seed a pre-compaction session with 400k used_tokens on disk.
+        let mut pre = Conversation::new();
+        pre.push(Message::user("q1"));
+        let mut a1 = Message::assistant("a1 ".repeat(500), vec![]);
+        a1.meta = Some(MessageMeta {
+            tokens: TokenUsage {
+                prompt: 400_000,
+                completion: 100,
+                cached: 0,
+            },
+            elapsed_ms: 10,
+            reasoning_elapsed_ms: 0,
+            ctx_window: 1_000_000,
+            used_tokens: 400_000,
+            utilization: 0.4,
+            round: 1,
+            turn_id: 1,
+            request_id: 1,
+            provider_response_id: None,
+            provider_model: None,
+            session_id: Some(id.into()),
+            finish_reason: "stop".into(),
+        });
+        pre.push(a1);
+
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .save_snapshot(id, &SessionSnapshot::from_conversation(&pre))
+            .unwrap();
+        manager.write_meta(&meta).unwrap();
+        manager
+            .write_presentation(id, &PresentationFile::default())
+            .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let hook_leased = SnapshotHook::new(manager.clone(), id, "/proj").with_lease(lease);
+        let mut msg_resp = pre.messages[1].clone();
+        hook_leased.on_model_response(&mut msg_resp).await;
+        hook_leased
+            .turn_complete(&pre, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+
+        // 2. Simulate a manual /compact reducing history by ~75% (400k -> ~100k).
+        let mut post = Conversation::new();
+        post.push(Message::synthetic_user(
+            "<!-- jeikcode:anchor v1 -->\nsummary",
+        ));
+        post.push(Message::user("q1-tail"));
+        post.cache_epoch = 1;
+        let post_snap = SessionSnapshot::from_conversation(&post);
+        hook_leased.save(&post_snap).unwrap();
+
+        let meta_after_compact = manager.read_meta(id).unwrap();
+        let compacted_toks = meta_after_compact
+            .compacted_context_tokens
+            .expect("compacted_context_tokens must be persisted immediately on /compact");
+        assert!(
+            compacted_toks > 0 && compacted_toks < 200_000,
+            "expected scaled post-compaction tokens << 400k, got {compacted_toks}"
+        );
+
+        // 3. Turn-end compaction before turn_complete must NOT wipe compacted_context_tokens.
+        let mut turn_msg = pre.messages[1].clone();
+        hook_leased.on_model_response(&mut turn_msg).await;
+        hook_leased.save(&post_snap).unwrap();
+        hook_leased
+            .turn_complete(&post, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+        let meta_after_turn_end = manager.read_meta(id).unwrap();
+        assert!(
+            meta_after_turn_end.compacted_context_tokens.is_some(),
+            "turn_complete after turn-end compaction must keep compacted_context_tokens"
+        );
+        drop(hook_leased);
+
+        // 4. Unleased SnapshotHook::save must also update meta.compacted_context_tokens.
+        let unleased_id = "compact-unleased";
+        let hook_unleased = SnapshotHook::new(manager.clone(), unleased_id, "/proj");
+        hook_unleased
+            .turn_complete(&pre, &StopReason::Stopped, &TurnCtx::default())
+            .await;
+        hook_unleased.save(&post_snap).unwrap();
+        let unleased_meta = manager.read_meta(unleased_id).unwrap();
+        assert!(
+            unleased_meta
+                .compacted_context_tokens
+                .is_some_and(|t| t > 0 && t < 200_000),
+            "unleased save must also persist compacted_context_tokens: {:?}",
+            unleased_meta.compacted_context_tokens
         );
     }
 }

@@ -1428,5 +1428,114 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "⏸ Rate limited (HTTP 429){reason}{retry_after} · Completed content preserved · Retry later or switch model"
         )
         .into(),
+        Msg::GoalFooterPausedBody => "goal paused".into(),
+        Msg::GoalFooterPausedMeta => " · send a message to resume · /goal stop to end".into(),
+        Msg::GoalFooterPausedAtCapBody => "goal paused".into(),
+        Msg::GoalFooterPausedAtCapMeta { round } => {
+            format!(" · reached {round} rounds · send a message to continue").into()
+        }
+        Msg::GoalFooterSatisfiedBody => "goal achieved".into(),
+        Msg::GoalFooterSatisfiedMeta => " · /goal clear to dismiss".into(),
+        Msg::RoundCapHeader => "Round limit".into(),
+        Msg::RoundCapQuestion { cap } => {
+            format!("Completed {cap} rounds, continue?").into()
+        }
+        Msg::RoundCapQuestionWithStats { cap, stats } => {
+            format!("Completed {cap} rounds ({stats}), continue?").into()
+        }
+        Msg::RoundCapContinue => "Continue".into(),
+        Msg::RoundCapContinueDesc { base } => {
+            format!("Run {base} more rounds then confirm again").into()
+        }
+        Msg::RoundCapStop => "Stop".into(),
+        Msg::RoundCapStopDesc => "End this turn".into(),
+        Msg::CustomAnswerPlaceholder => "Type your own answer\u{2026}".into(),
+        Msg::MenuSearchSessions => "Search sessions\u{2026}".into(),
+        Msg::MenuSearchDirectories => "Search saved directories or enter a path\u{2026}".into(),
+        Msg::MenuTypeToFilter => "Type to filter\u{2026}".into(),
+        Msg::RelayShareRuntimeFailed { error } => {
+            format!("Failed to share current runtime: {error}").into()
+        }
+        Msg::RelayStopShareFailed { error } => {
+            format!("Failed to stop sharing current runtime: {error}").into()
+        }
+        Msg::SlashSyncOutputFailed { error } => {
+            format!("Slash command output sync failed: {error}").into()
+        }
+        Msg::RelayClientSkipDownload { dir } => format!(
+            "Auto-download is disabled (JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1); place relay-client manually in {dir}"
+        )
+        .into(),
+        Msg::RelayClientUnsupportedPlatform { os, arch, dir } => format!(
+            "Unsupported platform: {os}/{arch}. Compile relay-client manually and place it in {dir}"
+        )
+        .into(),
+        Msg::RelayClientVersionUnsupportedPlatform { version, target } => {
+            format!("Version {version} does not support platform {target}").into()
+        }
+        Msg::RelayClientAutoDownloadFailed { error, cache } => format!(
+            "Failed to auto-download relay-client: {error}\n\
+             \n\
+             Manual download:\n\
+             1. Open in browser:\n\
+                https://github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/releases\n\
+             2. Download the binary for your platform\n\
+             3. Save to {cache}/jeikcode-relay-client\n\
+             4. chmod +x {cache}/jeikcode-relay-client\n\
+             5. Retry /app\n\
+             \n\
+             Quick install:\n\
+             curl -fsSL https://raw.github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/raw/main/scripts/install.sh | sh\n\
+             && retry /app"
+        )
+        .into(),
+        Msg::RelayClientCreateCacheDirFailed { error } => {
+            format!("Failed to create cache directory: {error}").into()
+        }
+        Msg::RelayClientCreateHttpFailed { error } => {
+            format!("Failed to create HTTP client: {error}").into()
+        }
+        Msg::RelayClientFetchManifestFailed { error } => {
+            format!("Failed to fetch version manifest: {error}").into()
+        }
+        Msg::RelayClientManifestHttpError { status } => {
+            format!("Version manifest request returned HTTP {status}").into()
+        }
+        Msg::RelayClientReadManifestFailed { error } => {
+            format!("Failed to read version manifest: {error}").into()
+        }
+        Msg::RelayClientParseManifestFailed { error } => {
+            format!("Failed to parse version manifest: {error}").into()
+        }
+        Msg::RelayClientDownloadRequestFailed { error } => {
+            format!("Download request failed: {error} (check network connection)").into()
+        }
+        Msg::RelayClientDownloadUnauthorized => {
+            "Download authentication failed (HTTP 401); check whether the release is publicly accessible".into()
+        }
+        Msg::RelayClientDownloadHttpError { status } => format!(
+            "Download returned HTTP {status} (release may not exist or lack permissions)"
+        )
+        .into(),
+        Msg::RelayClientCreateFileFailed { error } => {
+            format!("Failed to create file: {error}").into()
+        }
+        Msg::RelayClientReadStreamFailed { error } => {
+            format!("Failed to read download stream: {error}").into()
+        }
+        Msg::RelayClientWriteFileFailed { error } => {
+            format!("Failed to write file: {error}").into()
+        }
+        Msg::RelayClientFlushFileFailed { error } => {
+            format!("Failed to flush file: {error}").into()
+        }
+        Msg::RelayClientSizeMismatch { expected, actual } => {
+            format!("File size mismatch: expected {expected} bytes, downloaded {actual} bytes")
+                .into()
+        }
+        Msg::RelayClientSha256Mismatch { expected, actual } => format!(
+            "SHA256 verification failed:\n  expected: {expected}\n  actual: {actual}"
+        )
+        .into(),
     }
 }

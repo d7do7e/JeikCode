@@ -109,6 +109,7 @@ pub struct TuiSession {
     pub user_renamed: bool,
     pub ai_named: bool,
     pub turn_stats: Vec<TurnStat>,
+    pub compacted_context_tokens: Option<usize>,
 }
 
 impl TuiSession {
@@ -127,6 +128,7 @@ impl TuiSession {
             user_renamed: false,
             ai_named: false,
             turn_stats: Vec::new(),
+            compacted_context_tokens: None,
         }
     }
 
@@ -209,6 +211,11 @@ impl TuiSession {
             user_renamed: view.meta.user_renamed,
             ai_named: view.meta.ai_named,
             turn_stats: view.meta.turn_stats.into_iter().map(Into::into).collect(),
+            compacted_context_tokens: view
+                .meta
+                .compacted_context_tokens
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v > 0),
         })
     }
 

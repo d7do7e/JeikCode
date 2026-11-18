@@ -20901,7 +20901,17 @@ fn persist_native_compaction_snapshot(
     else {
         return true;
     };
-    if !outcome.committed || !outcome.is_manual() {
+    if !outcome.committed {
+        return true;
+    }
+    ctx.current_session.compacted_context_tokens =
+        (outcome.estimated_tokens_after > 0).then_some(outcome.estimated_tokens_after);
+    if !outcome.is_manual() {
+        if let Some(snapshot) = outcome.committed_snapshot.as_deref() {
+            apply_session_snapshot(&mut ctx.current_session, snapshot.clone());
+        }
+        ctx.bg_manager
+            .set_foreground_session(ctx.current_session.clone(), ctx.working_dir.clone());
         return true;
     }
     let Some(snapshot) = outcome.committed_snapshot.as_deref() else {
@@ -22661,6 +22671,9 @@ fn handle_agent_event(
             used_tokens,
             ctx_window,
         } => {
+            if used_tokens > 0 {
+                ctx.current_session.compacted_context_tokens = None;
+            }
             state.on_token_usage(used_tokens, ctx_window);
             let prompt = u.prompt as usize;
             let reported_cached = u.cached as usize;

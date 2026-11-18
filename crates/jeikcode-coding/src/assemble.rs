@@ -147,6 +147,8 @@ fn build_coding_agent_from_tools(
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).
         .compaction(Arc::new(cfg.build_compaction_strategy(summary_provider)))
         .compact_threshold(cfg.effective_stub_compact_threshold())
+        .auto_drain_threshold(cfg.effective_compact_threshold())
+        .compact_on_turn_end(true)
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)

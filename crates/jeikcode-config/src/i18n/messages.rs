@@ -1889,4 +1889,118 @@ pub enum Msg<'a> {
         reason: &'a str,
         retry_after: &'a str,
     },
+    /// Footer goal badge body when user paused the goal.
+    GoalFooterPausedBody,
+    /// Footer goal badge trailing actions when user paused the goal.
+    GoalFooterPausedMeta,
+    /// Footer goal badge body when paused at cap.
+    GoalFooterPausedAtCapBody,
+    /// Footer goal badge trailing round/resume hint when paused at cap.
+    GoalFooterPausedAtCapMeta {
+        round: u32,
+    },
+    /// Footer goal badge body when the goal is satisfied.
+    GoalFooterSatisfiedBody,
+    /// Footer goal badge trailing dismiss hint when satisfied.
+    GoalFooterSatisfiedMeta,
+    /// Round-cap checkpoint modal header.
+    RoundCapHeader,
+    /// Round-cap checkpoint question without stats.
+    RoundCapQuestion {
+        cap: u32,
+    },
+    /// Round-cap checkpoint question with elapsed/token stats.
+    RoundCapQuestionWithStats {
+        cap: u32,
+        stats: &'a str,
+    },
+    /// Round-cap continue option label.
+    RoundCapContinue,
+    /// Round-cap continue option description.
+    RoundCapContinueDesc {
+        base: u32,
+    },
+    /// Round-cap stop option label.
+    RoundCapStop,
+    /// Round-cap stop option description.
+    RoundCapStopDesc,
+    /// Custom answer placeholder in UserInput panels.
+    CustomAnswerPlaceholder,
+    /// Filter box placeholder when browsing sessions.
+    MenuSearchSessions,
+    /// Filter box placeholder when browsing directories.
+    MenuSearchDirectories,
+    /// Generic filter box placeholder.
+    MenuTypeToFilter,
+    /// Error formatting for sharing runtime / relay client lifecycle.
+    RelayShareRuntimeFailed {
+        error: &'a str,
+    },
+    RelayStopShareFailed {
+        error: &'a str,
+    },
+    SlashSyncOutputFailed {
+        error: &'a str,
+    },
+    RelayClientSkipDownload {
+        dir: &'a str,
+    },
+    RelayClientUnsupportedPlatform {
+        os: &'a str,
+        arch: &'a str,
+        dir: &'a str,
+    },
+    RelayClientVersionUnsupportedPlatform {
+        version: &'a str,
+        target: &'a str,
+    },
+    RelayClientAutoDownloadFailed {
+        error: &'a str,
+        cache: &'a str,
+    },
+    RelayClientCreateCacheDirFailed {
+        error: &'a str,
+    },
+    RelayClientCreateHttpFailed {
+        error: &'a str,
+    },
+    RelayClientFetchManifestFailed {
+        error: &'a str,
+    },
+    RelayClientManifestHttpError {
+        status: u16,
+    },
+    RelayClientReadManifestFailed {
+        error: &'a str,
+    },
+    RelayClientParseManifestFailed {
+        error: &'a str,
+    },
+    RelayClientDownloadRequestFailed {
+        error: &'a str,
+    },
+    RelayClientDownloadUnauthorized,
+    RelayClientDownloadHttpError {
+        status: u16,
+    },
+    RelayClientCreateFileFailed {
+        error: &'a str,
+    },
+    RelayClientReadStreamFailed {
+        error: &'a str,
+    },
+    RelayClientWriteFileFailed {
+        error: &'a str,
+    },
+    RelayClientFlushFileFailed {
+        error: &'a str,
+    },
+    RelayClientSizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    RelayClientSha256Mismatch {
+        expected: &'a str,
+        actual: &'a str,
+    },
 }

@@ -801,24 +801,28 @@ pub struct UserInputBatchMeta {
 /// (0 = "继续", 1 = "停止"). `stats` is a pre-formatted elapsed/token string
 /// (e.g. "2h0m0s · 305.00K tokens") — appended to the question when non-empty.
 pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserInputPanelView {
+    use crate::i18n::{t, Msg};
     use jeikcode_capabilities::tools::request_user_input::UserInputMode;
     let question = if stats.is_empty() {
-        format!("已运行 {cap} 轮，继续吗？")
+        t(Msg::RoundCapQuestion { cap }).into_owned()
     } else {
-        format!("已运行 {cap} 轮（{stats}），继续吗？")
+        t(Msg::RoundCapQuestionWithStats { cap, stats }).into_owned()
     };
     UserInputPanelView {
-        header: "轮次上限".to_string(),
+        header: t(Msg::RoundCapHeader).into_owned(),
         question,
         mode: UserInputMode::Single,
         options: vec![
             // `base` (the re-arm step), not `cap`: after a continuation `cap` has
             // grown but only `base` more rounds are granted before the next prompt.
             (
-                "继续".to_string(),
-                Some(format!("再跑 {base} 轮后重新确认")),
+                t(Msg::RoundCapContinue).into_owned(),
+                Some(t(Msg::RoundCapContinueDesc { base }).into_owned()),
             ),
-            ("停止".to_string(), Some("结束本回合".to_string())),
+            (
+                t(Msg::RoundCapStop).into_owned(),
+                Some(t(Msg::RoundCapStopDesc).into_owned()),
+            ),
         ],
         cursor,
         checked: vec![],

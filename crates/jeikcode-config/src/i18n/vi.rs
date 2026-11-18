@@ -1323,5 +1323,112 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
             "⏸ Bị giới hạn tốc độ (HTTP 429){reason}{retry_after} · Đã giữ nội dung hoàn tất · Thử lại sau hoặc đổi mô hình"
         )
         .into(),
+        Msg::GoalFooterPausedBody => "mục tiêu đã tạm dừng".into(),
+        Msg::GoalFooterPausedMeta => " · gửi tin nhắn để tiếp tục · /goal stop để kết thúc".into(),
+        Msg::GoalFooterPausedAtCapBody => "mục tiêu tạm dừng".into(),
+        Msg::GoalFooterPausedAtCapMeta { round } => {
+            format!(" · đã đạt {round} vòng · gửi tin nhắn để tiếp tục").into()
+        }
+        Msg::GoalFooterSatisfiedBody => "mục tiêu đã đạt".into(),
+        Msg::GoalFooterSatisfiedMeta => " · /goal clear để đóng".into(),
+        Msg::RoundCapHeader => "Giới hạn vòng".into(),
+        Msg::RoundCapQuestion { cap } => format!("Đã chạy {cap} vòng, tiếp tục chứ?").into(),
+        Msg::RoundCapQuestionWithStats { cap, stats } => {
+            format!("Đã chạy {cap} vòng ({stats}), tiếp tục chứ?").into()
+        }
+        Msg::RoundCapContinue => "Tiếp tục".into(),
+        Msg::RoundCapContinueDesc { base } => {
+            format!("Chạy thêm {base} vòng rồi xác nhận lại").into()
+        }
+        Msg::RoundCapStop => "Dừng".into(),
+        Msg::RoundCapStopDesc => "Kết thúc lượt này".into(),
+        Msg::CustomAnswerPlaceholder => "Nhập câu trả lời của riêng bạn\u{2026}".into(),
+        Msg::MenuSearchSessions => "Tìm phiên\u{2026}".into(),
+        Msg::MenuSearchDirectories => "Tìm thư mục đã lưu hoặc nhập đường dẫn\u{2026}".into(),
+        Msg::MenuTypeToFilter => "Gõ để lọc\u{2026}".into(),
+        Msg::RelayShareRuntimeFailed { error } => {
+            format!("Chia sẻ runtime hiện tại thất bại: {error}").into()
+        }
+        Msg::RelayStopShareFailed { error } => {
+            format!("Dừng chia sẻ runtime hiện tại thất bại: {error}").into()
+        }
+        Msg::SlashSyncOutputFailed { error } => {
+            format!("Đồng bộ đầu ra lệnh gạch chéo thất bại: {error}").into()
+        }
+        Msg::RelayClientSkipDownload { dir } => format!(
+            "Tự động tải đã tắt (JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1); vui lòng đặt relay-client thủ công vào thư mục {dir}"
+        )
+        .into(),
+        Msg::RelayClientUnsupportedPlatform { os, arch, dir } => format!(
+            "Nền tảng không được hỗ trợ: {os}/{arch}. Vui lòng tự biên dịch relay-client và đặt vào {dir}"
+        )
+        .into(),
+        Msg::RelayClientVersionUnsupportedPlatform { version, target } => {
+            format!("Phiên bản {version} không hỗ trợ nền tảng {target}").into()
+        }
+        Msg::RelayClientAutoDownloadFailed { error, cache } => format!(
+            "Tự động tải relay-client thất bại: {error}\n\
+             \n\
+             Tải thủ công:\n\
+             1. Mở trình duyệt truy cập:\n\
+                https://github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/releases\n\
+             2. Tải tệp nhị phân đúng nền tảng\n\
+             3. Lưu vào {cache}/jeikcode-relay-client\n\
+             4. chmod +x {cache}/jeikcode-relay-client\n\
+             5. Thử lại /app\n\
+             \n\
+             Cài nhanh:\n\
+             curl -fsSL https://raw.github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/raw/main/scripts/install.sh | sh\n\
+             && thử lại /app"
+        )
+        .into(),
+        Msg::RelayClientCreateCacheDirFailed { error } => {
+            format!("Tạo thư mục bộ nhớ đệm thất bại: {error}").into()
+        }
+        Msg::RelayClientCreateHttpFailed { error } => {
+            format!("Tạo trình khách HTTP thất bại: {error}").into()
+        }
+        Msg::RelayClientFetchManifestFailed { error } => {
+            format!("Lấy bảng kê khai phiên bản thất bại: {error}").into()
+        }
+        Msg::RelayClientManifestHttpError { status } => {
+            format!("Yêu cầu bảng kê khai phiên bản trả về HTTP {status}").into()
+        }
+        Msg::RelayClientReadManifestFailed { error } => {
+            format!("Đọc bảng kê khai phiên bản thất bại: {error}").into()
+        }
+        Msg::RelayClientParseManifestFailed { error } => {
+            format!("Phân tích bảng kê khai phiên bản thất bại: {error}").into()
+        }
+        Msg::RelayClientDownloadRequestFailed { error } => {
+            format!("Yêu cầu tải xuống thất bại: {error} (vui lòng kiểm tra kết nối mạng)").into()
+        }
+        Msg::RelayClientDownloadUnauthorized => {
+            "Xác thực tải xuống thất bại (HTTP 401); kiểm tra xem bản phát hành có công khai hay không".into()
+        }
+        Msg::RelayClientDownloadHttpError { status } => format!(
+            "Tải xuống trả về HTTP {status} (bản phát hành có thể không tồn tại hoặc không có quyền truy cập)"
+        )
+        .into(),
+        Msg::RelayClientCreateFileFailed { error } => {
+            format!("Tạo tệp thất bại: {error}").into()
+        }
+        Msg::RelayClientReadStreamFailed { error } => {
+            format!("Đọc luồng tải xuống thất bại: {error}").into()
+        }
+        Msg::RelayClientWriteFileFailed { error } => {
+            format!("Ghi tệp thất bại: {error}").into()
+        }
+        Msg::RelayClientFlushFileFailed { error } => {
+            format!("Đẩy dữ liệu tệp xuống đĩa thất bại: {error}").into()
+        }
+        Msg::RelayClientSizeMismatch { expected, actual } => format!(
+            "Kích thước tệp không khớp: dự kiến {expected} byte, thực tế tải {actual} byte"
+        )
+        .into(),
+        Msg::RelayClientSha256Mismatch { expected, actual } => format!(
+            "Kiểm tra SHA256 thất bại:\n  dự kiến: {expected}\n  thực tế: {actual}"
+        )
+        .into(),
     }
 }

@@ -1057,7 +1057,10 @@ pub(crate) fn attach_live_runtime(
         snapshot,
         std::sync::Arc::new(ctx.runtime.clone()),
     )
-    .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    .map_err(|error| {
+        let err = format!("{error:?}");
+        t(Msg::RelayShareRuntimeFailed { error: &err }).into_owned()
+    })?;
     // `/webui` must publish the unique handle before any WebUI `/chat` or
     // `/live/provider` runs. Waiting for a later runtime event used to miss
     // the bind, and the next send then collided with this lease.
@@ -1158,7 +1161,10 @@ fn detach_live_binding_with(
     let Some(current) = binding.as_ref() else {
         return Ok(false);
     };
-    unregister(current).map_err(|error| format!("停止共享当前 runtime 失败：{error:?}"))?;
+    unregister(current).map_err(|error| {
+        let err = format!("{error:?}");
+        t(Msg::RelayStopShareFailed { error: &err }).into_owned()
+    })?;
     *binding = None;
     Ok(true)
 }
@@ -1449,8 +1455,10 @@ pub(super) fn execute_slash_command(
             cmd.trim_start_matches('/'),
             cap.captured
         )) {
-            cap.inner
-                .render(UiLine::Error(format!("斜杠命令输出同步失败：{error:?}")));
+            let err = format!("{error:?}");
+            cap.inner.render(UiLine::Error(
+                t(Msg::SlashSyncOutputFailed { error: &err }).into_owned(),
+            ));
             cap.inner.flush();
         }
     }
@@ -1520,24 +1528,39 @@ async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+        .map_err(|e| {
+            t(Msg::RelayClientCreateHttpFailed {
+                error: &e.to_string(),
+            })
+            .into_owned()
+        })?;
 
-    let resp = client
-        .get(RELAY_MANIFEST_URL)
-        .send()
-        .await
-        .map_err(|e| format!("获取版本清单失败：{e}"))?;
+    let resp = client.get(RELAY_MANIFEST_URL).send().await.map_err(|e| {
+        t(Msg::RelayClientFetchManifestFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
 
     if !resp.status().is_success() {
-        return Err(format!("获取版本清单返回 HTTP {}", resp.status().as_u16()));
+        return Err(t(Msg::RelayClientManifestHttpError {
+            status: resp.status().as_u16(),
+        })
+        .into_owned());
     }
 
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("读取版本清单失败：{e}"))?;
-    let manifest: RelayManifest =
-        serde_json::from_str(&body).map_err(|e| format!("解析版本清单失败：{e}"))?;
+    let body = resp.text().await.map_err(|e| {
+        t(Msg::RelayClientReadManifestFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
+    let manifest: RelayManifest = serde_json::from_str(&body).map_err(|e| {
+        t(Msg::RelayClientParseManifestFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
 
     Ok(manifest)
 }
@@ -1668,22 +1691,20 @@ fn ensure_relay_client_bin() -> Result<String, String> {
 
     // 跳过下载标志
     if std::env::var("JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        return Err(format!(
-            "自动下载已禁用（JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-             请手动将 relay-client 放入 {} 目录",
-            cache_dir.display()
-        ));
+        let dir = cache_dir.display().to_string();
+        return Err(t(Msg::RelayClientSkipDownload { dir: &dir }).into_owned());
     }
 
     // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
-        return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 {} 中",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            cache_dir.display()
-        ));
+        let dir = cache_dir.display().to_string();
+        return Err(t(Msg::RelayClientUnsupportedPlatform {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            dir: &dir,
+        })
+        .into_owned());
     }
 
     // 6) 获取远端版本清单（含最新版本号 + sha256）
@@ -1736,10 +1757,11 @@ fn ensure_relay_client_bin() -> Result<String, String> {
     let entry = match manifest.binaries.get(target) {
         Some(e) => e,
         None => {
-            return Err(format!(
-                "版本 {} 不支持当前平台 {}",
-                manifest.version, target
-            ));
+            return Err(t(Msg::RelayClientVersionUnsupportedPlatform {
+                version: &manifest.version,
+                target,
+            })
+            .into_owned());
         }
     };
 
@@ -1773,23 +1795,12 @@ fn ensure_relay_client_bin() -> Result<String, String> {
             Ok(cache_path.to_string_lossy().into_owned())
         }
         Err(e) => {
-            let msg = format!(
-                "自动下载 relay-client 失败：{}\n\
-                 \n\
-                 安全下载：\n\
-                 1. 打开浏览器访问\n\
-                    https://github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/releases\n\
-                 2. 下载对应平台的 binary\n\
-                 3. 保存到 {cache}/jeikcode-relay-client\n\
-                 4. chmod +x {cache}/jeikcode-relay-client\n\
-                 5. /app 重试\n\
-                 \n\
-                 快速安装：\n\
-                 curl -fsSL https://raw.github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/raw/main/scripts/install.sh | sh\n\
-                 && /app 重试",
-                e,
-                cache = cache_dir.display()
-            );
+            let cache = cache_dir.display().to_string();
+            let msg = t(Msg::RelayClientAutoDownloadFailed {
+                error: &e,
+                cache: &cache,
+            })
+            .into_owned();
             Err(msg)
         }
     }
@@ -1811,65 +1822,94 @@ async fn download_relay_client(
 
     // 确保缓存目录存在
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败：{e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            t(Msg::RelayClientCreateCacheDirFailed {
+                error: &e.to_string(),
+            })
+            .into_owned()
+        })?;
     }
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+        .map_err(|e| {
+            t(Msg::RelayClientCreateHttpFailed {
+                error: &e.to_string(),
+            })
+            .into_owned()
+        })?;
 
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载请求失败：{e}（请检查网络连接）"))?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        t(Msg::RelayClientDownloadRequestFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("下载鉴权失败（HTTP 401），请检查 Release 是否公开可访问".to_string());
+        return Err(t(Msg::RelayClientDownloadUnauthorized).into_owned());
     }
     if !resp.status().is_success() {
-        return Err(format!(
-            "下载返回 HTTP {}（Release 可能不存在或无权访问）",
-            resp.status().as_u16()
-        ));
+        return Err(t(Msg::RelayClientDownloadHttpError {
+            status: resp.status().as_u16(),
+        })
+        .into_owned());
     }
 
     // 流式下载 + SHA256 累积
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| format!("创建文件失败：{e}"))?;
+    let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
+        t(Msg::RelayClientCreateFileFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("读取下载流失败：{e}"))?;
+        let chunk = chunk.map_err(|e| {
+            t(Msg::RelayClientReadStreamFailed {
+                error: &e.to_string(),
+            })
+            .into_owned()
+        })?;
         hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败：{e}"))?;
+        file.write_all(&chunk).await.map_err(|e| {
+            t(Msg::RelayClientWriteFileFailed {
+                error: &e.to_string(),
+            })
+            .into_owned()
+        })?;
         written += chunk.len() as u64;
     }
-    file.flush().await.map_err(|e| format!("刷盘失败：{e}"))?;
+    file.flush().await.map_err(|e| {
+        t(Msg::RelayClientFlushFileFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     drop(file);
 
     // 校验文件大小
     if expected_size > 0 && written != expected_size {
         let _ = std::fs::remove_file(dest);
-        return Err(format!(
-            "文件大小不匹配：预期 {} 字节，实际下载 {} 字节",
-            expected_size, written
-        ));
+        return Err(t(Msg::RelayClientSizeMismatch {
+            expected: expected_size,
+            actual: written,
+        })
+        .into_owned());
     }
 
     // 校验 SHA256
     let got = hex_encode(&hasher.finalize());
     if !got.eq_ignore_ascii_case(expected_sha256) {
         let _ = std::fs::remove_file(dest);
-        return Err(format!(
-            "SHA256 校验失败：\n  预期: {}\n  实际: {}",
-            expected_sha256, got
-        ));
+        return Err(t(Msg::RelayClientSha256Mismatch {
+            expected: expected_sha256,
+            actual: &got,
+        })
+        .into_owned());
     }
 
     Ok(())

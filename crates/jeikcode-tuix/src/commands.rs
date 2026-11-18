@@ -87,6 +87,7 @@ impl CommandRegistry {
 const COMMAND_ALIASES: &[(&str, &str)] = &[
     // List/switch saved sessions (OpenCode `/sessions`; `/resume` kept for muscle memory).
     ("resume", "sessions"),
+    ("restore", "sessions"),
     ("continue", "sessions"),
     // Keep `/exit` working while presenting one canonical quit command.
     ("exit", "quit"),
@@ -431,6 +432,7 @@ mod tests {
     #[test]
     fn canonical_name_resolves_aliases_case_insensitively() {
         assert_eq!(canonical_command_name("resume"), "sessions");
+        assert_eq!(canonical_command_name("restore"), "sessions");
         assert_eq!(canonical_command_name("continue"), "sessions");
         assert_eq!(canonical_command_name("clear"), "clear");
         assert_eq!(canonical_command_name("new"), "new");
@@ -446,7 +448,7 @@ mod tests {
     fn display_name_annotates_aliased_commands_only() {
         assert_eq!(
             command_display_name("sessions"),
-            "sessions (resume, continue)"
+            "sessions (resume, restore, continue)"
         );
         assert_eq!(command_display_name("quit"), "quit (exit)");
         assert_eq!(command_display_name("new"), "new");
