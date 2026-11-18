@@ -617,7 +617,10 @@ pub(crate) fn for_each_project_entry(
     } else {
         root
     };
-    let policy = Arc::new(crate::ignore_policy::IgnorePolicy::load_deep(policy_base));
+    let policy = Arc::new(crate::ignore_policy::IgnorePolicy::load_for_search(
+        policy_base,
+        root,
+    ));
 
     // If the caller explicitly targeted a directory inside or under a skip-listed path
     // (e.g. `node_modules/@lobehub/icons` or `target/doc`), disable the codegraph

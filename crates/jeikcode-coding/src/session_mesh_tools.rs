@@ -221,6 +221,7 @@ async fn ipc_send_to_session(
     text: String,
     hop_depth: u32,
     visited_sessions: Vec<String>,
+    waiting_sessions: Vec<String>,
     steer_if_busy: bool,
     wait_for_reply: Option<bool>,
     timeout_secs: Option<u64>,
@@ -244,6 +245,7 @@ async fn ipc_send_to_session(
             text,
             hop_depth,
             visited_sessions,
+            waiting_sessions,
             steer_if_busy,
             wait_for_reply,
             timeout_secs,
@@ -557,10 +559,16 @@ impl Tool for SendToSessionTool {
         }
 
         let hop = self.local.current_hop_context();
-        if hop.visited_sessions.iter().any(|s| s == &desc.session_id) {
+        let non_blocking = parsed.wait_for_reply == Some(false);
+        let cycle_chain = if non_blocking {
+            &hop.waiting_sessions
+        } else {
+            &hop.visited_sessions
+        };
+        if cycle_chain.iter().any(|s| s == &desc.session_id) {
             return tool_err(format!(
                 "mesh cycle detected: `{}` is already in visited chain {:?}",
-                desc.session_id, hop.visited_sessions
+                desc.session_id, cycle_chain
             ));
         }
         let max_hops = max_mesh_hops_from_mesh();
@@ -588,6 +596,7 @@ impl Tool for SendToSessionTool {
             parsed.message,
             hop.hop_depth,
             hop.visited_sessions,
+            hop.waiting_sessions,
             parsed.steer_if_busy.unwrap_or(false),
             parsed.wait_for_reply,
             parsed.timeout_secs,

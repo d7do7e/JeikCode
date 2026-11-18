@@ -87,7 +87,10 @@ impl ProjectMcpPool {
         super::schema_cache::refresh_session_mcp_schema(&project_dir).await;
         let _lifecycle = self.lifecycle.lock().await;
         let registry = Arc::new(McpRegistry::from_config_background(&project_dir));
-        spawn_mcp_registry_warmup(registry.clone());
+        if let Some(warm) = super::schema_cache::cached_project_mcp_schema(&project_dir).await {
+            registry.seed_warm_project_schema(&warm).await;
+        }
+        spawn_mcp_registry_warmup(project_dir.clone(), registry.clone());
         let (stale, evicted) = {
             let mut slots = self.slots.write().await;
             let stale = slots.remove(&project_dir);
@@ -112,7 +115,7 @@ impl ProjectMcpPool {
     pub async fn replace(&self, project_dir: &Path, replacement: Arc<McpRegistry>) {
         let project_dir = project_key(project_dir);
         let _lifecycle = self.lifecycle.lock().await;
-        spawn_mcp_registry_warmup(replacement.clone());
+        spawn_mcp_registry_warmup(project_dir.clone(), replacement.clone());
         let (stale, evicted) = {
             let mut slots = self.slots.write().await;
             let stale = slots.remove(&project_dir);
@@ -199,7 +202,10 @@ impl ProjectMcpPool {
         }
 
         let registry = Arc::new(McpRegistry::from_config_background(project_dir));
-        spawn_mcp_registry_warmup(registry.clone());
+        if let Some(warm) = super::schema_cache::cached_project_mcp_schema(project_dir).await {
+            registry.seed_warm_project_schema(&warm).await;
+        }
+        spawn_mcp_registry_warmup(project_dir.to_path_buf(), registry.clone());
         tokio::spawn({
             let project_dir = project_dir.to_path_buf();
             async move {
@@ -311,14 +317,18 @@ async fn shutdown_distinct(stale: Option<ProjectMcpSlot>, current: &Arc<McpRegis
     }
 }
 
-fn spawn_mcp_registry_warmup(registry: Arc<McpRegistry>) {
+fn spawn_mcp_registry_warmup(project_dir: PathBuf, registry: Arc<McpRegistry>) {
     tokio::spawn(async move {
         tokio::select! {
             _ = registry.wait_until_initial_connections_done() => {}
             _ = registry.wait_for_cancellation() => return,
         }
         let _statuses = registry.server_statuses().await;
-        let _tools = registry.list_all_tools_cached().await;
+        let tools = registry.list_all_tools_cached().await;
+        let instructions = registry.server_instructions_snapshot();
+        if !tools.is_empty() || !instructions.is_empty() {
+            super::schema_cache::record_project_mcp_schema(&project_dir, tools, instructions).await;
+        }
     });
 }
 

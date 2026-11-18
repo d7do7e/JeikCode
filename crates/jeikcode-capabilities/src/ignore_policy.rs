@@ -147,8 +147,23 @@ impl IgnorePolicy {
     /// scan is only needed by full graph indexing and search walks, not by every
     /// explicit `read`.
     pub fn load_deep(root: &Path) -> Self {
-        let mut policy = Self::load(root);
-        let root = policy.root.clone();
+        let root = canonical_root(root);
+        let cfg = crate::paths::config_dir();
+        let signature = policy_source_signature(&root, &cfg);
+        let now = std::time::Instant::now();
+        if let Some(cached) = deep_policy_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&root).cloned())
+        {
+            if cached.0 == signature
+                && now.saturating_duration_since(cached.1) <= std::time::Duration::from_secs(3)
+            {
+                return cached.2;
+            }
+        }
+
+        let mut policy = Self::load(&root);
         let mut hasher = DefaultHasher::new();
         policy.fingerprint.hash(&mut hasher);
 
@@ -183,7 +198,118 @@ impl IgnorePolicy {
         }
 
         policy.fingerprint = hasher.finish();
+        if let Ok(mut cache) = deep_policy_cache().lock() {
+            if cache.len() >= 32 {
+                cache.clear();
+            }
+            cache.insert(root, (signature, now, policy.clone()));
+        }
         policy
+    }
+
+    /// Scoped search policy loader (`#73`):
+    /// - When `search_root == policy_root`, uses `load_deep(policy_root)` (with a
+    ///   short-TTL cache invalidated immediately on `.codegraphignore*` writes).
+    /// - When `search_root` is a subdirectory or single file under `policy_root`,
+    ///   loads fast root/global scopes + nested rules along `search_root`'s own
+    ///   ancestors + nested rules under `search_root` only, eliminating full-repo
+    ///   directory walks on scoped `grep`/`glob` calls with zero NTFS staleness.
+    pub fn load_for_search(policy_root: &Path, search_root: &Path) -> Self {
+        let p_root = canonical_root(policy_root);
+        let s_root = canonical_root(search_root);
+        if s_root == p_root || !s_root.starts_with(&p_root) {
+            return Self::load_deep(&p_root);
+        }
+        let mut policy = Self::load(&p_root);
+        let mut hasher = DefaultHasher::new();
+        policy.fingerprint.hash(&mut hasher);
+        policy.add_nested_ancestor_matchers(&s_root, &p_root);
+        if s_root.is_dir() {
+            for name in [
+                ".codegraphignore",
+                ".codegraignore",
+                ".codegraphignore.graph",
+                ".codegraignore.graph",
+            ] {
+                let direct = s_root.join(name);
+                if direct.is_file() {
+                    let sensitive = name.ends_with(".graph");
+                    let mut builder = GitignoreBuilder::new(&s_root);
+                    if builder.add(&direct).is_none() {
+                        if let Ok(matcher) = builder.build() {
+                            let scoped = ScopedMatcher {
+                                base: s_root.clone(),
+                                order: 100 + s_root.components().count(),
+                                source: direct.clone(),
+                                matcher,
+                            };
+                            if sensitive {
+                                policy.sensitive.push(scoped);
+                            } else {
+                                policy.noise.push(scoped);
+                            }
+                            fingerprint_file(&mut hasher, &direct);
+                        }
+                    }
+                }
+            }
+            for path in nested_ignore_files(&s_root) {
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let sensitive = name.ends_with(".graph");
+                let Some(base) = path.parent() else {
+                    continue;
+                };
+                let mut builder = GitignoreBuilder::new(base);
+                if builder.add(&path).is_some() {
+                    continue;
+                }
+                let Ok(matcher) = builder.build() else {
+                    continue;
+                };
+                let order = 100 + base.components().count();
+                let scoped = ScopedMatcher {
+                    base: base.to_path_buf(),
+                    order,
+                    source: path.clone(),
+                    matcher,
+                };
+                if sensitive {
+                    policy.sensitive.push(scoped);
+                } else {
+                    policy.noise.push(scoped);
+                }
+                fingerprint_file(&mut hasher, &path);
+            }
+        }
+        policy.fingerprint = hasher.finish();
+        policy
+    }
+
+    /// Evict cached deep ignore policies when `.codegraphignore*` / `.codegraignore*`
+    /// files are created or modified by agent write/edit tools.
+    pub fn invalidate_if_ignore_file(modified_path: &Path) {
+        let is_ignore = modified_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    ".codegraphignore"
+                        | ".codegraignore"
+                        | ".codegraphignore.graph"
+                        | ".codegraignore.graph"
+                )
+            });
+        if is_ignore {
+            if let Ok(mut cache) = fast_policy_cache().lock() {
+                cache.clear();
+            }
+            if let Ok(mut cache) = deep_policy_cache().lock() {
+                cache.clear();
+            }
+        }
     }
 
     pub fn is_sensitive(&self, path: &Path) -> bool {
@@ -495,6 +621,13 @@ fn fast_policy_cache() -> &'static Mutex<HashMap<PathBuf, (u64, IgnorePolicy)>> 
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn deep_policy_cache() -> &'static Mutex<HashMap<PathBuf, (u64, std::time::Instant, IgnorePolicy)>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, std::time::Instant, IgnorePolicy)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Nested ignore files under `root` (depth > 0). The project `.jeikcode`
 /// directory is loaded by [`IgnorePolicy::load`] already; VCS/build/vendor trees
 /// are skipped so this stays a directory-only scan.
@@ -670,5 +803,31 @@ mod tests {
         std::fs::write(&f, "a.rs\nb.rs\n").unwrap();
         let second = IgnorePolicy::load(d.path()).fingerprint();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn load_for_search_honors_ancestor_and_subtree_rules_without_stale_cache() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("pkg/sub/deep")).unwrap();
+        std::fs::write(d.path().join("pkg/.codegraphignore"), "*.gen.rs\n").unwrap();
+        std::fs::write(
+            d.path().join("pkg/sub/deep/.codegraphignore.graph"),
+            "token.key\n",
+        )
+        .unwrap();
+        let gen_file = d.path().join("pkg/sub/foo.gen.rs");
+        let secret_file = d.path().join("pkg/sub/deep/token.key");
+        std::fs::write(&gen_file, "x").unwrap();
+        std::fs::write(&secret_file, "y").unwrap();
+
+        let scoped = IgnorePolicy::load_for_search(d.path(), &d.path().join("pkg/sub"));
+        assert!(
+            scoped.is_noise_ignored(&gen_file),
+            "ancestor pkg/.codegraphignore must apply to scoped search under pkg/sub"
+        );
+        assert!(
+            scoped.is_sensitive(&secret_file),
+            "descendant pkg/sub/deep/.codegraphignore.graph must apply to scoped search under pkg/sub"
+        );
     }
 }

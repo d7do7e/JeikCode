@@ -99,6 +99,7 @@ impl Tool for WriteFileTool {
         }
 
         crate::tools::write_state::record_write_success(&path);
+        crate::ignore_policy::IgnorePolicy::invalidate_if_ignore_file(&path);
 
         #[cfg(feature = "codeintel")]
         crate::codeintel::notify_code_index_file_changed(&path, Some(&a.content));

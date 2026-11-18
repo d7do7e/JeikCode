@@ -25,7 +25,7 @@ use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkConte
 use jeikcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_RESULTS: usize = 200;
@@ -61,6 +61,13 @@ struct Args {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
+    /// Optional multiple search roots (`["crates/a", "crates/b"]`, `#48`).
+    /// Aligned with `DenySensitivePaths` (`task.rs:67-73`).
+    #[serde(
+        default,
+        deserialize_with = "crate::tools::repair::deserialize_lenient_string_list"
+    )]
+    paths: Vec<String>,
     #[serde(default, alias = "head_limit", deserialize_with = "lenient_usize")]
     max_results: Option<usize>,
     #[serde(default, alias = "-C", deserialize_with = "lenient_usize")]
@@ -384,6 +391,11 @@ impl Tool for GrepTool {
                     "default": ".",
                     "description": "Path to search: directory for recursive search, or single file path. Defaults to '.'."
                 },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of directories or file paths to search in one call (overrides `path` when non-empty)."
+                },
                 "glob": {
                     "type": "string",
                     "description": "File glob pattern to filter search (e.g. '*.rs', '*.{ts,tsx}')."
@@ -453,12 +465,55 @@ impl Tool for GrepTool {
             Ok(v) => v,
             Err(e) => return e.into_tool_result(),
         };
-        let raw = a
-            .path
-            .clone()
-            .unwrap_or_else(|| ".".to_string())
-            .replace('\\', "/");
-        let mut root = resolve_path(&raw, &ctx.working_dir);
+        let explicit_paths: Vec<String> = a
+            .paths
+            .iter()
+            .map(|s| s.trim().replace('\\', "/"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let raw = if !explicit_paths.is_empty() {
+            explicit_paths.join(", ")
+        } else {
+            a.path
+                .clone()
+                .unwrap_or_else(|| ".".to_string())
+                .replace('\\', "/")
+        };
+        let mut extra_roots: Vec<PathBuf> = Vec::new();
+        let mut root = if !explicit_paths.is_empty() {
+            let mut valid = Vec::new();
+            for p_str in &explicit_paths {
+                let candidate = resolve_path(p_str, &ctx.working_dir);
+                if tokio::fs::metadata(&candidate).await.is_ok() {
+                    if !valid.contains(&candidate) {
+                        valid.push(candidate);
+                    }
+                } else if let Some((fb, notice)) =
+                    missing_path_fallback(&candidate, &ctx.working_dir).await
+                {
+                    if !valid.contains(&fb) {
+                        valid.push(fb);
+                    }
+                    recovered = Some(match recovered {
+                        Some(prev) => format!("{prev}\n{notice}"),
+                        None => notice,
+                    });
+                }
+            }
+            if valid.is_empty() {
+                let first = resolve_path(&explicit_paths[0], &ctx.working_dir);
+                let hint = not_found_hint(&first, &ctx.working_dir).await;
+                return err(format!(
+                    "{}{hint}",
+                    format_path_not_found("grep", &explicit_paths[0], &first, &ctx.working_dir)
+                ));
+            }
+            let primary = valid.remove(0);
+            extra_roots = valid;
+            primary
+        } else {
+            resolve_path(&raw, &ctx.working_dir)
+        };
         // 路径落空时的兜底（避免“报错 → 模型再猜一轮”）：
         // ① 工作区内存在唯一同名条目 → 直接搜它；
         // ② 否则退到最近的、仍在工作区内的已存在祖先目录（同时列出 did-you-mean 候选）；
@@ -588,20 +643,43 @@ impl Tool for GrepTool {
         let include_logs = a.include_logs;
         let include_sensitive = a.include_sensitive;
         let res = tokio::task::spawn_blocking(move || {
-            let mut result = search(
-                &root,
-                &initial_matcher,
-                max,
-                before_ctx,
-                after_ctx,
-                output_mode,
-                &base,
-                glob_filter.as_ref(),
-                include_ignored,
-                include_logs,
-                include_sensitive,
-                deadline,
-            );
+            let mut all_roots = vec![root.clone()];
+            all_roots.extend(extra_roots);
+            let run_across_roots = |matcher: &RegexMatcher| {
+                let mut agg_lines: Vec<String> = Vec::new();
+                let mut agg_matches = 0usize;
+                let mut agg_files = 0usize;
+                let mut agg_timed_out = false;
+                for r in &all_roots {
+                    let rem = max.saturating_sub(agg_matches);
+                    if rem == 0 {
+                        break;
+                    }
+                    let (mut l, m, f, t) = search(
+                        r,
+                        matcher,
+                        rem,
+                        before_ctx,
+                        after_ctx,
+                        output_mode,
+                        &base,
+                        glob_filter.as_ref(),
+                        include_ignored,
+                        include_logs,
+                        include_sensitive,
+                        deadline,
+                    );
+                    agg_lines.append(&mut l);
+                    agg_matches = agg_matches.saturating_add(m);
+                    agg_files = agg_files.saturating_add(f);
+                    agg_timed_out |= t;
+                    if agg_timed_out || Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                (agg_lines, agg_matches, agg_files, agg_timed_out)
+            };
+            let mut result = run_across_roots(&initial_matcher);
 
             // 零额外交互静默自愈：若默认字面量搜索 0 匹配（lines 为空）且处于字面量模式（!explicit_regex），
             // 启动分层递进自愈机制：
@@ -619,20 +697,7 @@ impl Tool for GrepTool {
                             .case_insensitive(is_case_insensitive)
                             .build(&pat)
                         {
-                            let retry_res = search(
-                                &root,
-                                &retry_matcher,
-                                max,
-                                before_ctx,
-                                after_ctx,
-                                output_mode,
-                                &base,
-                                glob_filter.as_ref(),
-                                include_ignored,
-                                include_logs,
-                                include_sensitive,
-                                deadline,
-                            );
+                            let retry_res = run_across_roots(&retry_matcher);
                             if !retry_res.0.is_empty() {
                                 result = retry_res;
                             }
@@ -649,20 +714,7 @@ impl Tool for GrepTool {
                     if let Ok(retry_matcher) =
                         build_regex_lenient(&make_pat(&search_pattern, false), is_case_insensitive)
                     {
-                        let retry_res = search(
-                            &root,
-                            &retry_matcher,
-                            max,
-                            before_ctx,
-                            after_ctx,
-                            output_mode,
-                            &base,
-                            glob_filter.as_ref(),
-                            include_ignored,
-                            include_logs,
-                            include_sensitive,
-                            deadline,
-                        );
+                        let retry_res = run_across_roots(&retry_matcher);
                         if !retry_res.0.is_empty() {
                             result = retry_res;
                         }
@@ -2786,5 +2838,27 @@ mod tests {
         assert_eq!(escape_bare_braces(r"foo\{bar{"), r"foo\{bar\{");
         assert_eq!(escape_bare_braces(".x{abc}"), ".x\\{abc}");
         assert_eq!(escape_bare_braces("{}"), "\\{}");
+    }
+
+    #[tokio::test]
+    async fn multi_path_grep_searches_selected_roots_only() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("mod_a")).unwrap();
+        std::fs::create_dir_all(d.path().join("mod_b")).unwrap();
+        std::fs::create_dir_all(d.path().join("mod_skip")).unwrap();
+        std::fs::write(d.path().join("mod_a/a.rs"), "pub fn needle_xyz() {}\n").unwrap();
+        std::fs::write(d.path().join("mod_b/b.rs"), "pub fn needle_xyz() {}\n").unwrap();
+        std::fs::write(d.path().join("mod_skip/c.rs"), "pub fn needle_xyz() {}\n").unwrap();
+
+        let res = GrepTool
+            .execute(
+                r#"{"pattern":"needle_xyz","paths":["mod_a","mod_b"]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("a.rs:1:"), "{}", res.content);
+        assert!(res.content.contains("b.rs:1:"), "{}", res.content);
+        assert!(!res.content.contains("c.rs"), "{}", res.content);
     }
 }

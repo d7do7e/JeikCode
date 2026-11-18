@@ -392,6 +392,13 @@ impl RuntimeMode {
     }
 }
 
+/// Per-block token breakdown entry within the frozen system + synthetic-user prefix (`#45`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPrefixBlock {
+    pub label: String,
+    pub tokens: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeContextStats {
     pub context_window: u32,
@@ -405,6 +412,7 @@ pub struct RuntimeContextStats {
     pub sent_tokens: usize,
     pub total_messages: usize,
     pub system_prompt: String,
+    pub prefix_blocks: Vec<ContextPrefixBlock>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2364,6 +2372,7 @@ pub struct PeerSubmitOrigin {
     pub from_repo_root: std::path::PathBuf,
     pub same_repo: bool,
     pub hop_depth: u32,
+    pub hop_context: crate::session_mesh::MeshHopContext,
     pub display_text: String,
 }
 
@@ -3945,6 +3954,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         };
                         if send_agent_command(&agent, command) {
                             if let Some(origin) = peer_origin {
+                                if let Some(host) = resources
+                                    .as_ref()
+                                    .and_then(|runtime| runtime.mesh_host.as_ref())
+                                {
+                                    host.local
+                                        .bind_hop_context(active_turn, origin.hop_context);
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::PeerMessageReceived {
                                         from_session_id: origin.from_session_id,
@@ -6499,7 +6515,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 {
                                     host.local.update_snapshot(Some(snapshot.clone()));
                                     if terminal_reason.is_some() || cancel_pending {
-                                        host.local.clear_hop_context();
+                                        host.local.clear_hop_context_for_turn(active_turn);
                                     }
                                 }
                                 let undo_snapshot = resources

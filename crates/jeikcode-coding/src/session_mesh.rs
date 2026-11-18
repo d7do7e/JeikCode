@@ -70,6 +70,12 @@ pub use crate::session_mesh_naming::{LiveSessionDescriptor, LiveSessionView};
 pub struct MeshHopContext {
     pub hop_depth: u32,
     pub visited_sessions: Vec<String>,
+    /// Sessions currently blocked waiting synchronously for a peer reply (`#17`).
+    /// Cycle detection checks `waiting_sessions` when `wait_for_reply == Some(false)`
+    /// so non-blocking async ring handoffs (`A -> B -> A`) can proceed within `max_hops`
+    /// while synchronous deadlock cycles remain strictly blocked.
+    #[serde(default)]
+    pub waiting_sessions: Vec<String>,
 }
 
 /// Completion outcome broadcast when a local runtime turn ends.
@@ -91,7 +97,7 @@ pub(crate) struct MeshLocalState {
     pub repo_root: Arc<RwLock<PathBuf>>,
     pub model: Arc<RwLock<String>>,
     pub latest_snapshot: Arc<RwLock<Option<Arc<SessionSnapshot>>>>,
-    pub active_hop: Arc<RwLock<Option<MeshHopContext>>>,
+    pub active_hop: Arc<RwLock<Option<(Option<u64>, MeshHopContext)>>>,
     pub turn_outcomes: broadcast::Sender<MeshTurnOutcome>,
     pub handle: CodingRuntimeHandle,
 }
@@ -136,13 +142,32 @@ impl MeshLocalState {
         self.active_hop
             .read()
             .ok()
-            .and_then(|g| g.clone())
+            .and_then(|g| g.as_ref().map(|(_, ctx)| ctx.clone()))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn bind_hop_context(&self, turn_id: Option<u64>, ctx: MeshHopContext) {
+        if let Ok(mut guard) = self.active_hop.write() {
+            *guard = Some((turn_id, ctx));
+        }
     }
 
     pub(crate) fn clear_hop_context(&self) {
         if let Ok(mut guard) = self.active_hop.write() {
             *guard = None;
+        }
+    }
+
+    pub(crate) fn clear_hop_context_for_turn(&self, completed_turn_id: Option<u64>) {
+        if let Ok(mut guard) = self.active_hop.write() {
+            let should_clear = match (guard.as_ref(), completed_turn_id) {
+                (Some((Some(bound_id), _)), Some(done_id)) => *bound_id == done_id,
+                (Some((None, _)), _) => true,
+                _ => false,
+            };
+            if should_clear {
+                *guard = None;
+            }
         }
     }
 
@@ -419,6 +444,8 @@ pub(crate) enum MeshRequest {
         text: String,
         hop_depth: u32,
         visited_sessions: Vec<String>,
+        #[serde(default)]
+        waiting_sessions: Vec<String>,
         steer_if_busy: bool,
         wait_for_reply: Option<bool>,
         timeout_secs: Option<u64>,
@@ -602,6 +629,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
             text,
             hop_depth,
             visited_sessions,
+            waiting_sessions,
             steer_if_busy,
             wait_for_reply,
             timeout_secs,
@@ -612,11 +640,17 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                     message: "cannot send a peer message to self".to_string(),
                 };
             }
-            if visited_sessions.iter().any(|s| s == &session_id) {
+            let non_blocking = wait_for_reply == Some(false);
+            let cycle_chain = if non_blocking {
+                &waiting_sessions
+            } else {
+                &visited_sessions
+            };
+            if cycle_chain.iter().any(|s| s == &session_id) {
                 return MeshResponse::Error {
                     message: format!(
                         "mesh cycle detected: session `{session_id}` already visited in {:?}",
-                        visited_sessions
+                        cycle_chain
                     ),
                 };
             }
@@ -651,17 +685,22 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 }
             };
 
+            let should_wait = wait_for_reply.unwrap_or(!steered);
             let next_hop = hop_depth.saturating_add(1);
             let mut next_visited = visited_sessions;
             if !next_visited.iter().any(|s| s == &from_session_id) {
                 next_visited.push(from_session_id.clone());
             }
-            if let Ok(mut guard) = local.active_hop.write() {
-                *guard = Some(MeshHopContext {
-                    hop_depth: next_hop,
-                    visited_sessions: next_visited,
-                });
+            let mut next_waiting = waiting_sessions;
+            if should_wait && !next_waiting.iter().any(|s| s == &from_session_id) {
+                next_waiting.push(from_session_id.clone());
             }
+            let hop_context = MeshHopContext {
+                hop_depth: next_hop,
+                visited_sessions: next_visited,
+                waiting_sessions: next_waiting,
+            };
+            local.bind_hop_context(None, hop_context.clone());
 
             let repo_scope_attr = if same_repo {
                 "same_repo"
@@ -684,7 +723,6 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 "<peer_message from_session=\"{from_session_id}\"{from_name_attr} from_cwd=\"{clean_cwd}\" from_repo=\"{clean_repo}\" repo_scope=\"{repo_scope_attr}\" hop=\"{next_hop}\">\n{external_repo_note}{trimmed_text}\n</peer_message>",
             );
 
-            let should_wait = wait_for_reply.unwrap_or(!steered);
             let mut outcome_rx = should_wait.then(|| local.turn_outcomes.subscribe());
 
             let origin = PeerSubmitOrigin {
@@ -694,6 +732,7 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 from_repo_root,
                 same_repo,
                 hop_depth: next_hop,
+                hop_context,
                 display_text: trimmed_text,
             };
             let turn_id = match local

@@ -409,6 +409,7 @@ impl Tool for EditFileTool {
         let plan = crate::tools::edit_history::plan_for(&path, final_applied.buf.len());
         crate::tools::edit_history::record_version(&path, &final_applied.buf, plan);
         crate::tools::write_state::record_edit(&path);
+        crate::ignore_policy::IgnorePolicy::invalidate_if_ignore_file(&path);
         #[cfg(feature = "codeintel")]
         crate::codeintel::notify_code_index_file_changed(&path, Some(&final_applied.buf));
         let diff = build_compact_diff(&diff_base, &final_applied.buf, Some(&path));

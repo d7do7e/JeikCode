@@ -1264,6 +1264,60 @@ impl McpRegistry {
         tools
     }
 
+    /// Non-blocking snapshot of tools currently in `tool_cache` (sorted by
+    /// `(server_name, tool_name)`), used by `CodingParts::mount` to synchronously
+    /// seed warm MCP tool schemas before Turn 1 (`#6`, `#64`).
+    pub fn try_cached_tools_snapshot(&self) -> Vec<McpToolInfo> {
+        let Ok(cache) = self.tool_cache.try_read() else {
+            return Vec::new();
+        };
+        let mut tools: Vec<McpToolInfo> = cache.values().flatten().cloned().collect();
+        tools.sort_by(|left, right| {
+            (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name))
+        });
+        tools
+    }
+
+    /// Pre-populate `tool_cache` and `server_instructions` for configured servers from
+    /// a warm project schema snapshot while background connections are still initializing (`#6`).
+    pub async fn seed_warm_project_schema(
+        &self,
+        snapshot: &super::schema_cache::SessionMcpSchemaSnapshot,
+    ) {
+        let configured: HashSet<String> = self
+            .configured_servers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if configured.is_empty() {
+            return;
+        }
+        for (server, inst) in &snapshot.instructions {
+            if configured.contains(server) {
+                self.record_server_instructions(server, Some(inst));
+            }
+        }
+        let mut by_server: BTreeMap<String, Vec<McpToolInfo>> = BTreeMap::new();
+        for tool in &snapshot.tools {
+            if configured.contains(&tool.server_name) {
+                by_server
+                    .entry(tool.server_name.clone())
+                    .or_default()
+                    .push(tool.clone());
+            }
+        }
+        if by_server.is_empty() {
+            return;
+        }
+        let mut cache = self.tool_cache.write().await;
+        for (server, mut tools) in by_server {
+            tools.sort_by(|l, r| {
+                (&l.server_name, &l.tool_name).cmp(&(&r.server_name, &r.tool_name))
+            });
+            cache.entry(server).or_insert(tools);
+        }
+    }
+
     async fn cached_tools_for_connected_servers(&self) -> Option<Vec<McpToolInfo>> {
         let connected: Vec<String> = self.servers.read().await.keys().cloned().collect();
         let cache = self.tool_cache.read().await;
@@ -1412,7 +1466,7 @@ impl McpRegistry {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(server_name);
-                let tools: Vec<McpToolInfo> = result
+                let mut tools: Vec<McpToolInfo> = result
                     .tools
                     .into_iter()
                     .map(|tool| {
@@ -1428,6 +1482,10 @@ impl McpRegistry {
                         }
                     })
                     .collect();
+                tools.sort_by(|left, right| {
+                    (&left.server_name, &left.tool_name)
+                        .cmp(&(&right.server_name, &right.tool_name))
+                });
                 self.tool_cache
                     .write()
                     .await
@@ -1547,6 +1605,18 @@ impl McpRegistry {
         };
         if self.lazy_connect {
             self.ensure_server_connected(server_name).await?;
+        } else if !self.initial_connections_complete()
+            && self
+                .configured_servers
+                .read()
+                .map(|s| s.contains(server_name))
+                .unwrap_or(false)
+        {
+            let currently_connected = self.servers.read().await.contains_key(server_name);
+            if !currently_connected {
+                self.wait_for_initial_connections(super::CONNECT_TIMEOUT)
+                    .await;
+            }
         }
         // Take a stable client snapshot, then release the registry lock before the
         // potentially slow transport call. Reload/add-server writes must not wait

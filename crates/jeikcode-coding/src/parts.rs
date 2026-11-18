@@ -1198,23 +1198,57 @@ impl CodingParts {
     /// by every reassembly of these parts; later calls republish the complete current
     /// set so model-dependent tools (notably `read_file`) stay fresh.
     fn mount(&mut self) -> MountedTools {
-        let names = self.selected_tool_names();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-
         if let (Some(mounted), Some(publisher)) =
             (&self.mounted_tools, &self.mounted_tools_publisher)
         {
+            let names = self.selected_tool_names();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             publisher.publish(&self.registry, &refs);
             return mounted.clone();
         }
 
-        let (mounted, publisher) = self.registry.mount_updatable(&refs);
         let mcp_registries: Vec<_> = self
             .mcp_registry
             .iter()
             .chain(self.session_mcp_registry.iter())
             .cloned()
             .collect();
+        // Synchronous Turn-1 warm seed (#6): if any registry already holds cached or
+        // warm-seeded tool schemas (e.g. from `SessionMcpPool` or `ProjectMcpPool`
+        // `schema_cache`), register them BEFORE mounting so Turn 1 starts with the
+        // full sorted MCP catalog and Turn 2 never invalidates the KV cache.
+        if !mcp_registries.is_empty()
+            && self
+                .mcp_publication_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let mut adapters: Vec<Arc<dyn jeikcode_kernel::tool::Tool>> = Vec::new();
+            let mut aliases = std::collections::HashSet::new();
+            for mcp_registry in &mcp_registries {
+                for info in mcp_registry.try_cached_tools_snapshot() {
+                    if let Ok(adapter) =
+                        jeikcode_capabilities::mcp::McpToolAdapter::new(mcp_registry.clone(), info)
+                    {
+                        if aliases.insert(adapter.full_name().to_string()) {
+                            adapters
+                                .push(Arc::new(adapter) as Arc<dyn jeikcode_kernel::tool::Tool>);
+                        }
+                    }
+                }
+            }
+            if !adapters.is_empty() {
+                adapters.sort_by(|l, r| l.name().cmp(r.name()));
+                let discovered = mcp::register_mcp_tools(&mut self.registry, adapters);
+                match self.mcp_tool_names.write() {
+                    Ok(mut names) => *names = discovered,
+                    Err(poisoned) => *poisoned.into_inner() = discovered,
+                }
+            }
+        }
+
+        let names = self.selected_tool_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mounted, publisher) = self.registry.mount_updatable(&refs);
         if !mcp_registries.is_empty() {
             let tool_registry = self.registry.clone();
             let base_names = self.tool_names.clone();
@@ -1413,6 +1447,9 @@ async fn publish_ready_mcp_tools(
     if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
+    // Sort adapters deterministically by canonical tool name across project + session
+    // registries so server discovery order never perturbs the KV-cache tool prefix (#64).
+    adapters.sort_by(|l, r| l.name().cmp(r.name()));
     let discovered = mcp::register_mcp_tools(&mut tool_registry, adapters);
     match mcp_tool_names.write() {
         Ok(mut names) => *names = discovered.clone(),

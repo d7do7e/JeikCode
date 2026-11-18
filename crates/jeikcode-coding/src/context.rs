@@ -12,7 +12,49 @@ use jeikcode_kernel::tool::ToolDef;
 
 use crate::config::CodingAgentConfig;
 use crate::parts::CodingParts;
-use crate::runtime::RuntimeContextStats;
+use crate::runtime::{ContextPrefixBlock, RuntimeContextStats};
+
+fn classify_prefix_block_label(role: &Role, text: &str, idx: usize) -> String {
+    let trimmed = text.trim_start();
+    for (tag, label) in [
+        ("<environment>", "environment"),
+        ("<system_rules>", "system_rules"),
+        ("<explore_strategy>", "explore_strategy"),
+        ("<available_skills>", "available_skills"),
+        ("=== AVAILABLE SKILLS ===", "available_skills"),
+        ("<mcp-server-instructions>", "mcp_server_instructions"),
+        ("<mcp_server_instructions>", "mcp_server_instructions"),
+        ("<memory>", "memory"),
+        ("<user_preferences>", "user_preferences"),
+        ("<project_instructions>", "project_instructions"),
+    ] {
+        if trimmed.starts_with(tag) || trimmed.contains(tag) {
+            return label.to_string();
+        }
+    }
+    match role {
+        Role::System => format!("system_block_{}", idx + 1),
+        _ => format!("frozen_user_block_{}", idx + 1),
+    }
+}
+
+fn build_baseline_prefix_blocks(blocks: &[String; 4]) -> Vec<ContextPrefixBlock> {
+    let labels = [
+        "environment",
+        "system_rules",
+        "explore_strategy",
+        "system_extra",
+    ];
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_empty())
+        .map(|(i, b)| ContextPrefixBlock {
+            label: labels.get(i).copied().unwrap_or("system").to_string(),
+            tokens: estimate_text_block_tokens(b),
+        })
+        .collect()
+}
 
 pub(crate) fn current_parts_snapshot(parts: &CodingParts) -> Option<SessionSnapshot> {
     let binding = parts.session.as_ref()?;
@@ -125,6 +167,7 @@ where
     let (
         system_prompt,
         system_tokens,
+        prefix_blocks,
         cold_zone_tokens,
         est_non_sys_tokens,
         total_messages,
@@ -137,7 +180,7 @@ where
             .collect();
 
         let lead_system = wire.iter().take_while(|m| m.role == Role::System).count();
-        let (system_prompt, system_tokens, frozen_end) = if lead_system > 0 {
+        let (system_prompt, system_tokens, prefix_blocks, frozen_end) = if lead_system > 0 {
             let mut end = lead_system;
             // Include the v2 frozen synthetic user prefix (skills, MCP, memory,
             // preferences, project instructions) before the first real prompt or anchor.
@@ -149,19 +192,25 @@ where
                 end += 1;
             }
             let prompt = join_non_empty_blocks(wire[..end].iter().map(|m| m.text.as_str()));
-            let tokens: usize = wire[..end]
-                .iter()
-                .map(|m| m.estimate_tokens() as usize)
-                .sum();
-            (prompt, tokens, end)
+            let mut p_blocks = Vec::with_capacity(end);
+            let mut tokens = 0usize;
+            for (idx, m) in wire[..end].iter().enumerate() {
+                let t = m.estimate_tokens() as usize;
+                tokens = tokens.saturating_add(t);
+                if !m.text.trim().is_empty() {
+                    p_blocks.push(ContextPrefixBlock {
+                        label: classify_prefix_block_label(&m.role, &m.text, idx),
+                        tokens: t,
+                    });
+                }
+            }
+            (prompt, tokens, p_blocks, end)
         } else {
             let blocks = baseline_blocks();
             let prompt = join_non_empty_blocks(blocks.iter().map(String::as_str));
-            let tokens: usize = blocks
-                .iter()
-                .map(|block| estimate_text_block_tokens(block))
-                .sum();
-            (prompt, tokens, 0)
+            let p_blocks = build_baseline_prefix_blocks(&blocks);
+            let tokens: usize = p_blocks.iter().map(|b| b.tokens).sum();
+            (prompt, tokens, p_blocks, 0)
         };
 
         let non_frozen = &wire[frozen_end..];
@@ -188,6 +237,7 @@ where
         (
             system_prompt,
             system_tokens,
+            prefix_blocks,
             cold_tokens,
             est_non_frozen_tokens,
             msg_count,
@@ -196,11 +246,9 @@ where
     } else {
         let blocks = baseline_blocks();
         let prompt = join_non_empty_blocks(blocks.iter().map(String::as_str));
-        let tokens: usize = blocks
-            .iter()
-            .map(|block| estimate_text_block_tokens(block))
-            .sum();
-        (prompt, tokens, 0, 0, 0, 0)
+        let p_blocks = build_baseline_prefix_blocks(&blocks);
+        let tokens: usize = p_blocks.iter().map(|b| b.tokens).sum();
+        (prompt, tokens, p_blocks, 0, 0, 0, 0)
     };
 
     let used_tokens = if observed_used_tokens > 0 {
@@ -239,6 +287,7 @@ where
         sent_tokens,
         total_messages,
         system_prompt,
+        prefix_blocks,
     }
 }
 
@@ -422,5 +471,44 @@ mod tests {
             stats.system_tokens + stats.tool_defs_tokens + stats.sent_tokens,
             42_000
         );
+    }
+
+    #[test]
+    fn snapshot_context_stats_exposes_per_block_prefix_breakdown() {
+        let msgs = vec![
+            Message::system("<environment>\nPlatform: Windows\n</environment>"),
+            Message::system("<system_rules>\nRules\n</system_rules>"),
+            Message::synthetic_user("<available_skills>\n- plan-tribunal\n</available_skills>"),
+            Message::synthetic_user("<memory>\n[Global]\n- fact\n</memory>"),
+            Message::synthetic_user("<project_instructions>\n# AGENTS\n</project_instructions>"),
+            Message::user("hello"),
+        ];
+        let snap = SessionSnapshot::new(msgs);
+        let stats = compute_snapshot_context_stats(
+            Some(&snap),
+            || unreachable!(),
+            500,
+            200_000,
+            "m",
+            PathBuf::from("."),
+            0,
+        );
+        let labels: Vec<&str> = stats
+            .prefix_blocks
+            .iter()
+            .map(|b| b.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "environment",
+                "system_rules",
+                "available_skills",
+                "memory",
+                "project_instructions"
+            ]
+        );
+        let sum: usize = stats.prefix_blocks.iter().map(|b| b.tokens).sum();
+        assert_eq!(sum, stats.system_tokens);
     }
 }

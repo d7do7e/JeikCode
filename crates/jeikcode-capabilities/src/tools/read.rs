@@ -317,6 +317,14 @@ fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
     })
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct LineRange {
+    #[serde(default, deserialize_with = "lenient_isize")]
+    offset: Option<isize>,
+    #[serde(default, deserialize_with = "lenient_usize")]
+    limit: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct Args {
     #[serde(alias = "file_path")]
@@ -325,6 +333,10 @@ struct Args {
     offset: Option<isize>,
     #[serde(default, deserialize_with = "lenient_usize")]
     limit: Option<usize>,
+    /// Optional multi-range batch (`[{"offset": 1, "limit": 80}, {"offset": 400, "limit": 80}]`)
+    /// to inspect several non-contiguous sections of a file in one call (`#47`).
+    #[serde(default)]
+    ranges: Option<Vec<LineRange>>,
     /// Keyword or code snippet to focus on (case-insensitive, centers window around match).
     #[serde(
         default,
@@ -496,6 +508,18 @@ impl Tool for ReadFileTool {
                 "max_matches": {
                     "type": "integer",
                     "description": "Maximum matches to show for keyword. Used only when keyword is specified; ignored otherwise. If omitted, all matches are shown."
+                },
+                "ranges": {
+                    "type": "array",
+                    "description": "Optional list of `{offset, limit}` slices to read multiple non-contiguous line ranges from the same file in a single call.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "offset": { "type": "integer", "description": "1-based starting line (negative for tail)." },
+                            "limit": { "type": "integer", "description": "Number of lines to read from offset." }
+                        },
+                        "required": ["offset"]
+                    }
                 }
             },
             "required": ["path"]
@@ -934,6 +958,109 @@ impl ReadFileTool {
                 fallback_limit,
             };
             let footer = km.build_footer(display_path);
+            if let Some(p) = record_path {
+                crate::tools::write_state::record_read(p);
+            }
+            return ok(finish_read_text(out, &footer));
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Multi-Range Batch Mode (`ranges: [{offset, limit}, ...]`, #47)
+        // ─────────────────────────────────────────────────────────────────────────────
+        if let Some(ranges) = a.ranges.as_ref().filter(|r| !r.is_empty()) {
+            let lines_vec: Vec<&str> = text.lines().collect();
+            let mut out = String::new();
+            let mut truncated_ranges = false;
+            for (r_idx, r) in ranges.iter().enumerate() {
+                if r.limit == Some(0) {
+                    return err("read: `ranges[].limit` must be at least 1.");
+                }
+                let (s, s_idx) = match r.offset {
+                    Some(neg) if neg < 0 => {
+                        let n = neg.unsigned_abs();
+                        let start = total.saturating_sub(n);
+                        (start + 1, start)
+                    }
+                    Some(pos) => {
+                        let p = pos.max(1) as usize;
+                        (p, p - 1)
+                    }
+                    None => (1, 0),
+                };
+                let lim = r.limit.unwrap_or(200);
+                let e_idx = s_idx.saturating_add(lim).min(total);
+                let header = if r_idx == 0 {
+                    format!(
+                        "--- [Range {}: lines {}-{} of {total}] ---\n",
+                        r_idx + 1,
+                        s,
+                        e_idx.max(s)
+                    )
+                } else {
+                    format!(
+                        "\n--- [Range {}: lines {}-{} of {total}] ---\n",
+                        r_idx + 1,
+                        s,
+                        e_idx.max(s)
+                    )
+                };
+                if !out.is_empty()
+                    && out
+                        .len()
+                        .saturating_add(header.len())
+                        .saturating_add(FOOTER_RESERVE_BYTES)
+                        > READ_BYTE_BUDGET
+                {
+                    truncated_ranges = true;
+                    break;
+                }
+                out.push_str(&header);
+                if s_idx >= total && total > 0 {
+                    out.push_str(&format!(
+                        "[no lines in requested range (start={s}, total={total})]\n"
+                    ));
+                    continue;
+                }
+                let dense_numbers = e_idx.saturating_sub(s_idx) <= 200;
+                for (i, &line) in lines_vec[s_idx..e_idx].iter().enumerate() {
+                    let n = s + i;
+                    let is_anchor = dense_numbers || i == 0 || n % 10 == 0;
+                    let rendered = if line.chars().count() > MAX_LINE_LEN {
+                        let head: String = line.chars().take(MAX_LINE_LEN).collect();
+                        if is_anchor {
+                            format!("{n}→{head}... (line truncated to {MAX_LINE_LEN} chars)\n")
+                        } else {
+                            format!("{head}... (line truncated to {MAX_LINE_LEN} chars)\n")
+                        }
+                    } else if is_anchor {
+                        format!("{n}→{line}\n")
+                    } else {
+                        format!("{line}\n")
+                    };
+                    if out
+                        .len()
+                        .saturating_add(rendered.len())
+                        .saturating_add(FOOTER_RESERVE_BYTES)
+                        > READ_BYTE_BUDGET
+                    {
+                        truncated_ranges = true;
+                        break;
+                    }
+                    out.push_str(&rendered);
+                }
+                if truncated_ranges {
+                    break;
+                }
+            }
+            let footer = format!(
+                "\nFile: {display_path}\nTotal Lines: {total} | Total Bytes: {total_bytes}\nMulti-range read: {} range(s){}.",
+                ranges.len(),
+                if truncated_ranges {
+                    " (byte-budget capped)"
+                } else {
+                    ""
+                }
+            );
             if let Some(p) = record_path {
                 crate::tools::write_state::record_read(p);
             }
@@ -2674,5 +2801,41 @@ mod tests {
                 res.content
             );
         }
+    }
+
+    #[tokio::test]
+    async fn multi_range_read_returns_disjoint_slices_in_single_call() {
+        let d = tempfile::tempdir().unwrap();
+        let body: String = (1..=50).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(d.path().join("ranges.txt"), body).unwrap();
+
+        let res = ReadFileTool::default()
+            .execute(
+                r#"{"path":"ranges.txt","ranges":[{"offset":2,"limit":2},{"offset":40,"limit":3}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(
+            res.content.contains("--- [Range 1: lines 2-3 of 50] ---"),
+            "{}",
+            res.content
+        );
+        assert!(
+            res.content.contains("2→line-2\n3→line-3"),
+            "{}",
+            res.content
+        );
+        assert!(
+            res.content.contains("--- [Range 2: lines 40-42 of 50] ---"),
+            "{}",
+            res.content
+        );
+        assert!(
+            res.content.contains("40→line-40\n41→line-41\n42→line-42"),
+            "{}",
+            res.content
+        );
+        assert!(!res.content.contains("line-20"), "{}", res.content);
     }
 }

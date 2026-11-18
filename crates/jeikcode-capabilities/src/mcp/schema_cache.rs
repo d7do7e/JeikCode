@@ -30,6 +30,7 @@ pub struct SessionMcpSchemaSnapshot {
 
 struct SchemaCacheState {
     by_project: RwLock<HashMap<PathBuf, SessionMcpSchemaSnapshot>>,
+    project_scope_by_project: RwLock<HashMap<PathBuf, SessionMcpSchemaSnapshot>>,
     probe_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -38,6 +39,7 @@ static CACHE: OnceLock<SchemaCacheState> = OnceLock::new();
 fn cache() -> &'static SchemaCacheState {
     CACHE.get_or_init(|| SchemaCacheState {
         by_project: RwLock::new(HashMap::new()),
+        project_scope_by_project: RwLock::new(HashMap::new()),
         probe_locks: Mutex::new(HashMap::new()),
     })
 }
@@ -58,6 +60,38 @@ fn project_key(project_dir: &Path) -> PathBuf {
 pub async fn cached_session_mcp_schema(project_dir: &Path) -> Option<SessionMcpSchemaSnapshot> {
     let key = project_key(project_dir);
     cache().by_project.read().await.get(&key).cloned()
+}
+
+/// Read the last warm project-scope MCP schema snapshot for `project_dir`, if any (`#6`).
+pub async fn cached_project_mcp_schema(project_dir: &Path) -> Option<SessionMcpSchemaSnapshot> {
+    let key = project_key(project_dir);
+    cache()
+        .project_scope_by_project
+        .read()
+        .await
+        .get(&key)
+        .cloned()
+}
+
+/// Record a discovered project-scope MCP schema snapshot so subsequent runtimes or
+/// registry reloads can warm-seed `tool_cache` and `server_instructions` before Turn 1 (`#6`).
+pub async fn record_project_mcp_schema(
+    project_dir: &Path,
+    tools: Vec<McpToolInfo>,
+    instructions: std::collections::BTreeMap<String, String>,
+) {
+    let key = project_key(project_dir);
+    let snapshot = SessionMcpSchemaSnapshot {
+        tools,
+        instructions,
+        statuses: Vec::new(),
+        configs: Vec::new(),
+    };
+    cache()
+        .project_scope_by_project
+        .write()
+        .await
+        .insert(key, snapshot);
 }
 
 async fn probe_lock(project_dir: &Path) -> Arc<Mutex<()>> {
