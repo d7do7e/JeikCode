@@ -376,7 +376,7 @@ fn is_unspecified_host(host: &str) -> bool {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    jeikcode_config::desktop_shared::is_loopback_host(host)
 }
 
 pub(crate) fn shareable_network_addrs() -> Vec<String> {
@@ -990,22 +990,18 @@ fn wait_child(child: &mut std::process::Child, limit: std::time::Duration) -> bo
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct WebuiListenPref {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    host: Option<String>,
-    port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
-}
+use jeikcode_config::desktop_shared::{
+    desktop_settings_path as shared_desktop_settings_path, load_close_action_at,
+    load_webui_listen_pref_at, save_close_action_at, save_webui_listen_pref_at, webui_listen_path,
+    DesktopSettings as DesktopSettingsPayload, DesktopSettingsError, WebuiListenPref,
+};
 
 fn webui_listen_pref_path() -> std::path::PathBuf {
-    jeikcode_config::config::Config::config_dir().join("webui-listen.json")
+    webui_listen_path()
 }
 
 fn load_webui_listen_pref() -> Option<WebuiListenPref> {
-    let text = std::fs::read_to_string(webui_listen_pref_path()).ok()?;
-    serde_json::from_str(&text).ok()
+    load_webui_listen_pref_at(&webui_listen_pref_path())
 }
 
 fn saved_listen_port() -> Option<u16> {
@@ -1015,10 +1011,7 @@ fn saved_listen_port() -> Option<u16> {
 }
 
 pub(crate) fn saved_listen_token() -> Option<String> {
-    load_webui_listen_pref()
-        .and_then(|pref| pref.token)
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    load_webui_listen_pref().and_then(|pref| pref.token)
 }
 
 /// Write the next desktop launch. `token: None` keeps the token already on disk.
@@ -1027,51 +1020,12 @@ pub(crate) fn save_webui_listen_pref(
     port: u16,
     token: Option<String>,
 ) -> Result<(), String> {
-    if port == 0 {
-        return Err("port must be 1-65535".to_string());
-    }
-    let path = webui_listen_pref_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
-    }
-    let mut pref = load_webui_listen_pref().unwrap_or(WebuiListenPref {
-        host: None,
+    save_webui_listen_pref_at(
+        &webui_listen_pref_path(),
+        host.as_deref(),
         port,
-        token: None,
-    });
-    pref.port = port;
-    if let Some(h) = host {
-        let trimmed = h.trim();
-        if !trimmed.is_empty() {
-            pref.host = Some(trimmed.to_string());
-        }
-    }
-    if token.is_some() {
-        pref.token = token;
-    }
-    let body = serde_json::to_string_pretty(&pref).map_err(|err| err.to_string())?;
-    write_private_file(&path, body.as_bytes()).map_err(|err| err.to_string())
-}
-
-fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+        token.as_deref(),
+    )
 }
 
 /// The running socket stays as it is. A matching port registers the token now.
@@ -1669,73 +1623,27 @@ pub(crate) async fn post_migrate_legacy(
     })
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct DesktopSettingsPayload {
-    #[serde(default)]
-    pub close_action: String,
-}
-
 fn desktop_settings_file_path() -> std::path::PathBuf {
-    jeikcode_config::config::Config::config_dir().join("desktop-settings.json")
+    shared_desktop_settings_path()
 }
 
 pub(crate) async fn get_desktop_settings() -> impl IntoResponse {
     let path = desktop_settings_file_path();
-    let text = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
-    let mut payload =
-        serde_json::from_str::<DesktopSettingsPayload>(&text).unwrap_or(DesktopSettingsPayload {
-            close_action: "ask".into(),
-        });
-    if payload.close_action.is_empty() {
-        payload.close_action = "ask".into();
-    }
-    Json(payload)
+    Json(DesktopSettingsPayload {
+        close_action: load_close_action_at(&path),
+    })
 }
 
 fn write_desktop_settings_at(
     path: &std::path::Path,
     payload: &DesktopSettingsPayload,
 ) -> Result<(), (axum::http::StatusCode, String)> {
-    let action = payload.close_action.trim();
-    if !matches!(action, "ask" | "tray" | "quit") {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            "close_action must be 'ask', 'tray', or 'quit'".to_string(),
-        ));
-    }
-    let normalized = DesktopSettingsPayload {
-        close_action: action.to_string(),
-    };
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    jeikcode_config::store::backup_sibling_bak(path)
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let body = serde_json::to_string_pretty(&normalized)
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        + "\n";
-    let tmp_name = format!(
-        ".desktop-settings.tmp-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = parent.join(tmp_name);
-    std::fs::write(&tmp_path, body.as_bytes())
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            err.to_string(),
-        ));
-    }
-    Ok(())
+    save_close_action_at(path, &payload.close_action).map_err(|err| match err {
+        DesktopSettingsError::InvalidAction => {
+            (axum::http::StatusCode::BAD_REQUEST, err.to_string())
+        }
+        DesktopSettingsError::Io(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })
 }
 
 pub(crate) async fn post_desktop_settings(

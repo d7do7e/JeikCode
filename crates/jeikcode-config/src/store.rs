@@ -228,7 +228,7 @@ pub fn backup_sibling_bak(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_parent(path: &Path) -> Result<()> {
+pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -252,12 +252,34 @@ fn read_snapshot_tolerant(path: &Path) -> Result<ConfigSnapshot> {
 }
 
 fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_replace_with_mode(path, bytes, false)
+}
+
+pub(crate) fn atomic_replace_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    private_0600: bool,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("Failed to create temporary config in {}", parent.display()))?;
+    #[cfg(unix)]
+    if private_0600 {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "Failed to restrict temporary file permissions for {}",
+                    path.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = private_0600;
     temp.write_all(bytes)
         .with_context(|| format!("Failed to write temporary config for {}", path.display()))?;
     temp.as_file()

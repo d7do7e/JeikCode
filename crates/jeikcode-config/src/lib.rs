@@ -49,5 +49,8 @@ pub mod system_proxy;
 /// Local scheduled-task model, file store, and next-run calculator.
 pub mod schedule;
 
+/// Shared desktop/daemon/CLI contracts, listen preferences, and settings I/O.
+pub mod desktop_shared;
+
 pub use config::{provider::ProviderConfig, Config};
 pub use store::{backup_sibling_bak, ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};

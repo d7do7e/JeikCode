@@ -12,16 +12,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jeikcode_config::desktop_shared::{
+    desktop_settings_path, is_loopback_host, load_close_action, load_webui_listen,
+    save_close_action_at, save_webui_listen_pref, DESKTOP_CLI_BIN_ENV, DESKTOP_ENV,
+    DESKTOP_MANAGED_ENV, DESKTOP_PID_ENV, RESTART_EXACT_PORT_ENV, RESTART_LISTEN_PORT_ENV,
+    RESTART_REQUESTED_EXIT_CODE, SERVER_TOKEN_ENV,
+};
+use jeikcode_config::i18n::resolve_locale_from_disk;
+use jeikcode_config::locale::Locale;
+use jeikcode_config::util::real_home_dir;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Listener, Manager};
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-
-/// 与 `jeikcode_updater::RESTART_REQUESTED_EXIT_CODE` 对齐的显式重启退出码。
-/// 仅当子进程因「软件更新」或「小地球更换端口/地址立即重启」主动以该退出码退出时，
-/// 桌面壳才重新拉起新实例，避免异常崩溃时陷入无条件死循环。
-const RESTART_REQUESTED_EXIT_CODE: i32 = 75;
 
 /// 这次桌面壳拉起的 WebUI。端口可能因占用从 13457 顺延。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,11 +55,6 @@ fn is_shell_internal_url(url: &tauri::Url) -> bool {
         }
     }
     false
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 fn is_launched_webui(url: &tauri::Url, origin: &WebuiOrigin) -> bool {
@@ -89,7 +88,7 @@ fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkActi
     if origin.is_some() {
         if let Some(host) = url.host_str() {
             if is_loopback_host(host) {
-                let (_h, saved_port, _t) = saved_webui_listen();
+                let (_h, saved_port, _t) = load_webui_listen();
                 if url.port() == Some(saved_port) {
                     return LinkAction::StayInWebview;
                 }
@@ -281,7 +280,7 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
         }
     }
     // 兜底 1：读取当前配置端口，向 /shutdown 发送优雅关停请求（即使子进程句柄丢失也能通知关停）
-    let (_host, port, token) = saved_webui_listen();
+    let (_host, port, token) = load_webui_listen();
     if port > 0 {
         send_desktop_shutdown(port, token.as_deref());
     }
@@ -290,58 +289,8 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     cleanup_desktop_owned_children_windows();
 }
 
-fn is_valid_close_action(action: &str) -> bool {
-    matches!(action, "ask" | "tray" | "quit")
-}
-
 fn is_authorized_shell_action_url(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> bool {
     is_shell_internal_url(url) || origin.is_some_and(|o| is_launched_webui(url, o))
-}
-
-fn backup_non_empty_file_bak(path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.is_file() && meta.len() > 0 {
-            let mut bak_os = path.as_os_str().to_os_string();
-            bak_os.push(".bak");
-            let _ = std::fs::copy(path, PathBuf::from(bak_os));
-        }
-    }
-}
-
-fn write_desktop_close_action_to(path: &Path, action: &str) -> std::io::Result<()> {
-    if !is_valid_close_action(action) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid close_action",
-        ));
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    backup_non_empty_file_bak(path);
-    let body = serde_json::to_string_pretty(&serde_json::json!({
-        "close_action": action,
-    }))
-    .map_err(std::io::Error::other)?
-        + "\n";
-    let tmp_name = format!(
-        ".desktop-settings.tmp-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = path
-        .parent()
-        .map(|p| p.join(&tmp_name))
-        .unwrap_or_else(|| PathBuf::from(&tmp_name));
-    std::fs::write(&tmp_path, body.as_bytes())?;
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(())
 }
 
 fn handle_desktop_shell_action(
@@ -372,9 +321,8 @@ fn handle_desktop_shell_action(
                 .query_pairs()
                 .find(|(k, _)| k == "action")
                 .map(|(_, v)| v.trim().to_string())
-                .filter(|v| is_valid_close_action(v))
             {
-                let _ = write_desktop_close_action_to(&desktop_settings_path(), &action);
+                let _ = save_close_action_at(&desktop_settings_path(), &action);
             }
             true
         }
@@ -598,25 +546,6 @@ fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
     });
 }
 
-fn desktop_settings_path() -> PathBuf {
-    jeikcode_dir().join("desktop-settings.json")
-}
-
-fn load_close_action() -> String {
-    let Ok(text) = std::fs::read_to_string(desktop_settings_path()) else {
-        return "ask".to_string();
-    };
-    #[derive(serde::Deserialize)]
-    struct Settings {
-        #[serde(default)]
-        close_action: Option<String>,
-    }
-    serde_json::from_str::<Settings>(&text)
-        .ok()
-        .and_then(|s| s.close_action)
-        .unwrap_or_else(|| "ask".to_string())
-}
-
 fn main() {
     #[cfg(target_os = "windows")]
     if ensure_single_instance_windows() {
@@ -798,75 +727,68 @@ struct TrayTexts {
     quit: &'static str,
 }
 
-fn resolve_tray_texts() -> TrayTexts {
-    let lang = detect_user_language();
-    if lang.starts_with("zh") {
-        TrayTexts {
+fn tray_texts_for_locale(locale: Locale) -> TrayTexts {
+    match locale {
+        Locale::ZhCn => TrayTexts {
             tooltip: "JeikCode Desktop - AI 编程助手",
             show_window: "显示主界面",
             quit: "退出",
-        }
-    } else if lang.starts_with("vi") {
-        TrayTexts {
+        },
+        Locale::ZhTw => TrayTexts {
+            tooltip: "JeikCode Desktop - AI 程式設計助手",
+            show_window: "顯示主視窗",
+            quit: "結束",
+        },
+        Locale::Vi => TrayTexts {
             tooltip: "JeikCode Desktop - Trợ lý lập trình AI",
             show_window: "Hiển thị giao diện",
             quit: "Thoát",
-        }
-    } else {
-        TrayTexts {
+        },
+        Locale::Ja => TrayTexts {
+            tooltip: "JeikCode Desktop - AI コーディングアシスタント",
+            show_window: "ウィンドウを表示",
+            quit: "終了",
+        },
+        Locale::Ko => TrayTexts {
+            tooltip: "JeikCode Desktop - AI 코딩 어시스턴트",
+            show_window: "창 표시",
+            quit: "종료",
+        },
+        Locale::Ru => TrayTexts {
+            tooltip: "JeikCode Desktop - AI-помощник программиста",
+            show_window: "Показать окно",
+            quit: "Выход",
+        },
+        Locale::Fr => TrayTexts {
+            tooltip: "JeikCode Desktop - Assistant de programmation IA",
+            show_window: "Afficher la fenêtre",
+            quit: "Quitter",
+        },
+        Locale::Es => TrayTexts {
+            tooltip: "JeikCode Desktop - Asistente de programación IA",
+            show_window: "Mostrar ventana",
+            quit: "Salir",
+        },
+        Locale::De => TrayTexts {
+            tooltip: "JeikCode Desktop - KI-Programmierassistent",
+            show_window: "Fenster anzeigen",
+            quit: "Beenden",
+        },
+        Locale::Ar => TrayTexts {
+            tooltip: "JeikCode Desktop - مساعد البرمجة بالذكاء الاصطناعي",
+            show_window: "إظهار النافذة",
+            quit: "إنهاء",
+        },
+        Locale::En => TrayTexts {
             tooltip: "JeikCode Desktop - AI Coding Agent",
             show_window: "Show Window",
             quit: "Quit",
-        }
+        },
     }
 }
 
-fn detect_user_language() -> String {
-    let config_path = jeikcode_dir().join("config.toml");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') {
-                break;
-            }
-            if let Some(rest) = trimmed.strip_prefix("language") {
-                let rest = rest.trim_start();
-                if let Some(val) = rest.strip_prefix('=') {
-                    let clean = val
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .trim()
-                        .to_lowercase();
-                    if !clean.is_empty() {
-                        return clean;
-                    }
-                }
-            }
-        }
-    }
-
-    for var in ["JEIKCODE_LANGUAGE", "JEIKCODE_LANG", "LANG", "LC_ALL"] {
-        if let Ok(val) = std::env::var(var) {
-            let val = val.trim().to_lowercase();
-            if !val.is_empty() {
-                return val;
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        if let Ok(hkcu) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-            .open_subkey("Control Panel\\International")
-        {
-            if let Ok(locale_name) = hkcu.get_value::<String, _>("LocaleName") {
-                return locale_name.to_lowercase();
-            }
-        }
-    }
-
-    "en".to_string()
+fn resolve_tray_texts() -> TrayTexts {
+    tray_texts_for_locale(resolve_locale_from_disk(None))
 }
 
 fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -950,8 +872,8 @@ fn start_webui(
 > {
     let bundled = bundled_cli(app);
     let bin = resolve_desktop_cli(bundled.as_deref());
-    let home = home_dir();
-    let (host, port, saved_token) = saved_webui_listen();
+    let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let (host, port, saved_token) = load_webui_listen();
     let token = saved_token.unwrap_or_else(|| mint_desktop_token(&host, port));
     let mut launch = WebuiLaunch {
         bin,
@@ -969,36 +891,9 @@ fn start_webui(
         .unwrap_or(launch.port);
     if probe_port != launch.port {
         launch.port = probe_port;
-        let dir = jeikcode_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let body = format!(
-            "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
-            launch.host, launch.token
-        );
-        let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
+        let _ = save_webui_listen_pref(Some(&launch.host), probe_port, Some(&launch.token));
     }
     Ok((url, child, eof_rx, launch))
-}
-
-fn write_private_listen_json(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
 }
 
 #[cfg(windows)]
@@ -1108,18 +1003,18 @@ fn spawn_desktop_server(
         .arg(launch.port.to_string())
         .arg("--no-open");
     if !launch.token.trim().is_empty() {
-        cmd.env("JEIKCODE_SERVER_TOKEN", &launch.token);
+        cmd.env(SERVER_TOKEN_ENV, &launch.token);
     }
-    cmd.env("JEIKCODE_DESKTOP", "1");
-    cmd.env("JEIKCODE_DESKTOP_MANAGED", "1");
-    cmd.env("JEIKCODE_DESKTOP_PID", std::process::id().to_string());
+    cmd.env(DESKTOP_ENV, "1");
+    cmd.env(DESKTOP_MANAGED_ENV, "1");
+    cmd.env(DESKTOP_PID_ENV, std::process::id().to_string());
     if exact_port {
         // 与 jeikcode-updater 的同名变量一致：只绑定这个端口，不顺延，也不关闭别的进程。
-        cmd.env("JEIKCODE_RESTART_EXACT_PORT", "1");
-        cmd.env("JEIKCODE_RESTART_LISTEN_PORT", launch.port.to_string());
+        cmd.env(RESTART_EXACT_PORT_ENV, "1");
+        cmd.env(RESTART_LISTEN_PORT_ENV, launch.port.to_string());
     }
     if let Some(ref bundled) = launch.bundled {
-        cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
+        cmd.env(DESKTOP_CLI_BIN_ENV, bundled);
     }
     // 开启 stdin 管道作为跨平台生命线（ChildSlot 持有 ChildStdin 写端；一旦桌面壳退出，
     // OS 内核立即关闭管道，子进程阻塞 read 瞬间收到 EOF 退出，0 轮询）。
@@ -1211,7 +1106,7 @@ fn supervise_webui(
             }
 
             // 动态读取最新配置与二进制路径，由桌面壳直接重新拉起并存入 ChildSlot
-            let (latest_host, latest_port, latest_token) = saved_webui_listen();
+            let (latest_host, latest_port, latest_token) = load_webui_listen();
             let effective_port = if latest_port != 0 {
                 latest_port
             } else {
@@ -1248,16 +1143,10 @@ fn supervise_webui(
                         .unwrap_or(launch.port);
                     if probe_port != launch.port {
                         launch.port = probe_port;
-                        let dir = jeikcode_dir();
-                        let _ = std::fs::create_dir_all(&dir);
-                        let body = format!(
-                            "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
-                            launch.host,
-                            launch.token
-                        );
-                        let _ = write_private_listen_json(
-                            &dir.join("webui-listen.json"),
-                            body.as_bytes(),
+                        let _ = save_webui_listen_pref(
+                            Some(&launch.host),
+                            probe_port,
+                            Some(&launch.token),
                         );
                     }
                     if let Some(slot) = app.try_state::<ChildSlot>() {
@@ -1505,11 +1394,7 @@ fn generate_csprng_token() -> String {
 
 fn mint_desktop_token(host: &str, port: u16) -> String {
     let token = generate_csprng_token();
-    let dir = jeikcode_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let body =
-        format!("{{\n  \"host\": \"{host}\",\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
-    let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
+    let _ = save_webui_listen_pref(Some(host), port, Some(&token));
     token
 }
 
@@ -1544,7 +1429,8 @@ fn resolve_desktop_cli(bundled: Option<&Path>) -> PathBuf {
 
 #[cfg(windows)]
 fn cleanup_legacy_dropper_install() {
-    let local_bin = home_dir().join(".local").join("bin");
+    let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let local_bin = home.join(".local").join("bin");
     if let Ok(entries) = std::fs::read_dir(&local_bin) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1658,7 +1544,8 @@ fn broadcast_env_change() {
 
 #[cfg(not(windows))]
 fn cleanup_legacy_dropper_install() {
-    let legacy_bin = home_dir().join(".local").join("bin").join("jeikcode");
+    let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let legacy_bin = home.join(".local").join("bin").join("jeikcode");
     if legacy_bin.is_file() {
         // 如果是孤儿残留且非当前运行程序，移除避免旧版本优先命中
         let _ = std::fs::remove_file(&legacy_bin);
@@ -1671,61 +1558,6 @@ fn cli_file_name() -> &'static str {
     } else {
         "jeikcode"
     }
-}
-
-const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
-const WEBUI_DEFAULT_PORT: u16 = 13457;
-
-/// `~/.jeikcode/webui-listen.json` written by the remote-access panel.
-/// Defaults to 127.0.0.1 and port 13457; supports user customized host (e.g. 0.0.0.0).
-fn saved_webui_listen() -> (String, u16, Option<String>) {
-    let path = jeikcode_dir().join("webui-listen.json");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (DEFAULT_LISTEN_HOST.to_string(), WEBUI_DEFAULT_PORT, None);
-    };
-    parse_webui_listen(&text)
-}
-
-fn parse_webui_listen(text: &str) -> (String, u16, Option<String>) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return (DEFAULT_LISTEN_HOST.to_string(), WEBUI_DEFAULT_PORT, None);
-    };
-    let host = value
-        .get("host")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_LISTEN_HOST.to_string());
-    let port = value
-        .get("port")
-        .and_then(|item| item.as_u64())
-        .and_then(|item| u16::try_from(item).ok())
-        .filter(|item| *item != 0)
-        .unwrap_or(WEBUI_DEFAULT_PORT);
-    let token = value
-        .get("token")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string);
-    (host, port, token)
-}
-
-fn jeikcode_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("JEIKCODE_HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
-        }
-    }
-    home_dir().join(".jeikcode")
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn set_executable(path: &Path) {
@@ -1751,11 +1583,15 @@ fn suppress_console(_cmd: &mut Command) {}
 mod tests {
     use std::sync::Mutex;
 
+    use jeikcode_config::desktop_shared::{
+        is_valid_close_action, parse_webui_listen, save_close_action_at,
+    };
+
     use super::{
         external_browser_url, extract_webui_url, generate_csprng_token, host_window_away,
-        is_authorized_shell_action_url, is_valid_close_action, navigation_action,
-        new_window_action, parse_webui_listen, remember_webui_origin, resolve_desktop_cli,
-        window_url, write_desktop_close_action_to, LinkAction, WebuiOrigin,
+        is_authorized_shell_action_url, navigation_action, new_window_action,
+        remember_webui_origin, resolve_desktop_cli, tray_texts_for_locale, window_url, LinkAction,
+        Locale, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -1977,19 +1813,29 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let settings = tmp_dir.join("desktop-settings.json");
 
-        write_desktop_close_action_to(&settings, "tray").unwrap();
+        save_close_action_at(&settings, "tray").unwrap();
         assert!(settings.read_to_string_lossy_test().contains("\"tray\""));
 
-        write_desktop_close_action_to(&settings, "quit").unwrap();
+        save_close_action_at(&settings, "quit").unwrap();
         let bak = tmp_dir.join("desktop-settings.json.bak");
         assert!(bak.is_file());
         assert!(std::fs::read_to_string(&bak).unwrap().contains("\"tray\""));
         assert!(std::fs::read_to_string(&settings)
             .unwrap()
             .contains("\"quit\""));
-        assert!(write_desktop_close_action_to(&settings, "bogus").is_err());
+        assert!(save_close_action_at(&settings, "bogus").is_err());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn tray_texts_cover_all_eleven_locales() {
+        for &loc in Locale::ALL {
+            let texts = tray_texts_for_locale(loc);
+            assert!(!texts.tooltip.is_empty());
+            assert!(!texts.show_window.is_empty());
+            assert!(!texts.quit.is_empty());
+        }
     }
 
     trait ReadToStringTest {

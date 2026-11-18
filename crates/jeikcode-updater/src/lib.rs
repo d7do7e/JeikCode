@@ -1008,44 +1008,17 @@ pub async fn run_upgrade_for_channel(
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
 
+pub use jeikcode_config::desktop_shared::{
+    DESKTOP_ENV, DESKTOP_MANAGED_ENV, DESKTOP_PID_ENV, RESTARTED_ENV, RESTART_EXACT_PORT_ENV,
+    RESTART_LISTEN_HOST_ENV, RESTART_LISTEN_PORT_ENV, RESTART_NO_TOKEN_ENV,
+    RESTART_REQUESTED_EXIT_CODE, RESTART_TOKEN_ENV,
+};
+
 /// Child waits for this parent pid to exit before binding the listen port.
 pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
 
 /// Old listen port of the predecessor process being replaced (used to wait for socket release).
 pub const RESTART_WAIT_PORT_ENV: &str = "JEIKCODE_RESTART_WAIT_PORT";
-
-/// Target listen host of the replacement process.
-pub const RESTART_LISTEN_HOST_ENV: &str = "JEIKCODE_RESTART_LISTEN_HOST";
-
-/// Actual listen port of the process that is being replaced.
-/// argv `--port` can still be the first choice from before a cold-start scan.
-pub const RESTART_LISTEN_PORT_ENV: &str = "JEIKCODE_RESTART_LISTEN_PORT";
-
-/// Successor must bind [`RESTART_LISTEN_PORT_ENV`] and must not scan or
-/// shut down any other jeikcode on a neighboring port.
-pub const RESTART_EXACT_PORT_ENV: &str = "JEIKCODE_RESTART_EXACT_PORT";
-
-/// Token the browser already stored. Set only when argv has no `--token`.
-pub const RESTART_TOKEN_ENV: &str = "JEIKCODE_RESTART_TOKEN";
-
-/// Explicit no-token mode indicator across restarts (`"1"` or `"0"`).
-pub const RESTART_NO_TOKEN_ENV: &str = "JEIKCODE_RESTART_NO_TOKEN";
-
-/// Marks that the current process is a restarted successor so interactive setup wizards are skipped.
-pub const RESTARTED_ENV: &str = "JEIKCODE_RESTARTED";
-
-/// Indicates the daemon/webui is directly supervised by `jeikcode-desktop`,
-/// which will immediately respawn the process upon exit.
-pub const DESKTOP_MANAGED_ENV: &str = "JEIKCODE_DESKTOP_MANAGED";
-
-/// PID of the supervising `jeikcode-desktop` process.
-pub const DESKTOP_PID_ENV: &str = "JEIKCODE_DESKTOP_PID";
-
-/// Dedicated exit code used by a desktop-managed child to signal an intentional
-/// restart (e.g. after self-upgrade or remote-access port/host/token change).
-/// Distinguishes intentional restarts from normal termination (`0`) or crashes,
-/// eliminating unconditional respawn loops in the desktop supervisor.
-pub const RESTART_REQUESTED_EXIT_CODE: i32 = 75;
 
 pub fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]

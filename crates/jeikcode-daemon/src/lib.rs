@@ -7028,7 +7028,7 @@ fn authorities_match(origin_authority: &str, origin_scheme: &str, host_hdr: &str
 
 fn is_loopback_authority(authority: &str) -> bool {
     let (host, _) = split_authority_host_port(authority, 80);
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    jeikcode_config::desktop_shared::is_loopback_host(host)
 }
 
 /// Whether this client can receive interactive approval prompts.
@@ -20934,7 +20934,7 @@ pub fn primary_lan_ipv6() -> Option<String> {
 /// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
 /// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
-pub const WEBUI_DEFAULT_PORT: u16 = 13457;
+pub use jeikcode_config::desktop_shared::WEBUI_DEFAULT_PORT;
 
 fn startup_webui_token(
     tokens: &auth_token::WebuiTokenStore,

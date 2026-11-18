@@ -14,7 +14,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::HashSet;
-use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -114,17 +113,7 @@ impl WebuiTokenStore {
 }
 
 pub(crate) fn is_loopback_bind_host(host: &str) -> bool {
-    let host = host.trim();
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
-    literal
-        .parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
+    jeikcode_config::desktop_shared::is_loopback_host(host)
 }
 
 /// Resolve authentication for the standalone daemon entrypoints.

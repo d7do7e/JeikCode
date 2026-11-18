@@ -146,7 +146,7 @@ fn resolve_serve_workdir(dir: Option<PathBuf>) -> Result<PathBuf, String> {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    jeikcode_config::desktop_shared::is_loopback_host(host)
 }
 
 /// Print serve listen / client / attach hints.
@@ -784,31 +784,8 @@ fn scan_argv_for_lang() -> Option<String> {
     None
 }
 
-/// Scan the config file (default path only) for the `language` field.
-/// Returns `None` if the config file does not exist, cannot be parsed, or
-/// has no `language` key. This is a lightweight pre-parse -- the full config
-/// is loaded later in `run()` after clap has parsed CLI flags.
 fn scan_config_language() -> Option<jeikcode_tuix::i18n::Locale> {
-    let path = jeikcode_config::config::Config::default_path();
-    if !path.exists() {
-        return None;
-    }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    if let Ok(val) = toml::from_str::<toml::Value>(&content) {
-        if let Some(lang_val) = val.get("language") {
-            if let Ok(loc) = lang_val.clone().try_into::<jeikcode_tuix::i18n::Locale>() {
-                return Some(loc);
-            }
-        }
-    }
-    let cfg: jeikcode_config::config::Config = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    cfg.language
+    jeikcode_config::i18n::read_config_language_at(&jeikcode_config::config::Config::default_path())
 }
 
 /// Build the top-level clap Command with i18n-localised about and help text.
@@ -4845,22 +4822,26 @@ fn handle_upgrade_reset() -> Result<()> {
 }
 
 fn notify_daemon_config_reload() {
-    let listen_file = jeikcode_config::Config::config_dir().join("webui-listen.json");
-    if let Ok(text) = std::fs::read_to_string(&listen_file) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            let port = val.get("port").and_then(|p| p.as_u64()).unwrap_or(13456);
-            let token = val.get("token").and_then(|t| t.as_str()).unwrap_or("");
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_millis(600))
-                .build();
-            if let Ok(client) = client {
-                let mut req = client.post(format!("http://127.0.0.1:{port}/config/reload"));
-                if !token.is_empty() {
-                    req = req.header("authorization", format!("Bearer {token}"));
-                }
-                let _ = req.send();
-            }
+    use jeikcode_config::desktop_shared::{
+        load_webui_listen_pref_at, webui_listen_path, WEBUI_DEFAULT_PORT,
+    };
+    let Some(pref) = load_webui_listen_pref_at(&webui_listen_path()) else {
+        return;
+    };
+    let port = if pref.port == 0 {
+        WEBUI_DEFAULT_PORT
+    } else {
+        pref.port
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(600))
+        .build();
+    if let Ok(client) = client {
+        let mut req = client.post(format!("http://127.0.0.1:{port}/config/reload"));
+        if let Some(token) = pref.token.as_deref() {
+            req = req.header("authorization", format!("Bearer {token}"));
         }
+        let _ = req.send();
     }
 }
 

@@ -322,6 +322,75 @@ pub fn resolve_initial_locale_with_sources(
     Locale::En
 }
 
+/// Read `language` cleanly from a `config.toml` file (tolerant of partial/legacy files).
+pub fn read_config_language_at(path: &std::path::Path) -> Option<Locale> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if let Ok(val) = toml::from_str::<toml::Value>(&content) {
+        if let Some(lang_val) = val.get("language") {
+            if let Ok(loc) = lang_val.clone().try_into::<Locale>() {
+                return Some(loc);
+            }
+        }
+    }
+    toml::from_str::<crate::config::Config>(&content)
+        .ok()
+        .and_then(|cfg| cfg.language)
+}
+
+/// Resolve UI locale using optional CLI flag, disk `config.toml`, env vars
+/// (`JEIKCODE_LANGUAGE`, `JEIKCODE_LANG`, `LC_ALL`, `LC_MESSAGES`, `LANG`), and OS locale.
+pub fn resolve_locale_from_disk(cli_lang: Option<&str>) -> Locale {
+    resolve_locale_from_disk_at(&crate::config::Config::default_path(), cli_lang)
+}
+
+pub fn resolve_locale_from_disk_at(
+    config_path: &std::path::Path,
+    cli_lang: Option<&str>,
+) -> Locale {
+    resolve_locale_from_disk_with_sources(
+        config_path,
+        cli_lang,
+        &|k| std::env::var(k).ok(),
+        &get_native_os_locale,
+    )
+}
+
+#[doc(hidden)]
+pub fn resolve_locale_from_disk_with_sources(
+    config_path: &std::path::Path,
+    cli_lang: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    native_os: &dyn Fn() -> Option<String>,
+) -> Locale {
+    if let Some(s) = cli_lang {
+        if let Ok(loc) = s.parse::<Locale>() {
+            return loc;
+        }
+    }
+    if let Some(loc) = read_config_language_at(config_path) {
+        return loc;
+    }
+    for key in [
+        "JEIKCODE_LANGUAGE",
+        "JEIKCODE_LANG",
+        "LC_ALL",
+        "LC_MESSAGES",
+        "LANG",
+    ] {
+        if let Some(val) = env(key) {
+            if !val.trim().is_empty() {
+                return classify_env_locale(&val);
+            }
+        }
+    }
+    if let Some(os_locale) = native_os() {
+        if !os_locale.trim().is_empty() {
+            return classify_env_locale(&os_locale);
+        }
+    }
+    Locale::En
+}
+
 #[cfg(windows)]
 fn get_native_os_locale() -> Option<String> {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -1058,5 +1127,37 @@ mod tests {
             Msg::ProviderPanelUpstreamFailed { error: "HTTP 401" }
         )
         .contains("401"));
+    }
+
+    #[test]
+    fn resolve_locale_from_disk_handles_toml_and_jeikcode_env_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "language = \"zh-CN\" # inline comment\n[coding]\n").unwrap();
+
+        let no_env = |_: &str| None;
+        let no_os = || None;
+        assert_eq!(
+            resolve_locale_from_disk_with_sources(&cfg, None, &no_env, &no_os),
+            Locale::ZhCn
+        );
+        // Invalid CLI flag falls back to disk config, then env.
+        assert_eq!(
+            resolve_locale_from_disk_with_sources(&cfg, Some("invalid-loc"), &no_env, &no_os),
+            Locale::ZhCn
+        );
+
+        let missing = dir.path().join("missing.toml");
+        let jeik_env = |k: &str| {
+            if k == "JEIKCODE_LANGUAGE" {
+                Some("ja_JP.UTF-8".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            resolve_locale_from_disk_with_sources(&missing, Some("bogus"), &jeik_env, &no_os),
+            Locale::Ja
+        );
     }
 }
