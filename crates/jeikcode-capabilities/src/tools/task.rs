@@ -376,13 +376,15 @@ impl ToolMiddleware for WorkerScopeGate {
 }
 
 /// The middleware stack for a subagent child: sensitive-path guard for everyone,
-/// air-gap offline network shielding, plus `WorkerScopeGate` for `worker` and
-/// `VerifierReadOnlyShellGuard` for `verifier`.
+/// air-gap offline network shielding, shared `ArtifactMiddleware` (when an
+/// `ArtifactStore` is mounted, across ALL roles — Explore, Verifier, Worker),
+/// plus `WorkerScopeGate` for `worker` and `VerifierReadOnlyShellGuard` for `verifier`.
 fn child_middlewares(
     role: SubagentRole,
     scope: &[String],
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    artifact_store: Option<Arc<ArtifactStore>>,
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
         Arc::new(DenySensitivePaths::new(working_dir)),
@@ -397,6 +399,9 @@ fn child_middlewares(
             mw.push(Arc::new(VerifierReadOnlyShellGuard));
         }
         SubagentRole::Explore => {}
+    }
+    if let Some(store) = artifact_store {
+        mw.push(Arc::new(super::ArtifactMiddleware::new(store)));
     }
     mw
 }
@@ -914,7 +919,10 @@ impl Tool for TaskTool {
 
             if run_bg {
                 let task_id = self.store.mint_task_id();
-                let child_cancel = self.store.child_cancel_token();
+                // Bind background subagents to the session-scoped cancel token (cancelled
+                // on session switch via `bind_session`, store drop/teardown, or explicit
+                // `task_output(cancel=true)` — NOT coupled to single-turn `ctx.cancel`).
+                let child_cancel = self.store.session_cancel_token();
                 let hook_cancel = child_cancel.clone();
                 let bg_handle = self.store.register_background(
                     task_id.clone(),
@@ -925,18 +933,6 @@ impl Tool for TaskTool {
                     model.clone(),
                     child_cancel.clone(),
                 );
-                let parent_cancel = ctx.cancel.clone();
-                let watcher_cancel = child_cancel.clone();
-                let mut watcher_rx = bg_handle.subscribe();
-                tokio::spawn(async move {
-                    if watcher_rx.borrow().is_some() {
-                        return;
-                    }
-                    tokio::select! {
-                        _ = parent_cancel.cancelled() => watcher_cancel.cancel(),
-                        _ = watcher_rx.changed() => {}
-                    }
-                });
                 ctx.progress.emit(subtask_progress_line(
                     &format!("\u{21bb} bg {label} [{task_id}]"),
                     &model,
@@ -985,6 +981,7 @@ impl Tool for TaskTool {
                         role,
                         &scope,
                         &inherited_worker_middlewares,
+                        artifact_store.clone(),
                         prompt,
                     )
                     .await;
@@ -1082,6 +1079,7 @@ impl Tool for TaskTool {
                     role,
                     &scope,
                     &inherited_worker_middlewares,
+                    artifact_store.clone(),
                     prompt,
                 )
                 .await;
@@ -1160,6 +1158,7 @@ async fn spawn_and_run_child(
     role: SubagentRole,
     scope: &[String],
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    artifact_store: Option<Arc<ArtifactStore>>,
     prompt: String,
 ) -> (Outcome, Option<SessionSnapshot>) {
     let mut builder = Agent::builder()
@@ -1167,6 +1166,7 @@ async fn spawn_and_run_child(
         .tools(tools)
         .working_dir(wd.clone())
         .cancel_token(child_cancel)
+        .graceful_final_synthesis(true)
         .hook(progress_hook.clone());
     if let Some(ctx) = inherited_context {
         builder = builder.hook(Arc::new(
@@ -1184,7 +1184,13 @@ async fn spawn_and_run_child(
     if let Some(max_rounds) = max_rounds {
         builder = builder.max_rounds(max_rounds);
     }
-    for mw in child_middlewares(role, scope, &wd, inherited_worker_middlewares) {
+    for mw in child_middlewares(
+        role,
+        scope,
+        &wd,
+        inherited_worker_middlewares,
+        artifact_store,
+    ) {
         builder = builder.middleware(mw);
     }
     let child = builder.build();
@@ -1228,7 +1234,9 @@ fn render_subtask_outcome(
     artifact_store: Option<&ArtifactStore>,
     telemetry: Option<SubtaskTelemetry>,
 ) -> (String, bool) {
-    let is_err = outcome.stop != StopReason::Stopped;
+    let synthesized_partial =
+        outcome.stop == StopReason::MaxRounds && !outcome.text.trim().is_empty();
+    let is_err = outcome.stop != StopReason::Stopped && !synthesized_partial;
     let produced = if !outcome.text.is_empty() {
         outcome.text
     } else {
@@ -1245,7 +1253,12 @@ fn render_subtask_outcome(
     } else {
         ledger.render_explore_receipt()
     };
-    let (state, tag, body) = if is_err {
+    let (state, tag, partial_attr, body) = if synthesized_partial {
+        let b = format!(
+            "{receipt}\n[Note: subagent reached max_rounds; final tool-less synthesis below]\n{produced}"
+        );
+        ("completed", "task_result", Some("max_rounds_synthesis"), b)
+    } else if is_err {
         let mut b = format!("{receipt}\nsubagent stopped early ({:?})", outcome.stop);
         if let Some(e) = &outcome.error {
             b.push_str(&format!(": {e}"));
@@ -1265,18 +1278,26 @@ fn render_subtask_outcome(
         if !produced.is_empty() {
             b.push_str(&format!("\n--- partial output ---\n{produced}"));
         }
-        ("error", "task_error", b)
+        ("error", "task_error", None, b)
     } else {
         let b = if produced.trim().is_empty() {
             receipt
         } else {
             format!("{receipt}\n{produced}")
         };
-        ("completed", "task_result", b)
+        ("completed", "task_result", None, b)
     };
     (
-        render_task_block_with_telemetry(
-            label, agent_id, desc, model, state, tag, &body, telemetry,
+        render_task_block_with_telemetry_and_partial(
+            label,
+            agent_id,
+            desc,
+            model,
+            state,
+            tag,
+            &body,
+            telemetry,
+            partial_attr,
         ),
         is_err,
     )
@@ -2229,6 +2250,23 @@ fn render_task_block_with_telemetry(
     body: &str,
     telemetry: Option<SubtaskTelemetry>,
 ) -> String {
+    render_task_block_with_telemetry_and_partial(
+        id, agent_id, summary, model, state, tag, body, telemetry, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_task_block_with_telemetry_and_partial(
+    id: &str,
+    agent_id: &str,
+    summary: &str,
+    model: &str,
+    state: &str,
+    tag: &str,
+    body: &str,
+    telemetry: Option<SubtaskTelemetry>,
+    partial: Option<&str>,
+) -> String {
     let telem_attrs = match telemetry {
         Some(t) => format!(
             " rounds=\"{}\" duration_ms=\"{}\" input_tokens=\"{}\" cached_tokens=\"{}\" output_tokens=\"{}\"",
@@ -2236,8 +2274,12 @@ fn render_task_block_with_telemetry(
         ),
         None => String::new(),
     };
+    let partial_attr = match partial {
+        Some(p) => format!(" partial=\"{p}\""),
+        None => String::new(),
+    };
     format!(
-        "<task id=\"{id}\" agent_id=\"{agent_id}\" model=\"{model}\"{telem_attrs} state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
+        "<task id=\"{id}\" agent_id=\"{agent_id}\" model=\"{model}\"{telem_attrs}{partial_attr} state=\"{state}\">\n<summary>{summary}</summary>\n<{tag}>\n{body}\n</{tag}>\n</task>"
     )
 }
 
@@ -2999,7 +3041,7 @@ mod tests {
         use std::path::Path;
         let base = 2; // DenySensitivePaths + DenyOfflineNetwork.
         assert_eq!(
-            child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &[]).len(),
+            child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &[], None).len(),
             base
         );
         assert_eq!(
@@ -3007,19 +3049,27 @@ mod tests {
                 SubagentRole::Worker,
                 &["src/**".into()],
                 Path::new("/w"),
-                &[]
+                &[],
+                None,
             )
             .len(),
             base + 1
         );
         assert_eq!(
-            child_middlewares(SubagentRole::Verifier, &[], Path::new("/w"), &[]).len(),
+            child_middlewares(SubagentRole::Verifier, &[], Path::new("/w"), &[], None).len(),
             base + 1,
             "verifier receives VerifierReadOnlyShellGuard"
         );
         let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths::default())];
         assert_eq!(
-            child_middlewares(SubagentRole::Explore, &[], Path::new("/w"), &inherited).len(),
+            child_middlewares(
+                SubagentRole::Explore,
+                &[],
+                Path::new("/w"),
+                &inherited,
+                None
+            )
+            .len(),
             base,
             "read-only explore children do not need worker execution policy"
         );
@@ -3029,10 +3079,47 @@ mod tests {
                 &["src/**".into()],
                 Path::new("/w"),
                 &inherited,
+                None,
             )
             .len(),
             base + 2,
             "worker receives inherited policy plus its scope gate"
+        );
+        // ArtifactMiddleware mounts across ALL child roles (Explore, Verifier, Worker).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::tools::ArtifactStore::new(dir.path()));
+        assert_eq!(
+            child_middlewares(
+                SubagentRole::Explore,
+                &[],
+                Path::new("/w"),
+                &[],
+                Some(store.clone()),
+            )
+            .len(),
+            base + 1
+        );
+        assert_eq!(
+            child_middlewares(
+                SubagentRole::Verifier,
+                &[],
+                Path::new("/w"),
+                &[],
+                Some(store.clone()),
+            )
+            .len(),
+            base + 2
+        );
+        assert_eq!(
+            child_middlewares(
+                SubagentRole::Worker,
+                &["src/**".into()],
+                Path::new("/w"),
+                &[],
+                Some(store),
+            )
+            .len(),
+            base + 2
         );
     }
 

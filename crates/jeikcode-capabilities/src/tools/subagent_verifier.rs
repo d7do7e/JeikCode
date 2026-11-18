@@ -710,6 +710,7 @@ pub async fn run_blind_verifier_with_context(
         .persona(persona)
         .working_dir(working_dir.clone())
         .cancel_token(cancel)
+        .graceful_final_synthesis(true)
         .tool_loop_policy(ToolLoopPolicy::default())
         .middleware(Arc::new(DenySensitivePaths::new(working_dir)))
         .middleware(Arc::new(DenyOfflineNetwork))
@@ -728,7 +729,9 @@ pub async fn run_blind_verifier_with_context(
             .await
             .map_err(|e| format!("blind verifier task failed: {e}"))?;
 
-    if outcome.stop != StopReason::Stopped {
+    if outcome.stop != StopReason::Stopped
+        && !(outcome.stop == StopReason::MaxRounds && !outcome.text.trim().is_empty())
+    {
         let err_detail = outcome
             .error
             .unwrap_or_else(|| format!("stopped with {:?}", outcome.stop));

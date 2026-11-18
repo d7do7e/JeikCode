@@ -134,6 +134,13 @@ pub enum AgentCommand {
     Compact {
         focus: Option<String>,
     },
+    /// Reset conversation history back to the frozen static prefix (system blocks +
+    /// leading frozen synthetic-user blocks), refresh session-start hooks such as
+    /// `<memory>`, bump `cache_epoch`, and optionally seed a bounded handoff summary
+    /// for fresh-context autonomous `/goal --fresh-epoch` rollovers.
+    ResetToFreshEpoch {
+        handoff_summary: String,
+    },
     Cancel,
     /// 取消当前运行中回合已排队但尚未并入模型的转向消息（steer）。
     CancelSteer {

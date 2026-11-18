@@ -1297,6 +1297,8 @@ pub struct Agent {
     keep_interrupted_context: bool,
     /// See `AgentBuilder::round_cap_checkpoint`.
     round_cap_checkpoint: bool,
+    /// See `AgentBuilder::graceful_final_synthesis`.
+    graceful_final_synthesis: bool,
 }
 
 impl Agent {
@@ -1367,6 +1369,7 @@ impl Agent {
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
             round_cap_checkpoint: self.round_cap_checkpoint,
+            graceful_final_synthesis: self.graceful_final_synthesis,
         };
         let session_scope = running.session_id.clone();
         let task = tokio::spawn(crate::tool::with_session_scope(
@@ -1492,6 +1495,8 @@ struct RunningAgent {
     keep_interrupted_context: bool,
     /// See `AgentBuilder::round_cap_checkpoint`.
     round_cap_checkpoint: bool,
+    /// See `AgentBuilder::graceful_final_synthesis`.
+    graceful_final_synthesis: bool,
 }
 
 impl RunningAgent {
@@ -1624,6 +1629,50 @@ impl RunningAgent {
     /// is confined to an inner block that ends BEFORE the `&mut convo.apply_plan`
     /// call — so the strategy may await without holding a borrow across the mutable
     /// apply.
+    /// Reset conversation history to its leading frozen prefix (system blocks +
+    /// leading frozen synthetic-user blocks), refresh `session_start` hooks (such as
+    /// `<memory>`), bump `cache_epoch`, and seed a bounded fresh-epoch handoff note.
+    async fn reset_to_fresh_epoch(&self, convo: &mut Conversation, handoff_summary: String) {
+        let len_before = convo.messages.len();
+        let bytes_before: usize = convo.messages.iter().map(|m| m.text.len()).sum();
+        let prefix_len = convo
+            .messages
+            .iter()
+            .take_while(|m| {
+                m.role == crate::message::Role::System
+                    || (m.role == crate::message::Role::User
+                        && m.synthetic
+                        && !m.is_compaction_turn_start()
+                        && !m.text.trim_start().starts_with("<!-- jeikcode:anchor"))
+            })
+            .count();
+        convo.messages.truncate(prefix_len);
+        self.hooks.session_start(convo, true).await;
+        let handoff = handoff_summary.trim();
+        if !handoff.is_empty() {
+            convo.push(Message::synthetic_user(handoff.to_string()));
+        }
+        convo.cache_epoch = convo.cache_epoch.saturating_add(1);
+        let bytes_after: usize = convo.messages.iter().map(|m| m.text.len()).sum();
+        let removed = len_before.saturating_sub(convo.messages.len());
+        let trigger = CompactTrigger::Manual {
+            focus: Some("fresh-epoch".to_string()),
+        };
+        let snapshot = self.capture_snapshot(convo);
+        if let Some(checkpoint) = &self.compaction_checkpoint {
+            let _ = checkpoint.save(&snapshot);
+        }
+        self.rt.emit(AgentEvent::Compacted {
+            trigger,
+            epoch: convo.cache_epoch,
+            removed,
+            bytes_before,
+            bytes_after,
+            committed: true,
+            snapshot: Some(snapshot),
+        });
+    }
+
     async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
@@ -1862,6 +1911,9 @@ impl RunningAgent {
                 AgentCommand::Compact { focus } => {
                     self.run_compaction(&mut convo, CompactTrigger::Manual { focus })
                         .await;
+                }
+                AgentCommand::ResetToFreshEpoch { handoff_summary } => {
+                    self.reset_to_fresh_epoch(&mut convo, handoff_summary).await;
                 }
                 AgentCommand::SendMessage { text, images } => {
                     let shutdown = self
@@ -2190,7 +2242,10 @@ impl RunningAgent {
                     // boundary via the drain loop — the documented cache-safe trigger
                     // point — instead of silently vanishing (a TUI user's /compact
                     // during streaming must eventually happen).
-                    Some(c @ AgentCommand::Compact { .. }) => {
+                    Some(
+                        c @ (AgentCommand::Compact { .. }
+                        | AgentCommand::ResetToFreshEpoch { .. }),
+                    ) => {
                         pending.push_back(c);
                     }
                     None => { shutdown = true; break; }
@@ -2334,6 +2389,9 @@ impl RunningAgent {
                 AgentCommand::Compact { focus } => {
                     self.run_compaction(convo, CompactTrigger::Manual { focus })
                         .await;
+                }
+                AgentCommand::ResetToFreshEpoch { handoff_summary } => {
+                    self.reset_to_fresh_epoch(convo, handoff_summary).await;
                 }
                 AgentCommand::CancelSteer { text, message_id } => {
                     if let Some(id) = message_id.as_deref() {
@@ -2635,6 +2693,9 @@ impl RunningAgent {
         // Re-armable round cap: on each checkpoint "continue" this grows by the base
         // `max_rounds`, giving a CONSTANT interval between confirmations.
         let mut round_cap = self.max_rounds;
+        // One-shot tool-less final synthesis pass when `graceful_final_synthesis` is enabled.
+        let mut in_final_synthesis = false;
+        let mut synthesis_used = false;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -2656,10 +2717,19 @@ impl RunningAgent {
                 used_tokens,
             };
             // Hard cap (safety fuse). With `round_cap_checkpoint`, this becomes an
-            // interactive checkpoint instead of a hard error.
+            // interactive checkpoint instead of a hard error. With `graceful_final_synthesis`,
+            // run 1 final `ToolChoice::None` synthesis round (keeping tools mounted so
+            // prior tool_use history stays wire-valid) before stopping with `StopReason::MaxRounds`.
             if let Some(cap) = round_cap {
                 if round > cap {
-                    if self.round_cap_checkpoint {
+                    if self.graceful_final_synthesis && !synthesis_used && !cancel.is_cancelled() {
+                        synthesis_used = true;
+                        in_final_synthesis = true;
+                        convo.push(Message::synthetic_user(
+                            "Round budget reached. Do NOT call any tools — immediately output your complete final synthesis, findings, or verdict from the evidence already gathered."
+                                .to_string(),
+                        ));
+                    } else if self.round_cap_checkpoint {
                         let resp = self
                             .rt
                             .request(
@@ -2987,6 +3057,9 @@ impl RunningAgent {
                 ));
             }
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
+            if in_final_synthesis {
+                request_options.tool_choice = crate::provider::ToolChoice::None;
+            }
             self.hooks
                 .pre_request_options(&messages, &mut request_options, &turn_ctx)
                 .await;
@@ -3749,6 +3822,18 @@ impl RunningAgent {
             // response, never empty. The two retry tiers in the `match opened` above
             // never catch this: an empty 200 OPENS successfully (`Ok`), so it is
             // neither a retryable `Err` nor a context overflow.
+            if in_final_synthesis && assistant_text.trim().is_empty() {
+                let cap = round_cap.unwrap_or(round.saturating_sub(1));
+                self.rt.emit(AgentEvent::Error {
+                    message: format!("max rounds ({cap}) reached"),
+                    http_status: None,
+                    code: None,
+                });
+                Self::persist_turn_diagnostic(convo, &format!("max rounds ({cap}) reached"));
+                self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                    .await;
+                return;
+            }
             let cleaned_reasoning = strip_reasoning_filler(&reasoning);
             let filler_only_reasoning = saw_stream_content
                 && assistant_text.trim().is_empty()
@@ -3905,6 +3990,11 @@ impl RunningAgent {
                 finish_reason,
             };
             let current_internal_continuation = active_internal_continuation.take();
+            // During the final tool-less synthesis pass, discard any stray tool_calls so
+            // we never execute additional tools or leave dangling tool_use blocks in history.
+            if in_final_synthesis {
+                pending_calls.clear();
+            }
             let mut assistant_msg =
                 Message::assistant(assistant_text.clone(), pending_calls.clone());
             if matches!(
@@ -3951,6 +4041,11 @@ impl RunningAgent {
             // From the next boundary on, parked steers fold normally.
             initial_prompt_round = false;
             self.hooks.on_turn_progress(convo).await;
+            if in_final_synthesis {
+                self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                    .await;
+                return;
+            }
             if pending_calls.is_empty() {
                 // Exact-loop evidence is consecutive across tool rounds only. A
                 // no-tool assistant reply is an observable break in that sequence,
@@ -4889,6 +4984,10 @@ pub struct AgentBuilder {
     /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
     /// never park). Only a driver that renders the checkpoint sets this true.
     round_cap_checkpoint: bool,
+    /// When true, hitting `max_rounds` runs one final `ToolChoice::None` synthesis round
+    /// (keeping `tools` mounted for wire compatibility) before stopping with
+    /// `StopReason::MaxRounds` so subagents do not discard gathered findings. Default `false`.
+    graceful_final_synthesis: bool,
 }
 
 impl Default for AgentBuilder {
@@ -4943,6 +5042,7 @@ impl Default for AgentBuilder {
             // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
             keep_interrupted_context: false,
             round_cap_checkpoint: false,
+            graceful_final_synthesis: false,
         }
     }
 }
@@ -4994,6 +5094,11 @@ impl AgentBuilder {
     /// See `AgentBuilder.round_cap_checkpoint`. Default false.
     pub fn round_cap_checkpoint(mut self, on: bool) -> Self {
         self.round_cap_checkpoint = on;
+        self
+    }
+    /// See `AgentBuilder.graceful_final_synthesis`. Default false.
+    pub fn graceful_final_synthesis(mut self, on: bool) -> Self {
+        self.graceful_final_synthesis = on;
         self
     }
     /// Enable conservative exact tool-loop detection for this live session.
@@ -5243,6 +5348,7 @@ impl AgentBuilder {
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
             round_cap_checkpoint: self.round_cap_checkpoint,
+            graceful_final_synthesis: self.graceful_final_synthesis,
         }
     }
 }

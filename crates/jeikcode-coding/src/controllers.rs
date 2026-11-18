@@ -63,6 +63,8 @@ pub struct GoalProgress {
     pub round: u32,
     pub max_rounds: Option<u32>,
     pub elapsed_secs: u64,
+    pub tokens_used: u64,
+    pub max_tokens: Option<u64>,
     pub condition: String,
     pub last_reason: Option<String>,
 }
@@ -116,6 +118,7 @@ pub(crate) struct GoalState {
     started_at: Instant,
     pub last_reason: Option<String>,
     pub tokens_used: u64,
+    pub max_tokens: Option<u64>,
     pub max_rounds: Option<u32>,
     deadline: Option<Instant>,
     pub unproductive: u32,
@@ -158,6 +161,7 @@ impl GoalState {
         max_duration_secs: u64,
         options: GoalOptions,
     ) -> Self {
+        let max_tokens = options.max_tokens;
         let started_at = Instant::now();
         Self {
             id,
@@ -169,6 +173,7 @@ impl GoalState {
             started_at,
             last_reason: None,
             tokens_used: 0,
+            max_tokens,
             max_rounds: (max_rounds != 0).then_some(max_rounds),
             deadline: (max_duration_secs != 0)
                 .then(|| started_at + Duration::from_secs(max_duration_secs)),
@@ -198,9 +203,21 @@ impl GoalState {
             round: self.total_rounds.max(self.round),
             max_rounds: self.max_rounds,
             elapsed_secs: self.started_at.elapsed().as_secs(),
+            tokens_used: self.tokens_used,
+            max_tokens: self.max_tokens,
             condition: self.condition.clone(),
             last_reason: self.last_reason.clone(),
         }
+    }
+
+    pub fn set_max_tokens_if_unset(&mut self, limit: Option<u64>) {
+        if self.max_tokens.is_none() {
+            self.max_tokens = limit.filter(|&n| n > 0);
+        }
+    }
+
+    pub fn progress_recap_str(&self) -> Option<&str> {
+        self.progress_recap.as_deref()
     }
 
     pub fn finish(&mut self, terminal: GoalTerminal, reason: impl Into<String>) {
@@ -345,6 +362,9 @@ impl GoalState {
         if !self.options.continuous && self.max_rounds.is_some_and(|max| self.round >= max) {
             return Some("round limit");
         }
+        if self.max_tokens.is_some_and(|max| self.tokens_used >= max) {
+            return Some("token limit");
+        }
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -392,6 +412,7 @@ pub fn goal_cap_stop_note(why: &str, max_rounds: Option<u32>) -> String {
             None => "已达轮数预算 · 继续对话即推进".to_string(),
         },
         "time limit" => "已达时间上限 · 继续对话即推进".to_string(),
+        "token limit" => "已达 Token 预算上限 · 继续对话即推进".to_string(),
         other => format!("已停止（{other}）· 继续对话即推进"),
     }
 }

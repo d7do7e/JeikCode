@@ -182,6 +182,9 @@ pub struct CodingAgentConfig {
     /// Goal-mode wall-clock cap in seconds (0 = unbounded). Override via
     /// `JEIKCODE_GOAL_MAX_DURATION_SECS`.
     pub goal_max_duration_secs: u64,
+    /// Optional cumulative prompt+completion token ceiling for `/goal` runs.
+    /// Override via `JEIKCODE_GOAL_MAX_TOKENS` or `/goal --max-tokens <N>`.
+    pub goal_max_tokens: Option<u64>,
     /// Self-paced `/loop` round cap. Default 100; the runtime overrides it from
     /// `[loop_config] max_rounds`. Env override `JEIKCODE_LOOP_MAX_ROUNDS`.
     pub loop_max_rounds: u32,
@@ -727,6 +730,12 @@ fn default_goal_max_rounds() -> u32 {
     // re-derives with the real limit after login via `derive_goal_max_rounds`.
     derive_goal_max_rounds(goal_max_rounds_env(), None)
 }
+fn default_goal_max_tokens() -> Option<u64> {
+    std::env::var("JEIKCODE_GOAL_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.trim().replace(['_', ','], "").parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
 fn default_turn_max_rounds() -> u32 {
     std::env::var("JEIKCODE_TURN_MAX_ROUNDS")
         .ok()
@@ -907,6 +916,7 @@ impl CodingAgentConfig {
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
+            goal_max_tokens: default_goal_max_tokens(),
             loop_max_rounds: default_loop_max_rounds(),
             chat_options: Default::default(),
             telemetry: None,
@@ -1455,6 +1465,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("tool_loop_policy", &self.tool_loop_policy)
             .field("goal_max_rounds", &self.goal_max_rounds)
             .field("goal_max_duration_secs", &self.goal_max_duration_secs)
+            .field("goal_max_tokens", &self.goal_max_tokens)
             .field("chat_options", &self.chat_options)
             .field("supports_vision", &self.supports_vision)
             .field("telemetry", &self.telemetry.is_some())

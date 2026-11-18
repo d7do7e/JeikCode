@@ -4,8 +4,13 @@
 //!    (`jeikcode_capabilities::tools::run_blind_verifier`)
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use futures::Stream;
 use jeikcode_capabilities::codeintel::{register_codeintel_tools_for_subagent, CodeIntelMode};
 use jeikcode_capabilities::session::instructions::render_project_instructions;
 use jeikcode_capabilities::tools::{
@@ -13,14 +18,115 @@ use jeikcode_capabilities::tools::{
     BashRuntimeState, InheritedSubagentContext,
 };
 use jeikcode_kernel::message::{Message, SessionSnapshot};
-use jeikcode_kernel::provider::LlmProvider;
-use jeikcode_kernel::tool::{MountedTools, ToolRegistry};
+use jeikcode_kernel::provider::{ChatOptions, LlmProvider};
+use jeikcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
+use jeikcode_kernel::tool::{MountedTools, ToolDef, ToolRegistry};
 use tokio_util::sync::CancellationToken;
+
+/// Lightweight provider wrapper that accumulates `StreamEvent::Usage` across every
+/// blind-verifier round so verifier token spend is folded into `EvalOutcome::usage`
+/// and enforced by `GoalState::tokens_used` / `goal_max_tokens` (#57).
+struct TokenMeteringProvider {
+    inner: Arc<dyn LlmProvider>,
+    totals: Arc<Mutex<TokenUsage>>,
+}
+
+impl TokenMeteringProvider {
+    fn new(inner: Arc<dyn LlmProvider>) -> (Arc<Self>, Arc<Mutex<TokenUsage>>) {
+        let totals = Arc::new(Mutex::new(TokenUsage::default()));
+        (
+            Arc::new(Self {
+                inner,
+                totals: Arc::clone(&totals),
+            }),
+            totals,
+        )
+    }
+}
+
+struct MeteringStream {
+    inner: BoxStream<'static, StreamEvent>,
+    totals: Arc<Mutex<TokenUsage>>,
+    round_usage: TokenUsage,
+    flushed: bool,
+}
+
+impl MeteringStream {
+    fn flush(&mut self) {
+        if self.flushed {
+            return;
+        }
+        self.flushed = true;
+        if self.round_usage.prompt > 0
+            || self.round_usage.completion > 0
+            || self.round_usage.cached > 0
+        {
+            if let Ok(mut g) = self.totals.lock() {
+                g.prompt = g.prompt.saturating_add(self.round_usage.prompt);
+                g.completion = g.completion.saturating_add(self.round_usage.completion);
+                g.cached = g.cached.saturating_add(self.round_usage.cached);
+            }
+        }
+    }
+}
+
+impl Drop for MeteringStream {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+impl Stream for MeteringStream {
+    type Item = StreamEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(ev)) => {
+                if let StreamEvent::Usage(u) = &ev {
+                    self.round_usage.merge_max(*u);
+                }
+                Poll::Ready(Some(ev))
+            }
+            Poll::Ready(None) => {
+                self.flush();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for TokenMeteringProvider {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+    fn bind_session_id(&self, session_id: &str) {
+        self.inner.bind_session_id(session_id);
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let inner = self.inner.chat_stream(messages, tools, options).await?;
+        Ok(Box::pin(MeteringStream {
+            inner,
+            totals: Arc::clone(&self.totals),
+            round_usage: TokenUsage::default(),
+            flushed: false,
+        }))
+    }
+}
 
 use crate::controllers::{evaluate_goal, summarize_for_goal, EvalOutcome, GoalResult};
 use crate::goal_harness::{
-    compute_workspace_fingerprint_async, create_milestone_checkpoint_async, GoalOptions,
-    WorkspaceFingerprint,
+    compute_git_diff_stat_async, compute_workspace_fingerprint_async,
+    create_milestone_checkpoint_async, GoalOptions, WorkspaceFingerprint,
 };
 
 const BLIND_VERIFIER_MAX_ROUNDS: u32 = 24;
@@ -49,36 +155,41 @@ pub(crate) struct GoalEvalJob {
 pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutcome {
     let summary = summarize_for_goal(&job.snapshot.messages, job.previous_reason.as_deref());
     let had_snapshot_mutations = snapshot_has_file_mutations(&job.snapshot.messages);
-    if job.baseline_fingerprint.is_none() {
-        if let Some(rx) = job.baseline_fingerprint_rx.as_mut() {
-            let ready = rx.borrow().clone();
-            if let Some(hash) = ready {
-                job.baseline_fingerprint = Some(hash);
-            } else {
-                let wait_res = tokio::select! {
-                    biased;
-                    _ = job.cancel.cancelled() => Err(()),
-                    changed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()) => {
-                        changed.ok().and_then(|r| r.ok()).ok_or(())
-                    }
-                };
-                if wait_res.is_ok() {
-                    job.baseline_fingerprint = rx.borrow().clone();
-                }
-            }
+    let baseline_wait = async {
+        if let Some(hash) = job.baseline_fingerprint {
+            return Some(hash);
         }
-    }
-    let fp_before = compute_workspace_fingerprint_async(job.working_dir.clone()).await;
-
-    let mut outcome = evaluate_goal(
-        job.generation,
-        job.controller_id,
-        job.evaluator_provider,
-        job.condition.clone(),
-        summary,
-        job.cancel.clone(),
-    )
-    .await;
+        let mut rx = job.baseline_fingerprint_rx?;
+        let ready = rx.borrow().clone();
+        if ready.is_some() {
+            return ready;
+        }
+        let wait_res = tokio::select! {
+            biased;
+            _ = job.cancel.cancelled() => Err(()),
+            changed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()) => {
+                changed.ok().and_then(|r| r.ok()).ok_or(())
+            }
+        };
+        if wait_res.is_ok() {
+            rx.borrow().clone()
+        } else {
+            None
+        }
+    };
+    let (baseline_fingerprint, fp_before, mut outcome) = tokio::join!(
+        baseline_wait,
+        compute_workspace_fingerprint_async(job.working_dir.clone()),
+        evaluate_goal(
+            job.generation,
+            job.controller_id,
+            job.evaluator_provider,
+            job.condition.clone(),
+            summary,
+            job.cancel.clone(),
+        )
+    );
+    job.baseline_fingerprint = baseline_fingerprint;
 
     outcome.fingerprint = Some(fp_before.clone());
     outcome.had_snapshot_mutations = had_snapshot_mutations;
@@ -111,9 +222,10 @@ pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutc
         return outcome;
     }
 
-    let Some(verifier_provider) = (job.make_verifier_provider)() else {
+    let Some(raw_verifier_provider) = (job.make_verifier_provider)() else {
         return outcome;
     };
+    let (metered_verifier, verifier_totals) = TokenMeteringProvider::new(raw_verifier_provider);
 
     let verifier_tools = build_verifier_tools(Arc::clone(&job.bash_runtime));
     let project_instructions = render_project_instructions(&job.working_dir);
@@ -126,10 +238,16 @@ pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutc
             .render_project_instructions_block()
             .or_else(|| project_instructions.clone()),
     };
-    let prompt = build_blind_verifier_prompt(&job.condition, &fp_before, &fast_reason);
+    let diff_stat = compute_git_diff_stat_async(job.working_dir.clone()).await;
+    let prompt = build_blind_verifier_prompt(
+        &job.condition,
+        &fp_before,
+        diff_stat.as_deref(),
+        &fast_reason,
+    );
 
     let verdict = match run_blind_verifier_with_context(
-        verifier_provider,
+        metered_verifier,
         verifier_tools,
         job.working_dir.clone(),
         prompt,
@@ -142,12 +260,14 @@ pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutc
     {
         Ok(v) => v,
         Err(err) => {
+            merge_usage_totals(&mut outcome.usage, &verifier_totals);
             outcome.result = GoalResult::NotMet(format!(
                 "blind verifier failed to run ({err}); refusing unverified completion"
             ));
             return outcome;
         }
     };
+    merge_usage_totals(&mut outcome.usage, &verifier_totals);
 
     // Re-compute workspace fingerprint after verification to reject stale passes if files
     // changed mid-verification (or if the verifier somehow violated read-only invariants).
@@ -208,9 +328,27 @@ fn should_run_blind_verifier(
     }
 }
 
+fn merge_usage_totals(dest: &mut Option<TokenUsage>, added: &Arc<Mutex<TokenUsage>>) {
+    let Ok(u) = added.lock() else {
+        return;
+    };
+    if u.prompt == 0 && u.completion == 0 && u.cached == 0 {
+        return;
+    }
+    match dest {
+        Some(existing) => {
+            existing.prompt = existing.prompt.saturating_add(u.prompt);
+            existing.completion = existing.completion.saturating_add(u.completion);
+            existing.cached = existing.cached.saturating_add(u.cached);
+        }
+        None => *dest = Some(*u),
+    }
+}
+
 fn build_blind_verifier_prompt(
     condition: &str,
     fp: &WorkspaceFingerprint,
+    diff_stat: Option<&str>,
     fast_reason: &str,
 ) -> String {
     let files_section = if fp.changed_files.is_empty() {
@@ -223,12 +361,16 @@ fn build_blind_verifier_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let diff_stat_section = diff_stat
+        .map(|stat| format!("\nDiff summary (`git diff --stat HEAD`):\n```\n{stat}\n```\n"))
+        .unwrap_or_default();
     let head = fp.head_sha.as_deref().unwrap_or("none");
     format!(
         "Independently verify whether the workspace satisfies this goal.\n\n\
          Goal condition:\n{condition}\n\n\
          Workspace fingerprint: {} (HEAD: {head})\n\
-         Changed/untracked files:\n{files_section}\n\n\
+         Changed/untracked files:\n{files_section}\n\
+         {diff_stat_section}\n\
          Note: The main agent believes the goal is complete ({fast_reason}). \
          Do NOT trust this claim — inspect the actual code and run real build/test/check commands.",
         fp.hash

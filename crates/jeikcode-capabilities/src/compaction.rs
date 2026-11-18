@@ -315,6 +315,9 @@ impl OverflowCompaction {
 
     /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
     /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe).
+    ///
+    /// Skips `Role::Assistant` turns carrying signed `reasoning_blocks` so tier-1 overflow
+    /// truncation never breaks Anthropic/Gemini thinking-block signature verification.
     fn truncate_rewrites(
         msgs: &[Message],
         from: usize,
@@ -322,6 +325,9 @@ impl OverflowCompaction {
     ) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         for (i, m) in msgs.iter().enumerate().skip(from) {
+            if m.role == Role::Assistant && !m.reasoning_blocks.is_empty() {
+                continue;
+            }
             if m.text.contains(TRUNCATE_MARKER) {
                 continue; // already truncated
             }
@@ -2932,6 +2938,34 @@ Dependencies verified.
             rewritten_indices,
             vec![3],
             "superseded read r1 (idx 3) must be stubbed while non-superseded r_other (idx 4) and latest r2 (idx 7) stay exempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_tier1_skips_signed_reasoning_assistant_turns() {
+        let mut signed_asst = Message::assistant("A".repeat(20_000), vec![]);
+        signed_asst
+            .reasoning_blocks
+            .push(jeikcode_kernel::message::ReasoningBlock {
+                text: "internal thinking".into(),
+                opaque: Some("sig-anthropic-xyz".into()),
+                provider: Some("anthropic".into()),
+                id: None,
+            });
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            signed_asst,
+            Message::user("B".repeat(20_000)),
+        ];
+        let plan = OverflowCompaction::new(StubCompaction::default(), None)
+            .plan(&overflow_view(&msgs, 2, 1, 4_000))
+            .await;
+        let rewritten_indices: Vec<usize> = plan.rewrites.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(
+            rewritten_indices,
+            vec![3],
+            "signed assistant message (idx 2) must not be text-truncated while oversized user message (idx 3) is truncated"
         );
     }
 }

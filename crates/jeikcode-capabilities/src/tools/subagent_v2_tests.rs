@@ -856,3 +856,177 @@ async fn deny_sensitive_paths_blocks_codegraphignore_graph_and_include_sensitive
         "subagent DenySensitivePaths must block grep include_sensitive=true"
     );
 }
+
+#[tokio::test]
+async fn task_max_rounds_runs_graceful_tool_less_synthesis_preserving_partial_marker() {
+    use jeikcode_kernel::provider::ToolChoice;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn alpha() {}\n").unwrap();
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+
+    let seen_choices: Arc<Mutex<Vec<(usize, ToolChoice)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sc = seen_choices.clone();
+
+    struct SynthesisProvider {
+        step: AtomicUsize,
+        seen: Arc<Mutex<Vec<(usize, ToolChoice)>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SynthesisProvider {
+        fn model_name(&self) -> &str {
+            "synth-mock"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            tools: &[ToolDef],
+            opts: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let n = self.step.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((tools.len(), opts.tool_choice.clone()));
+            if n == 0 {
+                Ok(stream::iter(vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src.rs"}"#.into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ])
+                .boxed())
+            } else {
+                Ok(stream::iter(vec![
+                    StreamEvent::TextDelta("FINAL_SYNTHESIS_OK: alpha verified".into()),
+                    StreamEvent::Done { truncated: false },
+                ])
+                .boxed())
+            }
+        }
+    }
+
+    let make_provider = move || {
+        Arc::new(SynthesisProvider {
+            step: AtomicUsize::new(0),
+            seen: sc.clone(),
+        }) as Arc<dyn LlmProvider>
+    };
+    let tool = TaskTool::new(
+        make_provider.clone(),
+        make_provider,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    );
+
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"bounded audit","prompt":"check src.rs","subagent_type":"explore","max_rounds":1}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("partial=\"max_rounds_synthesis\""),
+        "must preserve explicit partial marker: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("FINAL_SYNTHESIS_OK: alpha verified"),
+        "must deliver synthesized prose: {}",
+        out.content
+    );
+    let choices = seen_choices.lock().unwrap();
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[1].0, 1, "tools must stay mounted on synthesis turn");
+    assert_eq!(choices[1].1, ToolChoice::None);
+}
+
+#[tokio::test]
+async fn bind_session_switch_cancels_prior_background_subagent_while_turn_cancel_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+
+    let started = Arc::new(Notify::new());
+    let cancelled_observed = Arc::new(Notify::new());
+    let s_clone = started.clone();
+    let c_clone = cancelled_observed.clone();
+
+    struct PendingBgProvider {
+        started: Arc<Notify>,
+        cancelled_observed: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PendingBgProvider {
+        fn model_name(&self) -> &str {
+            "bg-pending"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _opts: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.started.notify_waiters();
+            struct DropNotify(Arc<Notify>);
+            impl Drop for DropNotify {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                }
+            }
+            let guard = DropNotify(self.cancelled_observed.clone());
+            Ok(stream::pending::<StreamEvent>()
+                .map(move |x| {
+                    let _ = &guard;
+                    x
+                })
+                .boxed())
+        }
+    }
+
+    let make_p = move || {
+        Arc::new(PendingBgProvider {
+            started: s_clone.clone(),
+            cancelled_observed: c_clone.clone(),
+        }) as Arc<dyn LlmProvider>
+    };
+    let tool = TaskTool::new(
+        make_p.clone(),
+        make_p,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    );
+    tool.bind_session("sess-A");
+
+    let turn_ctx = tool_ctx(dir.path());
+    let _ = tool
+        .execute(
+            r#"{"run_in_background":true,"tasks":[{"description":"bg","prompt":"work","subagent_type":"explore"}]}"#,
+            &turn_ctx,
+        )
+        .await;
+    started.notified().await;
+
+    // Cancelling the single foreground turn must NOT kill the detached background child.
+    turn_ctx.cancel.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), cancelled_observed.notified())
+            .await
+            .is_err(),
+        "single-turn ctx.cancel must not terminate a detached background subagent"
+    );
+
+    // Switching sessions via bind_session MUST cancel the prior session's background child.
+    tool.bind_session("sess-B");
+    tokio::time::timeout(Duration::from_secs(2), cancelled_observed.notified())
+        .await
+        .expect("bind_session switch must cancel prior session background subagents");
+}

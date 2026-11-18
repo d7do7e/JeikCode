@@ -90,6 +90,10 @@ pub(crate) struct SubagentStore {
     session_scope: RwLock<String>,
     next_seq: AtomicU64,
     root_cancel: CancellationToken,
+    /// Session-scoped cancel token (child of `root_cancel`) rotated whenever
+    /// `bind_session` switches sessions so background subagents from the prior
+    /// session stop immediately instead of leaking tokens.
+    session_cancel: Mutex<CancellationToken>,
     saved: Mutex<HashMap<String, SavedSubagentState>>,
     in_flight: Mutex<HashSet<String>>,
     background: Mutex<HashMap<String, Arc<BackgroundTaskHandle>>>,
@@ -114,10 +118,13 @@ impl SubagentStore {
             "subagent-scope-{}",
             NEXT_SCOPE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
+        let root_cancel = CancellationToken::new();
+        let session_cancel = root_cancel.child_token();
         Self {
             session_scope: RwLock::new(scope),
             next_seq: AtomicU64::new(1),
-            root_cancel: CancellationToken::new(),
+            root_cancel,
+            session_cancel: Mutex::new(session_cancel),
             saved: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
             background: Mutex::new(HashMap::new()),
@@ -147,8 +154,21 @@ impl SubagentStore {
         if trimmed.is_empty() {
             return;
         }
-        if let Ok(mut g) = self.session_scope.write() {
-            *g = trimmed.to_string();
+        let changed = if let Ok(mut g) = self.session_scope.write() {
+            if *g == trimmed {
+                false
+            } else {
+                *g = trimmed.to_string();
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            if let Ok(mut sc) = self.session_cancel.lock() {
+                sc.cancel();
+                *sc = self.root_cancel.child_token();
+            }
         }
     }
 
@@ -159,6 +179,16 @@ impl SubagentStore {
             .unwrap_or_else(|e| e.into_inner().clone())
     }
 
+    /// Child token tied to the current session lifecycle (cancelled on session switch,
+    /// store reset/drop, or explicit background cancel — never single-turn `ctx.cancel`).
+    pub(crate) fn session_cancel_token(&self) -> CancellationToken {
+        self.session_cancel
+            .lock()
+            .map(|g| g.child_token())
+            .unwrap_or_else(|_| self.root_cancel.child_token())
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn child_cancel_token(&self) -> CancellationToken {
         self.root_cancel.child_token()
     }

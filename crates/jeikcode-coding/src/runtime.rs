@@ -35,7 +35,8 @@ use crate::controllers::{
     LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::goal_harness::{
-    compute_workspace_fingerprint_async, goal_stall_limit_from_env, parse_goal_launch, GoalOptions,
+    compute_workspace_fingerprint_async, goal_stall_limit_from_env, parse_goal_launch,
+    restore_milestone_checkpoint_async, GoalOptions,
 };
 use crate::goal_verifier::{evaluate_goal_with_harness, GoalEvalJob};
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
@@ -2519,6 +2520,7 @@ pub enum CodingRuntimeControl {
         generation: u64,
         controller_id: u64,
         fingerprint_hash: String,
+        baseline_untracked: Vec<String>,
     },
     StopGoal {
         generation: u64,
@@ -3292,6 +3294,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
+                    let mut fresh_epoch_handoff: Option<String> = None;
                     // Only GoalResult::Met keeps the goal registered after the turn ends.
                     // All other finish_reason paths (e.g. evaluator Error) must still clear it.
                     let mut keep_goal_on_eval = false;
@@ -3331,8 +3334,36 @@ fn spawn_runtime_owner_with_optional_agent(
                                     )
                                 });
                                 if stalled {
+                                    let mut rollback_note = String::new();
+                                    if state.options.rollback_on_stall {
+                                        if let Some(cp_ref) = state.checkpoint_refs.last().cloned() {
+                                            if let Some(wd) = resources.as_ref().map(|rt| {
+                                                rt.parts
+                                                    .shared_cwd
+                                                    .read()
+                                                    .map(|g| g.clone())
+                                                    .unwrap_or_else(|_| rt.config.working_dir.clone())
+                                            }) {
+                                                let allowed = state.stall.baseline_untracked.clone();
+                                                match restore_milestone_checkpoint_async(
+                                                    wd, cp_ref, allowed,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(msg) => {
+                                                        rollback_note = format!(" ({msg})");
+                                                    }
+                                                    Err(err) => {
+                                                        rollback_note = format!(
+                                                            " (rollback failed: {err})"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let note = format!(
-                                        "paused by no-progress circuit breaker after {stall_limit} identical rounds; send guidance to continue or /goal stop to end"
+                                        "paused by no-progress circuit breaker after {stall_limit} stalled/oscillating rounds{rollback_note}; send guidance to continue or /goal stop to end"
                                     );
                                     state.pause_at_cap(note.clone());
                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -3340,12 +3371,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                     finish_reason = Some(StopReason::MaxRounds);
                                     keep_goal_on_eval = true;
                                 } else {
+                                    let mut rolled_over = false;
                                     if state.batch_rollover_due() {
                                         state.rollover_batch();
+                                        rolled_over = true;
                                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                             format!(
-                                                "goal continuous batch #{} rolled over (total rounds: {})",
-                                                state.rollovers, state.total_rounds
+                                                "goal continuous batch #{} rolled over (total rounds: {}, tokens: {})",
+                                                state.rollovers, state.total_rounds, state.tokens_used
                                             ),
                                         ));
                                     }
@@ -3353,6 +3386,25 @@ fn spawn_runtime_owner_with_optional_agent(
                                         state.update_progress_recap(summarize_for_goal(
                                             &snapshot.messages,
                                             Some(&verdict),
+                                        ));
+                                    }
+                                    if rolled_over && state.options.fresh_epoch {
+                                        let recap = state
+                                            .progress_recap_str()
+                                            .unwrap_or("(no prior recap)");
+                                        let last_cp = state
+                                            .checkpoint_refs
+                                            .last()
+                                            .map(|r| format!("\nLatest checkpoint ref: {r}"))
+                                            .unwrap_or_default();
+                                        fresh_epoch_handoff = Some(format!(
+                                            "[Fresh-epoch batch #{} handoff | total rounds: {} | cumulative tokens: {}]{last_cp}\n\
+                                             Goal:\n{}\n\n\
+                                             Progress recap from previous epoch:\n{recap}",
+                                            state.rollovers,
+                                            state.total_rounds,
+                                            state.tokens_used,
+                                            state.condition
                                         ));
                                     }
                                     continuation =
@@ -3386,6 +3438,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else if let Some(text) = continuation {
+                        if let Some(handoff_summary) = fresh_epoch_handoff {
+                            let _ = send_agent_command(
+                                &agent,
+                                AgentCommand::ResetToFreshEpoch { handoff_summary },
+                            );
+                        }
                         if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
                             held_turn = None;
                             terminal_reason = None;
@@ -5813,6 +5871,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime.config.goal_max_duration_secs,
                                 options,
                             );
+                            next.set_max_tokens_if_unset(runtime.config.goal_max_tokens);
                             let wd = runtime
                                 .parts
                                 .shared_cwd
@@ -5837,6 +5896,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         generation: request_generation,
                                         controller_id,
                                         fingerprint_hash: hash,
+                                        baseline_untracked: fp.untracked_files,
                                     });
                                 });
                             }
@@ -5875,11 +5935,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::SetGoalBaselineFingerprint { generation: request_generation, controller_id, fingerprint_hash }) => {
+                    Some(CodingRuntimeControl::SetGoalBaselineFingerprint { generation: request_generation, controller_id, fingerprint_hash, baseline_untracked }) => {
                         if request_generation == generation {
                             if let Some(state) = goal.as_mut() {
                                 if state.id == controller_id && state.stall.baseline_fingerprint.is_none() {
                                     state.stall.baseline_fingerprint = Some(fingerprint_hash);
+                                    state.stall.baseline_untracked = baseline_untracked;
                                 }
                             }
                         }
@@ -6519,7 +6580,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             state.pause_at_cap(note.clone());
                                             keep_goal_registered = true;
                                             completion_reason = match why {
-                                                "round limit" => StopReason::MaxRounds,
+                                                "round limit" | "token limit" => {
+                                                    StopReason::MaxRounds
+                                                }
                                                 "time limit" => StopReason::Timeout,
                                                 _ => StopReason::ProviderError,
                                             };
@@ -6552,17 +6615,35 @@ fn spawn_runtime_owner_with_optional_agent(
                                                         &runtime.config,
                                                         session_id,
                                                     )
-                                                    .ok()?;
+                                                    .ok()
+                                                    .map(|p| {
+                                                        wrap_goal_usage_recorder(
+                                                            p,
+                                                            runtime.parts.session.as_ref(),
+                                                            runtime
+                                                                .parts
+                                                                .snapshot_persistence_status(),
+                                                            &runtime.config.provider_name,
+                                                            runtime.config.pricing,
+                                                        )
+                                                    })?;
                                                 let verifier_factory =
                                                     Arc::clone(&runtime.provider_factory);
                                                 let verifier_config = runtime.config.clone();
                                                 let verifier_session_id =
                                                     session_id.map(str::to_string);
+                                                let verifier_session_manager = runtime
+                                                    .parts
+                                                    .session
+                                                    .as_ref()
+                                                    .map(|b| (b.manager.clone(), b.id.clone()));
+                                                let verifier_persist_status =
+                                                    runtime.parts.snapshot_persistence_status();
                                                 let make_verifier_provider: Box<
                                                     dyn FnOnce() -> Option<Arc<dyn LlmProvider>>
                                                         + Send,
                                                 > = Box::new(move || {
-                                                    verifier_config
+                                                    let raw = verifier_config
                                                         .subagent_capable_provider
                                                         .as_ref()
                                                         .and_then(|cell| cell.get())
@@ -6573,7 +6654,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                                                     verifier_session_id.as_deref(),
                                                                 )
                                                                 .ok()
-                                                        })
+                                                        })?;
+                                                    Some(wrap_goal_usage_recorder_parts(
+                                                        raw,
+                                                        verifier_session_manager.as_ref(),
+                                                        verifier_persist_status,
+                                                        &verifier_config.provider_name,
+                                                        verifier_config.pricing,
+                                                    ))
                                                 });
                                                 let working_dir = runtime
                                                     .parts
@@ -7481,6 +7569,48 @@ fn build_goal_evaluator_provider(
     }
 
     factory.build(host, session_id)
+}
+
+fn wrap_goal_usage_recorder(
+    provider: Arc<dyn LlmProvider>,
+    session: Option<&crate::parts::SessionBinding>,
+    persistence_status: Option<jeikcode_capabilities::session::snapshot::SnapshotPersistenceStatus>,
+    provider_name: &str,
+    pricing: Option<jeikcode_capabilities::session::ModelPricing>,
+) -> Arc<dyn LlmProvider> {
+    let pair = session.map(|b| (b.manager.clone(), b.id.clone()));
+    wrap_goal_usage_recorder_parts(
+        provider,
+        pair.as_ref(),
+        persistence_status,
+        provider_name,
+        pricing,
+    )
+}
+
+fn wrap_goal_usage_recorder_parts(
+    provider: Arc<dyn LlmProvider>,
+    session: Option<&(Arc<jeikcode_capabilities::session::SessionManager>, String)>,
+    persistence_status: Option<jeikcode_capabilities::session::snapshot::SnapshotPersistenceStatus>,
+    provider_name: &str,
+    pricing: Option<jeikcode_capabilities::session::ModelPricing>,
+) -> Arc<dyn LlmProvider> {
+    let Some((manager, session_id)) = session else {
+        return provider;
+    };
+    let mut recorder = jeikcode_capabilities::session::DetachedUsageRecorder::new(
+        Arc::clone(manager),
+        session_id.clone(),
+        provider_name.to_string(),
+        provider.model_name().to_string(),
+        pricing,
+    );
+    if let Some(status) = persistence_status {
+        recorder = recorder.with_persistence_status(status);
+    }
+    Arc::new(jeikcode_capabilities::session::UsageRecordingProvider::new(
+        provider, recorder,
+    ))
 }
 
 fn register_mesh_tools(parts: &mut crate::CodingParts, mesh_host: Option<&Arc<SessionMeshHost>>) {
