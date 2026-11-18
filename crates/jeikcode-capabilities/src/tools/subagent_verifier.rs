@@ -165,11 +165,11 @@ fn validate_invocation(inv: &BashInvocation) -> Result<(), String> {
     }
 
     match cmd.as_str() {
-        // Pure read-only / inspection utilities & shell builtins
+        // Pure read-only / inspection utilities, checksums & shell builtins
         "ls" | "dir" | "cat" | "head" | "tail" | "wc" | "sort" | "uniq" | "cut" | "tr" | "grep"
         | "rg" | "find" | "fd" | "which" | "where" | "pwd" | "echo" | "printf" | "env"
         | "printenv" | "stat" | "file" | "diff" | "cmp" | "cd" | "true" | "false" | "test"
-        | "[" | "jq" => Ok(()),
+        | "[" | "jq" | "sha256sum" | "shasum" | "sha1sum" | "md5sum" | "b3sum" => Ok(()),
         "sed" | "awk" | "gawk" => {
             if args.iter().any(|a| *a == "-i" || a.starts_with("-i")) {
                 Err(format!("verifier subagent cannot run `{cmd} -i`"))
@@ -775,6 +775,14 @@ mod tests {
         assert!(validate_verifier_shell_command("gh pr view 90").is_ok());
         assert!(validate_verifier_shell_command("gh run list --limit 5").is_ok());
         assert!(validate_verifier_shell_command("rustc --version").is_ok());
+        assert!(validate_verifier_shell_command(
+            "sha256sum Cargo.lock && shasum -a 256 Cargo.toml && b3sum Cargo.lock"
+        )
+        .is_ok());
+        assert!(validate_verifier_shell_command(
+            "wc -l crates/jeikcode-coding/src/runtime.rs && stat Cargo.toml"
+        )
+        .is_ok());
         assert!(validate_verifier_shell_command("npx tsc --noEmit").is_ok());
         assert!(validate_verifier_shell_command(
             "dart format --output=none --set-exit-if-changed ."

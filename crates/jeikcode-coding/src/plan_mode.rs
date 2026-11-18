@@ -71,11 +71,16 @@ impl ToolMiddleware for PlanModeGate {
         }
 
         if call.name.starts_with("mcp__") {
-            // A server-declared read-only external query can't modify anything → proceed.
-            // It is `Safe`, so the ApprovalMiddleware won't prompt for it either; a later
-            // guard (e.g. SensitivePathGate) may still fire if the args touch a secret path,
-            // which is the intended exfiltration guard — same as outside plan mode.
-            if tool.read_only_hint() {
+            // A server-declared read-only external query or a read-only action on a
+            // multiplex MCP tool (e.g. `vault_manage_board(action="get"|"trace_graph")`)
+            // can't modify anything → proceed without prompting.
+            if tool.read_only_hint()
+                || jeikcode_capabilities::mcp::is_mcp_call_read_only(
+                    &call.name,
+                    false,
+                    &call.arguments,
+                )
+            {
                 return BeforeOutcome::Proceed;
             }
             // Mutating / unannotated MCP tool: prompt instead of hard-blocking. Owns the
@@ -356,5 +361,75 @@ mod tests {
             "idempotent: {:?}",
             convo.messages[1].text
         );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_auto_allows_vault_manage_board_read_actions_and_gates_writes() {
+        struct MultiplexBoardMcpTool;
+        #[async_trait]
+        impl Tool for MultiplexBoardMcpTool {
+            fn name(&self) -> &str {
+                "mcp__datumref__vault_manage_board"
+            }
+            fn description(&self) -> &str {
+                "multiplex board tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+                ToolResult::default()
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let gate = PlanModeGate::new(flag, grants());
+        let tool: Arc<dyn Tool> = Arc::new(MultiplexBoardMcpTool);
+
+        for action in [
+            "get",
+            "list",
+            "list_boards",
+            "trace_graph",
+            "search",
+            "status",
+            "validate",
+        ] {
+            let mut call = ToolCall {
+                id: "c1".into(),
+                name: "mcp__datumref__vault_manage_board".into(),
+                arguments:
+                    serde_json::json!({ "action": action, "asset_id": "JeikCode_dblueprint" })
+                        .to_string(),
+            };
+            let out = gate.before(&mut call, &tool, &rt()).await;
+            assert_eq!(
+                out,
+                BeforeOutcome::Proceed,
+                "read-only action `{action}` must auto-allow in plan mode without prompting"
+            );
+        }
+
+        for mutating in [
+            "batch_upsert",
+            "auto_layout",
+            "create",
+            "delete",
+            "update",
+            "clear",
+        ] {
+            let mut call = ToolCall {
+                id: "c2".into(),
+                name: "mcp__datumref__vault_manage_board".into(),
+                arguments:
+                    serde_json::json!({ "action": mutating, "asset_id": "JeikCode_dblueprint" })
+                        .to_string(),
+            };
+            let out = gate.before(&mut call, &tool, &rt_timeout()).await;
+            assert!(
+                out.is_deny(),
+                "mutating action `{mutating}` must remain gated in plan mode: {out:?}"
+            );
+        }
     }
 }

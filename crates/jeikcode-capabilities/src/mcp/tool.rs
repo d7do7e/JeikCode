@@ -123,6 +123,83 @@ impl McpToolAdapter {
     }
 }
 
+/// Determine whether an MCP tool (or a specific invocation of a multiplex MCP tool)
+/// is strictly read-only.
+///
+/// Covers:
+/// 1. Server-declared `annotations.readOnlyHint == true` (when `destructiveHint != true`).
+/// 2. Known read-only MCP query/inspection tools (e.g. `vault_search`, `vault_list_*`,
+///    `vault_get_*`, `vault_inspect_*`, `vault_check_*`, `vault_compose_preview`).
+/// 3. Action-aware read-only invocations of multiplex MCP tools (`vault_manage_board` /
+///    `manage_board`, `vault_manage_annotations`, `vault_manage_linked_file`,
+///    `vault_manage_taxonomy`, `vault_manage_project`) when `arguments["action"]` is a
+///    purely read-only verb (or when `dry_run: true` is set on `infer_edges`).
+pub fn is_mcp_call_read_only(tool_name: &str, declared_read_only: bool, args: &str) -> bool {
+    if declared_read_only {
+        return true;
+    }
+    let short = tool_name
+        .rsplit("__")
+        .next()
+        .unwrap_or(tool_name)
+        .trim()
+        .to_ascii_lowercase();
+
+    if matches!(
+        short.as_str(),
+        "vault_search"
+            | "vault_list_projects"
+            | "vault_list_assets"
+            | "vault_get_lineage"
+            | "vault_get_generation_context"
+            | "vault_inspect_image"
+            | "vault_inspect_mesh_budget"
+            | "vault_check_ue_readiness"
+            | "vault_check_vault_health"
+            | "vault_compose_preview"
+    ) {
+        return true;
+    }
+
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(args) else {
+        return false;
+    };
+    let action = val
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    match short.as_str() {
+        "vault_manage_board" | "manage_board" => match action.as_deref() {
+            Some(
+                "get" | "list" | "list_boards" | "trace_graph" | "search" | "status" | "validate",
+            ) => true,
+            Some("infer_edges") => val
+                .get("dry_run")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
+        },
+        "vault_manage_annotations" | "manage_annotations" => {
+            matches!(action.as_deref(), Some("list" | "get"))
+        }
+        "vault_manage_linked_file" | "manage_linked_file" => {
+            matches!(action.as_deref(), Some("read_linked_file" | "get"))
+        }
+        "vault_manage_taxonomy" | "manage_taxonomy" => {
+            matches!(action.as_deref(), Some("get" | "list"))
+        }
+        "vault_manage_project" | "manage_project" => {
+            matches!(action.as_deref(), Some("list_locks" | "list_inbox"))
+        }
+        "vault_sample_colors" => !val
+            .get("persist_to_metadata")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl Tool for McpToolAdapter {
     fn name(&self) -> &str {
@@ -139,14 +216,10 @@ impl Tool for McpToolAdapter {
 
     /// MCP servers are external code, so `Risky` by default — the approval middleware
     /// gates the call (the kernel never sandboxes). EXCEPTION: a server configured
-    /// `trust: true`, or a tool on its `autoApprove` allowlist (or granted "Always"),
-    /// is `Safe` so it skips the prompt — this is what makes `.mcp.json` trust actually
-    /// take effect (it was silently ignored before). The `mcp__{server}__{tool}` name
-    /// conveys the origin to the prompt when it does fire.
-    fn risk(&self, _args: &str) -> RiskLevel {
-        // A server-declared read-only tool has no side effects → Safe (no approval),
-        // matching codex's `readOnlyHint` handling. Otherwise trust/auto-approve decide.
-        if self.read_only
+    /// `trust: true`, a tool on its `autoApprove` allowlist (or granted "Always"), or a
+    /// server-declared / action-verified read-only call is `Safe` so it skips the prompt.
+    fn risk(&self, args: &str) -> RiskLevel {
+        if is_mcp_call_read_only(&self.full_name, self.read_only, args)
             || self.registry.is_server_trusted(&self.server)
             || self.registry.is_tool_auto_approved(&self.full_name)
         {
@@ -156,10 +229,10 @@ impl Tool for McpToolAdapter {
         }
     }
 
-    /// Server-declared `annotations.readOnlyHint`. Plan mode reads this to allow
-    /// read-only external queries (distinct from `risk()`, which also folds in trust).
+    /// Server-declared `annotations.readOnlyHint` (or intrinsic read-only tool identity).
+    /// Plan mode also checks `is_mcp_call_read_only` with call arguments for multiplex tools.
     fn read_only_hint(&self) -> bool {
-        self.read_only
+        self.read_only || is_mcp_call_read_only(&self.full_name, false, "{}")
     }
 
     /// "Always" approves THIS tool (`mcp__{server}__{tool}`) regardless of the call's

@@ -55,7 +55,7 @@ pub use schema_cache::{
     SessionMcpSchemaSnapshot,
 };
 pub use session_pool::{SessionMcpLease, SessionMcpPool};
-pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};
+pub use tool::{is_mcp_call_read_only, mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};
 pub use types::*;
 
 /// Reap every global, project-scoped and session-scoped MCP transport. Drivers must

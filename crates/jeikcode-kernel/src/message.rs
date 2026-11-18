@@ -418,6 +418,16 @@ impl Message {
         if !self.images.is_empty() {
             return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
         }
+        let reasoning_bytes: usize = self
+            .reasoning
+            .as_ref()
+            .map_or(0, |r| r.len())
+            .saturating_add(
+                self.reasoning_blocks
+                    .iter()
+                    .map(|b| b.text.len() + b.opaque.as_deref().map_or(0, str::len))
+                    .sum::<usize>(),
+            );
         let byte_count = if self.role == Role::Tool {
             self.text.len() + 10 // tool result + small wrapper overhead
         } else if !self.tool_calls.is_empty() {
@@ -426,9 +436,9 @@ impl Message {
                 .iter()
                 .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                 .sum();
-            self.text.len() + calls + self.reasoning.as_ref().map_or(0, |r| r.len())
+            self.text.len() + calls + reasoning_bytes
         } else {
-            self.text.len()
+            self.text.len() + reasoning_bytes
         };
         ((byte_count / 4).max(1) + 4) as u32
     }
@@ -465,6 +475,12 @@ impl Message {
             }
             if let Some(reasoning) = &self.reasoning {
                 add(reasoning);
+            }
+            for block in &self.reasoning_blocks {
+                add(&block.text);
+                if let Some(opaque) = &block.opaque {
+                    add(opaque);
+                }
             }
         }
         // Mirror `estimate_tokens`' small per-shape overheads.

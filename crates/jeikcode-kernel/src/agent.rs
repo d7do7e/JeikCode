@@ -1677,14 +1677,28 @@ impl RunningAgent {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
         // Raw prompt tokens from the most recent assistant meta (default 0 if none yet).
-        let (recorded_window, used_tokens) = convo
+        let (recorded_window, mut used_tokens) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens))
+            .map(|meta| {
+                let used = if meta.used_tokens > 0 {
+                    meta.used_tokens
+                } else {
+                    meta.tokens.prompt.saturating_add(meta.tokens.completion)
+                };
+                (meta.ctx_window, used)
+            })
             .unwrap_or((0, 0));
+        let estimated_tokens: u32 = convo
+            .messages
+            .iter()
+            .map(|m| m.estimate_tokens_conservative() as u64)
+            .sum::<u64>()
+            .min(u32::MAX as u64) as u32;
+        used_tokens = used_tokens.max(estimated_tokens);
         // Size this compaction to the CURRENT model's WATERMARK budget (fall back to the
         // recorded window only when the live window is unknown), and recompute pressure
         // against it. A compaction running after a model switch must use the NEW window —
@@ -2876,23 +2890,47 @@ impl RunningAgent {
             // instead of waiting for the 100% overflow ladder. Runs at most once
             // per turn: if it cannot shrink (single huge input), the emergency
             // block below still owns the hard backstop.
-            if !midturn_auto_attempted {
+            if !midturn_auto_attempted && active_internal_continuation.is_none() {
                 let window = self.provider.context_window();
                 let messages_tokens: u64 = messages
                     .iter()
                     .map(|m| m.estimate_tokens_conservative() as u64)
                     .sum();
-                let estimated_prompt = messages_tokens
+                let heuristic_prompt = messages_tokens
                     .saturating_add(tool_defs_est)
                     .min(u32::MAX as u64) as u32;
+                let has_prior_assistant = messages
+                    .iter()
+                    .any(|m| m.role == crate::message::Role::Assistant);
+                let tail_since_last_asst: u32 = if has_prior_assistant {
+                    messages
+                        .iter()
+                        .rev()
+                        .take_while(|m| m.role != crate::message::Role::Assistant)
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum()
+                } else {
+                    0
+                };
+                // During a multi-round tool loop (`tail_since_last_asst > 0` because tool
+                // results were appended after the last Assistant turn), anchor the next
+                // round's size to the provider's exact `prompt + completion` plus the new
+                // tool results so CJK/tokenization underestimates never mask pressure.
+                let estimated_prompt = if tail_since_last_asst > 0 {
+                    let provider_context = convo.last_context_tokens();
+                    if provider_context > 0 {
+                        provider_context
+                            .saturating_add(tail_since_last_asst)
+                            .max(heuristic_prompt)
+                    } else {
+                        heuristic_prompt
+                    }
+                } else {
+                    heuristic_prompt
+                };
                 if let Some(utilization) =
                     midturn_auto_utilization(window, self.compact_threshold, estimated_prompt)
                 {
-                    // Only the HIGH-QUALITY drain+summary path is worth a mid-turn
-                    // cache break. A pure-stub strategy keeps the task-boundary
-                    // cadence it was designed for (the stub exists to protect the
-                    // prefix cache, and mid-turn stubbing would rewrite a prefix the
-                    // current turn already sent).
                     let view = CompactionView {
                         messages: &convo.messages,
                         trigger: CompactTrigger::Auto { utilization },
@@ -2901,7 +2939,7 @@ impl RunningAgent {
                         utilization,
                         sacred_floor: convo.sacred_floor(),
                     };
-                    if self.compaction.will_summarize(&view) {
+                    if self.compaction.will_summarize(&view) || round > 1 {
                         let epoch_before = convo.cache_epoch;
                         self.run_compaction(convo, CompactTrigger::Auto { utilization })
                             .await;

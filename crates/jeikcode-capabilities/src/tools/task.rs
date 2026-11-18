@@ -1749,12 +1749,12 @@ fn extract_search_query(tool: &str, args_json: &str) -> Option<String> {
     }
 }
 
-/// Max bytes returned from a subtask before head/tail output compaction triggers (~4k tokens).
-pub const MAX_SUBTASK_OUTPUT_BYTES: usize = 16_000;
-/// Bytes retained from the head of an oversized subtask output.
-pub const SUBTASK_PREVIEW_HEAD_BYTES: usize = 3_000;
-/// Bytes retained from the tail of an oversized subtask output.
-pub const SUBTASK_PREVIEW_TAIL_BYTES: usize = 4_000;
+/// Max bytes returned from a subtask before head/tail output compaction triggers (64 KiB).
+pub const MAX_SUBTASK_OUTPUT_BYTES: usize = 65_536;
+/// Bytes retained from the head of an oversized subtask output (24 KB).
+pub const SUBTASK_PREVIEW_HEAD_BYTES: usize = 24_000;
+/// Bytes retained from the tail of an oversized subtask output (24 KB).
+pub const SUBTASK_PREVIEW_TAIL_BYTES: usize = 24_000;
 
 fn head_boundary(s: &str, n: usize) -> usize {
     let mut i = n.min(s.len());
@@ -3855,17 +3855,20 @@ mod tests {
 
     #[test]
     fn compact_subtask_output_bounds_oversized_payload() {
-        // Small output passes through untouched
+        // Small output and 64 KiB output pass through untouched
         let small = "findings: all clear";
         assert_eq!(compact_subtask_output(small), small);
+        let at_64k = "M".repeat(65_536);
+        assert_eq!(compact_subtask_output(&at_64k), at_64k);
 
-        // Oversized output (>16KB) is compacted with head and tail
-        let huge = "A".repeat(10_000) + &"B".repeat(10_000);
+        // Oversized output (> 65_536 bytes) is compacted with 24 KB head + 24 KB tail
+        let huge = "A".repeat(40_000) + &"B".repeat(40_000);
         let compacted = compact_subtask_output(&huge);
         assert!(compacted.len() < huge.len());
-        assert!(compacted.starts_with(&"A".repeat(100)));
-        assert!(compacted.ends_with(&"B".repeat(100)));
-        assert!(compacted.contains("[... subagent output compacted: 20000 bytes total"));
+        assert!(compacted.starts_with(&"A".repeat(24_000)));
+        assert!(compacted.ends_with(&"B".repeat(24_000)));
+        assert!(compacted
+            .contains("[... subagent output compacted: 80000 bytes total, 32000 bytes omitted"));
     }
 
     struct MockReadTool;

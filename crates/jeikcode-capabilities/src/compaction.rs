@@ -65,12 +65,29 @@ impl Default for StubCompaction {
     }
 }
 
+/// Minimum number of most-recent `(Assistant tool_calls + Tool results)` rounds
+/// preserved verbatim when a single multi-round turn outgrows `keep_budget_tokens`.
+const MIN_INTRA_TURN_RECENT_ROUNDS: usize = 4;
+
 impl StubCompaction {
     pub fn new(keep_recent_turns: usize, exempt_read_file: bool) -> Self {
         Self {
             keep_recent_turns,
             exempt_read_file,
         }
+    }
+
+    /// Upper bound `[sacred_floor, boundary)` eligible for stubbing: either the
+    /// turn-aligned `active_turn_start`, or — when a single long multi-round turn
+    /// has accumulated more than `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds — the
+    /// start of the last `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds inside the active turn.
+    pub(crate) fn stub_boundary(&self, msgs: &[Message], floor: usize) -> usize {
+        let turn_boundary = active_turn_start(msgs, self.keep_recent_turns);
+        if turn_boundary > floor {
+            return turn_boundary;
+        }
+        intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS)
+            .unwrap_or(turn_boundary)
     }
 
     pub(crate) fn stub_rewrites_in_range(
@@ -114,7 +131,7 @@ impl StubCompaction {
 impl CompactionStrategy for StubCompaction {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
         let msgs = view.messages;
-        let boundary = active_turn_start(msgs, self.keep_recent_turns);
+        let boundary = self.stub_boundary(msgs, view.sacred_floor);
         if boundary <= view.sacred_floor {
             return CompactionPlan::noop(); // nothing older than the kept window
         }
@@ -378,12 +395,11 @@ impl OverflowCompaction {
             }
             _ => {
                 // Emergency recovery (the provider ALREADY rejected the request as too long)
-                // must be maximally aggressive to fit NOW — keep only the active turn. The
-                // proactive auto/manual drain (manual_plan) keeps ~25% recent for working
-                // context, but the emergency ladder can't afford that headroom.
-                let drain_to = active_turn_start(msgs, 1).max(floor);
+                // must be maximally aggressive to fit NOW — keep only the active turn (or the
+                // last few tool rounds if the active turn itself is a giant multi-round turn).
+                let drain_to = emergency_keep_boundary(msgs, floor);
                 if drain_to <= floor {
-                    return CompactionPlan::noop(); // nothing older than the active turn
+                    return CompactionPlan::noop(); // nothing older than the kept tail
                 }
                 let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
                 if !span_has_non_anchor(&msgs[floor..drain_to]) {
@@ -466,7 +482,7 @@ impl OverflowCompaction {
         let rewrites = self.inner.stub_rewrites_in_range(
             msgs,
             drain_to,
-            active_turn_start(msgs, self.inner.keep_recent_turns),
+            self.inner.stub_boundary(msgs, drain_to),
         );
         CompactionPlan {
             drain_from: floor,
@@ -918,67 +934,102 @@ impl CompactionStrategy for OverflowCompaction {
             // where plain `/compact` is a real summarize, not just tool-output stubbing. A
             // non-empty focus only STEERS the summary; it no longer gates the drain.
             CompactTrigger::Manual { focus } => self.manual_plan(view, focus.as_deref()).await,
-            // AUTO: cache-friendly stub at moderate pressure, but once utilization
-            // crosses `AUTO_DRAIN_UTILIZATION` the gentle stub can't keep context in
-            // check, so escalate to the SAME drain+summarize as `/compact` (falls back
-            // to the stub when there's nothing older than the active turn to drain).
-            // This is why auto-compaction now actually reduces context instead of only
-            // nibbling tool results — the prior behavior forced users to /compact by hand.
-            // The `auto_drain_would_help` guard prevents thrashing: if the bulk is the
-            // sacred-floor-protected first message / active turn (e.g. one over-window
-            // paste), summarizing the small drainable remainder can't cut pressure, so
-            // an LLM summary + cache-bust every turn would be pure waste — stay on stub.
-            CompactTrigger::Auto { .. }
+            CompactTrigger::Auto { .. } => {
+                let keep = self.keep_budget(view.ctx_window);
                 if view.utilization >= self.auto_drain_utilization
-                    && auto_drain_would_help(
-                        view,
-                        self.auto_drain_utilization,
-                        self.keep_budget(view.ctx_window),
-                    ) =>
-            {
-                self.manual_plan(view, None).await
+                    && auto_drain_would_help(view, self.auto_drain_utilization, keep)
+                {
+                    return self.manual_plan(view, None).await;
+                }
+                // Stub-first pass: try gentle in-place tool-result stubbing first.
+                // However, if we are already at/above the lower-water threshold and
+                // stubbing either produces a no-op OR leaves estimated post-stub
+                // utilization at/above `auto_drain_utilization`, immediately escalate
+                // in the SAME pass to `manual_plan` (drain + summarize) instead of
+                // letting context climb unhindered across rounds!
+                let stub_plan = self.inner.plan(view).await;
+                if self.should_escalate_after_stub(view, &stub_plan, keep) {
+                    return self.manual_plan(view, None).await;
+                }
+                stub_plan
             }
-            _ => self.inner.plan(view).await,
         }
     }
 
     /// True only when `plan` will DRAIN old turns into a summary (the slow path) — for
     /// a manual `/compact`, overflow tier 2, or an AUTO trigger that crossed
-    /// `self.auto_drain_utilization` AND whose drain would actually reduce pressure
-    /// (`auto_drain_would_help`). When there is nothing older than the kept window to
-    /// drain it falls back to the fast inner stub (drain ≤ floor) and is NOT announced.
-    /// Must predict with the SAME boundary each path actually uses: the proactive
-    /// (auto/manual) drain keeps recent turns (`self.keep_budget`); the emergency
-    /// overflow ladder keeps only the active turn (`active_turn_start(1)`).
+    /// `self.auto_drain_utilization` (or whose stub-only pass cannot relieve pressure
+    /// below `self.auto_drain_utilization`) AND whose drain would actually reduce pressure
+    /// (`auto_drain_would_help`).
     fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
         let floor = view.sacred_floor;
-        // Mirror the plans' guard exactly: a summarize happens only when the drained span
-        // has NON-anchor content (draining a lone prior anchor falls back to the silent
-        // stub — announcing it would be a spurious "compacting…" banner).
         let drains = |drain_to: usize| {
             drain_to > floor && span_has_non_anchor(&view.messages[floor..drain_to])
         };
-        let proactive_drains = || {
-            drains(recent_keep_boundary(
-                view.messages,
-                self.keep_budget(view.ctx_window),
-                floor,
-            ))
-        };
-        let overflow_drains = || drains(active_turn_start(view.messages, 1).max(floor));
+        let keep = self.keep_budget(view.ctx_window);
+        let proactive_drains = || drains(recent_keep_boundary(view.messages, keep, floor));
+        let overflow_drains = || drains(emergency_keep_boundary(view.messages, floor));
         match &view.trigger {
             CompactTrigger::Manual { .. } => proactive_drains(),
             CompactTrigger::Overflow { attempt } => *attempt >= 2 && overflow_drains(),
             CompactTrigger::Auto { .. } => {
-                view.utilization >= self.auto_drain_utilization
-                    && proactive_drains()
-                    && auto_drain_would_help(
-                        view,
-                        self.auto_drain_utilization,
-                        self.keep_budget(view.ctx_window),
-                    )
+                if !proactive_drains()
+                    || !auto_drain_would_help(view, self.auto_drain_utilization, keep)
+                {
+                    return false;
+                }
+                if view.utilization >= self.auto_drain_utilization {
+                    return true;
+                }
+                let boundary = self.inner.stub_boundary(view.messages, floor);
+                let rewrites = self
+                    .inner
+                    .stub_rewrites_in_range(view.messages, floor, boundary);
+                let stub_plan = CompactionPlan {
+                    drain_from: 0,
+                    drain_to: 0,
+                    summary: None,
+                    rewrites,
+                    resume_note: None,
+                };
+                self.should_escalate_after_stub(view, &stub_plan, keep)
             }
         }
+    }
+}
+
+impl OverflowCompaction {
+    fn should_escalate_after_stub(
+        &self,
+        view: &CompactionView<'_>,
+        stub_plan: &CompactionPlan,
+        keep_budget_tokens: usize,
+    ) -> bool {
+        let floor = view.sacred_floor;
+        let drain_to = recent_keep_boundary(view.messages, keep_budget_tokens, floor);
+        if drain_to <= floor || !span_has_non_anchor(&view.messages[floor..drain_to]) {
+            return false;
+        }
+        if !auto_drain_would_help(view, self.auto_drain_utilization, keep_budget_tokens) {
+            return false;
+        }
+        // Estimate how many tokens `stub_plan` actually saves.
+        let saved_bytes: usize = stub_plan
+            .rewrites
+            .iter()
+            .filter_map(|(idx, new_text)| {
+                view.messages
+                    .get(*idx)
+                    .map(|m| m.text.len().saturating_sub(new_text.len()))
+            })
+            .sum();
+        if view.ctx_window == 0 {
+            return false;
+        }
+        let saved_tokens = (saved_bytes / 4) as u32;
+        let post_stub_tokens = view.used_tokens.saturating_sub(saved_tokens);
+        let post_stub_util = post_stub_tokens as f32 / view.ctx_window as f32;
+        post_stub_util >= self.auto_drain_utilization
     }
 }
 
@@ -1005,20 +1056,62 @@ fn auto_drain_would_help(
     if view.ctx_window == 0 || view.used_tokens == 0 {
         return true; // no basis to estimate — allow (long-session default)
     }
-    let total_bytes: usize = view.messages.iter().map(|m| m.text.len()).sum();
-    if total_bytes == 0 {
+    let total_tokens: usize = view
+        .messages
+        .iter()
+        .map(|m| m.estimate_tokens_conservative() as usize)
+        .sum();
+    if total_tokens == 0 {
         return false;
     }
-    let drainable_bytes: usize = view.messages[floor..drain_to]
+    let drainable_tokens: usize = view.messages[floor..drain_to]
         .iter()
-        .map(|m| m.text.len())
+        .map(|m| m.estimate_tokens_conservative() as usize)
         .sum();
-    let remaining_bytes = total_bytes.saturating_sub(drainable_bytes);
-    // Token estimate of what survives the drain, by byte share of the recorded usage.
+    let remaining_tokens_est = total_tokens.saturating_sub(drainable_tokens);
+    // Token estimate of what survives the drain, by token share of the recorded usage.
     let remaining_tokens =
-        (remaining_bytes as u64).saturating_mul(view.used_tokens as u64) / total_bytes as u64;
+        (remaining_tokens_est as u64).saturating_mul(view.used_tokens as u64) / total_tokens as u64;
     let mark = (view.ctx_window as f32 * auto_drain_utilization) as u64;
     remaining_tokens < mark
+}
+
+/// Find the message index starting the last `keep_rounds` completed `(Assistant tool_calls + Tool results)`
+/// round pairs within the active turn (after `floor`), so a single 30–50 round turn can drain or
+/// stub its older tool rounds while keeping the most recent `keep_rounds` rounds intact.
+fn intra_turn_round_boundary(msgs: &[Message], floor: usize, keep_rounds: usize) -> Option<usize> {
+    if keep_rounds == 0 {
+        return None;
+    }
+    let active_start = msgs
+        .iter()
+        .enumerate()
+        .rfind(|(_, m)| m.is_compaction_turn_start())
+        .map(|(i, _)| i + 1)
+        .unwrap_or(floor)
+        .max(floor);
+    if active_start >= msgs.len() {
+        return None;
+    }
+    let round_starts: Vec<usize> = (active_start..msgs.len())
+        .filter(|&i| msgs[i].role == Role::Assistant && !msgs[i].tool_calls.is_empty())
+        .collect();
+    if round_starts.len() <= keep_rounds {
+        return None;
+    }
+    let target = round_starts[round_starts.len() - keep_rounds];
+    (target > floor).then_some(target)
+}
+
+/// Emergency drain boundary: prefers keeping only the active turn (`active_turn_start(msgs, 1)`),
+/// or — when the active turn itself is a giant multi-round turn with nothing older than `floor` —
+/// drains older tool rounds inside the active turn while keeping the last `MIN_INTRA_TURN_RECENT_ROUNDS`.
+fn emergency_keep_boundary(msgs: &[Message], floor: usize) -> usize {
+    let turn_start = active_turn_start(msgs, 1).max(floor);
+    if turn_start > floor {
+        return turn_start;
+    }
+    intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS).unwrap_or(floor)
 }
 
 /// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
@@ -1059,21 +1152,62 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
         .map(|(i, _)| i)
         .collect();
     let Some(&active) = starts.last() else {
-        return floor; // no real turns → nothing to keep-align on
+        return intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS)
+            .unwrap_or(floor);
     };
-    // Always keep the active turn; extend backward turn-by-turn while it fits.
-    let mut boundary = active;
-    let mut kept: usize = msgs[boundary..]
+    let active_tokens: usize = msgs[active..]
         .iter()
-        .map(|m| m.estimate_tokens() as usize)
+        .map(|m| m.estimate_tokens_conservative() as usize)
         .sum();
+
+    // Intra-turn round-pair slicing: when the current active turn alone exceeds
+    // `keep_budget_tokens` (or is the only turn after `floor`) and has accumulated
+    // more than `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds, slice at a completed
+    // `Role::Assistant` tool-round boundary inside the active turn so a single 40-round
+    // turn cannot balloon to 800K unhindered!
+    if (active <= floor || (keep_budget_tokens > 0 && active_tokens > keep_budget_tokens))
+        && msgs[active..]
+            .iter()
+            .filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .count()
+            > MIN_INTRA_TURN_RECENT_ROUNDS
+    {
+        let min_search_start = (active + 1).max(floor);
+        let round_starts: Vec<usize> = (min_search_start..msgs.len())
+            .filter(|&i| msgs[i].role == Role::Assistant && !msgs[i].tool_calls.is_empty())
+            .collect();
+        if round_starts.len() > MIN_INTRA_TURN_RECENT_ROUNDS {
+            let max_cut_idx = round_starts.len() - MIN_INTRA_TURN_RECENT_ROUNDS;
+            let mut boundary = round_starts[max_cut_idx];
+            let mut kept: usize = msgs[boundary..]
+                .iter()
+                .map(|m| m.estimate_tokens_conservative() as usize)
+                .sum();
+            for &r_start in round_starts[..max_cut_idx].iter().rev() {
+                let seg_tokens: usize = msgs[r_start..boundary]
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative() as usize)
+                    .sum();
+                if kept + seg_tokens > keep_budget_tokens {
+                    break;
+                }
+                kept += seg_tokens;
+                boundary = r_start;
+            }
+            return boundary.max(floor);
+        }
+    }
+
+    // Standard multi-turn path: keep the active turn, extending backward turn-by-turn while it fits.
+    let mut boundary = active;
+    let mut kept = active_tokens;
     for &s in starts.iter().rev().skip(1) {
         if s < floor {
             break; // don't cross the protected prefix
         }
         let turn_tokens: usize = msgs[s..boundary]
             .iter()
-            .map(|m| m.estimate_tokens() as usize)
+            .map(|m| m.estimate_tokens_conservative() as usize)
             .sum();
         if kept + turn_tokens > keep_budget_tokens {
             break;
@@ -2966,6 +3100,159 @@ Dependencies verified.
             rewritten_indices,
             vec![3],
             "signed assistant message (idx 2) must not be text-truncated while oversized user message (idx 3) is truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_first_escalates_in_same_pass_when_post_stub_exceeds_auto_drain_ceiling() {
+        // 1M context window (980K watermark), 350K auto-drain ceiling (~0.3571).
+        // Old turns are dominated by large assistant texts + signed reasoning blocks
+        // (very little stubbable tool output), so StubCompaction alone cannot bring
+        // 380K tokens below 350K. OverflowCompaction::plan MUST escalate immediately
+        // in the SAME pass to full drain+summarize!
+        let ctx_window = 980_000u32;
+        let auto_drain_util = 350_000.0 / ctx_window as f32;
+        let big_asst = "A".repeat(400_000); // ~100K tokens each
+        let mut msgs = vec![Message::system("sys"), Message::user("initial request")];
+        for i in 1..=4 {
+            let mut a = Message::assistant(
+                big_asst.clone(),
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: format!("c{i}"),
+                    name: "edit".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            );
+            a.reasoning_blocks
+                .push(jeikcode_kernel::message::ReasoningBlock {
+                    text: "T".repeat(40_000),
+                    opaque: Some("sig".into()),
+                    provider: Some("anthropic".into()),
+                    id: None,
+                });
+            msgs.push(a);
+            msgs.push(Message::tool_result(
+                format!("c{i}"),
+                "edited 1 line",
+                false,
+            ));
+            msgs.push(Message::user(format!("step {i}")));
+        }
+        let used_tokens = 380_000u32;
+        let utilization = used_tokens as f32 / ctx_window as f32;
+        let view = CompactionView {
+            messages: &msgs,
+            trigger: CompactTrigger::Auto { utilization },
+            ctx_window,
+            used_tokens,
+            utilization,
+            sacred_floor: 2,
+        };
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        )
+        .with_auto_drain_utilization(auto_drain_util);
+
+        assert!(
+            strat.will_summarize(&view),
+            "will_summarize must predict drain escalation at 380K > 350K ceiling"
+        );
+        let plan = strat.plan(&view).await;
+        assert!(
+            plan.drain_to > plan.drain_from,
+            "must escalate to drain+summarize instead of returning a futile stub: {plan:?}"
+        );
+        assert!(plan.summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn single_long_multi_round_turn_drains_older_tool_rounds_while_keeping_recent_tail() {
+        // Single real User prompt followed by 12 heavy (Assistant tool_call + Tool result)
+        // rounds inside the SAME turn (no new User turn). When total tokens exceed the
+        // 350K ceiling, `recent_keep_boundary` and `OverflowCompaction` must slice at an
+        // intra-turn Assistant boundary, draining older rounds while preserving the last
+        // `MIN_INTRA_TURN_RECENT_ROUNDS` (4) rounds intact!
+        let ctx_window = 980_000u32;
+        let auto_drain_util = 350_000.0 / ctx_window as f32;
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("execute Batches D, E, F"),
+        ];
+        let big_tool_out = "O".repeat(140_000); // ~35K tokens per round -> 12 rounds ≈ 420K tokens
+        for r in 1..=12 {
+            msgs.push(Message::assistant(
+                format!("round {r} edit"),
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: format!("call_{r}"),
+                    name: "edit".into(),
+                    arguments: format!(
+                        r#"{{"path":"src/mod_{r}.rs","old_string":"a","new_string":"b"}}"#
+                    ),
+                }],
+            ));
+            msgs.push(Message::tool_result(
+                format!("call_{r}"),
+                &big_tool_out,
+                false,
+            ));
+        }
+
+        let used_tokens = 420_000u32;
+        let utilization = used_tokens as f32 / ctx_window as f32;
+        let floor = 2; // system + first real user
+        let view = CompactionView {
+            messages: &msgs,
+            trigger: CompactTrigger::Auto { utilization },
+            ctx_window,
+            used_tokens,
+            utilization,
+            sacred_floor: floor,
+        };
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        )
+        .with_auto_drain_utilization(auto_drain_util);
+
+        assert!(
+            strat.will_summarize(&view),
+            "single 12-round turn at 420K must be recognized as summarizable"
+        );
+        let plan = strat.plan(&view).await;
+        assert_eq!(plan.drain_from, floor);
+        assert!(
+            plan.drain_to > floor,
+            "must drain older tool rounds inside the active single turn"
+        );
+        assert_eq!(
+            msgs[plan.drain_to].role,
+            Role::Assistant,
+            "intra-turn drain boundary must land cleanly on an Assistant tool-round start"
+        );
+
+        // Apply via Conversation::prepare_plan and verify the last 4 tool rounds survive
+        // paired and intact while total size drops below the ceiling.
+        let mut convo = jeikcode_kernel::message::Conversation {
+            messages: msgs,
+            cache_epoch: 0,
+        };
+        let report = convo.apply_plan(plan, floor);
+        assert!(report.committed, "intra-turn compaction plan must commit");
+        assert!(
+            report.bytes_after < report.bytes_before / 2,
+            "compaction must cut >50% of the 420K single-turn bloat: before={}, after={}",
+            report.bytes_before,
+            report.bytes_after
+        );
+        let surviving_asst_rounds = convo
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .count();
+        assert!(
+            surviving_asst_rounds >= MIN_INTRA_TURN_RECENT_ROUNDS,
+            "must keep at least {MIN_INTRA_TURN_RECENT_ROUNDS} recent tool rounds intact, got {surviving_asst_rounds}"
         );
     }
 }

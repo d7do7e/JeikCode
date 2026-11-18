@@ -739,7 +739,7 @@ async fn subagent_spills_oversized_output_to_artifact_store_and_emits_telemetry_
     let r_e = reg.clone();
     let r_w = reg.clone();
 
-    let huge_middle = "MIDDLE_CRITIQUE_EVIDENCE_TOKEN_".repeat(600);
+    let huge_middle = "MIDDLE_CRITIQUE_EVIDENCE_TOKEN_".repeat(2_500);
     let huge_reply = format!("HEAD_START\n{}\nTAIL_END", huge_middle);
     let huge_reply_c = huge_reply.clone();
 
