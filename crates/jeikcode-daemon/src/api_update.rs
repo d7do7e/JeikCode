@@ -1,18 +1,20 @@
 use anyhow::Result;
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::AppState;
 use jeikcode_coding::config_sync::{
-    apply_selected_diffs, get_last_seen_version, scan_jeikcode_config_diffs, set_last_seen_version,
-    ConfigDiffItem,
+    apply_selected_diffs_checked, get_last_seen_version, scan_jeikcode_config_diffs,
+    set_last_seen_version, ConfigDiffItem,
 };
 use jeikcode_config::config::Config;
 
@@ -794,7 +796,7 @@ async fn run_cli_update(
 // 配置更新多选覆盖 API
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpgradeDiffsQuery {
     pub first_launch: Option<bool>,
     pub force: Option<bool>,
@@ -809,7 +811,9 @@ pub struct UpgradeDiffsResponse {
 }
 
 /// GET /api/config/upgrade-diffs
-pub async fn get_upgrade_diffs(Query(query): Query<UpgradeDiffsQuery>) -> impl IntoResponse {
+pub async fn get_upgrade_diffs(
+    Query(query): Query<UpgradeDiffsQuery>,
+) -> Json<UpgradeDiffsResponse> {
     let home = Config::config_dir();
     let current_ver = format!("v{}", env!("CARGO_PKG_VERSION"));
     let last_seen = get_last_seen_version(&home);
@@ -836,13 +840,10 @@ pub async fn get_upgrade_diffs(Query(query): Query<UpgradeDiffsQuery>) -> impl I
         });
     }
 
-    let should_prompt = if query.force.unwrap_or(false) {
-        true
-    } else if query.first_launch.unwrap_or(false) {
-        last_seen.as_deref() != Some(&current_ver)
-    } else {
-        true
-    };
+    // Never auto-prompt an overwrite modal on first browser/WebUI load;
+    // only return `should_prompt: true` when explicitly requested via `force=true`.
+    let _ = query.first_launch;
+    let should_prompt = query.force.unwrap_or(false) && !diffs.is_empty();
 
     Json(UpgradeDiffsResponse {
         should_prompt,
@@ -857,34 +858,64 @@ pub struct ApplyDiffsRequest {
     pub selected_paths: Vec<String>,
 }
 
+pub(crate) fn apply_diffs_at(
+    home: &Path,
+    current_ver: &str,
+    selected_paths: &[String],
+) -> anyhow::Result<usize> {
+    let diffs = scan_jeikcode_config_diffs(home);
+    let selected_items: Vec<ConfigDiffItem> = diffs
+        .into_iter()
+        .map(|mut it| {
+            it.selected = selected_paths.contains(&it.relative_path);
+            it
+        })
+        .collect();
+
+    let applied_count = apply_selected_diffs_checked(selected_items)?;
+    let _ = set_last_seen_version(home, current_ver);
+    Ok(applied_count)
+}
+
 /// POST /api/config/apply-diffs
 pub async fn apply_diffs(Json(req): Json<ApplyDiffsRequest>) -> impl IntoResponse {
     let home = Config::config_dir();
     let current_ver = format!("v{}", env!("CARGO_PKG_VERSION"));
 
     if jeikcode_config::config::runtime_state::is_dead() {
-        return Json(serde_json::json!({
-            "success": true,
-            "applied_count": 0,
-        }));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "applied_count": 0,
+            })),
+        )
+            .into_response();
     }
 
-    let diffs = scan_jeikcode_config_diffs(&home);
-    let selected_items: Vec<ConfigDiffItem> = diffs
-        .into_iter()
-        .map(|mut it| {
-            it.selected = req.selected_paths.contains(&it.relative_path);
-            it
-        })
-        .collect();
-
-    let applied_count = apply_selected_diffs(selected_items);
-    let _ = set_last_seen_version(&home, &current_ver);
-
-    Json(serde_json::json!({
-        "success": true,
-        "applied_count": applied_count,
-    }))
+    match apply_diffs_at(&home, &current_ver, &req.selected_paths) {
+        Ok(applied_count) => {
+            if applied_count > 0 {
+                crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "applied_count": applied_count,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/config/dismiss-diffs
@@ -1010,5 +1041,50 @@ mod tests {
         assert_eq!(highest_beta.unwrap().tag_name, "v7.2.4-beta.5");
         let highest_stable = find_highest_release(&releases, UpdateChannel::Stable);
         assert_eq!(highest_stable.unwrap().tag_name, "v7.2.4");
+    }
+
+    #[tokio::test]
+    async fn upgrade_diffs_never_auto_prompts_without_force() {
+        let resp_default = get_upgrade_diffs(Query(UpgradeDiffsQuery::default()))
+            .await
+            .0;
+        assert!(!resp_default.should_prompt);
+
+        let resp_first = get_upgrade_diffs(Query(UpgradeDiffsQuery {
+            first_launch: Some(true),
+            force: Some(false),
+        }))
+        .await
+        .0;
+        assert!(!resp_first.should_prompt);
+    }
+
+    #[test]
+    fn apply_diffs_at_creates_bak_and_preserves_coding_and_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let orig_toml = "default_model = \"gpt-5.1\"\n[coding]\ncompact_threshold = 0.35\n";
+        let orig_mcp = r#"{"mcpServers":{"context7":{"command":"npx","args":[]}}}"#;
+        std::fs::write(home.join("config.toml"), orig_toml).unwrap();
+        std::fs::write(home.join("mcp.json"), orig_mcp).unwrap();
+
+        let count = apply_diffs_at(
+            home,
+            "v7.5.1",
+            &["config.toml".to_string(), "mcp.json".to_string()],
+        )
+        .unwrap();
+        assert!(count >= 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml.bak")).unwrap(),
+            orig_toml
+        );
+        let new_toml = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let parsed_toml = Config::load(&home.join("config.toml")).unwrap();
+        assert!(new_toml.contains("compact_threshold = 0.35"));
+        assert_eq!(parsed_toml.coding.compact_threshold, 0.35);
+        let parsed_mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("mcp.json")).unwrap()).unwrap();
+        assert!(parsed_mcp["mcpServers"].get("context7").is_some());
     }
 }

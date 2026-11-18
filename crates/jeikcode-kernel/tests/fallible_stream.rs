@@ -2,6 +2,7 @@
 //! reasoning content, and a `finish_reason=length` truncation are all first-class
 //! — none silently degrades into an empty SUCCESSFUL turn.
 
+use jeikcode_config::i18n;
 use jeikcode_kernel::event::{AgentCommand, AgentEvent};
 use jeikcode_kernel::message::{Message, Role};
 use jeikcode_kernel::stream::{ProviderError, StreamEvent};
@@ -369,11 +370,12 @@ impl LlmProvider for FlakyProvider {
 }
 
 // A RETRYABLE open failure must NOT hard-fail the turn: the agent loop re-opens
-// the same round, emits a VISIBLE Warning ("…秒后重试…") per attempt, and the turn
+// the same round, emits a VISIBLE Warning per attempt, and the turn
 // SUCCEEDS once the provider recovers. `start_paused` advances the 3/6/9s backoff
 // on virtual time so the test is instant.
 #[tokio::test(start_paused = true)]
 async fn retryable_open_failure_retries_visibly_then_succeeds() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     // Fail twice (→ two retries, 3s + 6s), then succeed on the third open.
     let provider = Arc::new(FlakyProvider::new(
@@ -406,15 +408,12 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
         }
     }
 
-    let retry_notes: Vec<&String> = warnings.iter().filter(|w| w.contains("秒后重试")).collect();
-    assert_eq!(
-        retry_notes.len(),
-        2,
-        "two retryable failures must emit two visible retry notices; got {warnings:?}"
-    );
+    let expected_reason = i18n::format_agent_status_connection_failed();
+    let expected_1 = i18n::format_agent_retry_api(&expected_reason, 3, 1, 6);
+    let expected_2 = i18n::format_agent_retry_api(&expected_reason, 6, 2, 6);
     assert!(
-        retry_notes[0].contains("(1/3)") && retry_notes[1].contains("(2/3)"),
-        "retry notices must be numbered 1/3 then 2/3; got {retry_notes:?}"
+        warnings.contains(&expected_1) && warnings.contains(&expected_2),
+        "two retryable failures must emit visible retry notices ({expected_1:?}, {expected_2:?}); got {warnings:?}"
     );
     assert!(
         !errored,
@@ -437,6 +436,7 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
 // cannot recover.
 #[tokio::test(start_paused = true)]
 async fn non_retryable_open_failure_fails_fast() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     let provider = Arc::new(FlakyProvider::new(
         99, // would fail forever, but classification must stop it at the first open
@@ -466,7 +466,7 @@ async fn non_retryable_open_failure_fails_fast() {
     }
 
     assert!(
-        !warnings.iter().any(|w| w.contains("秒后重试")),
+        warnings.is_empty(),
         "a non-retryable error must emit NO retry notice; got {warnings:?}"
     );
     assert_eq!(
@@ -493,6 +493,7 @@ async fn non_retryable_open_failure_fails_fast() {
 // `start_paused` advances the backoff on virtual time so the test is instant.
 #[tokio::test(start_paused = true)]
 async fn empty_response_is_retried_then_succeeds() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     // Call 1: an empty 200 (bare Done, no content). Call 2: a real recovery.
     let provider = Arc::new(MockProvider::new(vec![
@@ -535,11 +536,10 @@ async fn empty_response_is_retried_then_succeeds() {
         text, "hello",
         "the recovered response text must reach the driver"
     );
+    let expected_notice = i18n::format_agent_retry_empty(1, 6, 1);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("空响应") && w.contains("重试")),
-        "an empty response must emit a VISIBLE retry notice; got {warnings:?}"
+        warnings.contains(&expected_notice),
+        "an empty response must emit a VISIBLE retry notice ({expected_notice:?}); got {warnings:?}"
     );
     assert!(
         !errored,
@@ -554,6 +554,7 @@ async fn empty_response_is_retried_then_succeeds() {
 
 #[tokio::test(start_paused = true)]
 async fn thinking_only_stream_is_retried_then_succeeds() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![
         vec![
@@ -593,11 +594,10 @@ async fn thinking_only_stream_is_retried_then_succeeds() {
         "a thinking-only stream must be RETRIED; got {calls}"
     );
     assert_eq!(text, "done");
+    let expected_notice = i18n::format_agent_retry_thinking(1, 6, 0);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("只返回了思考") && w.contains("重试")),
-        "thinking-only must emit a distinct retry notice; got {warnings:?}"
+        warnings.contains(&expected_notice),
+        "thinking-only must emit a distinct retry notice ({expected_notice:?}); got {warnings:?}"
     );
     assert_eq!(stop.as_deref(), Some("Stopped"));
 }
@@ -610,6 +610,7 @@ async fn thinking_only_stream_is_retried_then_succeeds() {
 // being stored as a blank assistant bubble and reported as a clean stop.
 #[tokio::test(start_paused = true)]
 async fn whitespace_only_stream_is_retried_then_succeeds() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     let provider = Arc::new(MockProvider::new(vec![
         vec![
@@ -658,11 +659,10 @@ async fn whitespace_only_stream_is_retried_then_succeeds() {
         "hello",
         "the recovered round must carry the answer; got {text:?}"
     );
+    let expected_notice = i18n::format_agent_retry_empty(1, 6, 1);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("空响应") && w.contains("重试")),
-        "a whitespace-only stream must emit the VISIBLE empty-response retry notice; got {warnings:?}"
+        warnings.contains(&expected_notice),
+        "a whitespace-only stream must emit the VISIBLE empty-response retry notice ({expected_notice:?}); got {warnings:?}"
     );
     assert!(
         !errored,
@@ -678,6 +678,7 @@ async fn whitespace_only_stream_is_retried_then_succeeds() {
 // looks like a normal (empty) completion.
 #[tokio::test(start_paused = true)]
 async fn empty_response_exhaustion_fails_visibly() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     // An empty turns queue makes MockProvider yield a bare Done forever → every open
     // is an empty 200, so the retry budget is exhausted.
@@ -689,12 +690,12 @@ async fn empty_response_exhaustion_fails_visibly() {
     handle.commands.send(send("go")).unwrap();
 
     let mut events = handle.events;
-    let mut retry_notices = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
     let mut error_msg: Option<String> = None;
     let mut stop: Option<String> = None;
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::Warning(w) if w.contains("空响应") => retry_notices += 1,
+            AgentEvent::Warning(w) => warnings.push(w),
             AgentEvent::Error { message, .. } => error_msg = Some(message),
             AgentEvent::TurnComplete { reason } => {
                 stop = Some(format!("{reason:?}"));
@@ -704,18 +705,32 @@ async fn empty_response_exhaustion_fails_visibly() {
         }
     }
 
+    let expected_notices = [
+        i18n::format_agent_retry_empty(1, 6, 1),
+        i18n::format_agent_retry_empty(2, 6, 2),
+        i18n::format_agent_retry_empty(3, 6, 3),
+        i18n::format_agent_retry_empty(4, 6, 5),
+        i18n::format_agent_retry_empty(5, 6, 8),
+        i18n::format_agent_retry_empty(6, 6, 12),
+    ];
+    let retry_notices = warnings
+        .iter()
+        .filter(|w| expected_notices.contains(w))
+        .count();
     assert_eq!(
-        retry_notices, 5,
-        "the dedicated budget is 5 visible retries"
+        retry_notices, 6,
+        "the dedicated budget is 6 visible retries; got {warnings:?}"
     );
     let calls = received.lock().unwrap().len();
     assert_eq!(
-        calls, 6,
-        "1 initial empty open + 5 retries = 6 chat_stream calls; got {calls}"
+        calls, 7,
+        "1 initial empty open + 6 retries = 7 chat_stream calls; got {calls}"
     );
-    assert!(
-        error_msg.as_deref().is_some_and(|m| m.contains("空响应")),
-        "exhaustion must surface a clear empty-response Error; got {error_msg:?}"
+    let expected_err = i18n::format_agent_exhausted_empty_generic(6);
+    assert_eq!(
+        error_msg.as_deref(),
+        Some(expected_err.as_str()),
+        "exhaustion must surface a clear empty-response Error"
     );
     assert_eq!(
         stop.as_deref(),
@@ -724,14 +739,15 @@ async fn empty_response_exhaustion_fails_visibly() {
     );
 }
 
-// ── MALFORMED response is retried with a DISTINCT notice (格式异常, not 空响应) ──
+// ── MALFORMED response is retried with a DISTINCT notice (not empty-response) ──
 //
 // When the adapter dropped an unparseable chunk (StreamEvent::Malformed) and the
 // round carries no content, the kernel still retries (same as an empty 200) but the
-// notice says the response was MALFORMED ("响应格式异常") rather than empty — the two
+// notice says the response was MALFORMED rather than empty — the two
 // are different upstream faults and the wording should not conflate them.
 #[tokio::test(start_paused = true)]
 async fn malformed_response_retried_with_distinct_notice() {
+    let _locale = i18n::test_lock();
     let reg = ToolRegistry::new();
     // Call 1: a malformed-only round (adapter dropped a garbage chunk, no content).
     // Call 2: a clean recovery.
@@ -773,15 +789,15 @@ async fn malformed_response_retried_with_distinct_notice() {
         "a malformed (content-free) response must be RETRIED; got {calls}"
     );
     assert_eq!(text, "ok", "the recovered response must reach the driver");
+    let expected_malformed = i18n::format_agent_retry_malformed(1, 6, 1);
+    let unexpected_empty = i18n::format_agent_retry_empty(1, 6, 1);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("格式异常") && w.contains("重试")),
-        "a malformed response must emit a格式异常 retry notice; got {warnings:?}"
+        warnings.contains(&expected_malformed),
+        "a malformed response must emit a malformed retry notice ({expected_malformed:?}); got {warnings:?}"
     );
     assert!(
-        !warnings.iter().any(|w| w.contains("空响应")),
-        "a malformed response must NOT use the empty-response (空响应) wording; got {warnings:?}"
+        !warnings.contains(&unexpected_empty),
+        "a malformed response must NOT use the empty-response wording; got {warnings:?}"
     );
     assert_eq!(
         stop.as_deref(),

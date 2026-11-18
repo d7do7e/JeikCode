@@ -50,4 +50,4 @@ pub mod system_proxy;
 pub mod schedule;
 
 pub use config::{provider::ProviderConfig, Config};
-pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
+pub use store::{backup_sibling_bak, ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};

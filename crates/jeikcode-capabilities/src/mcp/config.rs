@@ -288,7 +288,7 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
 /// `//` in its scheme, and `"a\"//b"` must not end the string at the escaped quote.
 ///
 /// Trailing commas remain invalid — this is comment tolerance, not full JSON5.
-fn strip_json_comments(input: &str) -> String {
+pub fn strip_json_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -537,6 +537,80 @@ fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Valu
     out
 }
 
+/// Create a sibling `<filename>.bak` backup before mutating an existing non-empty MCP JSON file.
+pub fn backup_mcp_file_bak(path: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(());
+    }
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "mcp.json".into());
+    name.push(".bak");
+    let bak_path = path.with_file_name(name);
+    std::fs::copy(path, &bak_path).with_context(|| {
+        format!(
+            "Failed to create MCP backup {} before mutating {}",
+            bak_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Reject accidental full-wipe writes that would replace a non-empty `mcpServers` map
+/// on disk with `{}` unless an explicit per-server removal was requested.
+pub fn guard_against_accidental_mcp_wipe(
+    path: &Path,
+    new_root: &Value,
+    explicit_single_removal: bool,
+) -> Result<()> {
+    if explicit_single_removal || !path.is_file() {
+        return Ok(());
+    }
+    let existing_servers = read_raw_servers(path);
+    if existing_servers.is_empty() {
+        return Ok(());
+    }
+    let new_servers = new_root
+        .as_object()
+        .map(collect_merged_mcp_server_maps)
+        .unwrap_or_default();
+    if new_servers.is_empty() {
+        bail!(
+            "Refusing to overwrite non-empty MCP config {} ({} configured server(s)) with an empty mcpServers map",
+            path.display(),
+            existing_servers.len()
+        );
+    }
+    Ok(())
+}
+
+/// Validate against accidental full-wipe overwrites, create a `.bak` backup, and
+/// write pretty-formatted MCP JSON to `path`.
+pub fn write_mcp_json_safely(
+    path: &Path,
+    root: &Value,
+    explicit_single_removal: bool,
+) -> Result<()> {
+    guard_against_accidental_mcp_wipe(path, root, explicit_single_removal)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", path.display())
+            })?;
+        }
+    }
+    backup_mcp_file_bak(path)?;
+    let text = serde_json::to_string_pretty(root).context("Failed to serialize MCP config")?;
+    std::fs::write(path, format!("{text}\n"))
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    Ok(())
+}
+
 /// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `$JEIKCODE_HOME/mcp.json`).
 ///
 /// Merges existing `servers` and `mcpServers` maps, then writes a single `mcpServers` object (drops the legacy
@@ -612,17 +686,7 @@ pub fn merge_stdio_mcp_server_with_options_into_json_file(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory for {}", path.display())
-            })?;
-        }
-    }
-
-    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{text}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    write_mcp_json_safely(path, &root, false)?;
 
     Ok(())
 }
@@ -695,17 +759,7 @@ pub fn merge_http_mcp_server_with_options_into_json_file(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory for {}", path.display())
-            })?;
-        }
-    }
-
-    let pretty = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{pretty}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    write_mcp_json_safely(path, &root, false)?;
     Ok(())
 }
 
@@ -736,9 +790,7 @@ pub fn remove_mcp_server_from_json_file(path: &Path, server_key: &str) -> Result
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{text}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    write_mcp_json_safely(path, &root, true)?;
 
     Ok(true)
 }
@@ -785,17 +837,7 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory for {}", path.display())
-            })?;
-        }
-    }
-
-    let pretty = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{}\n", pretty))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    write_mcp_json_safely(path, &root, false)?;
     Ok(())
 }
 
@@ -928,10 +970,7 @@ pub fn add_auto_approved_tool(project_dir: &Path, server: &str, tool: &str) -> R
         arr.push(Value::String(tool.to_string()));
     }
 
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, serde_json::to_string_pretty(&root)?)?;
+    write_mcp_json_safely(&target, &root, false)?;
     Ok(())
 }
 
@@ -1123,16 +1162,7 @@ pub fn set_mcp_server_disabled(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory for {}", target.display())
-            })?;
-        }
-    }
-    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(&target, format!("{text}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", target.display()))?;
+    write_mcp_json_safely(&target, &root, drop_entry)?;
     Ok(())
 }
 
@@ -1910,5 +1940,39 @@ mod capability_tests {
         let filtered = load_mcp_config(dir.path()).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "enabled_srv");
+    }
+
+    #[test]
+    fn write_mcp_json_safely_guards_empty_wipe_and_creates_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let original = r#"{
+  "mcpServers": {
+    "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"] }
+  }
+}
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        // 1. Attempting an accidental full-wipe overwrite (`mcpServers: {}`) must fail
+        //    and leave the original file intact without creating/corrupting content.
+        let empty_payload = json!({ "mcpServers": {} });
+        let err = write_mcp_json_safely(&path, &empty_payload, false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Refusing to overwrite non-empty MCP config"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // 2. Adding a second server creates `mcp.json.bak` containing the prior state.
+        merge_stdio_mcp_server_into_json_file(&path, "datumref", "datumref-mcp", &[]).unwrap();
+        let bak_path = dir.path().join("mcp.json.bak");
+        assert!(bak_path.is_file());
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), original);
+
+        // 3. Explicit per-server removal IS allowed to leave `mcpServers: {}`.
+        assert!(remove_mcp_server_from_json_file(&path, "context7").unwrap());
+        assert!(remove_mcp_server_from_json_file(&path, "datumref").unwrap());
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after["mcpServers"].as_object().unwrap().is_empty());
     }
 }

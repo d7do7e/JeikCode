@@ -236,6 +236,7 @@ pub fn append_long_bash_command_keyword_at(path: &Path, keyword: &str) -> Result
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    crate::store::backup_sibling_bak(path)?;
     std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
@@ -284,6 +285,7 @@ pub fn remove_long_bash_command_keyword_at(path: &Path, keyword: &str) -> Result
     if arr.len() == before {
         return Ok(false);
     }
+    crate::store::backup_sibling_bak(path)?;
     std::fs::write(path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }

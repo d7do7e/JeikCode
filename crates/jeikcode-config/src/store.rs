@@ -160,6 +160,7 @@ impl ConfigStore {
     fn persist_locked(&self, next: &Config, disk: Option<&Config>) -> Result<ConfigSnapshot> {
         ensure_parent(&self.path)?;
         let content = next.serialize_for_disk(disk)?;
+        backup_sibling_bak(&self.path)?;
         atomic_replace(&self.path, content.as_bytes())?;
         // Parse tolerantly: the content we just wrote may legitimately carry a
         // preserved-but-invalid `[providers.<name>]` section (round-tripped from
@@ -199,6 +200,32 @@ fn sibling_lock_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "config.toml".into());
     name.push(".lock");
     path.with_file_name(name)
+}
+
+/// Create a sibling `<filename>.bak` copy before mutating an existing config file.
+/// Skips 0-byte or missing files so empty initial placeholders do not clobber a
+/// prior non-empty backup.
+pub fn backup_sibling_bak(path: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(());
+    }
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "config".into());
+    name.push(".bak");
+    let bak_path = path.with_file_name(name);
+    std::fs::copy(path, &bak_path).with_context(|| {
+        format!(
+            "Failed to create backup {} before mutating {}",
+            bak_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
@@ -275,4 +302,30 @@ fn is_not_found(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_store_replace_creates_bak_backup_and_skips_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bak_path = dir.path().join("config.toml.bak");
+
+        let original = "language = \"en\"\n\n[coding]\ncompact_threshold = 0.35\n";
+        std::fs::write(&path, original).unwrap();
+
+        let store = ConfigStore::new(path.clone());
+        store
+            .update(|cfg| {
+                cfg.language = Some(crate::locale::Locale::ZhCn);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(bak_path.is_file());
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), original);
+    }
 }

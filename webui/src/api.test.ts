@@ -882,4 +882,20 @@ test('watchChatSession tags 401 as AuthExpiredError and does not emit watch_clos
   }
 });
 
+test('app startup does not auto-trigger fetchUpgradeDiffs config-overwrite modal', async () => {
+  const { readFileSync } = await import('node:fs');
+  const appSource = readFileSync(new URL('./app.tsx', import.meta.url), 'utf8');
+  const modalSource = readFileSync(new URL('./components/ConfigSyncModal.tsx', import.meta.url), 'utf8');
+
+  // Startup timer must NOT invoke fetchUpgradeDiffs automatically on fresh browser load.
+  assert.equal(appSource.includes('fetchConfigUpgrade'), false);
+  assert.equal(appSource.includes('fetchUpgradeDiffs(true'), false);
+  // Explicit user-triggered sync calls fetchUpgradeDiffs(false, true).
+  assert.ok(appSource.includes('fetchUpgradeDiffs(false, true)'));
+  // Modal exposes clear directional actions (Load from disk vs Save to disk) and diff preview.
+  assert.ok(modalSource.includes('configSync.btnLoadFromDisk'));
+  assert.ok(modalSource.includes('configSync.btnApply'));
+  assert.ok(modalSource.includes('item.diff_preview'));
+});
+
 

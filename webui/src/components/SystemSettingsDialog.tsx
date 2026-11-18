@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getDesktopSettings, postDesktopSettings, getHealth, type DesktopSettings } from '../api';
+import { getDesktopSettings, postDesktopSettings, postConfigReload, getHealth, type DesktopSettings } from '../api';
 import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useSettings } from '../settings';
@@ -9,6 +9,7 @@ import { ModelConfigView } from './SettingsDialogs';
 interface SystemSettingsDialogProps {
   onClose: () => void;
   initialTab?: TabKey;
+  onOpenConfigSync?: () => void;
 }
 
 type TabKey = 'models' | 'desktop' | 'about';
@@ -20,13 +21,15 @@ interface ModuleTab {
   icon: string;
 }
 
-export function SystemSettingsDialog({ onClose, initialTab }: SystemSettingsDialogProps) {
+export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: SystemSettingsDialogProps) {
   const { t, escUndoEnabled, setEscUndoEnabled } = useSettings();
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab || 'models');
   const [closeAction, setCloseAction] = useState<'ask' | 'tray' | 'quit'>('ask');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [reloadingDisk, setReloadingDisk] = useState(false);
+  const [reloadedDisk, setReloadedDisk] = useState(false);
   const [appVersion, setAppVersion] = useState(bakedAppVersion());
 
   // 遮罩空白处点击关闭：避免弹窗内拖拽划词时被误判为外部点击而秒关。
@@ -252,6 +255,57 @@ export function SystemSettingsDialog({ onClose, initialTab }: SystemSettingsDial
                   </div>
                   <div class="about-features">
                     {t('settings.aboutFeatures')}
+                  </div>
+                </div>
+                <div class="system-settings-card-box" style={{ marginTop: '12px' }}>
+                  <div class="system-settings-box-title">
+                    {t('configSync.sectionTitle')}
+                  </div>
+                  <div class="system-settings-box-desc">
+                    {t('configSync.sectionDesc')}
+                  </div>
+                  <div class="system-settings-actions-row" style={{ marginTop: '10px', gap: '8px' }}>
+                    <button
+                      type="button"
+                      class="btn btn-secondary"
+                      disabled={reloadingDisk}
+                      onClick={async () => {
+                        setReloadingDisk(true);
+                        setReloadedDisk(false);
+                        try {
+                          await postConfigReload();
+                          if (typeof window !== 'undefined') {
+                            window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
+                            window.dispatchEvent(new CustomEvent('jeikcode:reload-models'));
+                          }
+                          setReloadedDisk(true);
+                          window.setTimeout(() => setReloadedDisk(false), 2000);
+                        } catch {
+                          /* ignore */
+                        } finally {
+                          setReloadingDisk(false);
+                        }
+                      }}
+                    >
+                      {t('configSync.btnLoadFromDisk')}
+                    </button>
+                    {onOpenConfigSync && (
+                      <button
+                        type="button"
+                        class="btn btn-secondary"
+                        onClick={() => {
+                          onClose();
+                          onOpenConfigSync();
+                        }}
+                      >
+                        {t('configSync.btnReviewDefaults')}
+                      </button>
+                    )}
+                    {reloadedDisk && (
+                      <span class="system-settings-saved-hint">
+                        ✓ {t('configSync.loadedFromDiskToast')}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>

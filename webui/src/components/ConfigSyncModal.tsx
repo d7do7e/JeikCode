@@ -6,9 +6,10 @@ interface ConfigSyncModalProps {
   diffs: ConfigDiffItem[];
   onDone: (appliedCount: number) => void;
   onSkip: () => void;
+  onLoadFromDisk?: () => Promise<void>;
 }
 
-export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps) {
+export function ConfigSyncModal({ diffs, onDone, onSkip, onLoadFromDisk }: ConfigSyncModalProps) {
   const t = useT();
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>(() => {
     const initial: Record<string, boolean> = {};
@@ -17,7 +18,9 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
     }
     return initial;
   });
+  const [expandedDiffs, setExpandedDiffs] = useState<Record<string, boolean>>({});
   const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const selectedCount = Object.values(selectedMap).filter(Boolean).length;
   const allSelected = selectedCount === diffs.length;
@@ -38,17 +41,40 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
     }));
   };
 
+  const handleTogglePreview = (path: string, e: Event) => {
+    e.stopPropagation();
+    setExpandedDiffs((prev) => ({
+      ...prev,
+      [path]: !prev[path],
+    }));
+  };
+
   const handleConfirm = async () => {
     const selectedPaths = Object.entries(selectedMap)
       .filter(([_, sel]) => sel)
       .map(([path]) => path);
 
     setSubmitting(true);
+    setErrorMsg(null);
     try {
       const res = await applyUpgradeDiffs(selectedPaths);
       onDone(res.applied_count);
     } catch (e) {
-      console.error('Failed to apply config diffs', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setErrorMsg(t('configSync.applyFailed', { error: msg }));
+      setSubmitting(false);
+    }
+  };
+
+  const handleLoadFromDisk = async () => {
+    if (!onLoadFromDisk || submitting) return;
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      await onLoadFromDisk();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setErrorMsg(msg);
       setSubmitting(false);
     }
   };
@@ -81,6 +107,12 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
             {t('configSync.dialogDesc')}
           </p>
 
+          {errorMsg && (
+            <div class="config-sync-error" role="alert">
+              {errorMsg}
+            </div>
+          )}
+
           <div class="config-sync-toolbar">
             <button
               type="button"
@@ -97,6 +129,7 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
           <div class="config-sync-list">
             {diffs.map((item) => {
               const isChecked = !!selectedMap[item.relative_path];
+              const isExpanded = !!expandedDiffs[item.relative_path];
               const kindBadgeClass =
                 item.kind === 'new'
                   ? 'badge-new'
@@ -128,13 +161,30 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
                       <span class="config-sync-item-path">
                         {item.relative_path}
                       </span>
-                      <span class={`config-sync-kind-badge ${kindBadgeClass}`}>
-                        {kindBadgeText}
-                      </span>
+                      <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                        <button
+                          type="button"
+                          class="config-sync-preview-btn"
+                          onClick={(e) => handleTogglePreview(item.relative_path, e)}
+                        >
+                          {isExpanded ? t('configSync.hideDiff') : t('configSync.previewDiff')}
+                        </button>
+                        <span class={`config-sync-kind-badge ${kindBadgeClass}`}>
+                          {kindBadgeText}
+                        </span>
+                      </div>
                     </div>
                     <div class="config-sync-item-desc">
                       {item.description}
                     </div>
+                    {isExpanded && (
+                      <pre
+                        class="config-sync-diff-preview"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {item.diff_preview || t('configSync.noDiffPreview')}
+                      </pre>
+                    )}
                   </div>
                 </div>
               );
@@ -143,22 +193,34 @@ export function ConfigSyncModal({ diffs, onDone, onSkip }: ConfigSyncModalProps)
         </div>
 
         <div class="modal-footer config-sync-footer">
-          <button
-            type="button"
-            class="btn btn-secondary"
-            onClick={handleSkip}
-            disabled={submitting}
-          >
-            {t('configSync.btnSkip')}
-          </button>
-          <button
-            type="button"
-            class="btn btn-primary config-sync-confirm-btn"
-            onClick={handleConfirm}
-            disabled={submitting}
-          >
-            {submitting ? t('configSync.applying') : t('configSync.btnApply')}
-          </button>
+          {onLoadFromDisk && (
+            <button
+              type="button"
+              class="btn btn-secondary"
+              onClick={handleLoadFromDisk}
+              disabled={submitting}
+            >
+              {t('configSync.btnLoadFromDisk')}
+            </button>
+          )}
+          <div class="config-sync-footer-actions">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              onClick={handleSkip}
+              disabled={submitting}
+            >
+              {t('configSync.btnSkip')}
+            </button>
+            <button
+              type="button"
+              class="btn btn-primary config-sync-confirm-btn"
+              onClick={handleConfirm}
+              disabled={submitting || selectedCount === 0}
+            >
+              {submitting ? t('configSync.applying') : t('configSync.btnApply')}
+            </button>
+          </div>
         </div>
       </div>
     </div>

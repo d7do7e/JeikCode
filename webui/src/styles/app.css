@@ -1514,10 +1514,53 @@ body {
 }
 .config-sync-footer {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
   gap: 10px;
   padding: 12px 20px;
   border-top: 1px solid var(--app-menu-border);
+}
+.config-sync-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+.config-sync-preview-btn {
+  background: none;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 11px;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+}
+.config-sync-preview-btn:hover {
+  color: var(--app-primary-foreground);
+  background: var(--app-secondary-background);
+}
+.config-sync-diff-preview {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--app-secondary-background);
+  border: 1px solid var(--app-primary-border-color);
+  font-family: var(--app-monospace-font-family);
+  font-size: 11px;
+  line-height: 1.45;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+.config-sync-error {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #ef4444;
+  font-size: 12px;
 }
 
 .app-sidebar {

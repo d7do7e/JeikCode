@@ -53,6 +53,7 @@ import {
   getHealth,
   checkUpdate,
   fetchUpgradeDiffs,
+  postConfigReload,
   postSessionSeen,
   UpdateCheckResponse,
   ConfigDiffItem,
@@ -888,22 +889,9 @@ export function App() {
         .catch(() => {});
     };
 
-    // 升级后首次启动配置覆盖检测（延迟执行，错峰避让冷启动首屏会话加载）
-    const fetchConfigUpgrade = () => {
-      if (cancelled) return;
-      fetchUpgradeDiffs(true, false)
-        .then((res) => {
-          if (!cancelled && res.should_prompt && res.diffs.length > 0) {
-            setConfigDiffs(res.diffs);
-          }
-        })
-        .catch(() => {});
-    };
-
-    // 1.5 秒后自动静默检测版本与配置覆盖（错峰延迟）
+    // 1.5 秒后仅静默检测应用版本更新（绝不在首次加载或新浏览器打开时自动弹窗/触发配置覆盖）
     const updateTimer = setTimeout(() => {
       fetchLatestUpdate();
-      fetchConfigUpgrade();
     }, 1500);
 
     // 每 15 分钟后台自动静默检测一次，保持更新时效性
@@ -922,6 +910,29 @@ export function App() {
       window.removeEventListener('focus', onWindowFocus);
     };
   }, []);
+
+  const handleOpenConfigSync = async () => {
+    try {
+      const res = await fetchUpgradeDiffs(false, true);
+      if (res.diffs.length > 0) {
+        setConfigDiffs(res.diffs);
+      } else {
+        showToast(t('configSync.upToDateToast'), 'info');
+      }
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), 'error');
+    }
+  };
+
+  const handleLoadConfigFromDisk = async () => {
+    await postConfigReload();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
+      window.dispatchEvent(new CustomEvent('jeikcode:reload-models'));
+    }
+    setConfigDiffs(null);
+    showToast(t('configSync.loadedFromDiskToast'), 'success');
+  };
 
   const openUpdateDialogWithFreshCheck = () => {
     if (updateDeadRef.current) return;
@@ -1985,12 +1996,20 @@ export function App() {
       )}
       {settingsSection === 'model' && (
         <LazyBoundary>
-          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
+          <SystemSettingsDialog
+            initialTab="models"
+            onClose={() => setSettingsSection(null)}
+            onOpenConfigSync={handleOpenConfigSync}
+          />
         </LazyBoundary>
       )}
       {settingsSection === 'system' && (
         <LazyBoundary>
-          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
+          <SystemSettingsDialog
+            initialTab="models"
+            onClose={() => setSettingsSection(null)}
+            onOpenConfigSync={handleOpenConfigSync}
+          />
         </LazyBoundary>
       )}
       {headerDialog === 'rename' && activeSession && (
@@ -2036,6 +2055,10 @@ export function App() {
             diffs={configDiffs}
             onDone={(count) => {
               setConfigDiffs(null);
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
+                window.dispatchEvent(new CustomEvent('jeikcode:reload-models'));
+              }
               // 选中大于 0 个文件才弹出成功提示；若选中 0 个文件点击确定直接静默完成，不跳提示
               if (count > 0) {
                 showToast(t('configSync.successToast', { n: count }), 'success');
@@ -2044,6 +2067,7 @@ export function App() {
             onSkip={() => {
               setConfigDiffs(null);
             }}
+            onLoadFromDisk={handleLoadConfigFromDisk}
           />
         </LazyBoundary>
       )}

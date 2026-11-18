@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -208,6 +209,8 @@ pub struct ConfigDiffItem {
     pub new_content: String,
     pub kind: DiffKind,
     pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_preview: Option<String>,
 }
 
 /// Keys that stay on upgrade: the user's model/account/provider customisation.
@@ -271,38 +274,188 @@ pub fn localized_asset_description(relative_path: &str, zh_fallback: &str) -> St
     en.to_string()
 }
 
-/// New-install defaults for everything except the user's model tables.
-pub fn merge_user_config_preserving_models(existing: &str, new_template: &str) -> String {
-    let existing_val: toml::Value = match toml::from_str(existing) {
-        Ok(v) => v,
-        Err(_) => return existing.to_string(),
-    };
-    let mut new_val: toml::Value = match toml::from_str(new_template) {
-        Ok(v) => v,
-        Err(_) => return existing.to_string(),
-    };
-
-    if let (toml::Value::Table(exist_tab), toml::Value::Table(ref mut new_tab)) =
-        (&existing_val, &mut new_val)
-    {
-        for k in PRESERVE_CONFIG_KEYS {
-            if let Some(v) = exist_tab.get(*k) {
-                new_tab.insert((*k).to_string(), v.clone());
+/// Recursively merge missing keys/tables from `template_tbl` into `existing_tbl`
+/// without overwriting any existing user values, comments, or formatting.
+fn merge_toml_tables_non_destructively(
+    existing_tbl: &mut toml_edit::Table,
+    template_tbl: &toml_edit::Table,
+) {
+    for (key, template_item) in template_tbl.iter() {
+        match existing_tbl.get_mut(key) {
+            None => {
+                existing_tbl.insert(key, template_item.clone());
             }
-        }
-        // 关键安全防线：默认将所有用户配置中的 [datalog] 强制关闭并写入硬上限，彻底防止全量 dump 撑爆 C 盘！
-        if let Some(toml::Value::Table(ref mut datalog_tab)) = new_tab.get_mut("datalog") {
-            datalog_tab.insert("enabled".to_string(), toml::Value::Boolean(false));
-            if !datalog_tab.contains_key("max_total_mb") {
-                datalog_tab.insert("max_total_mb".to_string(), toml::Value::Integer(512));
-            }
-            if !datalog_tab.contains_key("max_days") {
-                datalog_tab.insert("max_days".to_string(), toml::Value::Integer(7));
+            Some(existing_item) => {
+                if let (Some(existing_sub), Some(template_sub)) =
+                    (existing_item.as_table_mut(), template_item.as_table())
+                {
+                    merge_toml_tables_non_destructively(existing_sub, template_sub);
+                }
             }
         }
     }
+}
 
-    toml::to_string_pretty(&new_val).unwrap_or_else(|_| existing.to_string())
+/// Non-destructively merge missing defaults from `new_template` into `existing`
+/// using `toml_edit`, preserving `[coding]` (`compact_threshold`, etc.),
+/// `[models]`, `[providers]`, `[provider_accounts]`, custom fields, and comments.
+pub fn merge_user_config_preserving_models(existing: &str, new_template: &str) -> String {
+    if existing.trim().is_empty() {
+        return new_template.to_string();
+    }
+    let mut existing_doc = match existing.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return existing.to_string(),
+    };
+    let template_doc = match new_template.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return existing.to_string(),
+    };
+
+    merge_toml_tables_non_destructively(existing_doc.as_table_mut(), template_doc.as_table());
+    existing_doc.to_string()
+}
+
+/// Non-destructively merge bundled `mcp.json` defaults into an existing `mcp.json`
+/// without ever removing or overwriting existing user `mcpServers` entries.
+/// Commented JSONC files are left untouched (`Ok(existing.to_string())`).
+pub fn merge_mcp_json_preserving_servers(existing: &str, bundled: &str) -> Result<String> {
+    if existing.trim().is_empty() {
+        return Ok(bundled.to_string());
+    }
+    let stripped = jeikcode_capabilities::mcp::config::strip_json_comments(existing);
+    if stripped != existing {
+        // Respect the JSONC comment contract: never rewrite a commented file.
+        return Ok(existing.to_string());
+    }
+    let mut existing_val: Value = match serde_json::from_str(existing) {
+        Ok(v) => v,
+        Err(_) => return Ok(existing.to_string()),
+    };
+    let bundled_val: Value = match serde_json::from_str(bundled) {
+        Ok(v) => v,
+        Err(_) => return Ok(existing.to_string()),
+    };
+
+    let Some(existing_obj) = existing_val.as_object_mut() else {
+        return Ok(existing.to_string());
+    };
+    let Some(bundled_obj) = bundled_val.as_object() else {
+        return Ok(existing.to_string());
+    };
+
+    let mut merged_servers = Map::new();
+    if let Some(Value::Object(m)) = existing_obj.get("servers") {
+        for (k, v) in m {
+            merged_servers.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(Value::Object(m)) = existing_obj.get("mcpServers") {
+        for (k, v) in m {
+            merged_servers.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(Value::Object(m)) = bundled_obj.get("mcpServers") {
+        for (k, v) in m {
+            merged_servers.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    existing_obj.insert("mcpServers".to_string(), Value::Object(merged_servers));
+    existing_obj.remove("servers");
+
+    let text = serde_json::to_string_pretty(&existing_val)
+        .context("Failed to serialize merged mcp.json")?;
+    Ok(format!("{text}\n"))
+}
+
+fn build_diff_preview(old: &str, new: &str, kind: DiffKind, relative_path: &str) -> Option<String> {
+    const MAX_PREVIEW_BYTES: usize = 3500;
+    const MAX_PREVIEW_LINES: usize = 60;
+    let raw = match kind {
+        DiffKind::Obsolete => format!("--- {relative_path}\n+++ /dev/null\n(remove obsolete file)"),
+        DiffKind::New => {
+            let mut out = format!("--- /dev/null\n+++ {relative_path}\n");
+            for (idx, line) in new.lines().enumerate() {
+                if idx >= MAX_PREVIEW_LINES {
+                    out.push_str("... (truncated)\n");
+                    break;
+                }
+                out.push('+');
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+        DiffKind::Modified => {
+            let diff = similar::TextDiff::from_lines(old, new);
+            let mut udiff = diff.unified_diff();
+            udiff.context_radius(2);
+            udiff.header(
+                &format!("disk/{relative_path}"),
+                &format!("merged/{relative_path}"),
+            );
+            let rendered = udiff.to_string();
+            if rendered.trim().is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for (idx, line) in rendered.lines().enumerate() {
+                if idx >= MAX_PREVIEW_LINES || out.len() + line.len() + 1 > MAX_PREVIEW_BYTES {
+                    out.push_str("... (truncated)\n");
+                    break;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+    };
+    if raw.len() > MAX_PREVIEW_BYTES {
+        let mut end = MAX_PREVIEW_BYTES;
+        while !raw.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        Some(format!("{}...\n", &raw[..end]))
+    } else {
+        Some(raw)
+    }
+}
+
+/// Guard against overwriting an existing `config.toml` with content that drops
+/// existing user sections/keys (`[coding]`, `[providers]`, `[models]`, etc.).
+fn guard_config_toml_write(target: &Path, new_content: &str) -> Result<()> {
+    if !target.is_file() {
+        return Ok(());
+    }
+    let existing = fs::read_to_string(target).unwrap_or_default();
+    if existing.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(existing_doc) = existing.parse::<toml_edit::DocumentMut>() else {
+        return Ok(());
+    };
+    let new_doc = new_content
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("Refusing to write invalid TOML to {}", target.display()))?;
+
+    for protected in [
+        "coding",
+        "models",
+        "providers",
+        "provider_accounts",
+        "default_model",
+        "default_provider",
+    ] {
+        if existing_doc.contains_key(protected) && !new_doc.contains_key(protected) {
+            bail!(
+                "Refusing to overwrite {} because proposed config drops existing `{}`",
+                target.display(),
+                protected
+            );
+        }
+    }
+    Ok(())
 }
 
 /// MCP / skills 多为用户自定义接线与技能包，upgrade 交互勾选默认不覆盖。
@@ -318,11 +471,15 @@ pub fn is_user_custom_mcp_or_skill(relative_path: &str) -> bool {
     p == "skills" || p.starts_with("skills/") || p.contains("/skills/")
 }
 
-/// 交互式 upgrade 的默认勾选：MCP / skills 配置默认不选，废弃清理项仍默认勾选。
+/// 交互式 upgrade 的默认勾选：MCP / skills 以及已有用户的 config.toml 默认不选（仅 opt-in），
+/// 废弃清理项与新增文件仍默认勾选。
 pub fn default_selected_for(relative_path: &str, kind: DiffKind) -> bool {
     match kind {
         DiffKind::Obsolete => true,
-        DiffKind::New | DiffKind::Modified => !is_user_custom_mcp_or_skill(relative_path),
+        DiffKind::New => !is_user_custom_mcp_or_skill(relative_path),
+        DiffKind::Modified => {
+            !is_user_custom_mcp_or_skill(relative_path) && relative_path != "config.toml"
+        }
     }
 }
 
@@ -343,6 +500,12 @@ pub fn scan_jeikcode_config_diffs(jeikcode_home: &Path) -> Vec<ConfigDiffItem> {
                 new_content: bundled_content.to_string(),
                 kind: DiffKind::New,
                 selected: default_selected_for(entry.relative_path, DiffKind::New),
+                diff_preview: build_diff_preview(
+                    "",
+                    bundled_content,
+                    DiffKind::New,
+                    entry.relative_path,
+                ),
             });
             continue;
         }
@@ -359,6 +522,34 @@ pub fn scan_jeikcode_config_diffs(jeikcode_home: &Path) -> Vec<ConfigDiffItem> {
                         entry.description,
                     ),
                     target_path: target,
+                    diff_preview: build_diff_preview(
+                        &existing_content,
+                        &merged,
+                        DiffKind::Modified,
+                        entry.relative_path,
+                    ),
+                    new_content: merged,
+                    kind: DiffKind::Modified,
+                    selected: default_selected_for(entry.relative_path, DiffKind::Modified),
+                });
+            }
+        } else if entry.relative_path == "mcp.json" {
+            let merged = merge_mcp_json_preserving_servers(&existing_content, bundled_content)
+                .unwrap_or_else(|_| existing_content.clone());
+            if merged.trim() != existing_content.trim() {
+                diffs.push(ConfigDiffItem {
+                    relative_path: entry.relative_path.to_string(),
+                    description: localized_asset_description(
+                        entry.relative_path,
+                        entry.description,
+                    ),
+                    target_path: target,
+                    diff_preview: build_diff_preview(
+                        &existing_content,
+                        &merged,
+                        DiffKind::Modified,
+                        entry.relative_path,
+                    ),
                     new_content: merged,
                     kind: DiffKind::Modified,
                     selected: default_selected_for(entry.relative_path, DiffKind::Modified),
@@ -374,6 +565,12 @@ pub fn scan_jeikcode_config_diffs(jeikcode_home: &Path) -> Vec<ConfigDiffItem> {
                         entry.description,
                     ),
                     target_path: target,
+                    diff_preview: build_diff_preview(
+                        &existing_content,
+                        bundled_content,
+                        DiffKind::Modified,
+                        entry.relative_path,
+                    ),
                     new_content: bundled_content.to_string(),
                     kind: DiffKind::Modified,
                     selected: default_selected_for(entry.relative_path, DiffKind::Modified),
@@ -398,6 +595,7 @@ pub fn scan_jeikcode_config_diffs(jeikcode_home: &Path) -> Vec<ConfigDiffItem> {
                 new_content: String::new(),
                 kind: DiffKind::Obsolete,
                 selected: default_selected_for(stale_rel, DiffKind::Obsolete),
+                diff_preview: build_diff_preview("", "", DiffKind::Obsolete, stale_rel),
             });
         }
     }
@@ -414,30 +612,49 @@ pub fn remove_stale_home_files(jeikcode_home: &Path) {
     }
 }
 
-/// 自动应用已选中的差异项（供 `upgrade -y` / `--auto` 以及 WebUI 批量应用使用，自动保护 MCP / skills 与用户模型）
-pub fn apply_selected_diffs(items: Vec<ConfigDiffItem>) -> usize {
+fn write_diff_item_safely(item: &ConfigDiffItem) -> Result<()> {
+    if item.relative_path == "mcp.json" {
+        let val: Value = serde_json::from_str(&item.new_content)
+            .with_context(|| format!("Invalid MCP JSON for {}", item.target_path.display()))?;
+        return jeikcode_capabilities::mcp::write_mcp_json_safely(&item.target_path, &val, false);
+    }
+    if item.relative_path == "config.toml" {
+        guard_config_toml_write(&item.target_path, &item.new_content)?;
+    }
+    if let Some(parent) = item.target_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
+    }
+    if item.relative_path == "config.toml" {
+        jeikcode_config::backup_sibling_bak(&item.target_path)?;
+    }
+    fs::write(&item.target_path, &item.new_content)
+        .with_context(|| format!("Failed to write {}", item.target_path.display()))?;
+    Ok(())
+}
+
+/// Checked variant of [`apply_selected_diffs`] that returns safety errors (such as
+/// refusing to wipe non-empty `mcpServers` or protected `config.toml` sections) and
+/// creates `.bak` backups before mutating `config.toml` or `mcp.json`.
+pub fn apply_selected_diffs_checked(items: Vec<ConfigDiffItem>) -> Result<usize> {
     let mut applied_count = 0;
     for item in items.into_iter().filter(|it| it.selected) {
         match item.kind {
             DiffKind::New | DiffKind::Modified => {
-                if let Some(parent) = item.target_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if fs::write(&item.target_path, &item.new_content).is_ok() {
-                    let tag = if ui_is_english() {
-                        if item.kind == DiffKind::New {
-                            "added"
-                        } else {
-                            "updated"
-                        }
-                    } else if item.kind == DiffKind::New {
-                        "已新增"
+                write_diff_item_safely(&item)?;
+                let tag = if ui_is_english() {
+                    if item.kind == DiffKind::New {
+                        "added"
                     } else {
-                        "已更新"
-                    };
-                    println!("  ✔ {tag}: {}", item.relative_path);
-                    applied_count += 1;
-                }
+                        "updated"
+                    }
+                } else if item.kind == DiffKind::New {
+                    "已新增"
+                } else {
+                    "已更新"
+                };
+                println!("  ✔ {tag}: {}", item.relative_path);
+                applied_count += 1;
             }
             DiffKind::Obsolete => {
                 if fs::remove_file(&item.target_path).is_ok() {
@@ -463,7 +680,18 @@ pub fn apply_selected_diffs(items: Vec<ConfigDiffItem>) -> usize {
             );
         }
     }
-    applied_count
+    Ok(applied_count)
+}
+
+/// 自动应用已选中的差异项（供 `upgrade -y` / `--auto` 以及 CLI 使用，自动保护 MCP / skills 与用户模型）
+pub fn apply_selected_diffs(items: Vec<ConfigDiffItem>) -> usize {
+    match apply_selected_diffs_checked(items) {
+        Ok(count) => count,
+        Err(err) => {
+            eprintln!("⚠ Config sync skipped unsafe write: {err:#}");
+            0
+        }
+    }
 }
 
 /// 非交互式直接写入/更新全量内置资产（供 `jeikcode setup --defaults` / `jeikcode setup -y` 及自动化脚本使用）
@@ -485,11 +713,22 @@ pub fn apply_all_bundled_assets(jeikcode_home: &Path, force: bool) -> Result<usi
             let existing_content = fs::read_to_string(&target).unwrap_or_default();
             let merged = merge_user_config_preserving_models(&existing_content, entry.content);
             if merged.trim() != existing_content.trim() || force {
+                guard_config_toml_write(&target, &merged)?;
+                jeikcode_config::backup_sibling_bak(&target)?;
                 fs::write(&target, &merged)?;
                 println!(
                     "  ✔ [更新] {} (已保留用户模型/账号配置)",
                     entry.relative_path
                 );
+                applied_count += 1;
+            }
+        } else if entry.relative_path == "mcp.json" {
+            let existing_content = fs::read_to_string(&target).unwrap_or_default();
+            let merged = merge_mcp_json_preserving_servers(&existing_content, entry.content)?;
+            if merged.trim() != existing_content.trim() {
+                let val: Value = serde_json::from_str(&merged)?;
+                jeikcode_capabilities::mcp::write_mcp_json_safely(&target, &val, false)?;
+                println!("  ✔ [合并] {}", entry.relative_path);
                 applied_count += 1;
             }
         } else if force {
@@ -514,12 +753,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subagent_concurrency_default_syncs_over_existing_user_value() {
-        // 存量用户的 [subagent] max_concurrent 必须被新模板覆盖（模型/账号仍保留），
-        // 否则“取消子代理并发上限”这个新默认值永远传不到老用户。
-        let existing = r#"
+    fn non_destructive_merge_preserves_coding_compact_threshold_and_custom_fields() {
+        let existing = r#"# user comment must survive
 default_model = "gpt-5.1"
 language = "zh-CN"
+custom_top_level = "keep-me"
+
+[coding]
+compact_threshold = 0.35
+compact_max_tokens = 120000
 
 [subagent]
 max_concurrent = 3
@@ -529,13 +771,33 @@ max_rounds = 230
         let merged = merge_user_config_preserving_models(existing, template);
         let merged_val: toml::Value = toml::from_str(&merged).unwrap();
 
+        assert!(merged.contains("# user comment must survive"));
+        assert_eq!(
+            merged_val.get("custom_top_level").and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
+        let coding = merged_val.get("coding").expect("[coding] table");
+        assert_eq!(
+            coding.get("compact_threshold").and_then(|v| v.as_float()),
+            Some(0.35)
+        );
+        assert_eq!(
+            coding
+                .get("compact_max_tokens")
+                .and_then(|v| v.as_integer()),
+            Some(120000)
+        );
+        // Backfilled missing defaults from template
+        assert_eq!(
+            coding.get("max_rounds").and_then(|v| v.as_integer()),
+            Some(230)
+        );
+        // Existing user [subagent] values preserved
         let subagent = merged_val.get("subagent").expect("[subagent] table");
         assert_eq!(
             subagent.get("max_concurrent").and_then(|v| v.as_integer()),
-            Some(0),
-            "shipped default must win: 0 = unbounded"
+            Some(3)
         );
-        // upgrade 不得回退用户的模型与语言选择。
         assert_eq!(
             merged_val.get("default_model").and_then(|v| v.as_str()),
             Some("gpt-5.1")
@@ -572,5 +834,69 @@ max_rounds = 230
         assert!(!prompts_dir.join("root_docs_内置工具.yaml").exists());
         assert!(!prompts_dir.join("root_docs_内置技能.yaml").exists());
         assert!(!prompts_dir.join("root_docs_prompts.md").exists());
+    }
+
+    #[test]
+    fn apply_selected_diffs_checked_creates_bak_and_preserves_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let existing_toml = "default_model = \"gpt-5.1\"\n[coding]\ncompact_threshold = 0.35\n";
+        let existing_mcp = r#"{
+  "mcpServers": {
+    "context7": { "command": "npx", "args": [] }
+  }
+}
+"#;
+        std::fs::write(home.join("config.toml"), existing_toml).unwrap();
+        std::fs::write(home.join("mcp.json"), existing_mcp).unwrap();
+
+        let mut diffs = scan_jeikcode_config_diffs(home);
+        // Existing config.toml and mcp.json must be opt-in (default unselected)
+        let cfg_diff = diffs
+            .iter()
+            .find(|d| d.relative_path == "config.toml")
+            .expect("config.toml diff should exist when template keys are missing");
+        assert!(!cfg_diff.selected, "config.toml must not auto-select");
+        assert!(cfg_diff.diff_preview.is_some());
+        // mcp.json has no missing bundled keys, or if modified is unselected; verify merge preserves user server
+        let merged_mcp = merge_mcp_json_preserving_servers(existing_mcp, "{}\n").unwrap();
+        let merged_val: Value = serde_json::from_str(&merged_mcp).unwrap();
+        assert!(merged_val["mcpServers"].get("context7").is_some());
+
+        // Explicitly select config.toml and apply -> creates config.toml.bak and keeps compact_threshold
+        for d in &mut diffs {
+            if d.relative_path == "config.toml" {
+                d.selected = true;
+            }
+        }
+        let applied = apply_selected_diffs_checked(diffs).unwrap();
+        assert!(applied >= 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml.bak")).unwrap(),
+            existing_toml
+        );
+        let new_toml = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&new_toml).unwrap();
+        assert_eq!(parsed["coding"]["compact_threshold"].as_float(), Some(0.35));
+    }
+
+    #[test]
+    fn guard_config_toml_write_blocks_dropping_coding_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "[coding]\ncompact_threshold = 0.35\n").unwrap();
+
+        let item = ConfigDiffItem {
+            relative_path: "config.toml".into(),
+            description: "test".into(),
+            target_path: target.clone(),
+            new_content: "language = \"en\"\n".into(),
+            kind: DiffKind::Modified,
+            selected: true,
+            diff_preview: None,
+        };
+        let err = apply_selected_diffs_checked(vec![item]).unwrap_err();
+        assert!(err.to_string().contains("drops existing `coding`"));
     }
 }

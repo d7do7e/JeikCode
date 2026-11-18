@@ -3504,6 +3504,7 @@ export interface ConfigDiffItem {
   target_path: string;
   kind: 'new' | 'modified' | 'obsolete';
   selected: boolean;
+  diff_preview?: string | null;
 }
 
 export interface UpgradeDiffsResponse {

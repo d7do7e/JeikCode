@@ -2062,10 +2062,12 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "similar",
  "tempfile",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "toml_edit",
  "tracing",
  "uuid",
 ]
