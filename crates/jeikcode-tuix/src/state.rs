@@ -847,6 +847,9 @@ pub struct ContextSnapshot {
     /// Surfaced by `/context prompt`. Empty until the first rich
     /// emission lands.
     pub system_prompt: String,
+    /// Active skills loaded via `use_skill` in the current session, deduplicated
+    /// in invocation order.
+    pub loaded_skills: Vec<String>,
 }
 
 impl ContextSnapshot {
@@ -1171,6 +1174,10 @@ pub struct UiState {
     /// Unlike the old live-only row, this PERSISTS across turn boundaries — the
     /// panel is a standing view, hidden only when the list is empty or all done.
     pub active_todos: Option<crate::render::TodoProgress>,
+    /// Active skills loaded via `use_skill` in the current session, deduplicated
+    /// in invocation order (most recently invoked skill last). Cleared on session
+    /// switch / `/new`.
+    pub loaded_skills: Vec<String>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -1375,6 +1382,7 @@ impl UiState {
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
             active_todos: None,
+            loaded_skills: Vec::new(),
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,
@@ -1529,6 +1537,52 @@ impl UiState {
         // narrow path passes "" and we keep whatever was cached last.
         if !system_prompt.is_empty() {
             snap.system_prompt = system_prompt.to_string();
+        }
+    }
+
+    /// Record a skill loaded via `use_skill` in invocation order (moving an
+    /// already-loaded skill to the end so `<latest>` is always the most recent).
+    pub fn record_loaded_skill(&mut self, raw_name: &str) {
+        let trimmed = raw_name.trim();
+        let bare = trimmed.strip_prefix("skills:").unwrap_or(trimmed).trim();
+        if bare.is_empty() {
+            return;
+        }
+        let norm = bare.to_string();
+        if let Some(pos) = self
+            .loaded_skills
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&norm))
+        {
+            self.loaded_skills.remove(pos);
+        }
+        self.loaded_skills.push(norm);
+        if let Some(snap) = self.last_context.as_mut() {
+            snap.loaded_skills = self.loaded_skills.clone();
+        }
+    }
+
+    /// Remove a skill from `loaded_skills` if its `use_skill` tool call failed.
+    pub fn remove_loaded_skill(&mut self, raw_name: &str) {
+        let trimmed = raw_name.trim();
+        let bare = trimmed.strip_prefix("skills:").unwrap_or(trimmed).trim();
+        if bare.is_empty() {
+            return;
+        }
+        self.loaded_skills.retain(|s| !s.eq_ignore_ascii_case(bare));
+        if let Some(snap) = self.last_context.as_mut() {
+            snap.loaded_skills = self.loaded_skills.clone();
+        }
+    }
+
+    /// Synchronize `loaded_skills` from a complete list (e.g. `RuntimeContextStats` or session replay).
+    pub fn set_loaded_skills(&mut self, skills: Vec<String>) {
+        self.loaded_skills.clear();
+        for s in skills {
+            self.record_loaded_skill(&s);
+        }
+        if let Some(snap) = self.last_context.as_mut() {
+            snap.loaded_skills = self.loaded_skills.clone();
         }
     }
 
@@ -1837,6 +1891,10 @@ impl UiState {
         self.footer_persistence_warning = None;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.loaded_skills.clear();
+        if let Some(snap) = self.last_context.as_mut() {
+            snap.loaded_skills.clear();
+        }
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting

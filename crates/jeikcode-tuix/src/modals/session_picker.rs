@@ -764,6 +764,9 @@ pub(crate) fn replay_session(
     // same way the live path does. (Also resets a prior session's panel/titles.)
     state.active_todos = crate::event_loop::todo_progress_from_board(&session.id);
     crate::event_loop::sync_todo_titles(state);
+    state.set_loaded_skills(
+        jeikcode_capabilities::compaction::extract_active_skills_in_span(&session.messages),
+    );
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
             if seen_user {

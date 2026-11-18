@@ -698,7 +698,10 @@ are installed, they are listed under the '<available_skills>' ('=== AVAILABLE SK
 This takes \
 priority over asking the user a clarifying question: if a listed description matches the \
 request, load that exact skill FIRST and let it drive the questions — do \
-not ask ad-hoc questions or start exploring/planning before loading it. Announce in one line \
+not ask ad-hoc questions or start exploring/planning before loading it. If an installed skill \
+governs post-implementation verification (such as an execution verifier/inquisitor after \
+non-trivial multi-file changes), load it with `use_skill` once implementation edits complete \
+and before final commit/closure. Announce in one line \
 which skill you're using; if you skip an obviously matching skill, say why. If several match, \
 use the minimal set; if none match, proceed normally. When the loaded skill runs an interview \
 to refine a design, let the user answer in the UI \

@@ -2851,9 +2851,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
+        let skills_str = if let Some(latest) = status.loaded_skills.last() {
+            let glyph = if self.caps.unicode_symbols {
+                "\u{2726}"
+            } else {
+                "*"
+            };
+            let clean = scrub_controls(latest);
+            let extra = status.loaded_skills.len().saturating_sub(1);
+            if extra == 0 {
+                format!("{glyph} skill: {clean}")
+            } else {
+                format!("{glyph} skills: {clean} +{extra}")
+            }
+        } else {
+            String::new()
+        };
         // Widths of the static " · " separators between visible parts.
         let sep_w = if !model_str.is_empty() { 3 } else { 0 }
             + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
+                3
+            } else {
+                0
+            }
+            + if !skills_str.is_empty()
+                && (!model_str.is_empty() || !status.cwd.is_empty() || !ctx_str.is_empty())
+            {
                 3
             } else {
                 0
@@ -2861,9 +2884,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cwd_budget = left_max
             .saturating_sub(crate::width::display_width(&model_str))
             .saturating_sub(crate::width::display_width(&ctx_str))
+            .saturating_sub(crate::width::display_width(&skills_str))
             .saturating_sub(sep_w);
 
-        let mut parts: Vec<String> = Vec::with_capacity(4);
+        let mut parts: Vec<String> = Vec::with_capacity(5);
         if !model_str.is_empty() {
             parts.push(model_str);
         }
@@ -2881,6 +2905,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
+        }
+        if !skills_str.is_empty() {
+            parts.push(skills_str);
         }
         // NOTE: the goal indicator is NOT appended here any more — it lives on
         // its own dedicated footer row (`build_goal_row`) so it can't be the
@@ -9795,6 +9822,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         }
     }
 
@@ -9807,6 +9835,28 @@ mod tests {
         let row = r.build_status_row(&status, 80, false);
         let visible: String = row.iter().map(|cell| cell.ch).collect();
         assert!(visible.contains("0/1m tok (0%)"), "{visible:?}");
+    }
+
+    #[test]
+    fn status_row_renders_loaded_skills_pill() {
+        let (mut r, _counter) = new_counting(100, 24);
+        r.caps.unicode_symbols = true;
+        let mut status = status_basic();
+        status.loaded_skills = vec!["plan-tribunal".into()];
+        let row1 = r.build_status_row(&status, 100, false);
+        let vis1: String = row1.iter().map(|c| c.ch).collect();
+        assert!(
+            vis1.contains("\u{2726} skill: plan-tribunal"),
+            "single loaded skill must render pill: {vis1:?}"
+        );
+
+        status.loaded_skills.push("exec-inquisitor".into());
+        let row2 = r.build_status_row(&status, 100, false);
+        let vis2: String = row2.iter().map(|c| c.ch).collect();
+        assert!(
+            vis2.contains("\u{2726} skills: exec-inquisitor +1"),
+            "multiple loaded skills must render latest + count: {vis2:?}"
+        );
     }
 
     #[test]
@@ -10166,6 +10216,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -10222,6 +10273,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -10297,6 +10349,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -10348,6 +10401,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let idx = row
@@ -10403,6 +10457,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -10458,6 +10513,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -10497,6 +10553,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         let row = r.build_status_row(&status, 60, false);
         let visible: String = row.iter().map(|c| c.ch).collect();
@@ -22075,6 +22132,7 @@ mod tests {
             pending_messages: Vec::new(),
             next_prompt_suggestion: None,
             round_cap_panel: None,
+            loaded_skills: Vec::new(),
         };
         status.approval = Some(crate::render::ApprovalPanelView {
             tool: "Bash".into(),

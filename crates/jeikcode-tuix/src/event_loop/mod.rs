@@ -19791,6 +19791,7 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ContextStatsRefreshed(result) => {
                     match result {
                         Ok(stats) => {
+                            state.set_loaded_skills(stats.loaded_skills.clone());
                             state.on_runtime_context_stats(
                                 stats.system_tokens,
                                 stats.sent_tokens,
@@ -21870,6 +21871,13 @@ fn handle_agent_event(
                 parse_todo_titles_into(&mut state.todo_titles, &output);
                 sync_todo_titles(state);
             }
+            if name == "use_skill" && success {
+                if let Some((_, det, _)) = pending_tools.get(&call_id) {
+                    if !det.is_empty() {
+                        state.record_loaded_skill(det);
+                    }
+                }
+            }
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
             // child completion and skip the full ▸ + ⎿ body render.
@@ -22927,6 +22935,23 @@ fn handle_agent_event(
                 })
                 .collect();
             renderer.render(UiLine::AssistantLineBreak);
+            // Surface `use_skill` activations prominently ABOVE the muted batch
+            // group so active skill loading is never buried inside `Running N tools`.
+            for c in &calls {
+                if c.name == "use_skill" {
+                    let skill_name = format_tool_detail(&c.name, &c.arguments);
+                    if !skill_name.is_empty() {
+                        let glyph = if ctx.caps.unicode_symbols {
+                            "\u{2726}"
+                        } else {
+                            "*"
+                        };
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  {glyph} UseSkill({skill_name})\n"
+                        )));
+                    }
+                }
+            }
             renderer.render(UiLine::ToolGroupRender {
                 batch_id: batch_id.clone(),
                 header: header_text,
@@ -24297,6 +24322,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
+        loaded_skills: state.loaded_skills.clone(),
         subtasks: state.active_subtasks.clone(),
         approval,
         user_input,

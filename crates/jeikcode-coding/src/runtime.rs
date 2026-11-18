@@ -413,6 +413,7 @@ pub struct RuntimeContextStats {
     pub total_messages: usize,
     pub system_prompt: String,
     pub prefix_blocks: Vec<ContextPrefixBlock>,
+    pub loaded_skills: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

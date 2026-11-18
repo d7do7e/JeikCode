@@ -12,12 +12,20 @@ use std::sync::Arc;
 /// byte-identical (prompt-prefix caching), same rationale as the kernel ToolRegistry.
 pub struct SkillRegistry {
     skills: BTreeMap<String, Arc<Skill>>,
+    /// Configured `(dir, namespace)` roots recorded by `load`/`load_dir` so
+    /// `get_or_load_from_disk` can discover newly created `SKILL.md` files mid-session
+    /// without requiring `/reload`.
+    source_dirs: Vec<(PathBuf, Option<String>)>,
+    /// Disabled skill names recorded by `retain_enabled`, honored by on-demand disk scans.
+    disabled: std::collections::BTreeSet<String>,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: BTreeMap::new(),
+            source_dirs: Vec::new(),
+            disabled: std::collections::BTreeSet::new(),
         }
     }
 
@@ -34,6 +42,10 @@ impl SkillRegistry {
 
     /// Load one directory, optionally namespacing the skill names (`{ns}:{name}`).
     pub fn load_dir(&mut self, dir: &Path, namespace: Option<&str>) {
+        let entry = (dir.to_path_buf(), namespace.map(str::to_string));
+        if !self.source_dirs.contains(&entry) {
+            self.source_dirs.push(entry);
+        }
         self.scan_skill_dir(dir, namespace, 0);
     }
 
@@ -136,6 +148,47 @@ impl SkillRegistry {
         }
         None
     }
+
+    /// Resolve a skill from the in-memory snapshot, falling back to an on-demand scan
+    /// of the registry's configured `source_dirs` when a skill was created on disk
+    /// mid-session in another terminal. Respects any `disabled` set passed to `retain_enabled`.
+    pub fn get_or_load_from_disk(&self, name: &str) -> Option<Arc<Skill>> {
+        if let Some(skill) = self.get(name) {
+            return Some(skill);
+        }
+        if self.source_dirs.is_empty() {
+            return None;
+        }
+        let fresh = self.rescan_source_dirs();
+        fresh.get(name)
+    }
+
+    /// List `(name, description)` including any newly created skills in `source_dirs`.
+    pub fn list_with_disk_fallback(&self) -> Vec<(String, String)> {
+        if self.source_dirs.is_empty() {
+            return self.list();
+        }
+        let mut merged = self.skills.clone();
+        let fresh = self.rescan_source_dirs();
+        for (k, v) in fresh.skills {
+            merged.entry(k).or_insert(v);
+        }
+        merged
+            .values()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect()
+    }
+
+    fn rescan_source_dirs(&self) -> Self {
+        let mut fresh = Self::new();
+        for (dir, ns) in &self.source_dirs {
+            fresh.scan_skill_dir(dir, ns.as_deref(), 0);
+        }
+        if !self.disabled.is_empty() {
+            fresh.retain_enabled(&self.disabled);
+        }
+        fresh
+    }
     pub fn len(&self) -> usize {
         self.skills.len()
     }
@@ -160,6 +213,7 @@ impl SkillRegistry {
     /// uses — so no parse warnings are collected.
     pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
         self.skills.clear();
+        self.source_dirs.clear();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         for dir in runtime_skill_dirs(&home, working_dir) {
             self.load_dir(&dir, Some("skills"));
@@ -192,6 +246,7 @@ impl SkillRegistry {
     /// GLOBAL/PROJECT disable state ([`super::controls`]).
     /// Matches both bare names ("foo") and namespaced IDs ("skills:foo").
     pub fn retain_enabled(&mut self, disabled: &std::collections::BTreeSet<String>) {
+        self.disabled = disabled.clone();
         if disabled.is_empty() {
             return;
         }

@@ -41,7 +41,18 @@ impl Skill {
 
     /// Raw guide for the `use_skill` tool: the SKILL.md body verbatim, with no
     /// argument, variable, or shell substitution.
+    ///
+    /// Re-reads `source_path` from disk when the file exists so live edits to
+    /// `SKILL.md` in another terminal/editor take effect on the very next
+    /// `use_skill` call without requiring `/reload` and without mutating the
+    /// cached `<available_skills>` prefix block.
     pub fn raw_for_injection(&self) -> String {
+        if self.source_path.is_file() {
+            if let Ok(fresh) = std::fs::read_to_string(&self.source_path) {
+                let (_fm, body) = parse_frontmatter(&fresh);
+                return self.render_injection(&body);
+            }
+        }
         self.render_injection(&self.content)
     }
 }

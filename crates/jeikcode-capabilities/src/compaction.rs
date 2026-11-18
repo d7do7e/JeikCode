@@ -101,6 +101,7 @@ impl StubCompaction {
         }
         let id_to_tool = call_id_to_tool(msgs);
         let superseded_reads = superseded_read_call_ids(msgs);
+        let superseded_skills = superseded_use_skill_call_ids(msgs);
         let mut rewrites: Vec<(usize, String)> = Vec::new();
         for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
             if m.role != Role::Tool || m.text.len() <= MIN_COLLAPSE_SIZE {
@@ -115,6 +116,12 @@ impl StubCompaction {
                 && is_file_read_tool(tool)
                 && !superseded_reads.contains(call_id)
             {
+                continue;
+            }
+            // Keep the most recent non-error `use_skill` output for each distinct
+            // skill name intact across intra-turn and multi-turn stub passes so
+            // loaded `<Skill Guide>` rubrics and templates are not wiped mid-session.
+            if tool == "use_skill" && !m.is_error && !superseded_skills.contains(call_id) {
                 continue;
             }
             if tool == "code_explore" {
@@ -502,10 +509,18 @@ impl OverflowCompaction {
         // a failed/timed-out/empty summary leaves the exact history recoverable through the
         // pointer. No archive store ⇒ this is a no-op and behavior is summary-only.
         let pointer = self.archive_span(span);
+        let active_skills = extract_active_skills_in_span(span);
+        let skills_pointer = format_active_skills_pointer(&active_skills);
+        let combined_tail = match (&skills_pointer, &pointer) {
+            (Some(s), Some(p)) => Some(format!("{s}\n\n{p}")),
+            (Some(s), None) => Some(s.clone()),
+            (None, Some(p)) => Some(p.clone()),
+            (None, None) => None,
+        };
         let Some(provider) = self.summary_provider.as_ref() else {
             // No summarizer: a pointer-only anchored message is strictly better than a
             // silent plain-drain (which would discard the span with no way back).
-            return pointer.map(|pointer| pointer_only_summary(&pointer));
+            return combined_tail.map(|tail| pointer_only_summary(&tail));
         };
         // Split: the prior anchor (if any) is the UPDATE base; everything else is the new
         // transcript to fold in. The anchor is NEVER re-rendered as transcript (erosion fix).
@@ -531,10 +546,11 @@ impl OverflowCompaction {
             Some(MAX_SUMMARY_TOKENS),
             None,
         );
-        // Reserve room for the sentinel + framing + their newlines prepended below, so the FINAL
-        // summary still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
-        let body_budget =
-            MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
+        // Reserve room for the sentinel + framing + their newlines (+ optional active-skills
+        // pointer) prepended/appended below, so the FINAL summary still respects MAX_SUMMARY_BYTES.
+        let skills_reserve = skills_pointer.as_ref().map_or(0, |s| s.len() + 2);
+        let body_budget = MAX_SUMMARY_BYTES
+            .saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2 + skills_reserve);
         let cancel = tokio_util::sync::CancellationToken::new();
         let out = match crate::provider::collect_auxiliary_text(
             provider.as_ref(),
@@ -547,7 +563,7 @@ impl OverflowCompaction {
         .await
         {
             Ok((text, _)) => text,
-            Err(_) => return pointer.map(|pointer| pointer_only_summary(&pointer)),
+            Err(_) => return combined_tail.map(|tail| pointer_only_summary(&tail)),
         };
         // Strip any leading sentinel/framing the model may have echoed, then stamp exactly ONE
         // sentinel + the framing so the NEXT compaction recognizes the anchor and the model that
@@ -562,12 +578,12 @@ impl OverflowCompaction {
             .map(str::trim_start)
             .unwrap_or(body);
         if body.is_empty() {
-            return pointer.map(|pointer| pointer_only_summary(&pointer));
+            return combined_tail.map(|tail| pointer_only_summary(&tail));
         }
         let mut summary = format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}");
-        if let Some(pointer) = pointer {
+        if let Some(tail) = combined_tail {
             summary.push_str("\n\n");
-            summary.push_str(&pointer);
+            summary.push_str(&tail);
         }
         Some(summary)
     }
@@ -604,11 +620,22 @@ fn archive_pointer(id: &str) -> String {
     )
 }
 
-/// Strip a previous summary's archive pointer (the new summary carries THIS drain's id).
+/// Strip a previous summary's archive pointer and active-skills footer (the new summary
+/// recomputes and appends both for THIS drain).
 fn strip_archive_pointer(anchor: &str) -> String {
-    match anchor.rfind("\n[Verbatim archive]") {
-        Some(pos) => anchor[..pos].trim_end().to_string(),
-        None => anchor.to_string(),
+    let without_archive = if anchor.starts_with("[Verbatim archive]") {
+        ""
+    } else if let Some(pos) = anchor.rfind("\n[Verbatim archive]") {
+        anchor[..pos].trim_end()
+    } else {
+        anchor
+    };
+    if without_archive.starts_with(ACTIVE_SKILLS_POINTER_PREFIX) {
+        String::new()
+    } else if let Some(pos) = without_archive.rfind("\n[Active skills loaded in session:") {
+        without_archive[..pos].trim_end().to_string()
+    } else {
+        without_archive.to_string()
     }
 }
 
@@ -1353,6 +1380,154 @@ fn parse_read_footer_signature(text: &str) -> Option<(String, String)> {
         }
     }
     Some((file_path?, showing.unwrap_or_else(|| "default".to_string())))
+}
+
+const ACTIVE_SKILLS_POINTER_PREFIX: &str = "[Active skills loaded in session: ";
+
+fn normalize_skill_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let bare = lower.strip_prefix("skills:").unwrap_or(&lower).trim();
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
+fn parse_use_skill_call_name(args_json: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(args_json).ok()?;
+    v.get("name")
+        .and_then(|n| n.as_str())
+        .and_then(normalize_skill_key)
+}
+
+fn parse_use_skill_header_name(output: &str) -> Option<String> {
+    let first = output.lines().next()?.strip_prefix("Skill Path: ")?.trim();
+    let dir_name = first
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
+    normalize_skill_key(dir_name)
+}
+
+/// Identify `tool_call_id`s of older `use_skill` calls whose skill was subsequently
+/// reloaded by a later non-error `use_skill` call for the same skill name.
+/// The latest non-error `use_skill` result for each distinct skill stays exempt from
+/// `StubCompaction`, while older duplicate loads of the same skill are stubbed.
+fn superseded_use_skill_call_ids(msgs: &[Message]) -> std::collections::HashSet<String> {
+    let mut call_skill: HashMap<String, String> = HashMap::new();
+    for m in msgs {
+        if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                if tc.name == "use_skill" {
+                    if let Some(skill_name) = parse_use_skill_call_name(&tc.arguments) {
+                        call_skill.insert(tc.id.clone(), skill_name);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut latest_by_skill: HashMap<String, String> = HashMap::new();
+    let mut superseded = std::collections::HashSet::new();
+
+    for m in msgs {
+        if m.role != Role::Tool || m.is_error {
+            continue;
+        }
+        let Some(call_id) = m.tool_call_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(skill_key) = call_skill
+            .get(call_id)
+            .cloned()
+            .or_else(|| parse_use_skill_header_name(&m.text))
+        else {
+            continue;
+        };
+        if let Some(prev_id) = latest_by_skill.insert(skill_key, call_id.to_string()) {
+            if prev_id != call_id {
+                superseded.insert(prev_id);
+            }
+        }
+    }
+
+    superseded
+}
+
+/// Extract the ordered, deduplicated list of active skill names loaded in `msgs`
+/// (including any `[Active skills loaded in session: ...]` pointer carried by a
+/// prior compaction anchor).
+pub fn extract_active_skills_in_span(msgs: &[Message]) -> Vec<String> {
+    let mut skills: Vec<String> = Vec::new();
+    let mut push_unique = |name: String| {
+        if let Some(pos) = skills.iter().position(|s| s == &name) {
+            skills.remove(pos);
+        }
+        skills.push(name);
+    };
+
+    let mut call_skill: HashMap<String, String> = HashMap::new();
+    let mut errored_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in msgs {
+        if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                if tc.name == "use_skill" {
+                    if let Some(name) = parse_use_skill_call_name(&tc.arguments) {
+                        call_skill.insert(tc.id.clone(), name);
+                    }
+                }
+            }
+        } else if m.role == Role::Tool && m.is_error {
+            if let Some(id) = m.tool_call_id.as_deref() {
+                errored_calls.insert(id.to_string());
+            }
+        }
+    }
+
+    for m in msgs {
+        if is_anchor_message(m) {
+            for line in m.text.lines() {
+                if let Some(rest) = line.trim().strip_prefix(ACTIVE_SKILLS_POINTER_PREFIX) {
+                    let list_part = rest.split(" — ").next().unwrap_or(rest);
+                    let list_part = list_part.trim_end_matches(']');
+                    for item in list_part.split(',') {
+                        if let Some(norm) = normalize_skill_key(item) {
+                            push_unique(norm);
+                        }
+                    }
+                }
+            }
+        } else if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                if tc.name == "use_skill" && !errored_calls.contains(&tc.id) {
+                    if let Some(name) = call_skill.get(&tc.id).cloned() {
+                        push_unique(name);
+                    }
+                }
+            }
+        } else if m.role == Role::Tool && !m.is_error {
+            let call_id = m.tool_call_id.as_deref().unwrap_or("");
+            if !call_skill.contains_key(call_id) {
+                if let Some(name) = parse_use_skill_header_name(&m.text) {
+                    push_unique(name);
+                }
+            }
+        }
+    }
+
+    skills
+}
+
+fn format_active_skills_pointer(skills: &[String]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let list = skills.join(", ");
+    let latest = skills.last().unwrap_or(&skills[0]);
+    Some(format!(
+        "{ACTIVE_SKILLS_POINTER_PREFIX}{list} — re-call use_skill(\"{latest}\") if the full <Skill Guide> rubric/templates are needed]"
+    ))
 }
 
 /// Recoverable stub for a compacted tool result.
@@ -3254,6 +3429,161 @@ Dependencies verified.
             surviving_asst_rounds >= MIN_INTRA_TURN_RECENT_ROUNDS,
             "must keep at least {MIN_INTRA_TURN_RECENT_ROUNDS} recent tool rounds intact, got {surviving_asst_rounds}"
         );
+    }
+
+    #[tokio::test]
+    async fn stub_compaction_exempts_latest_use_skill_per_name_and_stubs_superseded_duplicates() {
+        let guide_v1 = format!(
+            "Skill Path: /skills/plan-tribunal\nSkill Guide: /skills/plan-tribunal/SKILL.md\n<Skill Guide>\n{}\n</Skill Guide>",
+            "V1_TRIBUNAL_RULE ".repeat(60)
+        );
+        let guide_v2 = format!(
+            "Skill Path: /skills/plan-tribunal\nSkill Guide: /skills/plan-tribunal/SKILL.md\n<Skill Guide>\n{}\n</Skill Guide>",
+            "V2_TRIBUNAL_RULE ".repeat(60)
+        );
+        let guide_inquisitor = format!(
+            "Skill Path: /skills/exec-inquisitor\nSkill Guide: /skills/exec-inquisitor/SKILL.md\n<Skill Guide>\n{}\n</Skill Guide>",
+            "INQUISITOR_GATE ".repeat(60)
+        );
+        let big_grep = "G".repeat(1_200);
+
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("build feature"),
+            // Round 1: load plan-tribunal (v1) + grep
+            Message::assistant(
+                "",
+                vec![
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "sk1".into(),
+                        name: "use_skill".into(),
+                        arguments: r#"{"name":"plan-tribunal"}"#.into(),
+                    },
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "gr1".into(),
+                        name: "grep".into(),
+                        arguments: r#"{"pattern":"foo"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("sk1", &guide_v1, false), // idx 3 (superseded by sk2)
+            Message::tool_result("gr1", &big_grep, false), // idx 4 (stubbable)
+            // Round 2: reload plan-tribunal (v2) + load exec-inquisitor
+            Message::assistant(
+                "",
+                vec![
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "sk2".into(),
+                        name: "use_skill".into(),
+                        arguments: r#"{"name":"skills:plan-tribunal"}"#.into(),
+                    },
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "sk3".into(),
+                        name: "use_skill".into(),
+                        arguments: r#"{"name":"exec-inquisitor"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("sk2", &guide_v2, false), // idx 6 (latest plan-tribunal -> exempt!)
+            Message::tool_result("sk3", &guide_inquisitor, false), // idx 7 (latest exec-inquisitor -> exempt!)
+        ];
+        // Add 5 more tool rounds inside the same turn so Rounds 1 & 2 fall before intra-turn stub_boundary
+        for r in 3..=7 {
+            msgs.push(Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: format!("g{r}"),
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"bar"}"#.into(),
+                }],
+            ));
+            msgs.push(Message::tool_result(format!("g{r}"), &big_grep, false));
+        }
+
+        let v = view(&msgs, 2);
+        let plan = StubCompaction::default().plan(&v).await;
+        let rewritten_indices: Vec<usize> = plan.rewrites.iter().map(|(idx, _)| *idx).collect();
+
+        assert!(
+            rewritten_indices.contains(&3),
+            "superseded first load of plan-tribunal (idx 3) must be stubbed: {rewritten_indices:?}"
+        );
+        assert!(
+            rewritten_indices.contains(&4),
+            "old grep result (idx 4) must be stubbed: {rewritten_indices:?}"
+        );
+        assert!(
+            !rewritten_indices.contains(&6),
+            "latest load of plan-tribunal (idx 6) must stay exempt from StubCompaction: {rewritten_indices:?}"
+        );
+        assert!(
+            !rewritten_indices.contains(&7),
+            "latest load of exec-inquisitor (idx 7) must stay exempt from StubCompaction: {rewritten_indices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_compaction_embeds_and_carries_forward_active_skills_pointer() {
+        let guide = format!(
+            "Skill Path: /skills/plan-tribunal\nSkill Guide: /skills/plan-tribunal/SKILL.md\n<Skill Guide>\n{}\n</Skill Guide>",
+            "TRIBUNAL_RULE ".repeat(40)
+        );
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "sk1".into(),
+                    name: "use_skill".into(),
+                    arguments: r#"{"name":"plan-tribunal"}"#.into(),
+                }],
+            ),
+            Message::tool_result("sk1", &guide, false),
+            Message::user("turn 2 active"),
+        ];
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        let plan = strat
+            .plan(&CompactionView {
+                messages: &msgs,
+                trigger: CompactTrigger::Manual { focus: None },
+                ctx_window: 8_000,
+                used_tokens: 7_500,
+                utilization: 0.94,
+                sacred_floor: 2,
+            })
+            .await;
+        let summary = plan
+            .summary
+            .expect("manual compaction must produce summary");
+        assert!(
+            summary.contains(
+                "[Active skills loaded in session: plan-tribunal — re-call use_skill(\"plan-tribunal\") if the full <Skill Guide> rubric/templates are needed]"
+            ),
+            "summary must carry active-skills pointer: {summary}"
+        );
+
+        // Verify a second compaction over that anchor carries forward `plan-tribunal` and adds `exec-inquisitor`
+        let msgs2 = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::synthetic_user(summary),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "sk2".into(),
+                    name: "use_skill".into(),
+                    arguments: r#"{"name":"exec-inquisitor"}"#.into(),
+                }],
+            ),
+            Message::tool_result("sk2", &guide, false),
+            Message::user("turn 3 active"),
+        ];
+        let extracted = extract_active_skills_in_span(&msgs2);
+        assert_eq!(extracted, vec!["plan-tribunal", "exec-inquisitor"]);
     }
 }
 

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use jeikcode_capabilities::compaction::is_compaction_anchor_text;
+use jeikcode_capabilities::compaction::{extract_active_skills_in_span, is_compaction_anchor_text};
 use jeikcode_kernel::message::{Message, Role, SessionSnapshot, LEGACY_COLD_SUMMARY_ORIGIN};
 use jeikcode_kernel::tool::ToolDef;
 
@@ -172,8 +172,10 @@ where
         est_non_sys_tokens,
         total_messages,
         snapshot_used_tokens,
+        loaded_skills,
     ) = if let Some(snapshot) = snapshot {
         let messages = &snapshot.messages;
+        let loaded_skills = extract_active_skills_in_span(messages);
         let wire: Vec<&Message> = messages
             .iter()
             .filter(|m| is_wire_history_message(m))
@@ -242,13 +244,14 @@ where
             est_non_frozen_tokens,
             msg_count,
             snapshot_used,
+            loaded_skills,
         )
     } else {
         let blocks = baseline_blocks();
         let prompt = join_non_empty_blocks(blocks.iter().map(String::as_str));
         let p_blocks = build_baseline_prefix_blocks(&blocks);
         let tokens: usize = p_blocks.iter().map(|b| b.tokens).sum();
-        (prompt, tokens, p_blocks, 0, 0, 0, 0)
+        (prompt, tokens, p_blocks, 0, 0, 0, 0, Vec::new())
     };
 
     let used_tokens = if observed_used_tokens > 0 {
@@ -288,6 +291,7 @@ where
         total_messages,
         system_prompt,
         prefix_blocks,
+        loaded_skills,
     }
 }
 

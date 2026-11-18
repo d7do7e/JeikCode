@@ -3956,7 +3956,7 @@ fn execute_slash_command_impl(
                 // 去重，也直接写进 `use_skill(<canonical>)`，避免裸名歧义。
                 let resolve = |name: &str| {
                     ctx.skill_registry.read().ok().and_then(|r| {
-                        r.get(name)
+                        r.get_or_load_from_disk(name)
                             .filter(|s| s.user_invocable)
                             .map(|s| s.name.clone())
                     })
@@ -4193,7 +4193,7 @@ pub(super) fn skill_invocation(ctx: &LoopCtx, name: &str, task: &str) -> Option<
         .skill_registry
         .read()
         .ok()?
-        .get(name)
+        .get_or_load_from_disk(name)
         .filter(|skill| skill.user_invocable)
         .map(|skill| skill.name.clone())?;
     Some(skill_invocation_prompt(&[canonical], task))
@@ -4952,7 +4952,13 @@ pub(crate) fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// unit-testability: the inner function takes plain values and can be
 /// asserted on directly.
 pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
-    format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
+    let mut snap = state.last_context.clone();
+    if let Some(ref mut s) = snap {
+        if s.loaded_skills.is_empty() && !state.loaded_skills.is_empty() {
+            s.loaded_skills = state.loaded_skills.clone();
+        }
+    }
+    format_context_report(snap.as_ref(), &ctx.model_name, show_prompt)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5335,6 +5341,13 @@ fn format_context_report(
             n: snap.total_messages
         }),
     );
+
+    if !snap.loaded_skills.is_empty() {
+        out.push_str(&format!(
+            "  ✦ Loaded skills : {}\n",
+            snap.loaded_skills.join(", ")
+        ));
+    }
 
     // `/context prompt` — append the full system-prompt bytes the last
     // turn sent. Kept out of the default output because the prompt is
@@ -7467,6 +7480,7 @@ mod tests {
             ctx_window: 0,
             ctx_name: String::new(),
             system_prompt: String::new(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "test-model", false);
         assert!(out.contains("waiting for first complete turn"));
@@ -7486,6 +7500,7 @@ mod tests {
             ctx_window: 128_000,
             ctx_name: "default".into(),
             system_prompt: String::new(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "claude-opus-4-7", false);
 
@@ -7528,6 +7543,7 @@ mod tests {
             ctx_window: 100_000,
             ctx_name: "default".into(),
             system_prompt: String::new(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "m", false);
         // Messages bucket should be 10K - 3K = 7K, not 10K.
@@ -7558,6 +7574,7 @@ mod tests {
             ctx_window: 120_000,
             ctx_name: "default".into(),
             system_prompt: String::new(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "m", false);
         // Free = window - (sys + tools + cold + messages)
@@ -7588,6 +7605,7 @@ mod tests {
             ctx_window: 100_000,
             ctx_name: "default".into(),
             system_prompt: "You are JeikCode.\nSOME SENTINEL BYTES".into(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "m", false);
         assert!(
@@ -7614,6 +7632,7 @@ mod tests {
             ctx_window: 100_000,
             ctx_name: "default".into(),
             system_prompt: "You are JeikCode.\nRULE_LINE_ABC\nEND".into(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "m", true);
         assert!(out.contains("=== SYSTEM PROMPT ==="));
@@ -7643,6 +7662,7 @@ mod tests {
             ctx_window: 100_000,
             ctx_name: "default".into(),
             system_prompt: String::new(),
+            loaded_skills: Vec::new(),
         };
         let out = format_context_report(Some(&snap), "m", true);
         assert!(out.contains("=== SYSTEM PROMPT ==="));
@@ -7650,6 +7670,29 @@ mod tests {
             out.contains("(empty"),
             "empty cached prompt must show an explanation, got: {}",
             out
+        );
+    }
+
+    #[test]
+    fn context_report_renders_loaded_skills_when_present() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 5_000,
+            used_tokens: None,
+            tool_defs_tokens: 500,
+            cold_zone_tokens: 0,
+            total_messages: 8,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+            loaded_skills: vec!["plan-tribunal".into(), "exec-inquisitor".into()],
+        };
+        let out = format_context_report(Some(&snap), "m", false);
+        assert!(
+            out.contains("Loaded skills : plan-tribunal, exec-inquisitor"),
+            "expected Loaded skills row in /context report, got:\n{out}"
         );
     }
 

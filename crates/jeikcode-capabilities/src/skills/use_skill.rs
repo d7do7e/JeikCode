@@ -51,10 +51,15 @@ impl Tool for UseSkillTool {
                 ))
             }
         };
-        let skill = match self.registry.get(&a.name) {
+        let skill = match self.registry.get_or_load_from_disk(&a.name) {
             Some(s) => s,
             None => {
-                let names: Vec<String> = self.registry.list().into_iter().map(|(n, _)| n).collect();
+                let names: Vec<String> = self
+                    .registry
+                    .list_with_disk_fallback()
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
                 return err(format!(
                     "use_skill: skill '{}' not found. Available: {}. Do not guess another skill \
                      name; use an exact available name or continue without a skill",
@@ -253,6 +258,57 @@ mod tests {
             r.content.contains("my-plugin:alpha"),
             "available list missing plugin entry: {}",
             r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_discovers_newly_created_skill_and_live_edits_on_disk_without_reload() {
+        let base = tempfile::tempdir().unwrap();
+        let existing_dir = base.path().join("plan-tribunal");
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        let existing_md = existing_dir.join("SKILL.md");
+        std::fs::write(
+            &existing_md,
+            "---\ndescription: v1\n---\nInitial v1 guide\n",
+        )
+        .unwrap();
+
+        let reg = Arc::new(SkillRegistry::load(&[base.path().to_path_buf()]));
+        let tool = UseSkillTool::new(reg);
+
+        // 1. Live edit to an already-registered SKILL.md is picked up immediately
+        std::fs::write(
+            &existing_md,
+            "---\ndescription: v2\n---\nUpdated v2 guide on disk\n",
+        )
+        .unwrap();
+        let r1 = tool.execute(r#"{"name":"plan-tribunal"}"#, &ctx()).await;
+        assert!(!r1.is_error, "{}", r1.content);
+        assert!(
+            r1.content.contains("Updated v2 guide on disk"),
+            "live disk edit must be reflected without /reload: {}",
+            r1.content
+        );
+
+        // 2. Brand-new skill created on disk mid-session in another terminal is discovered on demand
+        let new_dir = base.path().join("exec-inquisitor");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(
+            new_dir.join("SKILL.md"),
+            "---\ndescription: verify implementation\n---\nRun 4 verification gates\n",
+        )
+        .unwrap();
+
+        let r2 = tool.execute(r#"{"name":"exec-inquisitor"}"#, &ctx()).await;
+        assert!(
+            !r2.is_error,
+            "newly created skill on disk must resolve without /reload: {}",
+            r2.content
+        );
+        assert!(
+            r2.content.contains("Run 4 verification gates"),
+            "new skill body must be returned: {}",
+            r2.content
         );
     }
 }

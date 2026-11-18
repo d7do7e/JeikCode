@@ -678,6 +678,10 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
+    /// Active skills loaded via `use_skill` in this session (deduplicated in
+    /// invocation order, latest last). Rendered as a compact `✦ skill: <latest>`
+    /// or `✦ skills: <latest> +N` pill in the status bar.
+    pub loaded_skills: Vec<String>,
     /// Active `task` fan-out, rendered as a fixed panel above the input. While
     /// present it takes the expanded top-panel slot and TodoWrite collapses.
     pub subtasks: Option<SubtaskProgress>,
