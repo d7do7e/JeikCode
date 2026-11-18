@@ -68,3 +68,23 @@ test('mobile keyboard keeps the composer against the IME without a dead gap', ()
   assert.match(css, /html\[data-keyboard-open\] \.landing-input\s*\{[^}]*margin-top:\s*auto;/s);
   assert.match(css, /html\[data-keyboard-open\] \.landing-chips\s*\{[^}]*display:\s*none;/s);
 });
+
+test('responsive sidebar, iOS 16px inputs, touch actions, and safe-area drawers stay intact', () => {
+  const sidebar = readFileSync(join(root, 'src/components/Sidebar.tsx'), 'utf8');
+  const css = readFileSync(join(root, 'src/styles/app.css'), 'utf8');
+
+  // Inline style must set only --sidebar-width so mobile/tablet media queries win.
+  assert.match(sidebar, /'--sidebar-width': `\$\{sidebarWidth\}px`/);
+  assert.doesNotMatch(sidebar, /width:\s*['"`]var\(--sidebar-width\)['"`]/);
+
+  // Mobile .message-input must stay >= 16px to prevent iOS Safari auto-zoom.
+  assert.doesNotMatch(css, /@media \(max-width: 768px\)[\s\S]*?\.message-input\s*\{[^}]*font-size:\s*13\.5px/);
+  assert.match(css, /@media \(max-width: 768px\),\s*\(pointer: coarse\)[\s\S]*?\.message-input[\s\S]*?font-size:\s*16px\s*!important;/);
+
+  // Hover-only row actions must stay visible on touch devices.
+  assert.match(css, /@media \(hover: none\),\s*\(pointer: coarse\)\s*\{[^}]*\.git-row-actions[^}]*\.msg-actions[^}]*opacity:\s*1;/s);
+
+  // Header dropdown and mobile bottom sheet must respect safe-area-inset-top & --app-vvh.
+  assert.match(css, /\.mobile-session-tabs-menu\s*\{[^}]*env\(safe-area-inset-top/s);
+  assert.match(css, /\.chat-stage\.has-right-panel \.right-inspector-panel\s*\{[^}]*var\(--app-vvh/s);
+});

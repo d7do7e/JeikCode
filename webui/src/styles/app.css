@@ -412,12 +412,12 @@ body {
 @media (max-width: 768px) {
   .mobile-session-tabs-menu {
     position: fixed !important;
-    top: 50px !important;
+    top: calc(var(--app-vv-top, 0px) + 50px + env(safe-area-inset-top, 0px)) !important;
     left: 8px !important;
     right: 8px !important;
     width: auto !important;
     max-width: calc(100vw - 16px) !important;
-    max-height: calc(85vh - 50px) !important;
+    max-height: calc(var(--app-vvh, 85dvh) - 58px - env(safe-area-inset-top, 0px)) !important;
     overflow-y: auto !important;
     z-index: 99999 !important;
     background: var(--app-card-background, #252526) !important;
@@ -2731,6 +2731,13 @@ body {
 }
 .git-status-file-row:hover .git-row-actions {
   opacity: 1;
+}
+@media (hover: none), (pointer: coarse) {
+  .git-row-actions,
+  .msg-actions,
+  .git-checkout-btn {
+    opacity: 1;
+  }
 }
 .git-row-btn {
   display: inline-flex;
@@ -11479,8 +11486,10 @@ html[data-keyboard-open] .chat-landing {
     position: static;
     top: auto;
     left: auto;
-    width: 32px;
-    height: 32px;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
     margin: 0;
     border-radius: 50%;
     background: var(--app-primary-background);
@@ -11515,8 +11524,10 @@ html[data-keyboard-open] .chat-landing {
     display: flex !important;
   }
   .top-nav-btn {
-    width: 32px;
-    height: 32px;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
     flex-shrink: 0;
   }
   .header-spacer {
@@ -11617,13 +11628,16 @@ html[data-keyboard-open] .chat-landing {
   /* Sidebar becomes off-canvas drawer (Gemini Drawer Style) */
   .session-list {
     position: fixed;
-    top: 0;
+    top: var(--app-vv-top, 0px);
     left: 0;
-    bottom: 0;
+    bottom: auto;
+    height: var(--app-vvh, 100dvh);
     z-index: 70;
     width: 86vw;
+    min-width: 0;
     max-width: 320px;
     padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
     transform: translateX(-100%);
     transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1);
     border-right: 1px solid var(--app-primary-border-color);
@@ -11671,17 +11685,23 @@ html[data-keyboard-open] .chat-landing {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
-    bottom: 0 !important;
-    top: auto !important;
+    top: calc(var(--app-vv-top, 0px) + var(--app-vvh, 100dvh) - min(85dvh, calc(var(--app-vvh, 100dvh) - 16px - env(safe-area-inset-top, 0px)))) !important;
+    bottom: auto !important;
     width: 100% !important;
     max-width: 100% !important;
-    height: 85dvh !important;
-    max-height: 85dvh !important;
+    height: min(85dvh, calc(var(--app-vvh, 100dvh) - 16px - env(safe-area-inset-top, 0px))) !important;
+    max-height: calc(var(--app-vvh, 100dvh) - 16px - env(safe-area-inset-top, 0px)) !important;
     border-radius: 20px 20px 0 0 !important;
     z-index: 80 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.5) !important;
     background: var(--app-secondary-background) !important;
     animation: mobileSheetSlideUp 0.24s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  }
+  html:not([data-keyboard-open]) .chat-stage.has-right-panel .right-panel-body {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  html[data-keyboard-open] .chat-stage.has-right-panel .right-panel-body {
+    padding-bottom: 0;
   }
   .chat-stage.has-right-panel .git-commit-files-panel {
     margin-left: 0 !important;
@@ -11700,6 +11720,7 @@ html[data-keyboard-open] .chat-landing {
     align-items: center !important;
     gap: 3px !important;
     padding: 3px !important;
+    width: 46px !important;
     background: var(--app-card-background, #1e1e1e) !important;
     border: 1px solid var(--app-border, rgba(255, 255, 255, 0.18)) !important;
     border-radius: 10px !important;
@@ -11711,9 +11732,9 @@ html[data-keyboard-open] .chat-landing {
     display: none !important;
   }
   .right-panel-collapsed-rail .right-panel-tab-btn {
-    height: 30px !important;
-    min-width: 30px !important;
-    width: 30px !important;
+    height: 38px !important;
+    min-width: 38px !important;
+    width: 38px !important;
     padding: 0 !important;
     font-size: 11px !important;
     justify-content: center !important;
@@ -11748,7 +11769,7 @@ html[data-keyboard-open] .chat-landing {
     min-height: 36px !important;
     max-height: 84px !important; /* 手机端输入框高度深度压缩，最多3-4行，防止输入法弹起时遮挡对话内容 */
     padding: 6px 10px !important;
-    font-size: 13.5px !important;
+    font-size: 16px !important;
     line-height: 1.35 !important;
   }
 
@@ -11801,12 +11822,25 @@ html[data-keyboard-open] .chat-landing {
   }
 
   /* Tap targets */
-  .ghost-btn { min-width: 34px; height: 34px; }
+  .ghost-btn { min-width: 38px; height: 38px; }
+  .btn-native-upload {
+    width: 38px !important;
+    height: 38px !important;
+    min-width: 38px;
+    min-height: 38px;
+  }
+  .git-row-btn,
+  .git-icon-action-btn {
+    min-width: 32px;
+    min-height: 32px;
+  }
   .input-footer {
     flex-direction: row !important;
+    flex-wrap: wrap !important;
     align-items: center !important;
     justify-content: space-between !important;
     gap: 6px !important;
+    min-width: 0;
   }
   .input-footer-primary {
     width: auto !important;
@@ -11818,23 +11852,29 @@ html[data-keyboard-open] .chat-landing {
     width: auto !important;
     display: flex !important;
     align-items: center !important;
+    justify-content: flex-end !important;
+    flex-wrap: wrap !important;
     gap: 6px !important;
-    flex-shrink: 0 !important;
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
   }
   .input-footer-actions > .mode-selector {
     max-width: 100%;
   }
   .input-footer-actions .mode-selector-trigger {
-    height: 32px !important;
-    min-height: 32px !important;
-    padding: 0 8px !important;
-    font-size: 11.5px !important;
+    height: 36px !important;
+    min-height: 36px !important;
+    padding: 0 10px !important;
+    font-size: 12px !important;
+  }
+  .input-turn-controls {
+    flex-shrink: 0 !important;
   }
   .input-turn-controls > .btn-send,
   .input-turn-controls > .btn-stop {
-    width: 34px !important;
-    height: 34px !important;
-    min-height: 34px !important;
+    width: 40px !important;
+    height: 40px !important;
+    min-height: 40px !important;
   }
 
   /* Universal Modal → Native-like Bottom Sheet (Covers ALL Modals Automatically) */
@@ -12309,6 +12349,7 @@ html[data-keyboard-open] .chat-landing {
 @media (min-width: 769px) and (max-width: 1080px) {
   .session-list {
     width: clamp(200px, 22vw, 250px);
+    min-width: 200px;
   }
   .session-header {
     padding: 0 12px 0 16px;
@@ -12350,6 +12391,23 @@ html[data-keyboard-open] .chat-landing {
   }
   .session-todo-panel {
     max-height: min(160px, 20vh);
+  }
+}
+
+/* Prevent iOS Safari auto-zoom (>1.01 visualViewport scale) on mobile/touch inputs */
+@media (max-width: 768px), (pointer: coarse) {
+  .message-input,
+  .turn-nav-search,
+  .msg-search-input,
+  .search-input,
+  .git-commit-textarea {
+    font-size: 16px !important;
+  }
+}
+
+@media (max-width: 400px) {
+  .composer-floating-elapsed {
+    display: none;
   }
 }
 

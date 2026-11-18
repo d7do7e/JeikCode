@@ -2528,7 +2528,7 @@ export function Sidebar({
   return (
     <aside
       class={'session-list app-sidebar' + (open ? ' open' : '')}
-      style={{ '--sidebar-width': `${sidebarWidth}px`, width: `var(--sidebar-width)` } as any}
+      style={{ '--sidebar-width': `${sidebarWidth}px` } as any}
     >
       {/* 边缘拖拽把手，支持拉宽侧栏以防标题文字被按钮遮挡 */}
       <div
