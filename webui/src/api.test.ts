@@ -716,4 +716,68 @@ test('streamGlobalEvents exits cleanly when signal is aborted', async () => {
   }
 });
 
+test('buildRestartRedirectUrl omits ?token= on same-port restart when WEBUI_TOKEN_STORAGE_KEY matches and preserves on rotation/port change', async () => {
+  const { buildRestartRedirectUrl, WEBUI_TOKEN_STORAGE_KEY } = await import('./api.ts');
+  const origLocal = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const origSession = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+
+  const mkStorage = (map: Record<string, string>) => ({
+    getItem: (k: string) => map[k] ?? null,
+    setItem: (k: string, v: string) => { map[k] = v; },
+    removeItem: (k: string) => { delete map[k]; },
+  });
+
+  try {
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: mkStorage({ [WEBUI_TOKEN_STORAGE_KEY]: 'tok-same' }),
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      value: mkStorage({}),
+      configurable: true,
+    });
+
+    // 1. Same port + matching stored token -> ?token= omitted
+    const same = buildRestartRedirectUrl('http://192.168.1.5:4096/?token=tok-same', {
+      samePort: true,
+      targetPortNum: 4096,
+      currentToken: 'tok-same',
+    });
+    assert.equal(same, 'http://192.168.1.5:4096/');
+
+    // 2. Same port + rotated token -> ?token= preserved for cookie refresh
+    const rotated = buildRestartRedirectUrl('http://192.168.1.5:4096/', {
+      samePort: true,
+      targetPortNum: 4096,
+      currentToken: 'tok-new',
+    });
+    assert.equal(rotated, 'http://192.168.1.5:4096/?token=tok-new');
+
+    // 3. Port change -> ?token= preserved even when stored matches
+    const portChanged = buildRestartRedirectUrl('http://192.168.1.5:4096/', {
+      samePort: false,
+      targetPortNum: 4097,
+      currentToken: 'tok-same',
+    });
+    assert.equal(portChanged, 'http://192.168.1.5:4097/?token=tok-same');
+
+    // 4. Unreadable storage -> ?token= preserved
+    Object.defineProperty(globalThis, 'localStorage', {
+      get() { throw new Error('blocked'); },
+      configurable: true,
+    });
+    const noStorage = buildRestartRedirectUrl('http://192.168.1.5:4096/', {
+      samePort: true,
+      targetPortNum: 4096,
+      currentToken: 'tok-same',
+    });
+    assert.equal(noStorage, 'http://192.168.1.5:4096/?token=tok-same');
+  } finally {
+    if (origLocal) Object.defineProperty(globalThis, 'localStorage', origLocal);
+    else delete (globalThis as any).localStorage;
+    if (origSession) Object.defineProperty(globalThis, 'sessionStorage', origSession);
+    else delete (globalThis as any).sessionStorage;
+  }
+});
+
 

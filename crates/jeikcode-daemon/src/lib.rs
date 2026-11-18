@@ -6938,77 +6938,86 @@ fn resolve_client_mode(header: &str) -> SessionMode {
     }
 }
 
-/// CORS allowlist for webui: loopback **or** RFC1918 / link-local private hosts.
-/// Used so LAN clients of `jeikcode serve` are not blocked when a browser emits
-/// an Origin header for same-host API calls with custom headers.
-fn is_allowed_cors_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
-    let Some(authority) = origin_authority(origin) else {
+/// CORS allowlist for webui: strict same-`Host` match, Tauri desktop shell,
+/// or loopback-to-loopback local development.
+fn is_allowed_cors_origin(origin: &HeaderValue, request_parts: &RequestParts) -> bool {
+    let Ok(origin_str) = origin.to_str() else {
         return false;
     };
-    if is_loopback_authority(&authority) || is_private_network_authority(&authority) {
+    if is_tauri_origin(origin_str) {
         return true;
     }
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        authority.split(':').next().unwrap_or(&authority)
+    let Some((scheme, authority)) = origin_scheme_and_authority(origin_str) else {
+        return false;
     };
-    // 允许局域网/Tailscale/常见内部域名
-    if host.ends_with(".local") || host.ends_with(".lan") || host.ends_with(".ts.net") {
-        return true;
-    }
-    // 若 Origin authority 与请求的 Host 头一致（同主机直连自托管请求，包括公网 IPv4 / 双栈公网 IPv6 / 域名直连），直接放行
-    if let Some(host_hdr) = _request_parts
+    let host_hdr = request_parts
         .headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
-    {
-        if authority.eq_ignore_ascii_case(host_hdr.trim()) {
-            return true;
-        }
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(host_hdr) = host_hdr else {
+        // Without a Host header (synthetic tests only), allow strictly loopback origins.
+        return is_loopback_authority(authority);
+    };
+    if authorities_match(authority, scheme, host_hdr) {
+        return true;
     }
-    false
+    is_loopback_authority(authority) && is_loopback_authority(host_hdr)
 }
 
-fn origin_authority(origin: &HeaderValue) -> Option<String> {
-    let origin = origin.to_str().ok()?;
-    let authority = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))?;
-    Some(authority.to_string())
+fn is_tauri_origin(origin: &str) -> bool {
+    let trimmed = origin.trim().trim_end_matches('/');
+    trimmed.eq_ignore_ascii_case("tauri://localhost")
+        || trimmed.eq_ignore_ascii_case("http://tauri.localhost")
+        || trimmed.eq_ignore_ascii_case("https://tauri.localhost")
+}
+
+fn origin_scheme_and_authority(origin: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = origin.strip_prefix("http://") {
+        Some(("http", rest))
+    } else if let Some(rest) = origin.strip_prefix("https://") {
+        Some(("https", rest))
+    } else {
+        None
+    }
+}
+
+fn split_authority_host_port(authority: &str, default_port: u16) -> (&str, u16) {
+    let trimmed = authority.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            return (host, port);
+        }
+        return (trimmed, default_port);
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (host, port);
+        }
+    }
+    (trimmed, default_port)
+}
+
+fn authorities_match(origin_authority: &str, origin_scheme: &str, host_hdr: &str) -> bool {
+    let default_port = if origin_scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let (oh, op) = split_authority_host_port(origin_authority, default_port);
+    let (hh, hp) = split_authority_host_port(host_hdr, default_port);
+    oh.eq_ignore_ascii_case(hh) && op == hp
 }
 
 fn is_loopback_authority(authority: &str) -> bool {
-    if let Some(rest) = authority.strip_prefix("[::1]") {
-        return rest.is_empty() || rest.starts_with(':');
-    }
-
-    let host = authority.split(':').next().unwrap_or(authority);
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
-/// Host part of an Origin/authority is a private/LAN address (not public internet).
-fn is_private_network_authority(authority: &str) -> bool {
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: [::ffff:192.168.0.1]:port or [fe80::1]:port
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => {
-                let seg0 = v6.segments()[0];
-                v6.is_loopback()
-                    || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
-                    || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
-            }
-        };
-    }
-    false
+    let (host, _) = split_authority_host_port(authority, 80);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// Whether this client can receive interactive approval prompts.
@@ -7632,16 +7641,11 @@ async fn serve_webui_index(
     webui::serve_webui(uri).await
 }
 
-/// First value for `key` in a raw `a=b&c=d` query string. Returns the raw
-/// (still percent-encoded) value; the webui token is a hex UUID so no
-/// decoding is needed.
+/// First value for `key` in a raw `a=b&c=d` query string, percent-decoded.
 fn first_query_value(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
-        let mut it = pair.splitn(2, '=');
-        match (it.next(), it.next()) {
-            (Some(k), Some(v)) if k == key => Some(v.to_string()),
-            _ => None,
-        }
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| auth_token::percent_decode_query_value(v))
     })
 }
 
@@ -18207,11 +18211,95 @@ struct TerminalWsQuery {
     rows: Option<u16>,
 }
 
+fn validate_terminal_ws_origin(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    state: &AppState,
+) -> Result<(), axum::response::Response> {
+    let host_hdr = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(origin_hdr) = headers.get(header::ORIGIN) {
+        let Ok(origin_str) = origin_hdr.to_str() else {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "Forbidden: invalid WebSocket Origin header",
+            )
+            .into_response());
+        };
+        if is_tauri_origin(origin_str) {
+            return Ok(());
+        }
+        let Some((scheme, authority)) = origin_scheme_and_authority(origin_str) else {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "Forbidden: unsupported WebSocket Origin scheme",
+            )
+            .into_response());
+        };
+        let Some(host_hdr) = host_hdr else {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "Forbidden: missing Host header for WebSocket Origin check",
+            )
+            .into_response());
+        };
+        if !authorities_match(authority, scheme, host_hdr) {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "Forbidden: cross-origin WebSocket connection rejected",
+            )
+            .into_response());
+        }
+        return Ok(());
+    }
+
+    // Without Origin (e.g., non-browser CLI/test clients), block cookie-only
+    // ambient authentication while allowing explicit Bearer/API-key/query-token auth.
+    let cookie = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
+    let has_webui_cookie =
+        auth_token::token_from_cookie(cookie, &state.webui_cookie_name).is_some();
+    let has_explicit_cred = auth_token::token_from_header(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok()),
+    )
+    .is_some()
+        || auth_token::token_from_x_api_key_header(
+            headers.get("x-api-key").and_then(|h| h.to_str().ok()),
+        )
+        .is_some()
+        || auth_token::token_from_api_key_header(
+            headers.get("api-key").and_then(|h| h.to_str().ok()),
+        )
+        .is_some()
+        || uri
+            .query()
+            .and_then(|q| first_query_value(q, "token"))
+            .is_some_and(|t| !t.is_empty());
+    if has_webui_cookie && !has_explicit_cred {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden: missing Origin header for cookie-authenticated WebSocket",
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 async fn terminal_ws_handler(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     Query(q): Query<TerminalWsQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    if let Err(resp) = validate_terminal_ws_origin(&headers, &uri, &state) {
+        return resp;
+    }
     ws.on_upgrade(move |socket| handle_terminal_socket(socket, q, state))
 }
 
@@ -26211,27 +26299,104 @@ mod tests {
     }
 
     fn origin_is_allowed(origin: &str) -> bool {
+        origin_is_allowed_with_host(origin, None)
+    }
+
+    fn origin_is_allowed_with_host(origin: &str, host: Option<&str>) -> bool {
         let origin = HeaderValue::from_str(origin).unwrap();
-        let request = axum::http::Request::builder().body(()).unwrap();
+        let mut builder = axum::http::Request::builder();
+        if let Some(h) = host {
+            builder = builder.header(header::HOST, h);
+        }
+        let request = builder.body(()).unwrap();
         let (parts, _) = request.into_parts();
         is_allowed_cors_origin(&origin, &parts)
     }
 
     #[test]
     fn cors_allows_loopback_origins() {
-        assert!(origin_is_allowed("http://localhost:3000"));
-        assert!(origin_is_allowed("http://127.0.0.1:3000"));
-        assert!(origin_is_allowed("http://[::1]:3000"));
-        assert!(origin_is_allowed("https://localhost"));
+        assert!(origin_is_allowed_with_host("http://localhost:3000", None));
+        assert!(origin_is_allowed_with_host("http://127.0.0.1:3000", None));
+        assert!(origin_is_allowed_with_host("http://[::1]:3000", None));
+        assert!(origin_is_allowed_with_host("https://localhost", None));
+        assert!(origin_is_allowed_with_host("tauri://localhost", None));
+        assert!(origin_is_allowed_with_host("https://tauri.localhost", None));
     }
 
     #[test]
-    fn cors_allows_private_lan_origins() {
-        // Remote clients of `jeikcode serve --host 0.0.0.0` load the SPA from
-        // a LAN IP; their Origin is that private host, not loopback.
-        assert!(origin_is_allowed("http://192.168.6.3:4096"));
-        assert!(origin_is_allowed("http://10.0.0.5:13456"));
-        assert!(origin_is_allowed("http://172.16.2.14:8080"));
+    fn cors_allows_same_host_private_lan_and_rejects_cross_origin() {
+        // Same-host LAN access is allowed.
+        assert!(origin_is_allowed_with_host(
+            "http://192.168.6.3:4096",
+            Some("192.168.6.3:4096")
+        ));
+        assert!(origin_is_allowed_with_host(
+            "http://10.0.0.5:13456",
+            Some("10.0.0.5:13456")
+        ));
+        // Default port equivalence (:80 / :443).
+        assert!(origin_is_allowed_with_host(
+            "http://192.168.6.3",
+            Some("192.168.6.3:80")
+        ));
+        // Cross-origin LAN / evil.local / cross-IP must be rejected.
+        assert!(!origin_is_allowed_with_host(
+            "http://192.168.6.99:9999",
+            Some("127.0.0.1:4096")
+        ));
+        assert!(!origin_is_allowed_with_host(
+            "http://evil.local:3000",
+            Some("127.0.0.1:4096")
+        ));
+        assert!(!origin_is_allowed_with_host(
+            "http://192.168.6.3:4096",
+            None
+        ));
+    }
+
+    #[test]
+    fn terminal_ws_origin_check_blocks_cswsh_and_allows_same_host_or_tauri() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let uri: axum::http::Uri = "/terminal/ws".parse().unwrap();
+
+        let mut same_host = axum::http::HeaderMap::new();
+        same_host.insert(header::HOST, "192.168.1.10:4096".parse().unwrap());
+        same_host.insert(header::ORIGIN, "http://192.168.1.10:4096".parse().unwrap());
+        assert!(validate_terminal_ws_origin(&same_host, &uri, &state).is_ok());
+
+        let mut tauri = axum::http::HeaderMap::new();
+        tauri.insert(header::HOST, "127.0.0.1:13457".parse().unwrap());
+        tauri.insert(header::ORIGIN, "tauri://localhost".parse().unwrap());
+        assert!(validate_terminal_ws_origin(&tauri, &uri, &state).is_ok());
+
+        let mut evil = axum::http::HeaderMap::new();
+        evil.insert(header::HOST, "127.0.0.1:13457".parse().unwrap());
+        evil.insert(header::ORIGIN, "http://evil.local:8080".parse().unwrap());
+        assert_eq!(
+            validate_terminal_ws_origin(&evil, &uri, &state)
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut cookie_only_no_origin = axum::http::HeaderMap::new();
+        cookie_only_no_origin.insert(header::HOST, "127.0.0.1:13457".parse().unwrap());
+        cookie_only_no_origin.insert(
+            header::COOKIE,
+            format!("{}=secret", state.webui_cookie_name)
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            validate_terminal_ws_origin(&cookie_only_no_origin, &uri, &state)
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let uri_with_tok: axum::http::Uri = "/terminal/ws?token=secret".parse().unwrap();
+        assert!(validate_terminal_ws_origin(&cookie_only_no_origin, &uri_with_tok, &state).is_ok());
     }
 
     #[test]

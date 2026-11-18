@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getRemoteAccess, getToken, postRemoteAccess, type RemoteAccessStatus } from '../api';
+import { buildRestartRedirectUrl, getRemoteAccess, getToken, postRemoteAccess, type RemoteAccessStatus } from '../api';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
@@ -233,14 +233,6 @@ export function RemoteAccessControl() {
           // 避免旧标签页里 per-tab 的过期 sessionStorage 覆盖轮换后的新 token。
           currentToken = getToken();
         }
-        const nextUrl = new URL(window.location.href);
-        if (!samePort) nextUrl.port = String(targetPortNum);
-        if (currentToken) {
-          // Token 可能已更换，始终用新值覆盖
-          nextUrl.searchParams.set('token', currentToken);
-        } else {
-          nextUrl.searchParams.delete('token');
-        }
         let isDesktop = window.location.search.includes('desktop=');
         if (!isDesktop) {
           try {
@@ -249,8 +241,12 @@ export function RemoteAccessControl() {
             /* ignore */
           }
         }
-        if (isDesktop) nextUrl.searchParams.set('desktop', '1');
-        window.location.href = nextUrl.toString();
+        window.location.href = buildRestartRedirectUrl(window.location.href, {
+          samePort,
+          targetPortNum,
+          currentToken,
+          isDesktop,
+        });
         return;
       }
       await sleep(600);

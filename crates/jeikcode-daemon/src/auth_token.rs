@@ -216,6 +216,35 @@ pub fn token_from_cookie(value: Option<&str>, cookie_name: &str) -> Option<Strin
     None
 }
 
+/// Percent-decode a raw URL query component (`%XX` UTF-8 bytes) without
+/// translating literal `+` into space so base64/custom tokens stay intact.
+pub(crate) fn percent_decode_query_value(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// JSON 401 so the webui can show the server error instead of
 /// `Failed to execute 'json' on 'Response': Unexpected end of JSON input`.
 /// Axum `Err(StatusCode::UNAUTHORIZED)` is an empty body.
@@ -261,12 +290,8 @@ pub async fn require_webui_token(
     let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
     let query_token = req.uri().query().and_then(|q| {
         q.split('&').find_map(|pair| {
-            let mut parts = pair.split('=');
-            if parts.next()? == "token" {
-                parts.next().map(|s| s.to_string())
-            } else {
-                None
-            }
+            let (k, v) = pair.split_once('=')?;
+            (k == "token").then(|| percent_decode_query_value(v))
         })
     });
     // Read THIS instance's port-scoped cookie name so a sibling `/webui` on a
@@ -527,5 +552,15 @@ mod tests {
         );
         // A third instance whose cookie was never set sees nothing (→ 401, correct).
         assert_eq!(token_from_cookie(Some(jar), &webui_cookie_name(3333)), None);
+    }
+
+    #[test]
+    fn percent_decode_query_value_preserves_plus_and_equals_tokens() {
+        assert_eq!(
+            percent_decode_query_value("sk%2Ba%2Fb%3D%3D%20c"),
+            "sk+a/b== c"
+        );
+        assert_eq!(percent_decode_query_value("a+b=c"), "a+b=c");
+        assert_eq!(percent_decode_query_value("bad%ZZtok"), "bad%ZZtok");
     }
 }

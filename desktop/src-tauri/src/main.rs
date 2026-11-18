@@ -907,9 +907,30 @@ fn start_webui(
             "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
             launch.host, launch.token
         );
-        let _ = std::fs::write(dir.join("webui-listen.json"), body);
+        let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
     }
     Ok((url, child, eof_rx, launch))
+}
+
+fn write_private_listen_json(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 #[cfg(windows)]
@@ -1165,7 +1186,7 @@ fn supervise_webui(
                             launch.host,
                             launch.token
                         );
-                        let _ = std::fs::write(dir.join("webui-listen.json"), body);
+                        let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
                     }
                     if let Some(slot) = app.try_state::<ChildSlot>() {
                         *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
@@ -1363,7 +1384,7 @@ fn mint_desktop_token(host: &str, port: u16) -> String {
     let _ = std::fs::create_dir_all(&dir);
     let body =
         format!("{{\n  \"host\": \"{host}\",\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
-    let _ = std::fs::write(dir.join("webui-listen.json"), body);
+    let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
     token
 }
 

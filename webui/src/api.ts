@@ -144,6 +144,46 @@ function currentWebuiToken(): string {
   return '';
 }
 
+/**
+ * Build the reload URL after a daemon restart. Keeps `?token=` out of the URL
+ * on same-port restarts when Web Storage is readable and already holds
+ * `currentToken`; preserves `?token=` when the port changed, storage is
+ * unavailable, or the token rotated / was newly enabled.
+ */
+export function buildRestartRedirectUrl(
+  href: string,
+  opts: {
+    samePort: boolean;
+    targetPortNum: number;
+    currentToken: string;
+    isDesktop?: boolean;
+  },
+): string {
+  const nextUrl = new URL(href);
+  if (!opts.samePort) nextUrl.port = String(opts.targetPortNum);
+  let storedToken = '';
+  let storageReadable = false;
+  try {
+    storedToken =
+      localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ||
+      sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ||
+      '';
+    storageReadable = true;
+  } catch {
+    storageReadable = false;
+  }
+  const needQueryToken =
+    Boolean(opts.currentToken) &&
+    (!opts.samePort || !storageReadable || storedToken !== opts.currentToken);
+  if (needQueryToken) {
+    nextUrl.searchParams.set('token', opts.currentToken);
+  } else {
+    nextUrl.searchParams.delete('token');
+  }
+  if (opts.isDesktop) nextUrl.searchParams.set('desktop', '1');
+  return nextUrl.toString();
+}
+
 function authHeaders(): Record<string, string> {
   // X-JeikCode-Client lets the daemon tag telemetry as webui-originated
   // (resolve_client_mode → SessionMode::Webui); sent regardless of token.

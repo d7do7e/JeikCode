@@ -1050,7 +1050,28 @@ pub(crate) fn save_webui_listen_pref(
         pref.token = token;
     }
     let body = serde_json::to_string_pretty(&pref).map_err(|err| err.to_string())?;
-    std::fs::write(path, body).map_err(|err| err.to_string())
+    write_private_file(&path, body.as_bytes()).map_err(|err| err.to_string())
+}
+
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 /// The running socket stays as it is. A matching port registers the token now.
@@ -1075,10 +1096,18 @@ fn apply_launch_settings(
 
     if body.no_token {
         if !port_changed && !host_changed {
-            apply_remote_auth(state, true);
+            // Only disable auth live when no non-loopback listener is active.
+            let extra_non_loopback = state
+                .extra_remote
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .as_ref()
+                .is_some_and(|b| !crate::auth_token::is_loopback_bind_host(&b.host));
+            if crate::auth_token::is_loopback_bind_host(&state.bind_host) && !extra_non_loopback {
+                apply_remote_auth(state, true);
+            }
         } else {
             save_webui_listen_pref(host_opt, body.port, None)?;
-            apply_remote_auth(state, true);
         }
     } else {
         let token = body.token.trim();
@@ -1140,22 +1169,45 @@ pub(crate) async fn post_remote_access(
     State(state): State<AppState>,
     Json(body): Json<RemoteAccessBody>,
 ) -> impl IntoResponse {
+    if body.stop {
+        if let Some(prev) = take_extra_remote(&state) {
+            prev.abort_all();
+        }
+        restore_remote_auth(&state);
+        return Json(remote_status(&state, None)).into_response();
+    }
+
     // Remote-access is a privilege expansion: it must never turn a loopback/no-token
-    // daemon into a network-reachable/no-token daemon. Explicit `serve --no-token`
-    // startup semantics remain unchanged; this only constrains the runtime expansion API.
+    // daemon into a network-reachable/no-token daemon, nor strip auth from any active
+    // non-loopback listener via a loopback-targeted `apply_launch` payload.
     if body.no_token {
         let already_unauthenticated_remote = !state.initial_enforce_token
             && !crate::auth_token::is_loopback_bind_host(&state.bind_host);
         if !already_unauthenticated_remote {
             let target = body.host.trim();
-            let affected_host = if body.apply_launch && !body.restart && target.is_empty() {
-                state.bind_host.as_str()
-            } else if !target.is_empty() {
+            let saved_host = load_webui_listen_pref().and_then(|p| p.host);
+            let effective_target = if !target.is_empty() {
                 target
+            } else if body.apply_launch {
+                saved_host.as_deref().unwrap_or(state.bind_host.as_str())
             } else {
                 state.bind_host.as_str()
             };
-            if !crate::auth_token::is_loopback_bind_host(affected_host) {
+            let extra_non_loopback = state
+                .extra_remote
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .as_ref()
+                .is_some_and(|b| !crate::auth_token::is_loopback_bind_host(&b.host));
+            let active_non_loopback =
+                !crate::auth_token::is_loopback_bind_host(&state.bind_host) || extra_non_loopback;
+            let is_restart_to_loopback = body.apply_launch
+                && body.restart
+                && crate::auth_token::is_loopback_bind_host(effective_target)
+                && !extra_non_loopback;
+            if !crate::auth_token::is_loopback_bind_host(effective_target)
+                || (active_non_loopback && !is_restart_to_loopback)
+            {
                 return json_error(
                     axum::http::StatusCode::BAD_REQUEST,
                     "non-loopback remote access requires an access token",
@@ -1199,13 +1251,6 @@ pub(crate) async fn post_remote_access(
             }
             Err(err) => json_error(axum::http::StatusCode::BAD_REQUEST, err).into_response(),
         };
-    }
-    if body.stop {
-        if let Some(prev) = take_extra_remote(&state) {
-            prev.abort_all();
-        }
-        restore_remote_auth(&state);
-        return Json(remote_status(&state, None)).into_response();
     }
 
     let host = body.host.trim().to_string();
@@ -2132,5 +2177,63 @@ mod tests {
         assert!(saved.contains("\"port\": 4096"), "{saved}");
         assert!(saved.contains("later-token"), "{saved}");
         assert!(!saved.contains("no_token"), "{saved}");
+    }
+
+    #[tokio::test]
+    async fn loopback_no_token_payload_cannot_strip_auth_off_active_non_loopback_listener() {
+        use axum::extract::State;
+        use axum::Json;
+
+        let home = crate::tests::ScopedChatHome::new();
+        let mut state = crate::tests::chat_test_state(&home);
+        state.bind_host = "127.0.0.1".into();
+        state.bind_port = 13457;
+        state.initial_enforce_token = false;
+        state
+            .enforce_token
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.extra_remote.lock().unwrap() = Some(crate::ExtraRemoteBind {
+            host: "0.0.0.0".into(),
+            port: 4096,
+            aborts: Vec::new(),
+            token: Some("lan-token".into()),
+        });
+
+        // Targeting 127.0.0.1 with no_token=true while 0.0.0.0 extra_remote is active must fail 400.
+        let resp = post_remote_access(
+            State(state.clone()),
+            Json(RemoteAccessBody {
+                host: "127.0.0.1".into(),
+                port: 13457,
+                token: String::new(),
+                no_token: true,
+                stop: false,
+                apply_launch: true,
+                restart: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(state.is_token_enforced());
+
+        // `stop: true` must still succeed even if the client sends `no_token: true`.
+        let stop_resp = post_remote_access(
+            State(state.clone()),
+            Json(RemoteAccessBody {
+                host: "0.0.0.0".into(),
+                port: 4096,
+                token: String::new(),
+                no_token: true,
+                stop: true,
+                apply_launch: false,
+                restart: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stop_resp.status(), axum::http::StatusCode::OK);
+        assert!(state.extra_remote.lock().unwrap().is_none());
+        assert!(!state.is_token_enforced());
     }
 }
