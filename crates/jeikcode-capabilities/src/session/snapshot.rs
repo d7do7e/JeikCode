@@ -821,7 +821,12 @@ fn estimate_post_compaction_tokens(
         .messages
         .iter()
         .rev()
-        .find(|m| m.role == jeikcode_kernel::message::Role::Assistant)
+        .find(|m| {
+            m.role == jeikcode_kernel::message::Role::Assistant
+                && m.internal_origin.as_deref()
+                    != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
+                && m.meta.is_some()
+        })
         .and_then(|m| m.meta.as_ref())
         .map(|m| u64::from(m.used_tokens))
         .filter(|&v| v > 0);

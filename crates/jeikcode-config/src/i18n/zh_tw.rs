@@ -147,6 +147,102 @@ pub(super) fn zh_tw(msg: Msg<'_>) -> Cow<'static, str> {
                 "無效的自動壓縮閾值「{input}」。請使用百分比（10%-100% 或 0.1-1.0）、Token 數（>= 8000，例如 350k）、'off' 或 'default'。"
             )
             .into(),
+        Msg::GoalFooterPausedBody => "goal 已暫停".into(),
+        Msg::GoalFooterPausedMeta => " · 繼續對話即恢復 · /goal stop 結束".into(),
+        Msg::GoalFooterPausedAtCapBody => "goal 暫停".into(),
+        Msg::GoalFooterPausedAtCapMeta { round } => {
+            format!(" · 已達 {round} 輪 · 繼續對話即推進").into()
+        }
+        Msg::GoalFooterSatisfiedBody => "goal 已達成".into(),
+        Msg::GoalFooterSatisfiedMeta => " · /goal clear 結束".into(),
+        Msg::RoundCapHeader => "輪次上限".into(),
+        Msg::RoundCapQuestion { cap } => format!("已運行 {cap} 輪，繼續嗎？").into(),
+        Msg::RoundCapQuestionWithStats { cap, stats } => {
+            format!("已運行 {cap} 輪（{stats}），繼續嗎？").into()
+        }
+        Msg::RoundCapContinue => "繼續".into(),
+        Msg::RoundCapContinueDesc { base } => format!("再跑 {base} 輪後重新確認").into(),
+        Msg::RoundCapStop => "停止".into(),
+        Msg::RoundCapStopDesc => "結束本回合".into(),
+        Msg::CustomAnswerPlaceholder => "輸入自己的答案…".into(),
+        Msg::MenuSearchSessions => "搜尋工作階段…".into(),
+        Msg::MenuSearchDirectories => "搜尋歷史目錄或輸入路徑…".into(),
+        Msg::MenuTypeToFilter => "輸入以篩選…".into(),
+        Msg::RelayShareRuntimeFailed { error } => {
+            format!("共用目前 runtime 失敗：{error}").into()
+        }
+        Msg::RelayStopShareFailed { error } => {
+            format!("停止共用目前 runtime 失敗：{error}").into()
+        }
+        Msg::SlashSyncOutputFailed { error } => {
+            format!("斜線命令輸出同步失敗：{error}").into()
+        }
+        Msg::RelayClientSkipDownload { dir } => format!(
+            "自動下載已停用（JEIKCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），請手動將 relay-client 放入 {dir} 目錄"
+        )
+        .into(),
+        Msg::RelayClientUnsupportedPlatform { os, arch, dir } => format!(
+            "不支援的平台：{os}/{arch}。請手動編譯 relay-client 並放到 {dir} 中"
+        )
+        .into(),
+        Msg::RelayClientVersionUnsupportedPlatform { version, target } => {
+            format!("版本 {version} 不支援目前平台 {target}").into()
+        }
+        Msg::RelayClientAutoDownloadFailed { error, cache } => format!(
+            "自動下載 relay-client 失敗：{error}\n\
+             \n\
+             安全下載：\n\
+             1. 開啟瀏覽器造訪\n\
+                https://github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/releases\n\
+             2. 下載對應平台的 binary\n\
+             3. 儲存到 {cache}/jeikcode-relay-client\n\
+             4. chmod +x {cache}/jeikcode-relay-client\n\
+             5. /app 重試\n\
+             \n\
+             快速安裝：\n\
+             curl -fsSL https://raw.github.com/JeikCode/JeikCode/jeikcode_jeikcode/jeikcode-relay-release/raw/main/scripts/install.sh | sh\n\
+             && /app 重試"
+        )
+        .into(),
+        Msg::RelayClientCreateCacheDirFailed { error } => {
+            format!("建立快取目錄失敗：{error}").into()
+        }
+        Msg::RelayClientCreateHttpFailed { error } => {
+            format!("建立 HTTP 用戶端失敗：{error}").into()
+        }
+        Msg::RelayClientFetchManifestFailed { error } => {
+            format!("取得版本清單失敗：{error}").into()
+        }
+        Msg::RelayClientManifestHttpError { status } => {
+            format!("取得版本清單傳回 HTTP {status}").into()
+        }
+        Msg::RelayClientReadManifestFailed { error } => {
+            format!("讀取版本清單失敗：{error}").into()
+        }
+        Msg::RelayClientParseManifestFailed { error } => {
+            format!("解析版本清單失敗：{error}").into()
+        }
+        Msg::RelayClientDownloadRequestFailed { error } => {
+            format!("下載請求失敗：{error}（請檢查網路連線）").into()
+        }
+        Msg::RelayClientDownloadUnauthorized => {
+            "下載驗證失敗（HTTP 401），請檢查 Release 是否公開可存取".into()
+        }
+        Msg::RelayClientDownloadHttpError { status } => {
+            format!("下載傳回 HTTP {status}（Release 可能不存在或無權存取）").into()
+        }
+        Msg::RelayClientCreateFileFailed { error } => format!("建立檔案失敗：{error}").into(),
+        Msg::RelayClientReadStreamFailed { error } => {
+            format!("讀取下載串流失敗：{error}").into()
+        }
+        Msg::RelayClientWriteFileFailed { error } => format!("寫入檔案失敗：{error}").into(),
+        Msg::RelayClientFlushFileFailed { error } => format!("寫入磁碟失敗：{error}").into(),
+        Msg::RelayClientSizeMismatch { expected, actual } => {
+            format!("檔案大小不符：預期 {expected} 位元組，實際下載 {actual} 位元組").into()
+        }
+        Msg::RelayClientSha256Mismatch { expected, actual } => {
+            format!("SHA256 校驗失敗：\n  預期: {expected}\n  實際: {actual}").into()
+        }
         _ => super::zh_cn::zh_cn(msg),
     }
 }
