@@ -39,7 +39,10 @@ enum LinkAction {
 /// Tauri 自己的页面。交给系统浏览器会去连一个不存在的 `tauri.localhost`。
 fn is_shell_internal_url(url: &tauri::Url) -> bool {
     let scheme = url.scheme();
-    if matches!(scheme, "tauri" | "about" | "data" | "ipc" | "asset") {
+    if matches!(
+        scheme,
+        "tauri" | "about" | "data" | "ipc" | "asset" | "blob"
+    ) {
         return true;
     }
     if scheme == "http" || scheme == "https" {
@@ -78,22 +81,20 @@ fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkActi
     if is_shell_internal_url(url) {
         return LinkAction::StayInWebview;
     }
-    // 回环地址上的内部重载、端口变更或携带 desktop=1 标志的均保留在窗口内，绝不弹出到系统浏览器
-    if let Some(host) = url.host_str() {
-        if is_loopback_host(host) {
-            if url.query().is_some_and(|q| q.contains("desktop=")) {
-                return LinkAction::StayInWebview;
-            }
-            if origin.is_some() {
+    // 仅允许当前已拉起的 WebUI 端口，或在重启交接时允许配置文件中的目标回环端口；
+    // 不再凭 `desktop=` 查询参数放行任意本地端口。
+    if origin.is_some_and(|origin| is_launched_webui(url, origin)) {
+        return LinkAction::StayInWebview;
+    }
+    if origin.is_some() {
+        if let Some(host) = url.host_str() {
+            if is_loopback_host(host) {
                 let (_h, saved_port, _t) = saved_webui_listen();
                 if url.port() == Some(saved_port) {
                     return LinkAction::StayInWebview;
                 }
             }
         }
-    }
-    if origin.is_some_and(|origin| is_launched_webui(url, origin)) {
-        return LinkAction::StayInWebview;
     }
     LinkAction::OpenExternal
 }
@@ -289,7 +290,71 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     cleanup_desktop_owned_children_windows();
 }
 
-fn handle_desktop_shell_action(url: &tauri::Url, app: &tauri::AppHandle) -> bool {
+fn is_valid_close_action(action: &str) -> bool {
+    matches!(action, "ask" | "tray" | "quit")
+}
+
+fn is_authorized_shell_action_url(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> bool {
+    is_shell_internal_url(url) || origin.is_some_and(|o| is_launched_webui(url, o))
+}
+
+fn backup_non_empty_file_bak(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() > 0 {
+            let mut bak_os = path.as_os_str().to_os_string();
+            bak_os.push(".bak");
+            let _ = std::fs::copy(path, PathBuf::from(bak_os));
+        }
+    }
+}
+
+fn write_desktop_close_action_to(path: &Path, action: &str) -> std::io::Result<()> {
+    if !is_valid_close_action(action) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid close_action",
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    backup_non_empty_file_bak(path);
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "close_action": action,
+    }))
+    .map_err(std::io::Error::other)?
+        + "\n";
+    let tmp_name = format!(
+        ".desktop-settings.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp_path = path
+        .parent()
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| PathBuf::from(&tmp_name));
+    std::fs::write(&tmp_path, body.as_bytes())?;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn handle_desktop_shell_action(
+    url: &tauri::Url,
+    app: &tauri::AppHandle,
+    origin: Option<&WebuiOrigin>,
+) -> bool {
+    if !url.path().starts_with("/__desktop_action/") {
+        return false;
+    }
+    if !is_authorized_shell_action_url(url, origin) {
+        return false;
+    }
     match url.path() {
         "/__desktop_action/hide_to_tray" => {
             if let Some(window) = app.get_webview_window("main") {
@@ -303,15 +368,14 @@ fn handle_desktop_shell_action(url: &tauri::Url, app: &tauri::AppHandle) -> bool
             true
         }
         "/__desktop_action/set_close_action" => {
-            let action = url
+            if let Some(action) = url
                 .query_pairs()
                 .find(|(k, _)| k == "action")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_else(|| "ask".to_string());
-            let dir = jeikcode_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            let body = format!("{{\n  \"close_action\": \"{action}\"\n}}\n");
-            let _ = std::fs::write(desktop_settings_path(), body);
+                .map(|(_, v)| v.trim().to_string())
+                .filter(|v| is_valid_close_action(v))
+            {
+                let _ = write_desktop_close_action_to(&desktop_settings_path(), &action);
+            }
             true
         }
         _ => false,
@@ -565,6 +629,7 @@ fn main() {
         .setup(|app| {
             let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
+            let new_win_origin = Arc::clone(&webui_origin);
             let nav_app_handle = app.handle().clone();
             let new_win_app_handle = app.handle().clone();
             let window_builder = tauri::WebviewWindowBuilder::new(
@@ -576,13 +641,11 @@ fn main() {
             .inner_size(1280.0, 800.0)
             .resizable(true)
             .on_navigation(move |url| {
-                if handle_desktop_shell_action(url, &nav_app_handle) {
+                let current_origin = nav_origin.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if handle_desktop_shell_action(url, &nav_app_handle, current_origin.as_ref()) {
                     return false;
                 }
-                let action = {
-                    let guard = nav_origin.lock().unwrap_or_else(|e| e.into_inner());
-                    navigation_action(url, guard.as_ref())
-                };
+                let action = navigation_action(url, current_origin.as_ref());
                 match action {
                     LinkAction::StayInWebview => {
                         if !is_shell_internal_url(url) {
@@ -597,7 +660,12 @@ fn main() {
                 }
             })
             .on_new_window(move |url, _features| {
-                if handle_desktop_shell_action(&url, &new_win_app_handle) {
+                let current_origin = new_win_origin
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if handle_desktop_shell_action(&url, &new_win_app_handle, current_origin.as_ref())
+                {
                     return tauri::webview::NewWindowResponse::Deny;
                 }
                 if new_window_action(&url) == LinkAction::OpenExternal {
@@ -1038,9 +1106,10 @@ fn spawn_desktop_server(
         .arg(&launch.host)
         .arg("--port")
         .arg(launch.port.to_string())
-        .arg("--no-open")
-        .arg("--token")
-        .arg(&launch.token);
+        .arg("--no-open");
+    if !launch.token.trim().is_empty() {
+        cmd.env("JEIKCODE_SERVER_TOKEN", &launch.token);
+    }
     cmd.env("JEIKCODE_DESKTOP", "1");
     cmd.env("JEIKCODE_DESKTOP_MANAGED", "1");
     cmd.env("JEIKCODE_DESKTOP_PID", std::process::id().to_string());
@@ -1186,7 +1255,10 @@ fn supervise_webui(
                             launch.host,
                             launch.token
                         );
-                        let _ = write_private_listen_json(&dir.join("webui-listen.json"), body.as_bytes());
+                        let _ = write_private_listen_json(
+                            &dir.join("webui-listen.json"),
+                            body.as_bytes(),
+                        );
                     }
                     if let Some(slot) = app.try_state::<ChildSlot>() {
                         *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
@@ -1374,12 +1446,65 @@ fn health_ready(port: u16) -> bool {
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
+fn fill_os_random_bytes(buf: &mut [u8]) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(
+                hAlgorithm: *mut std::ffi::c_void,
+                pbBuffer: *mut u8,
+                cbBuffer: u32,
+                dwFlags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        status == 0
+    }
+    #[cfg(unix)]
+    {
+        let Ok(mut file) = std::fs::File::open("/dev/urandom") else {
+            return false;
+        };
+        file.read_exact(buf).is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = buf;
+        false
+    }
+}
+
+fn generate_csprng_token() -> String {
+    let mut bytes = [0u8; 16];
+    if !fill_os_random_bytes(&mut bytes) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = nanos ^ (pid << 64) ^ (&bytes as *const _ as usize as u128);
+        bytes = mixed.to_le_bytes();
+    }
+    let mut token = String::with_capacity(3 + bytes.len() * 2);
+    token.push_str("sk-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{b:02x}");
+    }
+    token
+}
+
 fn mint_desktop_token(host: &str, port: u16) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let token = format!("sk-{:x}-{:x}", std::process::id(), nanos);
+    let token = generate_csprng_token();
     let dir = jeikcode_dir();
     let _ = std::fs::create_dir_all(&dir);
     let body =
@@ -1627,9 +1752,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        external_browser_url, extract_webui_url, host_window_away, navigation_action,
+        external_browser_url, extract_webui_url, generate_csprng_token, host_window_away,
+        is_authorized_shell_action_url, is_valid_close_action, navigation_action,
         new_window_action, parse_webui_listen, remember_webui_origin, resolve_desktop_cli,
-        window_url, LinkAction, WebuiOrigin,
+        window_url, write_desktop_close_action_to, LinkAction, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -1805,5 +1931,82 @@ mod tests {
         remember_webui_origin(&slot, "http://127.0.0.1:13480/?token=abc&desktop=1");
         let stored = slot.lock().unwrap().clone().unwrap();
         assert_eq!(stored, origin("127.0.0.1", 13480));
+    }
+
+    #[test]
+    fn desktop_query_param_does_not_bypass_navigation_port_check() {
+        let launched = origin("127.0.0.1", 13457);
+        assert_eq!(
+            navigation_action(
+                &parse_url("http://127.0.0.1:3000/?desktop=1"),
+                Some(&launched)
+            ),
+            LinkAction::OpenExternal
+        );
+    }
+
+    #[test]
+    fn blob_urls_stay_in_webview() {
+        let blob = parse_url("blob:http://127.0.0.1:13457/1234-5678");
+        assert_eq!(navigation_action(&blob, None), LinkAction::StayInWebview);
+    }
+
+    #[test]
+    fn shell_action_gating_and_atomic_bak_settings_write() {
+        let launched = origin("127.0.0.1", 13457);
+        assert!(is_authorized_shell_action_url(
+            &parse_url("http://tauri.localhost/__desktop_action/hide_to_tray"),
+            Some(&launched)
+        ));
+        assert!(is_authorized_shell_action_url(
+            &parse_url("http://127.0.0.1:13457/__desktop_action/quit_app"),
+            Some(&launched)
+        ));
+        assert!(!is_authorized_shell_action_url(
+            &parse_url("https://evil.example/__desktop_action/quit_app"),
+            Some(&launched)
+        ));
+        assert!(is_valid_close_action("tray"));
+        assert!(!is_valid_close_action("tray\",\"injected\":\"1"));
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "jeikcode-desktop-settings-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let settings = tmp_dir.join("desktop-settings.json");
+
+        write_desktop_close_action_to(&settings, "tray").unwrap();
+        assert!(settings.read_to_string_lossy_test().contains("\"tray\""));
+
+        write_desktop_close_action_to(&settings, "quit").unwrap();
+        let bak = tmp_dir.join("desktop-settings.json.bak");
+        assert!(bak.is_file());
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("\"tray\""));
+        assert!(std::fs::read_to_string(&settings)
+            .unwrap()
+            .contains("\"quit\""));
+        assert!(write_desktop_close_action_to(&settings, "bogus").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    trait ReadToStringTest {
+        fn read_to_string_lossy_test(&self) -> String;
+    }
+    impl ReadToStringTest for std::path::PathBuf {
+        fn read_to_string_lossy_test(&self) -> String {
+            std::fs::read_to_string(self).unwrap()
+        }
+    }
+
+    #[test]
+    fn csprng_desktop_tokens_are_distinct_and_random_length() {
+        let a = generate_csprng_token();
+        let b = generate_csprng_token();
+        assert!(a.starts_with("sk-"));
+        assert_eq!(a.len(), 35);
+        assert_ne!(a, b);
     }
 }

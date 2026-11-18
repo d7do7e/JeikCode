@@ -898,4 +898,69 @@ test('app startup does not auto-trigger fetchUpgradeDiffs config-overwrite modal
   assert.ok(modalSource.includes('item.diff_preview'));
 });
 
+test('concurrent 401 responses coalesce on a single /config probe and retry all callers once via HttpOnly cookie', async () => {
+  const { getProjects, listSessions, resetAuthExpired, applyWebuiToken } = await import('./api.ts');
+  const origFetch = globalThis.fetch;
+  const origLS = (globalThis as any).localStorage;
+  const origSS = (globalThis as any).sessionStorage;
+  const lsStore = new Map<string, string>();
+  const ssStore = new Map<string, string>();
+  const makeStorage = (m: Map<string, string>) => ({
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => m.set(k, String(v)),
+    removeItem: (k: string) => m.delete(k),
+  });
+  (globalThis as any).localStorage = makeStorage(lsStore);
+  (globalThis as any).sessionStorage = makeStorage(ssStore);
+  resetAuthExpired();
+
+  let cookieProbeCount = 0;
+  let projectsCalls = 0;
+  let sessionsCalls = 0;
+
+  try {
+    // Seed a stale token so initial requests carry Authorization: Bearer stale-tok.
+    globalThis.fetch = (async () => new Response('{}', { status: 200 })) as typeof fetch;
+    await applyWebuiToken('stale-tok');
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const auth = new Headers(init?.headers).get('Authorization') ?? '';
+      if (url === '/config') {
+        await new Promise((r) => setTimeout(r, 10));
+        if (!auth) cookieProbeCount += 1;
+        // Succeed only when stale Bearer is stripped (HttpOnly cookie probe).
+        return new Response('{}', { status: auth ? 401 : 200 });
+      }
+      if (url === '/projects') {
+        projectsCalls += 1;
+        return auth
+          ? new Response('unauthorized', { status: 401 })
+          : new Response('[]', { status: 200 });
+      }
+      if (url === '/sessions' || url.startsWith('/sessions?')) {
+        sessionsCalls += 1;
+        return auth
+          ? new Response('unauthorized', { status: 401 })
+          : new Response('[]', { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+
+    const [p, s] = await Promise.all([getProjects(), listSessions()]);
+    assert.deepEqual(p, []);
+    assert.deepEqual(s, []);
+    assert.equal(cookieProbeCount, 1);
+    assert.equal(projectsCalls, 2);
+    assert.equal(sessionsCalls, 2);
+  } finally {
+    resetAuthExpired();
+    globalThis.fetch = origFetch;
+    if (origLS === undefined) delete (globalThis as any).localStorage;
+    else (globalThis as any).localStorage = origLS;
+    if (origSS === undefined) delete (globalThis as any).sessionStorage;
+    else (globalThis as any).sessionStorage = origSS;
+  }
+});
+
 

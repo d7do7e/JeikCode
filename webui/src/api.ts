@@ -323,14 +323,51 @@ async function sendWithToken(
   return fetch(input, { ...init, credentials: 'include', headers: buildHeaders(init, bearer) });
 }
 
-let recoveringUnauthorized = false;
+interface TokenRecoveryResult {
+  ok: boolean;
+  bearer: string | null;
+  configResponse: Response | null;
+}
+
+let recoveryPromise: Promise<TokenRecoveryResult> | null = null;
+
+async function runTokenRecoveryProbe(rejectedToken: string): Promise<TokenRecoveryResult> {
+  if (rejectedToken) forgetWebuiToken(rejectedToken);
+
+  for (const candidate of tokenCandidates(rejectedToken)) {
+    const probe = await sendWithToken('/config', { method: 'GET' }, candidate);
+    if (probe.status !== 401 && probe.status !== 403) {
+      confirmWebuiToken(candidate);
+      clearAuthExpired();
+      return { ok: true, bearer: candidate, configResponse: probe };
+    }
+    if (probe.status === 401) {
+      forgetWebuiToken(candidate);
+    }
+  }
+
+  // Cookie 是 `/?token=` 交接后由服务端写入的 HttpOnly 凭据。旧 Bearer 会
+  // 在中间件里优先于 Cookie，把它遮蔽掉；去掉 Bearer 才能让新 Cookie 生效。
+  // 原本就没带 Bearer 说明 Cookie 已经被试过，无需重复请求。
+  if (!rejectedToken) {
+    setAuthExpired(true);
+    return { ok: false, bearer: null, configResponse: null };
+  }
+  const cookieProbe = await sendWithToken('/config', { method: 'GET' }, null);
+  if (cookieProbe.status !== 401 && cookieProbe.status !== 403) {
+    clearAuthExpired();
+    return { ok: true, bearer: null, configResponse: cookieProbe };
+  }
+
+  setAuthExpired(true);
+  return { ok: false, bearer: null, configResponse: null };
+}
 
 /**
  * 401 自愈：绝不刷新页面（旧 token 仍会被存储回放，刷新只会无限循环）。
  *
- * 顺序：丢弃服务端刚拒绝的 token → 尝试其他已保存的候选 token（另一个
- * 标签页可能已经轮换成功）→ 最后用 HttpOnly cookie 重试一次。全部失败才
- * 锁存“认证失效”，交由 UI 让用户粘贴新访问链接/token。
+ * 多个并发请求同时命中 401 时共享同一个幂等探测（GET /config），避免重复执行
+ * 非幂等 POST 请求；恢复成功后按探测结果（候选 Bearer 或 HttpOnly cookie）各自重试一次。
  */
 async function recoverUnauthorized(
   input: RequestInfo | URL,
@@ -338,41 +375,25 @@ async function recoverUnauthorized(
   rejectedToken: string,
   unauthorized: Response,
 ): Promise<Response> {
-  if (authExpired || recoveringUnauthorized) return unauthorized;
+  if (authExpired) return unauthorized;
 
-  recoveringUnauthorized = true;
-  try {
-    if (rejectedToken) forgetWebuiToken(rejectedToken);
-
-    for (const candidate of tokenCandidates(rejectedToken)) {
-      const retry = await sendWithToken(input, init, candidate);
-      if (retry.ok) {
-        confirmWebuiToken(candidate);
-        return retry;
-      }
-      if (retry.status !== 401) return retry;
-      forgetWebuiToken(candidate);
-    }
-
-    // Cookie 是 `/?token=` 交接后由服务端写入的 HttpOnly 凭据。旧 Bearer 会
-    // 在中间件里优先于 Cookie，把它遮蔽掉；去掉 Bearer 才能让新 Cookie 生效。
-    // 原本就没带 Bearer 说明 Cookie 已经被试过，无需重复请求。
-    if (!rejectedToken) {
-      setAuthExpired(true);
-      return unauthorized;
-    }
-    const cookieRetry = await sendWithToken(input, init, null);
-    if (cookieRetry.ok) {
-      clearAuthExpired();
-      return cookieRetry;
-    }
-    if (cookieRetry.status !== 401) return cookieRetry;
-
-    setAuthExpired(true);
-    return unauthorized;
-  } finally {
-    recoveringUnauthorized = false;
+  if (!recoveryPromise) {
+    recoveryPromise = runTokenRecoveryProbe(rejectedToken).finally(() => {
+      recoveryPromise = null;
+    });
   }
+
+  const result = await recoveryPromise;
+  if (!result.ok) return unauthorized;
+
+  const isSimpleConfigGet =
+    input === '/config' && (!init.method || init.method.toUpperCase() === 'GET') && !init.body;
+  if (isSimpleConfigGet && result.configResponse) {
+    const resp = result.configResponse;
+    result.configResponse = null;
+    return resp;
+  }
+  return sendWithToken(input, init, result.bearer);
 }
 
 /**

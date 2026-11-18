@@ -6939,8 +6939,19 @@ fn resolve_client_mode(header: &str) -> SessionMode {
 }
 
 /// CORS allowlist for webui: strict same-`Host` match, Tauri desktop shell,
-/// or loopback-to-loopback local development.
+/// or loopback-to-loopback local development (only when `JEIKCODE_WEBUI_DEV` is set).
 fn is_allowed_cors_origin(origin: &HeaderValue, request_parts: &RequestParts) -> bool {
+    let webui_dev = std::env::var("JEIKCODE_WEBUI_DEV")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    is_allowed_cors_origin_with_dev(origin, request_parts, webui_dev)
+}
+
+fn is_allowed_cors_origin_with_dev(
+    origin: &HeaderValue,
+    request_parts: &RequestParts,
+    webui_dev: bool,
+) -> bool {
     let Ok(origin_str) = origin.to_str() else {
         return false;
     };
@@ -6964,7 +6975,7 @@ fn is_allowed_cors_origin(origin: &HeaderValue, request_parts: &RequestParts) ->
     if authorities_match(authority, scheme, host_hdr) {
         return true;
     }
-    is_loopback_authority(authority) && is_loopback_authority(host_hdr)
+    webui_dev && is_loopback_authority(authority) && is_loopback_authority(host_hdr)
 }
 
 fn is_tauri_origin(origin: &str) -> bool {
@@ -22142,6 +22153,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             None
         }
     };
+    if let Some(cfg) = startup_config.as_ref() {
+        jeikcode_config::proxy::apply_process_proxy_config(&cfg.network.proxy);
+    }
     // Tool text and upgrade copy in this process follow config.language.
     // A missing choice stays English, matching a fresh install.
     let ui_locale = startup_config
@@ -26352,6 +26366,21 @@ mod tests {
             "http://192.168.6.3:4096",
             None
         ));
+    }
+
+    #[test]
+    fn cors_blocks_cross_port_loopback_unless_webui_dev_enabled() {
+        let origin = HeaderValue::from_static("http://localhost:3000");
+        let req = axum::http::Request::builder()
+            .header(header::HOST, "127.0.0.1:13457")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert!(!is_allowed_cors_origin_with_dev(&origin, &parts, false));
+        assert!(is_allowed_cors_origin_with_dev(&origin, &parts, true));
+
+        let same_port = HeaderValue::from_static("http://127.0.0.1:13457");
+        assert!(is_allowed_cors_origin_with_dev(&same_port, &parts, false));
     }
 
     #[test]

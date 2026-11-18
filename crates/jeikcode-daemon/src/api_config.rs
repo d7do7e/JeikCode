@@ -1160,6 +1160,19 @@ pub(crate) async fn get_remote_access(State(state): State<AppState>) -> impl Int
     }
 }
 
+fn validate_desktop_no_token(
+    no_token: bool,
+    desktop_managed: bool,
+) -> Result<(), (axum::http::StatusCode, &'static str)> {
+    if no_token && desktop_managed {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "desktop mode requires an access token",
+        ));
+    }
+    Ok(())
+}
+
 /// POST /api/remote-access — open or close an extra listen address.
 ///
 /// The desktop and local WebUI stay on their original port. This binds a
@@ -1175,6 +1188,12 @@ pub(crate) async fn post_remote_access(
         }
         restore_remote_auth(&state);
         return Json(remote_status(&state, None)).into_response();
+    }
+
+    if let Err((status, msg)) =
+        validate_desktop_no_token(body.no_token, jeikcode_updater::is_desktop_managed())
+    {
+        return json_error(status, msg).into_response();
     }
 
     // Remote-access is a privilege expansion: it must never turn a loopback/no-token
@@ -1673,16 +1692,60 @@ pub(crate) async fn get_desktop_settings() -> impl IntoResponse {
     Json(payload)
 }
 
+fn write_desktop_settings_at(
+    path: &std::path::Path,
+    payload: &DesktopSettingsPayload,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    let action = payload.close_action.trim();
+    if !matches!(action, "ask" | "tray" | "quit") {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "close_action must be 'ask', 'tray', or 'quit'".to_string(),
+        ));
+    }
+    let normalized = DesktopSettingsPayload {
+        close_action: action.to_string(),
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    jeikcode_config::store::backup_sibling_bak(path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = serde_json::to_string_pretty(&normalized)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        + "\n";
+    let tmp_name = format!(
+        ".desktop-settings.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp_path = parent.join(tmp_name);
+    std::fs::write(&tmp_path, body.as_bytes())
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            err.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn post_desktop_settings(
     Json(payload): Json<DesktopSettingsPayload>,
 ) -> impl IntoResponse {
     let path = desktop_settings_file_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    match write_desktop_settings_at(&path, &payload) {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err((status, msg)) => json_error(status, msg).into_response(),
     }
-    let body = serde_json::to_string_pretty(&payload).unwrap_or_default();
-    let _ = std::fs::write(path, body);
-    Json(serde_json::json!({ "success": true }))
 }
 
 /// POST /config/reload - Reloads config.toml from disk, remounts MCP/skills on
@@ -2235,5 +2298,57 @@ mod tests {
         assert_eq!(stop_resp.status(), axum::http::StatusCode::OK);
         assert!(state.extra_remote.lock().unwrap().is_none());
         assert!(!state.is_token_enforced());
+    }
+
+    #[test]
+    fn desktop_settings_write_validates_action_and_creates_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-settings.json");
+
+        let bad = write_desktop_settings_at(
+            &path,
+            &DesktopSettingsPayload {
+                close_action: "invalid".into(),
+            },
+        );
+        assert_eq!(bad.unwrap_err().0, axum::http::StatusCode::BAD_REQUEST);
+
+        write_desktop_settings_at(
+            &path,
+            &DesktopSettingsPayload {
+                close_action: "tray".into(),
+            },
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"tray\""));
+
+        write_desktop_settings_at(
+            &path,
+            &DesktopSettingsPayload {
+                close_action: "quit".into(),
+            },
+        )
+        .unwrap();
+        let bak = dir.path().join("desktop-settings.json.bak");
+        assert!(bak.is_file());
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("\"tray\""));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"quit\""));
+        assert!(write_desktop_settings_at(
+            &path,
+            &DesktopSettingsPayload {
+                close_action: "bogus".into(),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn desktop_managed_mode_rejects_no_token_for_all_non_stop_payloads() {
+        assert_eq!(
+            validate_desktop_no_token(true, true).unwrap_err().0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert!(validate_desktop_no_token(false, true).is_ok());
+        assert!(validate_desktop_no_token(true, false).is_ok());
     }
 }

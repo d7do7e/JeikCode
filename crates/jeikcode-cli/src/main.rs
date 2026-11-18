@@ -1261,7 +1261,7 @@ enum Commands {
         no_open: bool,
         /// Fixed access token. When omitted, a random token is minted.
         /// Desktop passes the token saved from the remote-access panel.
-        #[arg(long)]
+        #[arg(long, env = "JEIKCODE_SERVER_TOKEN")]
         token: Option<String>,
     },
     /// Headless JeikCode server for remote clients (web UI + HTTP API).
@@ -1830,6 +1830,14 @@ fn desktop_webui_fast_launch() -> Option<DesktopWebuiLaunch> {
 }
 
 fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
+    let env_token = std::env::var("JEIKCODE_SERVER_TOKEN").ok();
+    parse_desktop_webui_args_with_env(args, env_token.as_deref())
+}
+
+fn parse_desktop_webui_args_with_env(
+    args: &[String],
+    env_token: Option<&str>,
+) -> Option<DesktopWebuiLaunch> {
     if args.first().map(String::as_str) != Some("webui") {
         return None;
     }
@@ -1861,6 +1869,11 @@ fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
         }
         index += 1;
     }
+    if token.is_none() {
+        if let Some(trimmed) = env_token.map(str::trim).filter(|t| !t.is_empty()) {
+            token = Some(trimmed.to_string());
+        }
+    }
     Some(DesktopWebuiLaunch {
         host,
         port,
@@ -1871,7 +1884,10 @@ fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
 
 async fn async_main() {
     let inherited_token = jeikcode_updater::take_restart_token();
-    if let Some(mut launch) = desktop_webui_fast_launch() {
+    let fast_launch = desktop_webui_fast_launch();
+    if let Some(mut launch) = fast_launch {
+        std::env::remove_var("JEIKCODE_SERVER_TOKEN");
+        init_file_logging();
         if let Some(h) = jeikcode_updater::restart_listen_host_from_env() {
             launch.host = h;
         }
@@ -2108,6 +2124,11 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             .get_matches(),
     )
     .unwrap_or_else(|e| e.exit());
+    // Clear JEIKCODE_SERVER_TOKEN once CLI flags have absorbed it (keeping it only until
+    // Attach finishes reading it) so spawned agent/MCP child processes never inherit it.
+    if !matches!(cli.command, Some(Commands::Attach { .. })) {
+        std::env::remove_var("JEIKCODE_SERVER_TOKEN");
+    }
 
     // ── Askpass early exit ────────────────────────────────────────────────────
     // Handle `jeikcode __askpass <prompt>` before ANY TUI/telemetry setup.
@@ -2210,7 +2231,10 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
-                let token = token.or_else(|| inherited_token.clone());
+                let token = token
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| inherited_token.clone());
                 let webui_tokens = match jeikcode_daemon::auth_token::standalone_daemon_tokens(
                     &host,
                     token.as_deref(),
@@ -2281,7 +2305,10 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
-                let token = token.or_else(|| inherited_token.clone());
+                let token = token
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| inherited_token.clone());
                 let msg =
                     jeikcode_daemon::ensure_webui(&host, port, !no_open, token.as_deref(), None)
                         .await;
@@ -2316,7 +2343,10 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 let token = if no_token {
                     None
                 } else {
-                    token.or_else(|| inherited_token.clone())
+                    token
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .or_else(|| inherited_token.clone())
                 };
                 let code = run_serve_mode(
                     host,
@@ -2348,6 +2378,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                         1
                     }
                 };
+                std::env::remove_var("JEIKCODE_SERVER_TOKEN");
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
@@ -2504,7 +2535,12 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
         let token = if no_token {
             None
         } else {
-            cli.token.clone().or_else(|| inherited_token.clone())
+            cli.token
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .or_else(|| inherited_token.clone())
         };
         let code = run_serve_mode(
             host,
@@ -5360,9 +5396,9 @@ mod tests {
         headless_completion_exit_code, headless_completion_notify_reason,
         interactive_provider_bootstrap, is_completion_invocation, jeikcode_log_path,
         merge_startup_notices, normalize_attach_base, parse_desktop_webui_args,
-        print_shell_completion, resolve_working_dir, runtime_config_from,
-        should_fork_busy_continue, token_from_url, truncate_log_line, Cli, Commands,
-        DEFAULT_LOG_DIRECTIVES,
+        parse_desktop_webui_args_with_env, print_shell_completion, resolve_working_dir,
+        runtime_config_from, should_fork_busy_continue, token_from_url, truncate_log_line, Cli,
+        Commands, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
@@ -6351,5 +6387,60 @@ mod tests {
         std::fs::write(&gi4, ".jeikcode/\n").unwrap();
         ensure_gitignore_codegraph_entry(git_repo4.path());
         assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".jeikcode/\n");
+    }
+
+    #[test]
+    fn desktop_webui_args_accept_trimmed_env_token_and_reject_blank() {
+        let args = vec![
+            "webui".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "13457".to_string(),
+            "--no-open".to_string(),
+        ];
+        let with_tok = parse_desktop_webui_args_with_env(&args, Some("  sk-env-123  ")).unwrap();
+        assert_eq!(with_tok.token.as_deref(), Some("sk-env-123"));
+        assert!(with_tok.no_open);
+
+        let blank_tok = parse_desktop_webui_args_with_env(&args, Some("   ")).unwrap();
+        assert_eq!(blank_tok.token, None);
+
+        // Explicit --token wins over env token.
+        let mut with_arg = args.clone();
+        with_arg.push("--token".to_string());
+        with_arg.push("sk-arg-456".to_string());
+        let parsed = parse_desktop_webui_args_with_env(&with_arg, Some("sk-env-123")).unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("sk-arg-456"));
+    }
+
+    #[test]
+    fn cli_parses_webui_token_flag_and_serve_token_flag() {
+        let parsed = Cli::try_parse_from([
+            "jeikcode",
+            "webui",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "13457",
+            "--no-open",
+            "--token",
+            "sk-flag-789",
+        ])
+        .unwrap();
+        match parsed.command {
+            Some(Commands::Webui {
+                host,
+                port,
+                no_open,
+                token,
+            }) => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 13457);
+                assert!(no_open);
+                assert_eq!(token.as_deref(), Some("sk-flag-789"));
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 }
