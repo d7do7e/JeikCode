@@ -605,7 +605,11 @@ impl Tool for BashTool {
                             Ok(0) => stdout_done = true,
                             Ok(n) => {
                                 *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                                stdout_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&out_buf[..n]);
+                                extend_capped(
+                                    &mut *stdout_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                    &out_buf[..n],
+                                    MAX_STREAM_CAPTURE_BYTES,
+                                );
                                 if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
                                     emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
                                     for line in chunk.lines() {
@@ -621,7 +625,11 @@ impl Tool for BashTool {
                             Ok(0) => stderr_done = true,
                             Ok(n) => {
                                 *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                                stderr_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&err_buf[..n]);
+                                extend_capped(
+                                    &mut *stderr_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                    &err_buf[..n],
+                                    MAX_STREAM_CAPTURE_BYTES,
+                                );
                                 if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
                                     emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
                                     for line in chunk.lines() {
@@ -998,10 +1006,11 @@ impl Tool for BashTool {
                             }
                             runtime.unregister_live_bash(child_pid_val);
                             let (out, errb) = snapshot();
-                            let notice = "\n[Process finished emitting output and became idle waiting for stdin. Harvested available output.]";
-                            let mut full_out = out;
-                            full_out.extend_from_slice(notice.as_bytes());
-                            break Drive::Result(ok(format_streams(&full_out, &errb, Some((true, Some(0))), false)));
+                            break Drive::Result(err(with_note(
+                                &out,
+                                &errb,
+                                "bash: process stopped emitting output and became idle waiting for stdin after 15s; terminated to prevent hang (partial output preserved above; no exit code 0).",
+                            )));
                         }
                     }
                 }
@@ -1051,11 +1060,31 @@ impl Tool for BashTool {
                             emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
                         }
                     };
-                    let _ = tokio::time::timeout(Duration::from_secs(2), drain_pipes).await;
+                    let drain_timed_out = tokio::time::timeout(Duration::from_secs(2), drain_pipes)
+                        .await
+                        .is_err();
+                    if drain_timed_out {
+                        #[cfg(windows)]
+                        crate::process_utils::kill_windows_tree(&job_guard, child_pid);
+                        #[cfg(not(target_os = "windows"))]
+                        if let Some(pgid) = child_pid {
+                            unsafe { killpg(pgid as i32, SIGKILL) };
+                        }
+                    }
                     break Drive::Result(match status {
                         Ok(st) => {
                             let (out, errb) = snapshot();
-                            ok(format_streams(&out, &errb, Some((st.success(), st.code())), false))
+                            let mut formatted =
+                                format_streams(&out, &errb, Some((st.success(), st.code())), false);
+                            if drain_timed_out {
+                                if !formatted.is_empty() && !formatted.ends_with('\n') {
+                                    formatted.push('\n');
+                                }
+                                formatted.push_str(
+                                    "[warning: grandchild process held stdout/stderr open >2s after exit and was terminated; start long-lived services with background=true]",
+                                );
+                            }
+                            ok(formatted)
                         }
                         Err(e) => err(format!("bash: error running command: {e}")),
                     });
@@ -4357,12 +4386,14 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     if let Some(reason) = git_worktree_discard(&cmd) {
         return Some(reason.to_string());
     }
+    if is_disk_format_invocation(command) {
+        return Some("disk format".to_string());
+    }
     // Substring pattern table (matched against the lowercased command).
     let patterns: &[(&str, &str)] = &[
         ("rmdir ", "directory removal"),
         ("drop table", "SQL DROP TABLE"),
         ("drop database", "SQL DROP DATABASE"),
-        ("format ", "disk format"),
         ("mkfs", "filesystem creation"),
         ("chmod 777", "world-writable permission"),
         ("chmod -r ", "recursive permission change"),
@@ -4388,6 +4419,26 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Tokenized check for Windows/DOS disk `format` invocations (e.g. `format C:`,
+/// `cmd /c format D: /fs:ntfs`) without false-tripping on code formatters or flags
+/// (`dart format`, `ruff format`, `git log --format`).
+fn is_disk_format_invocation(command: &str) -> bool {
+    if let Some(invs) = bash_invocations(command) {
+        return invs.iter().any(|inv| {
+            let bin = command_basename(&inv.command);
+            (bin == "format" || bin == "format.com") && !inv.arguments.is_empty()
+        });
+    }
+    command.split([';', '|', '&', '\n']).any(|seg| {
+        let mut toks = seg.split_whitespace();
+        let Some(first) = toks.next() else {
+            return false;
+        };
+        let bin = command_basename(first);
+        (bin == "format" || bin == "format.com") && toks.next().is_some()
+    })
 }
 
 /// Pre-flight static check for commands that inherently require an interactive terminal / TTY,
@@ -4932,6 +4983,8 @@ const ALWAYS_LONG_BINS: &[&str] = &[
     "parcel",
     "swc",
     "pytest",
+    "vitest",
+    "jest",
     "ctest",
     "xcodebuild",
     "ansible-playbook",
@@ -5345,6 +5398,76 @@ fn pulumi_is_long(args: &[String]) -> bool {
     )
 }
 
+/// Peel `uv|poetry|pdm|pipenv run ... <inner_cmd> ...` into the inner invocation
+/// so `uv run pytest` or `poetry run python -m unittest` is classified accurately as long.
+fn peel_python_runner_command(args: &[String]) -> Option<BashInvocation> {
+    const PRE_RUN_TAKING: &[&str] = &[
+        "--project",
+        "--directory",
+        "-C",
+        "--config-file",
+        "--cache-dir",
+        "--python",
+        "-p",
+    ];
+    const RUN_TAKING: &[&str] = &[
+        "--extra",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--directory",
+        "--project",
+        "--group",
+        "--env-file",
+        "--package",
+        "--cwd",
+        "--from",
+        "-w",
+        "-m",
+        "-C",
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        let a = arg_word(&args[i]);
+        if a.starts_with('-') {
+            let takes_value = !a.contains('=') && PRE_RUN_TAKING.contains(&a);
+            i += 1;
+            if takes_value && i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    if arg_word(args.get(i)?) != "run" {
+        return None;
+    }
+    i += 1;
+    while i < args.len() {
+        let a = arg_word(&args[i]);
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.starts_with('-') {
+            let takes_value = !a.contains('=') && RUN_TAKING.contains(&a);
+            i += 1;
+            if takes_value && i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    let cmd = args.get(i)?;
+    Some(BashInvocation {
+        command: arg_word(cmd).to_string(),
+        arguments: args[i + 1..].to_vec(),
+    })
+}
+
 /// Strip `sudo` flags (`-n`, `-A`, `-u user`, …) and classify the inner command.
 /// Bare `sudo` (no command) stays long so a password prompt is not idle-killed.
 fn peel_sudo_command(args: &[String]) -> Option<BashInvocation> {
@@ -5390,9 +5513,12 @@ fn invocation_is_long_job(inv: &BashInvocation) -> bool {
         "npm" | "pnpm" | "yarn" | "bun" => npm_family_is_long(&bin, &inv.arguments),
         "npx" | "bunx" => npx_is_long(&inv.arguments),
         "python" | "python3" | "py" => python_is_long(&inv.arguments),
-        "pip" | "pip3" | "poetry" | "uv" | "pipenv" | "pdm" | "conda" | "mamba" | "composer" => {
+        "uv" | "poetry" | "pdm" | "pipenv" => {
             pip_family_is_long(&inv.arguments)
+                || peel_python_runner_command(&inv.arguments)
+                    .is_some_and(|inner| invocation_is_long_job(&inner))
         }
+        "pip" | "pip3" | "conda" | "mamba" | "composer" => pip_family_is_long(&inv.arguments),
         "docker" | "podman" => docker_is_long(&inv.arguments),
         "docker-compose" => docker_compose_bin_is_long(&inv.arguments),
         "dotnet" => dotnet_is_long(&inv.arguments),
@@ -8984,5 +9110,34 @@ mod msys_arg_rewrite_tests {
             rewrite("env -i grep -f /dev/null x", Some(root)),
             "env -i grep -f /dev/null x"
         );
+    }
+
+    #[test]
+    fn python_runner_long_job_and_tokenized_disk_format_checks() {
+        // #70: uv/poetry/pdm/pipenv run peel inner long jobs + vitest/jest.
+        assert!(looks_like_long_job("uv run pytest tests/"));
+        assert!(looks_like_long_job("uv run --extra dev pytest -q"));
+        assert!(looks_like_long_job("poetry run python -m unittest"));
+        assert!(looks_like_long_job("pdm run pytest"));
+        assert!(looks_like_long_job("pipenv run pytest"));
+        assert!(looks_like_long_job("vitest run"));
+        assert!(looks_like_long_job("jest --runInBand"));
+        assert!(!looks_like_long_job("uv run ruff check ."));
+
+        // #74: disk format detection is tokenized by command verb, not raw substring.
+        assert_eq!(
+            check_destructive_command("format C: /fs:ntfs").as_deref(),
+            Some("disk format")
+        );
+        assert_eq!(
+            check_destructive_command("echo ok && format D:").as_deref(),
+            Some("disk format")
+        );
+        assert!(
+            check_destructive_command("dart format --output=none --set-exit-if-changed .")
+                .is_none()
+        );
+        assert!(check_destructive_command("uv run ruff format --check .").is_none());
+        assert!(check_destructive_command("git log --format \"%h %s\"").is_none());
     }
 }

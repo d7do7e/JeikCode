@@ -140,6 +140,28 @@ impl std::fmt::Debug for ProgressSink {
     }
 }
 
+tokio::task_local! {
+    static CURRENT_SESSION_SCOPE: Option<Arc<str>>;
+}
+
+/// Bind a session identifier to the current async task so tools can partition
+/// per-session state (such as read-before-write tracking) without expanding
+/// `ToolContext` across all callers.
+pub fn with_session_scope<F: std::future::Future>(
+    session_id: Option<Arc<str>>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    CURRENT_SESSION_SCOPE.scope(session_id, fut)
+}
+
+/// Read the active session scope bound to the current async task, if any.
+pub fn current_session_scope() -> Option<String> {
+    CURRENT_SESSION_SCOPE
+        .try_with(|s| s.as_deref().map(str::to_string))
+        .ok()
+        .flatten()
+}
+
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub cancel: tokio_util::sync::CancellationToken,

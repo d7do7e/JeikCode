@@ -126,16 +126,9 @@ pub(crate) fn validate_verifier_shell_command(command: &str) -> Result<(), Strin
         ));
     }
     if let Some(reason) = check_destructive_command(trimmed) {
-        let false_positive_disk_format = reason == "disk format"
-            && !trimmed
-                .split_whitespace()
-                .next()
-                .is_some_and(|tok| tok.eq_ignore_ascii_case("format"));
-        if !false_positive_disk_format {
-            return Err(format!(
-                "verifier subagent blocked potentially destructive command ({reason})"
-            ));
-        }
+        return Err(format!(
+            "verifier subagent blocked potentially destructive command ({reason})"
+        ));
     }
     let Some(invocations) = bash_invocations(trimmed) else {
         return Err(
@@ -185,8 +178,11 @@ fn validate_invocation(inv: &BashInvocation) -> Result<(), String> {
             }
         }
         "cargo" => validate_cargo(&args),
+        "rustc" => validate_rustc(&args),
         "git" => validate_git(&args),
+        "gh" => validate_gh(&args),
         "uv" => validate_uv(&args),
+        "dotnet" => validate_dotnet(&args),
         "npm" | "pnpm" | "yarn" | "bun" => validate_node_pkg(&cmd, &args),
         "npx" => validate_npx(&args),
         "pytest" | "ruff" | "mypy" | "pyright" | "flake8" | "tsc" | "eslint" | "vitest"
@@ -194,6 +190,20 @@ fn validate_invocation(inv: &BashInvocation) -> Result<(), String> {
         "node" => validate_node(&args),
         "python" | "python3" | "py" => validate_python(&args),
         "flutter" | "dart" => validate_dart_flutter(&cmd, &args),
+        "ninja" => {
+            if args.iter().any(|a| *a == "-n" || *a == "--dry-run") {
+                Ok(())
+            } else {
+                Err("verifier `ninja` only allows dry-run (`-n` / `--dry-run`)".to_string())
+            }
+        }
+        "cmake" => {
+            if args.iter().any(|a| *a == "--version" || *a == "-V") {
+                Ok(())
+            } else {
+                Err("verifier `cmake` only allows `--version` (use `ctest` for tests)".to_string())
+            }
+        }
         "make" => {
             if args.iter().any(|a| matches!(*a, "test" | "check" | "lint")) {
                 Ok(())
@@ -217,12 +227,60 @@ fn has_inline_write_redirect_or_inplace_flag(cmd: &str, args: &[&str]) -> bool {
     false
 }
 
+/// Skip flags (including value-taking flags) and optional leading `+toolchain` tokens,
+/// returning the first positional subcommand and its index in `args`.
+fn first_subcommand<'a>(
+    args: &'a [&'a str],
+    value_flags: &[&str],
+    skip_plus_toolchain: bool,
+) -> Option<(usize, &'a str)> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return args.get(i + 1).copied().map(|s| (i + 1, s));
+        }
+        if skip_plus_toolchain && a.starts_with('+') {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            let takes_value = !a.contains('=') && value_flags.contains(&a);
+            i += 1;
+            if takes_value && i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        return Some((i, a));
+    }
+    None
+}
+
 fn validate_cargo(args: &[&str]) -> Result<(), String> {
-    let sub = args.iter().copied().find(|a| !a.starts_with('-'));
+    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+        return Ok(());
+    }
+    const CARGO_GLOBAL_VALUE_FLAGS: &[&str] = &[
+        "-C",
+        "--config",
+        "-Z",
+        "--color",
+        "--manifest-path",
+        "--target-dir",
+    ];
+    let sub = first_subcommand(args, CARGO_GLOBAL_VALUE_FLAGS, true).map(|(_, s)| s);
     match sub {
+        Some("clippy") => {
+            if args.iter().any(|a| *a == "--fix") {
+                Err("verifier `cargo clippy` cannot use `--fix` (read-only)".to_string())
+            } else {
+                Ok(())
+            }
+        }
         Some(
-            "check" | "test" | "nextest" | "clippy" | "mutants" | "tree" | "metadata"
-            | "verify-project" | "doc" | "llvm-cov" | "version",
+            "check" | "test" | "nextest" | "mutants" | "tree" | "metadata" | "verify-project"
+            | "doc" | "llvm-cov" | "version",
         ) => Ok(()),
         Some("bench") if args.iter().any(|a| *a == "--no-run") => Ok(()),
         Some("fmt") => {
@@ -239,19 +297,93 @@ fn validate_cargo(args: &[&str]) -> Result<(), String> {
     }
 }
 
+fn validate_rustc(args: &[&str]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|a| *a == "--version" || *a == "-V" || *a == "--print")
+    {
+        Ok(())
+    } else {
+        Err("verifier `rustc` only allows `--version`, `-V`, or `--print`".to_string())
+    }
+}
+
+fn validate_dotnet(args: &[&str]) -> Result<(), String> {
+    if args.iter().any(|a| *a == "--version" || *a == "--info") {
+        return Ok(());
+    }
+    let sub = first_subcommand(args, &[], false).map(|(_, s)| s);
+    match sub {
+        Some("test" | "list") => Ok(()),
+        other => Err(format!(
+            "verifier `dotnet` subcommand `{}` is not permitted (use `dotnet test` / `dotnet list`)",
+            other.unwrap_or("<none>")
+        )),
+    }
+}
+
+fn validate_gh(args: &[&str]) -> Result<(), String> {
+    const GH_GLOBAL_VALUE_FLAGS: &[&str] = &["-R", "--repo"];
+    let Some((idx, group)) = first_subcommand(args, GH_GLOBAL_VALUE_FLAGS, false) else {
+        return Err("verifier `gh` requires a read-only subcommand".to_string());
+    };
+    if group == "status" || group == "version" {
+        return Ok(());
+    }
+    if !matches!(group, "pr" | "issue" | "run" | "workflow" | "release") {
+        return Err(format!("verifier `gh {group}` is not permitted"));
+    }
+    let action = first_subcommand(&args[idx + 1..], GH_GLOBAL_VALUE_FLAGS, false).map(|(_, s)| s);
+    if matches!(action, Some("view" | "list" | "status" | "diff" | "checks")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "verifier `gh {group}` only allows read-only view/list/status/diff/checks, got `{}`",
+            action.unwrap_or("<none>")
+        ))
+    }
+}
+
 fn validate_uv(args: &[&str]) -> Result<(), String> {
     if args.iter().any(|a| *a == "--version" || *a == "-V") {
         return Ok(());
     }
-    let non_flags: Vec<&str> = args
-        .iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    match non_flags.first().copied() {
-        Some("version") => Ok(()),
-        Some("run") => {
-            let Some(&runner) = non_flags.get(1) else {
+    const UV_GLOBAL_VALUE_FLAGS: &[&str] = &[
+        "--project",
+        "--directory",
+        "-C",
+        "--config-file",
+        "--cache-dir",
+        "--python",
+        "-p",
+    ];
+    const UV_RUN_VALUE_FLAGS: &[&str] = &[
+        "--extra",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--directory",
+        "--project",
+        "--group",
+        "--env-file",
+        "--package",
+        "--cwd",
+        "--from",
+        "-w",
+        "-m",
+        "-C",
+    ];
+    let Some((sub_idx, sub)) = first_subcommand(args, UV_GLOBAL_VALUE_FLAGS, false) else {
+        return Err("verifier `uv` requires a subcommand".to_string());
+    };
+    match sub {
+        "version" => Ok(()),
+        "run" => {
+            let after_run = &args[sub_idx + 1..];
+            let Some((rel_idx, runner)) = first_subcommand(after_run, UV_RUN_VALUE_FLAGS, false)
+            else {
                 return Err("verifier `uv run` requires a target checker command".to_string());
             };
             let runner_name = std::path::Path::new(runner)
@@ -260,8 +392,7 @@ fn validate_uv(args: &[&str]) -> Result<(), String> {
                 .unwrap_or(runner)
                 .trim_end_matches(".exe")
                 .to_ascii_lowercase();
-            let runner_pos = args.iter().position(|&a| a == runner).unwrap_or(0);
-            let tail = &args[runner_pos + 1..];
+            let tail = &after_run[rel_idx + 1..];
             match runner_name.as_str() {
                 "pytest" | "mypy" | "pyright" | "flake8" => Ok(()),
                 "ruff" => validate_checker("ruff", tail),
@@ -272,21 +403,45 @@ fn validate_uv(args: &[&str]) -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "verifier `uv` subcommand `{}` is not permitted (use `uv run pytest|mypy|ruff check`)",
-            other.unwrap_or("<none>")
+            "verifier `uv` subcommand `{other}` is not permitted (use `uv run pytest|mypy|ruff check`)"
         )),
     }
 }
 
 fn validate_git(args: &[&str]) -> Result<(), String> {
-    let sub = args.iter().copied().find(|a| !a.starts_with('-'));
+    if args.iter().any(|a| *a == "--version" || *a == "-v") {
+        return Ok(());
+    }
+    const GIT_GLOBAL_VALUE_FLAGS: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--exec-path",
+    ];
+    let Some((sub_idx, sub)) = first_subcommand(args, GIT_GLOBAL_VALUE_FLAGS, false) else {
+        return Err("verifier `git` requires a read-only subcommand".to_string());
+    };
+    let tail = &args[sub_idx + 1..];
     match sub {
-        Some(
-            "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "grep" | "blame"
-            | "describe",
-        ) => Ok(()),
-        Some("branch") => {
-            if args
+        "diff" => {
+            if tail
+                .iter()
+                .any(|a| *a == "--output" || a.starts_with("--output="))
+            {
+                Err("verifier `git diff` cannot write `--output` files".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        "status" | "log" | "show" | "rev-parse" | "ls-files" | "grep" | "blame" | "describe"
+        | "merge-base" | "rev-list" | "cat-file" | "check-ignore" | "diff-tree" | "show-ref"
+        | "symbolic-ref" | "shortlog" => Ok(()),
+        "branch" => {
+            if tail
                 .iter()
                 .any(|a| matches!(*a, "-d" | "-D" | "-m" | "-M" | "--delete" | "--move"))
             {
@@ -296,8 +451,7 @@ fn validate_git(args: &[&str]) -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "verifier `git` subcommand `{}` is not read-only",
-            other.unwrap_or("<none>")
+            "verifier `git` subcommand `{other}` is not read-only"
         )),
     }
 }
@@ -332,14 +486,26 @@ fn validate_node_pkg(cmd: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn validate_npx(args: &[&str]) -> Result<(), String> {
-    let tool = args.iter().copied().find(|a| !a.starts_with('-'));
+    const NPX_VALUE_FLAGS: &[&str] = &["-p", "--package", "-c", "--call"];
+    let Some((idx, tool)) = first_subcommand(args, NPX_VALUE_FLAGS, false) else {
+        return Err("verifier `npx` requires a checker tool".to_string());
+    };
+    let tail = &args[idx + 1..];
     match tool {
-        Some("tsc" | "eslint" | "vitest" | "jest") => Ok(()),
-        Some("prettier") if args.iter().any(|a| *a == "--check") => Ok(()),
-        other => Err(format!(
-            "verifier `npx` tool `{}` is not permitted",
-            other.unwrap_or("<none>")
-        )),
+        "tsc" | "eslint" | "vitest" | "jest" => validate_checker(tool, tail),
+        "prettier" => {
+            if tail.iter().any(|a| *a == "--write" || *a == "-w") {
+                Err("verifier `npx prettier` cannot use `--write`/`-w`".to_string())
+            } else if tail
+                .iter()
+                .any(|a| *a == "--check" || *a == "--list-different" || *a == "-l")
+            {
+                Ok(())
+            } else {
+                Err("verifier `npx prettier` requires `--check`".to_string())
+            }
+        }
+        other => Err(format!("verifier `npx` tool `{other}` is not permitted")),
     }
 }
 
@@ -348,9 +514,39 @@ fn validate_checker(cmd: &str, args: &[&str]) -> Result<(), String> {
         "ruff" => {
             let sub = args.iter().copied().find(|a| !a.starts_with('-'));
             match sub {
-                Some("check") | None => Ok(()),
+                Some("check") | None => {
+                    if args.iter().any(|a| {
+                        matches!(*a, "--fix" | "--unsafe-fixes" | "--add-noqa")
+                            || a.starts_with("--fix=")
+                    }) {
+                        Err("verifier `ruff check` cannot use `--fix`/`--unsafe-fixes`".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
                 Some("format") if args.iter().any(|a| *a == "--check" || *a == "--diff") => Ok(()),
                 _ => Err("verifier `ruff` only allows `check` or `format --check`".to_string()),
+            }
+        }
+        "eslint" => {
+            if args.iter().any(|a| {
+                matches!(*a, "--fix" | "--output-file" | "-o")
+                    || a.starts_with("--fix=")
+                    || a.starts_with("--output-file=")
+            }) {
+                Err("verifier `eslint` cannot use `--fix` or `--output-file`".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        "tsc" => {
+            if args
+                .iter()
+                .any(|a| matches!(*a, "--noEmit" | "--version" | "-v" | "--showConfig"))
+            {
+                Ok(())
+            } else {
+                Err("verifier `tsc` requires `--noEmit` (no JS emit to disk)".to_string())
             }
         }
         "go" => {
@@ -559,8 +755,41 @@ mod tests {
         assert!(validate_verifier_shell_command("uv run pytest tests/").is_ok());
         assert!(validate_verifier_shell_command("uv run ruff check .").is_ok());
         assert!(validate_verifier_shell_command("uv run ruff format --check .").is_ok());
+        assert!(validate_verifier_shell_command("uv run --extra dev pytest tests/").is_ok());
+        assert!(
+            validate_verifier_shell_command("uv --project sub run --with pytest pytest").is_ok()
+        );
+        assert!(validate_verifier_shell_command(
+            "git -C C:/Users/depc/Projects/Personal/JeikCode status --short -uall"
+        )
+        .is_ok());
+        assert!(
+            validate_verifier_shell_command("git -c core.quotepath=false diff --stat HEAD").is_ok()
+        );
+        assert!(validate_verifier_shell_command("git -C /repo merge-base HEAD main").is_ok());
+        assert!(validate_verifier_shell_command("cargo +nightly check --workspace").is_ok());
+        assert!(validate_verifier_shell_command("dotnet test --no-restore").is_ok());
+        assert!(validate_verifier_shell_command("gh pr view 90").is_ok());
+        assert!(validate_verifier_shell_command("gh run list --limit 5").is_ok());
+        assert!(validate_verifier_shell_command("rustc --version").is_ok());
+        assert!(validate_verifier_shell_command("npx tsc --noEmit").is_ok());
+        assert!(validate_verifier_shell_command(
+            "dart format --output=none --set-exit-if-changed ."
+        )
+        .is_ok());
         assert!(validate_verifier_shell_command("npm run typecheck").is_ok());
 
+        // Block mutating flags and write-emitting checks
+        assert!(validate_verifier_shell_command("cargo clippy --fix --allow-dirty").is_err());
+        assert!(validate_verifier_shell_command("ruff check --fix .").is_err());
+        assert!(validate_verifier_shell_command("uv run ruff check --fix .").is_err());
+        assert!(validate_verifier_shell_command("eslint --fix src/").is_err());
+        assert!(validate_verifier_shell_command("npx eslint --fix src/").is_err());
+        assert!(validate_verifier_shell_command("tsc").is_err());
+        assert!(validate_verifier_shell_command("npx tsc").is_err());
+        assert!(validate_verifier_shell_command("git -C /repo commit -m bad").is_err());
+        assert!(validate_verifier_shell_command("git diff --output=patch.diff").is_err());
+        assert!(validate_verifier_shell_command("gh pr merge 90").is_err());
         assert!(validate_verifier_shell_command("uv run ruff format .").is_err());
         assert!(validate_verifier_shell_command("uv pip install requests").is_err());
         assert!(validate_verifier_shell_command("cargo fmt --all").is_err());

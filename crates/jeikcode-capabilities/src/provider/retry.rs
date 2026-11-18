@@ -124,10 +124,12 @@ pub(crate) fn is_retryable_status(code: u16) -> bool {
 }
 
 /// Whether a transient status should be retried inside the provider's OPEN loop.
-/// HTTP 429 follows the per-call owner; all other transient statuses remain
-/// provider-owned fast retries.
+/// HTTP 429 and 529 follow the per-call owner so the kernel can manage cancellable
+/// waits (without 6× provider retry amplification or blocking Esc); all other
+/// transient statuses remain provider-owned fast retries.
 pub(crate) fn should_retry_open_status(code: u16, owner: RateLimitRetryOwner) -> bool {
-    is_retryable_status(code) && (code != 429 || owner == RateLimitRetryOwner::Provider)
+    is_retryable_status(code)
+        && (!matches!(code, 429 | 529) || owner == RateLimitRetryOwner::Provider)
 }
 
 /// Transient transport errors worth retrying.
@@ -404,14 +406,19 @@ mod tests {
     }
 
     #[test]
-    fn open_retry_ownership_excludes_429_only() {
-        assert!(
-            is_retryable_status(429),
-            "kernel must still receive a retryable 429"
-        );
-        assert!(should_retry_open_status(429, RateLimitRetryOwner::Provider));
-        assert!(!should_retry_open_status(429, RateLimitRetryOwner::Kernel));
-        for code in [408, 425, 500, 502, 503, 504, 529] {
+    fn open_retry_ownership_excludes_429_and_529_under_kernel() {
+        for code in [429, 529] {
+            assert!(
+                is_retryable_status(code),
+                "kernel must still receive retryable {code}"
+            );
+            assert!(should_retry_open_status(
+                code,
+                RateLimitRetryOwner::Provider
+            ));
+            assert!(!should_retry_open_status(code, RateLimitRetryOwner::Kernel));
+        }
+        for code in [408, 425, 500, 502, 503, 504] {
             assert!(
                 should_retry_open_status(code, RateLimitRetryOwner::Kernel),
                 "{code} should keep provider fast retry"

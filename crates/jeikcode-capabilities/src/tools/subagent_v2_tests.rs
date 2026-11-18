@@ -815,3 +815,44 @@ async fn subagent_spills_oversized_output_to_artifact_store_and_emits_telemetry_
         batch_out.content
     );
 }
+
+#[tokio::test]
+async fn deny_sensitive_paths_blocks_codegraphignore_graph_and_include_sensitive() {
+    use super::task::DenySensitivePaths;
+    use jeikcode_kernel::middleware::ToolMiddleware;
+    use jeikcode_kernel::request::RequestCtx;
+    use jeikcode_kernel::tool::ToolCall;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".codegraphignore.graph"), "secrets/**\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+    std::fs::write(dir.path().join("secrets/api.txt"), "TOKEN=123").unwrap();
+
+    let mw = DenySensitivePaths::new(dir.path());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let rt = RequestCtx::new(tx, None);
+    let read_tool: Arc<dyn Tool> = Arc::new(crate::tools::ReadFileTool::default());
+    let grep_tool: Arc<dyn Tool> = Arc::new(crate::tools::GrepTool);
+
+    let mut read_call = ToolCall {
+        id: "t1".into(),
+        name: "read".into(),
+        arguments: r#"{"path":"secrets/api.txt"}"#.into(),
+    };
+    let out1 = mw.before(&mut read_call, &read_tool, &rt).await;
+    assert!(
+        out1.is_deny(),
+        "subagent DenySensitivePaths must block .codegraphignore.graph paths"
+    );
+
+    let mut grep_call = ToolCall {
+        id: "t2".into(),
+        name: "grep".into(),
+        arguments: r#"{"pattern":"TOKEN","include_sensitive":true}"#.into(),
+    };
+    let out2 = mw.before(&mut grep_call, &grep_tool, &rt).await;
+    assert!(
+        out2.is_deny(),
+        "subagent DenySensitivePaths must block grep include_sensitive=true"
+    );
+}

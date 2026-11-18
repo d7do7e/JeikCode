@@ -149,6 +149,12 @@ const MAX_FIRST_TOKEN_RETRIES: u32 = 6;
 /// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
 
+/// Dedicated cancellable backoff cap for HTTP 529 / `overloaded_error` responses.
+/// Kept distinct from 429 rate-limit hooks so transient upstream overload never
+/// triggers a 5-hour CodingPlan quota pause, while avoiding un-cancellable
+/// provider-layer retry storms.
+const MAX_OVERLOAD_RETRIES: u32 = 5;
+
 /// The FIRST transient 429 of a turn that has NO host verdict and NO server
 /// `Retry-After` is almost always a momentary burst over a per-second gateway
 /// limit that clears immediately. Retry it QUIETLY after this short wait — without
@@ -465,6 +471,24 @@ fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
 /// pause instead of a bare "HTTP 429". `None` when the body is empty / only the
 /// prefix. Kept prefix-exact (the known status) rather than a loose match, and
 /// falls back to the whole message if the prefix isn't present (other providers).
+fn is_overload_error(e: &crate::stream::ProviderError) -> bool {
+    e.http_status == Some(529)
+        || e.code
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("overloaded_error"))
+}
+
+fn overload_backoff_secs(attempt: u32, e: &crate::stream::ProviderError, clock_ms: u64) -> u64 {
+    if let Some(secs) = effective_retry_after(e) {
+        return secs.clamp(1, 120);
+    }
+    // 5s -> 10s -> 20s -> 40s -> 80s with ±20% decorrelation jitter.
+    let base = (5u64 << attempt.saturating_sub(1).min(4)).min(80);
+    let bucket = (clock_ms % 41) as f64 / 100.0; // 0.00..=0.40
+    let factor = 0.80 + bucket; // 0.80..=1.20
+    ((base as f64) * factor).round().clamp(1.0, 120.0) as u64
+}
+
 fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
     let status = e.http_status.unwrap_or(429);
     let prefix = format!("HTTP {status}: ");
@@ -1344,7 +1368,11 @@ impl Agent {
             keep_interrupted_context: self.keep_interrupted_context,
             round_cap_checkpoint: self.round_cap_checkpoint,
         };
-        let task = tokio::spawn(running.session_loop(cmd_rx));
+        let session_scope = running.session_id.clone();
+        let task = tokio::spawn(crate::tool::with_session_scope(
+            session_scope,
+            running.session_loop(cmd_rx),
+        ));
         AgentHandle {
             commands: cmd_tx,
             events: ev_rx,
@@ -2565,6 +2593,8 @@ impl RunningAgent {
         // livelock if the host hook is broken or the window never opens — at that
         // point the kernel forces a Pause stop rather than spinning indefinitely.
         let mut rate_limit_waits: u32 = 0;
+        // Dedicated HTTP 529 / `overloaded_error` retry counter (reset on natural completion).
+        let mut overload_retries: u32 = 0;
         // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
         // after a content-free 200. UNLIKE the two above it is NOT reset per round —
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
@@ -3110,6 +3140,31 @@ impl RunningAgent {
                         }
                     }
                 }
+                // HTTP 529 OVERLOADED: dedicated cancellable exponential backoff
+                // (5s -> 10s -> 20s -> 40s -> 80s, honoring Retry-After) that does NOT
+                // route through `hooks.on_rate_limit` (avoiding false 5h quota pauses)
+                // and does NOT burn the generic 3/6/9s provider_retry budget.
+                Err(e) if is_overload_error(&e) && overload_retries < MAX_OVERLOAD_RETRIES => {
+                    overload_retries += 1;
+                    let wait = overload_backoff_secs(overload_retries, &e, self.clock.now_millis());
+                    self.rt
+                        .emit(AgentEvent::Warning(i18n::format_agent_retry_api(
+                            &retry_reason(&e),
+                            wait,
+                            overload_retries,
+                            MAX_OVERLOAD_RETRIES,
+                        )));
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                    }
+                    round -= 1;
+                    continue;
+                }
                 // TRANSIENT failure (5xx/transport — `retryable` is set by the
                 // provider's classifier, incl. `is_retryable_reqwest_error` covering
                 // the stale keep-alive ConnectionReset class). The transport layer
@@ -3599,6 +3654,32 @@ impl RunningAgent {
                             }
                         }
                     }
+                    StreamEvent::Error(e)
+                        if !saw_stream_content
+                            && is_overload_error(&e)
+                            && overload_retries < MAX_OVERLOAD_RETRIES =>
+                    {
+                        overload_retries += 1;
+                        let wait =
+                            overload_backoff_secs(overload_retries, &e, self.clock.now_millis());
+                        self.rt
+                            .emit(AgentEvent::Warning(i18n::format_agent_retry_api(
+                                &retry_reason(&e),
+                                wait,
+                                overload_retries,
+                                MAX_OVERLOAD_RETRIES,
+                            )));
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                return;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                        }
+                        retry_this_round = true;
+                        break;
+                    }
                     StreamEvent::Error(e) => {
                         Self::persist_interrupted_turn(
                             convo,
@@ -3646,6 +3727,7 @@ impl RunningAgent {
             // OPEN returned 200: some gateways report throttling as the first SSE
             // error event, and resetting there would disable the five-wait fuse.
             rate_limit_waits = 0;
+            overload_retries = 0;
             // The stream reached its natural end this round (no timeout, no 429
             // retry) — refill the reconnect budget so a LATER round's stall gets a
             // fresh MAX_STREAM_RETRIES.

@@ -171,25 +171,21 @@ impl LlmProvider for ResponsesProvider {
         let idle_timeout = self.cfg.idle_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
 
+        let resp = open_responses_stream(
+            &client,
+            &url,
+            &body_bytes,
+            &signer,
+            &api_key,
+            &session_id,
+            &retry,
+            rate_limit_retry_owner,
+            open_timeout,
+        )
+        .await?;
+
         let s = async_stream::stream! {
             let mut dec = ResponsesSseDecoder::default();
-            let resp = match open_responses_stream(
-                &client,
-                &url,
-                &body_bytes,
-                &signer,
-                &api_key,
-                &session_id,
-                &retry,
-                rate_limit_retry_owner,
-                open_timeout,
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield StreamEvent::Error(e);
-                    return;
-                }
-            };
             let mut bytes = resp.bytes_stream();
             loop {
                 match tokio::time::timeout(idle_timeout, bytes.next()).await {
@@ -245,7 +241,6 @@ async fn open_responses_stream(
     rate_limit_retry_owner: jeikcode_kernel::provider::RateLimitRetryOwner,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
-    let _ = rate_limit_retry_owner;
     let mut attempt = 1u32;
     loop {
         let http = client.get();
@@ -274,6 +269,7 @@ async fn open_responses_stream(
         let sent = match retry::send_with_ttfb(req, open_timeout).await {
             retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
+                    let _ = client.rebuild(false);
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -287,29 +283,35 @@ async fn open_responses_stream(
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let detail = resp.text().await.unwrap_or_default();
-                let retryable = status == 429 || (500..600).contains(&status);
-                if retryable && attempt < policy.max_attempts {
-                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                if retry::should_retry_open_status(status, rate_limit_retry_owner)
+                    && attempt < policy.max_attempts
+                {
+                    let wait = retry::parse_retry_after(resp.headers())
+                        .unwrap_or_else(|| retry::compute_backoff(attempt, policy));
+                    tokio::time::sleep(wait).await;
                     attempt += 1;
                     continue;
                 }
+                let retry_after_secs =
+                    retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
+                let detail = resp.text().await.unwrap_or_default();
                 return Err(ProviderError {
-                    retryable,
+                    retryable: retry::is_retryable_status(status),
                     message: super::friendly_http_error(status, &detail),
                     http_status: Some(status),
+                    retry_after_secs,
                     ..Default::default()
                 });
             }
             Err(e) => {
-                if attempt < policy.max_attempts {
+                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
                     let _ = client.rebuild(false);
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
                 }
                 return Err(ProviderError {
-                    retryable: true,
+                    retryable: retry::is_retryable_reqwest_error(&e),
                     message: format!("open failed: {}", retry::err_chain(&e)),
                     ..Default::default()
                 });

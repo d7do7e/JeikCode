@@ -143,27 +143,23 @@ impl LlmProvider for GeminiProvider {
         let api_key = self.cfg.api_key.clone();
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let resp = open_stream(
+            &client,
+            &url,
+            &body,
+            &api_key,
+            &session_id,
+            &policy,
+            rate_limit_retry_owner,
+            open_timeout,
+        )
+        .await?;
 
         let s = async_stream::stream! {
             const MAX_STREAM_ATTEMPTS: u32 = 6;
-            let mut stream_attempt = 0u32;
+            let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
-            let mut resp = match open_stream(
-                &client.get(),
-                &url,
-                &body,
-                &api_key,
-                &session_id,
-                &policy,
-                rate_limit_retry_owner,
-                open_timeout,
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    yield StreamEvent::Error(e);
-                    return;
-                }
-            };
+            let mut resp = resp;
 
             'reopen: loop {
                 let mut dec = GeminiSseDecoder::default();
@@ -177,7 +173,7 @@ impl LlmProvider for GeminiProvider {
                     match tokio::time::timeout(idle, byte_stream.next()).await {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: true,
                                 message: "stream idle timeout".to_string(),
                                 ..Default::default()
                             });
@@ -211,8 +207,9 @@ impl LlmProvider for GeminiProvider {
                             if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
                                 reconnect_attempts += 1;
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
+                                let _ = client.rebuild(false);
                                 if let Ok(fresh) = open_stream(
-                                    &client.get(),
+                                    &client,
                                     &url,
                                     &body,
                                     &api_key,
@@ -283,7 +280,7 @@ impl LlmProvider for GeminiProvider {
 }
 
 async fn open_stream(
-    client: &reqwest::Client,
+    client: &SwappableClient,
     url: &str,
     body: &Value,
     api_key: &str,
@@ -294,7 +291,8 @@ async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
-        let mut req = client
+        let http = client.get();
+        let mut req = http
             .post(url)
             .header("Content-Type", "application/json")
             .json(body);
@@ -305,6 +303,7 @@ async fn open_stream(
         match super::retry::send_with_ttfb(req, open_timeout).await {
             super::retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
+                    let _ = client.rebuild(false);
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -313,6 +312,7 @@ async fn open_stream(
             }
             super::retry::OpenSend::Transport(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    let _ = client.rebuild(false);
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;

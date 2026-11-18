@@ -20,8 +20,14 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Local};
-use jeikcode_kernel::hook::{LifecycleHooks, TurnCtx};
+use jeikcode_kernel::hook::LifecycleHooks;
+#[cfg(test)]
+use jeikcode_kernel::hook::TurnCtx;
 use jeikcode_kernel::message::{Conversation, Role};
+#[cfg(feature = "tools")]
+use jeikcode_kernel::middleware::{AfterOutcome, ToolMiddleware};
+#[cfg(feature = "tools")]
+use jeikcode_kernel::tool::{Tool, ToolResult};
 #[cfg(feature = "tools")]
 use std::sync::Arc;
 
@@ -129,6 +135,41 @@ fn append_session_long_keyword_lines(runtime: &BashRuntimeState, lines: &mut Vec
 }
 
 #[cfg(feature = "tools")]
+pub(crate) fn format_background_alerts_reminder(runtime: &BashRuntimeState) -> Option<String> {
+    let alerts = runtime.drain_background_alerts();
+    if alerts.is_empty() {
+        return None;
+    }
+    let mut alert_lines = Vec::new();
+    alert_lines.push("[Background Task Alert]".to_string());
+    for a in alerts {
+        let exit_info = a
+            .exit_code
+            .map(|c| format!("exit code {c}"))
+            .unwrap_or_else(|| "terminated".to_string());
+        // NOT "CRASHED": the status is the WRAPPER shell's own report, so an external
+        // stop (taskkill / Stop-Process / job teardown) lands here too — the old
+        // wording asserted a crash and pushed models into chasing phantom bugs.
+        alert_lines.push(format!(
+            "- Background command `{}` (pid {}) exited: {exit_info}. \
+             The status is the wrapper shell's own report, so it also covers an external \
+             stop — ignore this alert if it was stopped deliberately; otherwise inspect its \
+             log (path from the start message).",
+            a.command, a.pid
+        ));
+        if !a.error_tail.is_empty() {
+            // "Recent output", NOT "error output": the tail mixes stdout and stderr, and
+            // the old label made a healthy startup line look like the cause of a crash.
+            alert_lines.push("  Recent output:".to_string());
+            for l in a.error_tail.lines() {
+                alert_lines.push(format!("    {l}"));
+            }
+        }
+    }
+    Some(crate::reminder::system_reminder(&alert_lines.join("\n")))
+}
+
+#[cfg(feature = "tools")]
 fn append_background_task_lines(runtime: &BashRuntimeState, lines: &mut Vec<String>) {
     let alerts = runtime.drain_background_alerts();
     if !alerts.is_empty() {
@@ -206,48 +247,23 @@ impl LifecycleHooks for StatusReminderHook {
         query.text.push_str("\n\n");
         query.text.push_str(&self.render_turn_start(Local::now()));
     }
+}
 
-    #[cfg(feature = "tools")]
-    async fn pre_request(
-        &self,
-        messages: &mut Vec<jeikcode_kernel::message::Message>,
-        ctx: &TurnCtx,
-    ) {
-        if ctx.round <= 1 {
-            return;
-        }
-        let mut alert_lines = Vec::new();
-        let alerts = self.bash_runtime.drain_background_alerts();
-        if alerts.is_empty() {
-            return;
-        }
-        alert_lines.push("[Background Task Alert]".to_string());
-        for a in alerts {
-            let exit_info = a
-                .exit_code
-                .map(|c| format!("exit code {c}"))
-                .unwrap_or_else(|| "terminated".to_string());
-            alert_lines.push(format!(
-                "- Background command `{}` (pid {}) exited: {exit_info}. \
-                 The status is the wrapper shell's own report, so it also covers an external \
-                 stop — ignore this alert if it was stopped deliberately; otherwise inspect its \
-                 log (path from the start message).",
-                a.command, a.pid
-            ));
-            if !a.error_tail.is_empty() {
-                alert_lines.push("  Recent output:".to_string());
-                for l in a.error_tail.lines() {
-                    alert_lines.push(format!("    {l}"));
-                }
+/// Deliver mid-turn background bash crash/exit alerts via `ToolMiddleware::after`
+/// instead of mutating history inside `pre_request`. Appending onto the freshly
+/// produced `ToolResult` keeps `pre_request` strictly append-only (preserving KV
+/// cache invariance) and prevents compaction re-projection from dropping drained alerts.
+#[cfg(feature = "tools")]
+#[async_trait]
+impl ToolMiddleware for StatusReminderHook {
+    async fn after(&self, result: &mut ToolResult, _tool: Option<&dyn Tool>) -> AfterOutcome {
+        if let Some(wrapped) = format_background_alerts_reminder(self.bash_runtime.as_ref()) {
+            if !result.content.is_empty() {
+                result.content.push_str("\n\n");
             }
+            result.content.push_str(&wrapped);
         }
-        let wrapped = crate::reminder::system_reminder(&alert_lines.join("\n"));
-        if let Some(last) = messages.last_mut() {
-            if !last.text.is_empty() {
-                last.text.push_str("\n\n");
-            }
-            last.text.push_str(&wrapped);
-        }
+        AfterOutcome::Proceed
     }
 }
 
@@ -502,5 +518,56 @@ mod tests {
         assert!(!a_text.contains("webpack"));
         assert!(b_text.contains("webpack"));
         assert!(!b_text.contains("ninja"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tools")]
+    async fn pre_request_is_strictly_append_only_and_after_delivers_background_alerts() {
+        use crate::tools::bash_runtime::BackgroundAlert;
+
+        let runtime = Arc::new(BashRuntimeState::new());
+        runtime.push_background_alert(BackgroundAlert {
+            pid: 9911,
+            command: "uvicorn app:main".into(),
+            exit_code: Some(1),
+            error_tail: "Address already in use".into(),
+        });
+        let hook = StatusReminderHook::with_runtime_state(Arc::clone(&runtime));
+
+        // pre_request must NOT mutate messages or drain alerts (preserves cache + compaction safety).
+        let mut msgs = vec![
+            Message::user("run"),
+            Message::tool_result("c1", "ok", false),
+        ];
+        let before = msgs.clone();
+        hook.pre_request(&mut msgs, &ctx(2, 128_000, 1_000)).await;
+        assert_eq!(msgs, before, "pre_request must remain strictly append-only");
+
+        // ToolMiddleware::after drains the alert once onto the tool result.
+        let mut res = ToolResult {
+            call_id: "c1".into(),
+            content: "tool output".into(),
+            is_error: false,
+            images: vec![],
+        };
+        hook.after(&mut res, None).await;
+        assert!(res.content.contains("tool output"), "{}", res.content);
+        assert!(
+            res.content.contains("<system-reminder>")
+                && res.content.contains("[Background Task Alert]")
+                && res.content.contains("uvicorn app:main"),
+            "{}",
+            res.content
+        );
+
+        // Second tool call sees no duplicate alert.
+        let mut res2 = ToolResult {
+            call_id: "c2".into(),
+            content: "next output".into(),
+            is_error: false,
+            images: vec![],
+        };
+        hook.after(&mut res2, None).await;
+        assert_eq!(res2.content, "next output");
     }
 }

@@ -37,6 +37,7 @@ pub(crate) struct GoalEvalJob {
     pub evaluator_provider: Arc<dyn LlmProvider>,
     pub make_verifier_provider: Box<dyn FnOnce() -> Option<Arc<dyn LlmProvider>> + Send>,
     pub baseline_fingerprint: Option<String>,
+    pub baseline_fingerprint_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub options: GoalOptions,
     pub round: u32,
     pub checkpoint_requested: bool,
@@ -45,9 +46,28 @@ pub(crate) struct GoalEvalJob {
 
 /// Evaluate one `/goal` round with change-driven fingerprint verification and blind
 /// fresh-context `verifier` gating when workspace edits occurred (or `--verify` is set).
-pub(crate) async fn evaluate_goal_with_harness(job: GoalEvalJob) -> EvalOutcome {
+pub(crate) async fn evaluate_goal_with_harness(mut job: GoalEvalJob) -> EvalOutcome {
     let summary = summarize_for_goal(&job.snapshot.messages, job.previous_reason.as_deref());
     let had_snapshot_mutations = snapshot_has_file_mutations(&job.snapshot.messages);
+    if job.baseline_fingerprint.is_none() {
+        if let Some(rx) = job.baseline_fingerprint_rx.as_mut() {
+            let ready = rx.borrow().clone();
+            if let Some(hash) = ready {
+                job.baseline_fingerprint = Some(hash);
+            } else {
+                let wait_res = tokio::select! {
+                    biased;
+                    _ = job.cancel.cancelled() => Err(()),
+                    changed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()) => {
+                        changed.ok().and_then(|r| r.ok()).ok_or(())
+                    }
+                };
+                if wait_res.is_ok() {
+                    job.baseline_fingerprint = rx.borrow().clone();
+                }
+            }
+        }
+    }
     let fp_before = compute_workspace_fingerprint_async(job.working_dir.clone()).await;
 
     let mut outcome = evaluate_goal(
@@ -346,6 +366,7 @@ mod tests {
             evaluator_provider: fast_eval,
             make_verifier_provider: Box::new(move || Some(verifier)),
             baseline_fingerprint: None,
+            baseline_fingerprint_rx: None,
             options: GoalOptions::default(),
             round: 0,
             checkpoint_requested: false,
@@ -404,6 +425,7 @@ mod tests {
             evaluator_provider: fast_eval,
             make_verifier_provider: Box::new(move || Some(verifier)),
             baseline_fingerprint: None,
+            baseline_fingerprint_rx: None,
             options: GoalOptions::default(),
             round: 0,
             checkpoint_requested: false,

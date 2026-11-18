@@ -78,7 +78,21 @@ impl DenySensitivePaths {
             }
             let resolved = crate::tools::resolve_path(trimmed, wd);
             crate::tools::path_is_sensitive(&resolved)
+                || crate::ignore_policy::IgnorePolicy::is_sensitive_at(wd, &resolved)
         })
+    }
+
+    fn requests_include_sensitive(tool_name: &str, args: &str) -> bool {
+        if !matches!(tool_name, "grep" | "glob") {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| {
+                v.get("include_sensitive")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -90,11 +104,12 @@ impl ToolMiddleware for DenySensitivePaths {
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if crate::tools::references_sensitive_path(&call.arguments)
+        if Self::requests_include_sensitive(&call.name, &call.arguments)
+            || crate::tools::references_sensitive_path(&call.arguments)
             || self.references_resolved_sensitive_path(&call.arguments)
         {
             return BeforeOutcome::deny_turn(format!(
-                "subagent may not touch sensitive paths (credentials / ~/.ssh / .env): {}",
+                "subagent may not touch sensitive paths (credentials / ~/.ssh / .env / .codegraphignore.graph): {}",
                 call.name
             ));
         }

@@ -35,7 +35,7 @@ use crate::controllers::{
     LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::goal_harness::{
-    compute_workspace_fingerprint, goal_stall_limit_from_env, parse_goal_launch, GoalOptions,
+    compute_workspace_fingerprint_async, goal_stall_limit_from_env, parse_goal_launch, GoalOptions,
 };
 use crate::goal_verifier::{evaluate_goal_with_harness, GoalEvalJob};
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
@@ -2513,6 +2513,13 @@ pub enum CodingRuntimeControl {
         controller_id: u64,
         max_rounds: u32,
     },
+    /// Self-sent from a background task after goal start: populates the initial
+    /// workspace fingerprint without blocking the async owner loop on synchronous `git`.
+    SetGoalBaselineFingerprint {
+        generation: u64,
+        controller_id: u64,
+        fingerprint_hash: String,
+    },
     StopGoal {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
@@ -2889,6 +2896,7 @@ fn spawn_runtime_owner_with_optional_agent(
     let (_closed_wakeup_tx, closed_wakeup_rx) = mpsc::unbounded_channel();
     let mut wakeup_rx = wakeup_rx.unwrap_or(closed_wakeup_rx);
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
+    let (goal_resume_tx, mut goal_resume_rx) = mpsc::unbounded_channel::<(u64, u64)>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<SessionNameSuggestion>();
     let (next_prompt_tx, mut next_prompt_rx) =
@@ -2944,6 +2952,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut loop_state: Option<LoopState> = None;
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
+        let mut last_rate_limit_wait_secs: Option<u64> = None;
         let mut next_turn_id = 0u64;
         let mut persistence_failure = None;
         if agent_available {
@@ -3408,6 +3417,46 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                        }
+                    }
+                }
+                fired_goal = goal_resume_rx.recv(), if native_protocol => {
+                    let Some((resume_generation, controller_id)) = fired_goal else { continue };
+                    if resume_generation != generation
+                        || !agent_available
+                        || active_turn.is_some()
+                        || held_turn.is_some()
+                        || compaction_suspended
+                    {
+                        continue;
+                    }
+                    if let Some(state) = goal.as_mut() {
+                        if state.id != controller_id || state.phase != GoalPhase::PausedAtCap {
+                            continue;
+                        }
+                        state.resume_after_rate_limit();
+                        let text = goal_continuation_message(
+                            "rate-limit window reopened; resuming autonomous goal",
+                            &state.condition,
+                        );
+                        if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
+                            next_turn_id = next_turn_id.wrapping_add(1);
+                            active_turn = Some(next_turn_id);
+                            turn_stats = RuntimeTurnStats::default();
+                            turn_started_at = Some(std::time::Instant::now());
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::InTurn),
+                                Ordering::Release,
+                            );
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                "goal auto-resumed after rate-limit cooldown".into(),
+                            ));
+                        } else {
+                            state.pause_for_recovery(
+                                "paused after rate-limit cooldown; failed to dispatch auto-resume",
+                            );
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                         }
                     }
                 }
@@ -5770,11 +5819,27 @@ fn spawn_runtime_owner_with_optional_agent(
                                 .read()
                                 .map(|g| g.clone())
                                 .unwrap_or_else(|_| runtime.config.working_dir.clone());
-                            next.stall.baseline_fingerprint =
-                                Some(compute_workspace_fingerprint(&wd).hash);
+                            // Compute initial workspace fingerprint off the owner event loop (#58),
+                            // publishing into a watch channel so fast-finishing turns wait cleanly
+                            // off-loop instead of racing against `baseline_fingerprint == None`.
+                            let (fp_tx, fp_rx) = watch::channel(None::<String>);
+                            next.baseline_fingerprint_rx = Some(fp_rx);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
                             goal = Some(next);
                             let _ = done.send(Ok(()));
+                            {
+                                let tx = recovery_tx.clone();
+                                tokio::spawn(async move {
+                                    let fp = compute_workspace_fingerprint_async(wd).await;
+                                    let hash = fp.hash;
+                                    let _ = fp_tx.send(Some(hash.clone()));
+                                    let _ = tx.send(CodingRuntimeControl::SetGoalBaselineFingerprint {
+                                        generation: request_generation,
+                                        controller_id,
+                                        fingerprint_hash: hash,
+                                    });
+                                });
+                            }
                             // Only spawn the quota fetch when it could actually change the cap:
                             // an env override short-circuits to the default, and with no live
                             // rate-limit source there is nothing to derive from.
@@ -5806,6 +5871,15 @@ fn spawn_runtime_owner_with_optional_agent(
                                     state.set_round_cap(max_rounds);
                                     let _ = runtime_event_tx
                                         .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::SetGoalBaselineFingerprint { generation: request_generation, controller_id, fingerprint_hash }) => {
+                        if request_generation == generation {
+                            if let Some(state) = goal.as_mut() {
+                                if state.id == controller_id && state.stall.baseline_fingerprint.is_none() {
+                                    state.stall.baseline_fingerprint = Some(fingerprint_hash);
                                 }
                             }
                         }
@@ -6459,6 +6533,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let previous_reason = state.last_reason.clone();
                                             let baseline_fingerprint =
                                                 state.stall.baseline_fingerprint.clone();
+                                            let baseline_fingerprint_rx =
+                                                state.baseline_fingerprint_rx.clone();
                                             let options = state.options.clone();
                                             let eval_round = state.total_rounds.max(state.round);
                                             let checkpoint_requested =
@@ -6536,6 +6612,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     evaluator_provider,
                                                     make_verifier_provider,
                                                     baseline_fingerprint,
+                                                    baseline_fingerprint_rx,
                                                     options,
                                                     round: eval_round,
                                                     checkpoint_requested,
@@ -6637,6 +6714,46 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal paused after repeated provider/timeout failures — check provider/network status, or run /compact if context is full, then continue".into()));
+                                            }
+                                        } else if reason == StopReason::RateLimited {
+                                            // Overnight rate-limit resilience (#51): preserve the goal in
+                                            // `PausedAtCap` and schedule a cancellable auto-resume timer
+                                            // instead of destroying the active goal.
+                                            let max_wait_secs = std::env::var("JEIKCODE_GOAL_RATE_LIMIT_MAX_WAIT_SECS")
+                                                .ok()
+                                                .and_then(|v| v.trim().parse::<u64>().ok())
+                                                .filter(|&v| v > 0)
+                                                .unwrap_or(6 * 3600);
+                                            let reported_wait = last_rate_limit_wait_secs;
+                                            keep_goal_registered = true;
+                                            held_turn = None;
+                                            completion_reason = StopReason::RateLimited;
+                                            if let Some(wait_secs) = reported_wait.filter(|&s| s > max_wait_secs) {
+                                                let note = format!(
+                                                    "paused on rate limit (reset in {wait_secs}s exceeds auto-wait ceiling {max_wait_secs}s); send a message to continue"
+                                                );
+                                                state.pause_for_recovery(note.clone());
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
+                                            } else {
+                                                let wait_secs = reported_wait.unwrap_or(60).clamp(5, max_wait_secs);
+                                                let note = format!(
+                                                    "paused on rate limit; auto-resuming in {wait_secs}s (send a message or /goal stop to intervene)"
+                                                );
+                                                state.pause_for_recovery(note.clone());
+                                                let cancel = state.cancel.clone();
+                                                let controller_id = state.id;
+                                                let tx = goal_resume_tx.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::select! {
+                                                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {
+                                                            let _ = tx.send((generation, controller_id));
+                                                        }
+                                                        _ = cancel.cancelled() => {}
+                                                    }
+                                                });
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
                                             }
                                         } else {
                                             state.finish(
@@ -6751,6 +6868,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::TurnStarted => {
                                 turn_started_at = Some(std::time::Instant::now());
+                                last_rate_limit_wait_secs = None;
                                 if active_turn.is_none() {
                                     next_turn_id = next_turn_id.wrapping_add(1);
                                     active_turn = Some(next_turn_id);
@@ -6767,6 +6885,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             event @ AgentEvent::ToolStarted { .. } => {
                                 turn_stats.tool_call_count =
                                     turn_stats.tool_call_count.saturating_add(1);
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
+                            }
+                            event @ AgentEvent::RateLimited { secs_until_reset, .. } => {
+                                last_rate_limit_wait_secs = secs_until_reset;
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
                             event => {
@@ -6953,7 +7075,8 @@ fn reject_runtime_control(
         }
         CodingRuntimeControl::Shutdown { .. } => {}
         // Fire-and-forget self-send with no waiter: nothing to fail-close.
-        CodingRuntimeControl::AdjustGoalRounds { .. } => {}
+        CodingRuntimeControl::AdjustGoalRounds { .. }
+        | CodingRuntimeControl::SetGoalBaselineFingerprint { .. } => {}
         CodingRuntimeControl::Submit { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }

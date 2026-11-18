@@ -24,11 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use jeikcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
-use jeikcode_kernel::provider::{ChatOptions, LlmProvider};
+#[cfg(test)]
+use jeikcode_kernel::provider::ChatOptions;
+use jeikcode_kernel::provider::LlmProvider;
+#[cfg(test)]
 use jeikcode_kernel::stream::StreamEvent;
 
 use crate::tools::output_artifact::ArtifactStore;
@@ -499,35 +501,32 @@ impl OverflowCompaction {
             Message::system(SUMMARY_SYSTEM_PROMPT),
             Message::user(build_summary_prompt(previous_anchor, &transcript, focus)),
         ];
-        // Soft-cap the generation (`max_tokens`); the byte loop below is the hard backstop.
-        let opts = ChatOptions {
-            max_tokens: Some(MAX_SUMMARY_TOKENS),
-            ..ChatOptions::default()
-        };
-        let mut stream = match provider.chat_stream(&prompt, &[], &opts).await {
-            Ok(stream) => stream,
-            Err(_) => return pointer.map(|pointer| pointer_only_summary(&pointer)),
-        };
-        let mut out = String::new();
+        // Soft-cap the generation (`max_tokens`); use provider-safe low/off thinking
+        // and a bounded total wall-clock open+stream timeout so reasoning models never
+        // burn 180s thinking during compaction drains.
+        let opts = crate::provider::auxiliary_chat_options(
+            provider.model_name(),
+            Some(MAX_SUMMARY_TOKENS),
+            None,
+        );
         // Reserve room for the sentinel + framing + their newlines prepended below, so the FINAL
         // summary still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
         let body_budget =
             MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
-        while let Some(ev) = stream.next().await {
-            if let StreamEvent::TextDelta(t) = ev {
-                let remaining = body_budget.saturating_sub(out.len());
-                if t.len() <= remaining {
-                    out.push_str(&t);
-                } else {
-                    let mut cut = remaining;
-                    while !t.is_char_boundary(cut) {
-                        cut -= 1; // is_char_boundary(0) == true, so this terminates
-                    }
-                    out.push_str(&t[..cut]);
-                    break;
-                }
-            }
-        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = match crate::provider::collect_auxiliary_text(
+            provider.as_ref(),
+            &prompt,
+            &opts,
+            SUMMARY_TIMEOUT.saturating_add(Duration::from_secs(5)),
+            body_budget,
+            &cancel,
+        )
+        .await
+        {
+            Ok((text, _)) => text,
+            Err(_) => return pointer.map(|pointer| pointer_only_summary(&pointer)),
+        };
         // Strip any leading sentinel/framing the model may have echoed, then stamp exactly ONE
         // sentinel + the framing so the NEXT compaction recognizes the anchor and the model that
         // READS this block is told it's reference context, not instructions.

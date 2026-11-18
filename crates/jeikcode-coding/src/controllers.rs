@@ -8,10 +8,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use jeikcode_capabilities::provider::{auxiliary_chat_options, collect_auxiliary_text};
 use jeikcode_kernel::message::{Message, Role};
-use jeikcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
-use jeikcode_kernel::stream::{StreamEvent, TokenUsage};
+use jeikcode_kernel::provider::LlmProvider;
+#[cfg(test)]
+use jeikcode_kernel::provider::{ChatOptions, ToolChoice};
+#[cfg(test)]
+use jeikcode_kernel::stream::StreamEvent;
+use jeikcode_kernel::stream::TokenUsage;
 use jeikcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -23,7 +27,8 @@ use crate::goal_harness::{
 };
 
 pub(crate) const MAX_UNPRODUCTIVE: u32 = 5;
-const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(30);
+const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(90);
+const EVALUATOR_MAX_ATTEMPTS: u32 = 3;
 
 const EVALUATOR_SYSTEM_PROMPT: &str = r#"You are a strict goal evaluator for an autonomous coding agent.
 
@@ -126,6 +131,10 @@ pub(crate) struct GoalState {
     recovery_pause: bool,
     pub options: GoalOptions,
     pub stall: StallTracker,
+    /// Pending async baseline workspace fingerprint watch channel spawned at `StartGoal`
+    /// so the owner loop never blocks on synchronous `git` while evaluation still waits
+    /// deterministically for the baseline hash before checking for edits.
+    pub baseline_fingerprint_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub checkpoint_refs: Vec<String>,
     pub total_rounds: u32,
     pub rollovers: u32,
@@ -170,6 +179,7 @@ impl GoalState {
             recovery_pause: false,
             options,
             stall: StallTracker::default(),
+            baseline_fingerprint_rx: None,
             checkpoint_refs: Vec::new(),
             total_rounds: 0,
             rollovers: 0,
@@ -263,6 +273,18 @@ impl GoalState {
         self.last_reason = None;
         // Recovery context is consumed once at re-engage (captured before this
         // call); clear the flag so it never leaks into the resumed Pursuing state.
+        self.recovery_pause = false;
+    }
+
+    /// Re-activate a goal that was automatically parked during a rate-limit pause,
+    /// preserving accumulated round counters, `tokens_used`, `StallTracker`, and
+    /// milestone checkpoints while issuing a fresh cancellation token.
+    pub fn resume_after_rate_limit(&mut self) {
+        self.cancel = CancellationToken::new();
+        self.active = true;
+        self.phase = GoalPhase::Pursuing;
+        self.terminal = None;
+        self.last_reason = None;
         self.recovery_pause = false;
     }
 
@@ -450,44 +472,71 @@ pub(crate) async fn evaluate_goal(
         Message::system(EVALUATOR_SYSTEM_PROMPT),
         Message::user(user),
     ];
-    let options = ChatOptions {
-        temperature: Some(0.0),
-        tool_choice: ToolChoice::None,
-        ..ChatOptions::default()
-    };
-    let result = match provider.chat_stream(&messages, &[], &options).await {
-        Ok(mut stream) => {
-            let mut text = String::new();
-            let mut usage = None;
-            let collected = loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break Err("evaluator cancelled by user".to_owned()),
-                    event = tokio::time::timeout(EVALUATOR_TIMEOUT, stream.next()) => match event {
-                        Ok(Some(StreamEvent::TextDelta(chunk))) => text.push_str(&chunk),
-                        Ok(Some(StreamEvent::Usage(value))) => usage = Some(value),
-                        Ok(Some(StreamEvent::Done { .. })) | Ok(None) => break Ok(()),
-                        Ok(Some(StreamEvent::Error(error))) => break Err(format!("evaluator provider error: {error:?}")),
-                        Ok(Some(_)) => {}
-                        Err(_) => break Err(format!("evaluator stream timed out after {}s", EVALUATOR_TIMEOUT.as_secs())),
+    // Preserve `max_tokens: None` so reasoning models sharing output budget do not starve
+    // their final Verdict line, while still selecting low/off reasoning effort where safe.
+    let options = auxiliary_chat_options(provider.model_name(), None, Some(0.0));
+    let mut final_result = GoalResult::Error("evaluator did not run".to_owned());
+    let mut final_usage: Option<TokenUsage> = None;
+
+    for attempt in 1..=EVALUATOR_MAX_ATTEMPTS {
+        let mut should_retry = false;
+        match collect_auxiliary_text(
+            provider.as_ref(),
+            &messages,
+            &options,
+            EVALUATOR_TIMEOUT,
+            4_096,
+            &cancel,
+        )
+        .await
+        {
+            Ok((text, usage)) => {
+                if let Some(u) = usage {
+                    final_usage = Some(match final_usage {
+                        Some(mut prev) => {
+                            prev.prompt = prev.prompt.saturating_add(u.prompt);
+                            prev.completion = prev.completion.saturating_add(u.completion);
+                            prev.cached = prev.cached.saturating_add(u.cached);
+                            prev
+                        }
+                        None => u,
+                    });
+                }
+                let parsed = parse_evaluator_response(&text);
+                match parsed {
+                    GoalResult::Met(_) | GoalResult::NotMet(_) => {
+                        final_result = parsed;
+                        break;
+                    }
+                    GoalResult::Error(err) => {
+                        final_result = GoalResult::Error(err);
                     }
                 }
-            };
-            match collected {
-                Ok(()) => (parse_evaluator_response(&text), usage),
-                Err(error) => (GoalResult::Error(error), usage),
+            }
+            Err(error) => {
+                should_retry = error.retryable;
+                final_result =
+                    GoalResult::Error(format!("evaluator call failed: {}", error.message));
             }
         }
-        Err(error) => (
-            GoalResult::Error(format!("evaluator chat_stream setup failed: {error:?}")),
-            None,
-        ),
-    };
+        if !should_retry || cancel.is_cancelled() || attempt >= EVALUATOR_MAX_ATTEMPTS {
+            break;
+        }
+        let backoff = Duration::from_millis(250 * u64::from(attempt));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                final_result = GoalResult::Error("evaluator cancelled by user".to_owned());
+                break;
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
+    }
     EvalOutcome {
         generation,
         controller_id,
-        result: result.0,
-        usage: result.1,
+        result: final_result,
+        usage: final_usage,
         fingerprint: None,
         verified_fingerprint: None,
         had_snapshot_mutations: false,
@@ -497,8 +546,15 @@ pub(crate) async fn evaluate_goal(
 }
 
 pub(crate) fn summarize_for_goal(messages: &[Message], previous: Option<&str>) -> String {
+    const PATH_KEYS: &[&str] = &["path", "file_path", "target_file", "filePath", "filename"];
     let mut sections = Vec::new();
     let mut files = Vec::new();
+    let mut push_file = |path: &str| {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() && !files.iter().any(|seen| seen == trimmed) {
+            files.push(trimmed.to_owned());
+        }
+    };
     for message in messages {
         for call in &message.tool_calls {
             // Canonical names first; the legacy ones stay so a replayed pre-rename
@@ -519,20 +575,35 @@ pub(crate) fn summarize_for_goal(messages: &[Message], previous: Option<&str>) -
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
                 continue;
             };
-            if let Some(path) = value.get("file_path").and_then(|value| value.as_str()) {
-                if !files.iter().any(|seen| seen == path) {
-                    files.push(path.to_owned());
+            for key in PATH_KEYS {
+                if let Some(path) = value.get(*key).and_then(|v| v.as_str()) {
+                    push_file(path);
                 }
             }
             if let Some(entries) = value.get("files").and_then(|value| value.as_array()) {
                 for entry in entries {
-                    if let Some(path) = entry
-                        .get("file_path")
-                        .or_else(|| entry.get("path"))
-                        .and_then(|value| value.as_str())
-                    {
-                        if !files.iter().any(|seen| seen == path) {
-                            files.push(path.to_owned());
+                    for key in PATH_KEYS {
+                        if let Some(path) = entry.get(*key).and_then(|v| v.as_str()) {
+                            push_file(path);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Also collect worker subagent receipts (`[Worker touched: a.rs, b.rs, ran: ...]`).
+        if message.role == Role::Tool && message.text.contains("[Worker touched:") {
+            for line in message.text.lines() {
+                if let Some(rest) = line.trim().strip_prefix("[Worker touched:") {
+                    let body = rest
+                        .split(", ran:")
+                        .next()
+                        .unwrap_or(rest)
+                        .trim_end_matches(']');
+                    for item in body.split(',') {
+                        let candidate = item.trim();
+                        if !candidate.is_empty() && !candidate.starts_with('(') {
+                            push_file(candidate);
                         }
                     }
                 }
@@ -788,28 +859,20 @@ pub(crate) async fn classify_followup(
         Message::system(FOLLOWUP_CLASSIFIER_SYSTEM_PROMPT),
         Message::user(user),
     ];
-    let options = ChatOptions {
-        temperature: Some(0.0),
-        tool_choice: ToolChoice::None,
-        ..ChatOptions::default()
-    };
-    let Ok(mut stream) = provider.chat_stream(&messages, &[], &options).await else {
-        return FollowupClass::Continuation;
-    };
-    let mut text = String::new();
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return FollowupClass::Continuation,
-            event = tokio::time::timeout(EVALUATOR_TIMEOUT, stream.next()) => match event {
-                Ok(Some(StreamEvent::TextDelta(chunk))) => text.push_str(&chunk),
-                Ok(Some(StreamEvent::Done { .. })) | Ok(None) => break,
-                Ok(Some(StreamEvent::Error(_))) | Err(_) => return FollowupClass::Continuation,
-                Ok(Some(_)) => {}
-            }
-        }
+    let options = auxiliary_chat_options(provider.model_name(), None, Some(0.0));
+    match collect_auxiliary_text(
+        provider.as_ref(),
+        &messages,
+        &options,
+        EVALUATOR_TIMEOUT,
+        1_024,
+        &cancel,
+    )
+    .await
+    {
+        Ok((text, _)) => parse_followup_class(&text),
+        Err(_) => FollowupClass::Continuation,
     }
-    parse_followup_class(&text)
 }
 
 #[derive(Deserialize)]
@@ -1371,5 +1434,36 @@ mod tests {
         goal.pause("user paused");
         goal.resume_paused();
         assert_eq!(goal.recovery_context(), None);
+    }
+
+    #[test]
+    fn summarize_for_goal_extracts_canonical_path_aliases_and_worker_receipts() {
+        let msgs = vec![
+            Message::assistant(
+                "applying changes",
+                vec![
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "c1".into(),
+                        name: "edit".into(),
+                        arguments: r#"{"path":"crates/a/src/lib.rs","edits":[]}"#.into(),
+                    },
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "c2".into(),
+                        name: "write".into(),
+                        arguments: r#"{"target_file":"crates/b/src/main.rs","content":"hi"}"#
+                            .into(),
+                    },
+                ],
+            ),
+            Message::tool_result(
+                "c3",
+                "[Worker touched: crates/c/src/mod.rs, ran: cargo test (ok)]\nDone.",
+                false,
+            ),
+        ];
+        let summary = summarize_for_goal(&msgs, None);
+        assert!(summary.contains("crates/a/src/lib.rs"), "{summary}");
+        assert!(summary.contains("crates/b/src/main.rs"), "{summary}");
+        assert!(summary.contains("crates/c/src/mod.rs"), "{summary}");
     }
 }

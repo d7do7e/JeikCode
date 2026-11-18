@@ -47,17 +47,20 @@ pub struct FileTurnState {
 
 #[derive(Debug)]
 struct WriteStateMachine {
-    /// Workspace-specific turn counters for multi-session / parallel test isolation
+    /// Session-specific turn counters for isolating concurrent sessions in the same repo.
+    session_turns: HashMap<String, u64>,
+    /// Workspace-specific turn counters for sessionless / parallel test isolation.
     workspace_turns: HashMap<PathBuf, u64>,
-    /// Global fallback turn counter
+    /// Global fallback turn counter.
     global_turn: u64,
-    /// Files: canonical_path -> (turn_id_when_recorded, FileTurnState)
-    files: HashMap<PathBuf, (u64, FileTurnState)>,
+    /// Files: (optional_session_id, canonical_path) -> (turn_id_when_recorded, FileTurnState)
+    files: HashMap<(Option<String>, PathBuf), (u64, FileTurnState)>,
 }
 
 impl Default for WriteStateMachine {
     fn default() -> Self {
         Self {
+            session_turns: HashMap::new(),
             workspace_turns: HashMap::new(),
             global_turn: 1,
             files: HashMap::new(),
@@ -72,23 +75,30 @@ fn canon(path: &Path) -> PathBuf {
     crate::pathnorm::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn current_scope() -> Option<String> {
+    jeikcode_kernel::tool::current_session_scope()
+}
+
 fn prune_files(state: &mut WriteStateMachine) {
     if state.files.len() <= MAX_TRACKED_FILES {
         return;
     }
-    let mut entries: Vec<(u64, PathBuf)> = state
+    let mut entries: Vec<(u64, (Option<String>, PathBuf))> = state
         .files
         .iter()
-        .map(|(path, (turn, _))| (*turn, path.clone()))
+        .map(|(key, (turn, _))| (*turn, key.clone()))
         .collect();
     entries.sort_by_key(|(turn, _)| *turn);
     let remove = state.files.len() - MAX_TRACKED_FILES;
-    for (_, path) in entries.into_iter().take(remove) {
-        state.files.remove(&path);
+    for (_, key) in entries.into_iter().take(remove) {
+        state.files.remove(&key);
     }
 }
 
-fn get_turn_for_path(p: &Path, state: &WriteStateMachine) -> u64 {
+fn get_turn_for_key(session: Option<&str>, p: &Path, state: &WriteStateMachine) -> u64 {
+    if let Some(sid) = session {
+        return state.session_turns.get(sid).copied().unwrap_or(1);
+    }
     let mut matched_turn = None;
     let mut longest_len = 0;
     for (ws, turn) in &state.workspace_turns {
@@ -100,10 +110,30 @@ fn get_turn_for_path(p: &Path, state: &WriteStateMachine) -> u64 {
     matched_turn.unwrap_or(state.global_turn)
 }
 
+/// Advance the turn counter strictly for a single session, leaving other
+/// concurrent sessions (including peers in the same repository) unaffected.
+pub fn advance_turn_for_session(session_id: &str) {
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = lock
+        .session_turns
+        .entry(session_id.to_string())
+        .or_insert(1);
+    *entry += 1;
+    prune_files(&mut lock);
+}
+
+/// Drop all tracked write-state entries belonging to a finished session.
+pub fn clear_session(session_id: &str) {
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    lock.session_turns.remove(session_id);
+    lock.files
+        .retain(|(scope, _), _| scope.as_deref() != Some(session_id));
+}
+
 /// Advance the turn counter for a specific workspace directory.
 pub fn advance_turn_for_dir(dir: &Path) {
     let d = canon(dir);
-    let mut lock = STATE_MACHINE.lock().unwrap();
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = lock.workspace_turns.entry(d).or_insert(1);
     *entry += 1;
     prune_files(&mut lock);
@@ -111,9 +141,12 @@ pub fn advance_turn_for_dir(dir: &Path) {
 
 /// Advance the global turn counter (and all registered workspaces), resetting all read states to unread.
 pub fn advance_turn() {
-    let mut lock = STATE_MACHINE.lock().unwrap();
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
     lock.global_turn += 1;
     for turn in lock.workspace_turns.values_mut() {
+        *turn += 1;
+    }
+    for turn in lock.session_turns.values_mut() {
         *turn += 1;
     }
     prune_files(&mut lock);
@@ -121,20 +154,22 @@ pub fn advance_turn() {
 
 /// Reset all state (useful for unit test isolation).
 pub fn reset_all() {
-    let mut lock = STATE_MACHINE.lock().unwrap();
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
     lock.files.clear();
+    lock.session_turns.clear();
     lock.workspace_turns.clear();
     lock.global_turn = 1;
 }
 
 /// Record a successful `read` on `path`.
 pub fn record_read(path: &Path) {
+    let scope = current_scope();
     let p = canon(path);
-    let mut lock = STATE_MACHINE.lock().unwrap();
-    let turn = get_turn_for_path(&p, &lock);
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let turn = get_turn_for_key(scope.as_deref(), &p, &lock);
     let entry = lock
         .files
-        .entry(p)
+        .entry((scope, p))
         .or_insert((turn, FileTurnState::default()));
     if entry.0 != turn {
         *entry = (
@@ -153,12 +188,13 @@ pub fn record_read(path: &Path) {
 
 /// Record a successful `edit` on `path`.
 pub fn record_edit(path: &Path) {
+    let scope = current_scope();
     let p = canon(path);
-    let mut lock = STATE_MACHINE.lock().unwrap();
-    let turn = get_turn_for_path(&p, &lock);
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let turn = get_turn_for_key(scope.as_deref(), &p, &lock);
     let entry = lock
         .files
-        .entry(p)
+        .entry((scope, p))
         .or_insert((turn, FileTurnState::default()));
     if entry.0 != turn {
         *entry = (
@@ -176,12 +212,13 @@ pub fn record_edit(path: &Path) {
 
 /// Record a successful `write` on `path`.
 pub fn record_write_success(path: &Path) {
+    let scope = current_scope();
     let p = canon(path);
-    let mut lock = STATE_MACHINE.lock().unwrap();
-    let turn = get_turn_for_path(&p, &lock);
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let turn = get_turn_for_key(scope.as_deref(), &p, &lock);
     let entry = lock
         .files
-        .entry(p)
+        .entry((scope, p))
         .or_insert((turn, FileTurnState::default()));
     entry.0 = turn;
     entry.1.read_confirmed = true;
@@ -191,12 +228,13 @@ pub fn record_write_success(path: &Path) {
 
 /// Record that a file has been confirmed read in this turn (e.g. by returning its full content on write intercept).
 pub fn record_read_confirmed(path: &Path) {
+    let scope = current_scope();
     let p = canon(path);
-    let mut lock = STATE_MACHINE.lock().unwrap();
-    let turn = get_turn_for_path(&p, &lock);
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let turn = get_turn_for_key(scope.as_deref(), &p, &lock);
     let entry = lock
         .files
-        .entry(p)
+        .entry((scope, p))
         .or_insert((turn, FileTurnState::default()));
     entry.0 = turn;
     entry.1.read_confirmed = true;
@@ -218,12 +256,13 @@ pub fn check_write_permitted(path: &Path) -> WritePermission {
     if !path.exists() {
         return WritePermission::Allowed;
     }
+    let scope = current_scope();
     let p = canon(path);
-    let mut lock = STATE_MACHINE.lock().unwrap();
-    let turn = get_turn_for_path(&p, &lock);
+    let mut lock = STATE_MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    let turn = get_turn_for_key(scope.as_deref(), &p, &lock);
     let entry = lock
         .files
-        .entry(p)
+        .entry((scope, p))
         .or_insert((turn, FileTurnState::default()));
     if entry.0 != turn {
         // If the immediately preceding turn granted a read confirmation (e.g. from an intercept
@@ -345,19 +384,34 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
 }
 
 /// Lifecycle hook that advances the turn counter on each turn start,
-/// resetting all file read confirmation states.
+/// resetting all file read confirmation states for the active session (or
+/// workspace directory when sessionless).
 #[derive(Clone, Default, Debug)]
 pub struct WriteStateHook {
+    session_id: Option<String>,
     working_dir: Option<PathBuf>,
 }
 
 impl WriteStateHook {
     pub fn new() -> Self {
-        Self { working_dir: None }
+        Self {
+            session_id: None,
+            working_dir: None,
+        }
     }
 
     pub fn with_dir(working_dir: impl Into<PathBuf>) -> Self {
         Self {
+            session_id: None,
+            working_dir: Some(working_dir.into()),
+        }
+    }
+
+    pub fn with_session(session_id: impl Into<String>, working_dir: impl Into<PathBuf>) -> Self {
+        let sid = session_id.into();
+        let trimmed = sid.trim();
+        Self {
+            session_id: (!trimmed.is_empty()).then(|| trimmed.to_string()),
             working_dir: Some(working_dir.into()),
         }
     }
@@ -366,10 +420,60 @@ impl WriteStateHook {
 #[async_trait]
 impl LifecycleHooks for WriteStateHook {
     async fn turn_start(&self, _convo: &mut Conversation) {
-        if let Some(dir) = &self.working_dir {
+        if let Some(sid) = &self.session_id {
+            advance_turn_for_session(sid);
+        } else if let Some(dir) = &self.working_dir {
             advance_turn_for_dir(dir);
         } else {
             advance_turn();
         }
+    }
+
+    async fn session_end(&self, _convo: &Conversation) {
+        if let Some(sid) = &self.session_id {
+            clear_session(sid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn concurrent_sessions_in_same_repo_do_not_clobber_read_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shared.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let hook_a = WriteStateHook::with_session("sess-a", dir.path());
+        let hook_b = WriteStateHook::with_session("sess-b", dir.path());
+        let mut convo = Conversation::new();
+
+        // Session A starts Turn 1 and reads the file.
+        hook_a.turn_start(&mut convo).await;
+        jeikcode_kernel::tool::with_session_scope(Some(Arc::from("sess-a")), async {
+            record_read(&file);
+            assert_eq!(check_write_permitted(&file), WritePermission::Allowed);
+        })
+        .await;
+
+        // Session B advances multiple turns in the SAME workspace.
+        hook_b.turn_start(&mut convo).await;
+        hook_b.turn_start(&mut convo).await;
+
+        // Session A's read confirmation must still hold, while Session B remains unread.
+        jeikcode_kernel::tool::with_session_scope(Some(Arc::from("sess-a")), async {
+            assert_eq!(check_write_permitted(&file), WritePermission::Allowed);
+        })
+        .await;
+        jeikcode_kernel::tool::with_session_scope(Some(Arc::from("sess-b")), async {
+            assert_eq!(check_write_permitted(&file), WritePermission::RefusedUnread);
+        })
+        .await;
+
+        hook_a.session_end(&convo).await;
+        hook_b.session_end(&convo).await;
     }
 }

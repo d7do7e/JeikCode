@@ -74,8 +74,191 @@ pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
 pub use timeouts::ApplyTimeouts;
 
+use futures::StreamExt;
+use jeikcode_kernel::message::Message;
+use jeikcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort, ToolChoice};
+use jeikcode_kernel::stream::{StreamEvent, TokenUsage};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// Structured failure returned by [`collect_auxiliary_text`] so callers can
+/// distinguish transient/retryable transport or timeout errors from permanent
+/// provider rejections.
+#[derive(Clone, Debug)]
+pub struct AuxiliaryCallError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for AuxiliaryCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Build provider-safe [`ChatOptions`] for short auxiliary calls (goal evaluation,
+/// compaction summaries, follow-up classifiers) that should not burn minutes in deep
+/// reasoning while avoiding HTTP 400s on gateways that reject `reasoning_effort`.
+pub fn auxiliary_chat_options(
+    model: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> ChatOptions {
+    let lower = model.trim().to_ascii_lowercase();
+    let reasoning_effort = if lower.contains("claude") {
+        Some(ReasoningEffort::Off)
+    } else if lower.contains("gemini")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.contains("o1-")
+        || lower.contains("o3-")
+        || lower.contains("o4-")
+        || lower.starts_with("gpt-5")
+        || lower.contains("gpt-5")
+        || reason_effort_applicable(model)
+    {
+        Some(ReasoningEffort::Low)
+    } else {
+        None
+    };
+    ChatOptions {
+        reasoning_effort,
+        max_tokens,
+        temperature,
+        tool_choice: ToolChoice::None,
+        ..ChatOptions::default()
+    }
+}
+
+async fn open_auxiliary_stream(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    opts: &ChatOptions,
+    deadline: tokio::time::Instant,
+    wall_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<futures::stream::BoxStream<'static, StreamEvent>, AuxiliaryCallError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(AuxiliaryCallError {
+            message: "auxiliary call cancelled".to_string(),
+            retryable: false,
+        }),
+        res = tokio::time::timeout_at(deadline, provider.chat_stream(messages, &[], opts)) => match res {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(err)) => Err(AuxiliaryCallError {
+                message: format!("open failed: {}", err.message),
+                retryable: err.retryable,
+            }),
+            Err(_) => Err(AuxiliaryCallError {
+                message: format!("open timed out after {}s", wall_timeout.as_secs()),
+                retryable: true,
+            }),
+        }
+    }
+}
+
+/// Execute a one-shot auxiliary text call with a unified wall-clock deadline covering
+/// both HTTP OPEN and SSE streaming, cooperative cancellation, UTF-8 byte capping,
+/// and one automatic fallback retry without `reasoning_effort` if a strict gateway
+/// rejects it with HTTP 400.
+pub async fn collect_auxiliary_text(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    options: &ChatOptions,
+    wall_timeout: Duration,
+    max_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<(String, Option<TokenUsage>), AuxiliaryCallError> {
+    let deadline = tokio::time::Instant::now() + wall_timeout;
+    let mut stream =
+        match open_auxiliary_stream(provider, messages, options, deadline, wall_timeout, cancel)
+            .await
+        {
+            Ok(s) => s,
+            Err(first_err)
+                if options.reasoning_effort.is_some()
+                    && !cancel.is_cancelled()
+                    && tokio::time::Instant::now() < deadline
+                    && (first_err.message.contains("400")
+                        || first_err.message.to_ascii_lowercase().contains("reasoning")) =>
+            {
+                let mut fallback = options.clone();
+                fallback.reasoning_effort = None;
+                open_auxiliary_stream(
+                    provider,
+                    messages,
+                    &fallback,
+                    deadline,
+                    wall_timeout,
+                    cancel,
+                )
+                .await?
+            }
+            Err(err) => return Err(err),
+        };
+
+    let mut out = String::new();
+    let mut usage: Option<TokenUsage> = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(AuxiliaryCallError {
+                    message: "auxiliary call cancelled".to_string(),
+                    retryable: false,
+                });
+            }
+            ev = tokio::time::timeout_at(deadline, stream.next()) => match ev {
+                Ok(Some(StreamEvent::TextDelta(chunk))) => {
+                    if max_bytes == 0 {
+                        out.push_str(&chunk);
+                    } else {
+                        let remaining = max_bytes.saturating_sub(out.len());
+                        if chunk.len() <= remaining {
+                            out.push_str(&chunk);
+                        } else {
+                            let mut cut = remaining;
+                            while cut > 0 && !chunk.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            out.push_str(&chunk[..cut]);
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(StreamEvent::Usage(u))) => {
+                    if let Some(existing) = usage.as_mut() {
+                        existing.merge_max(u);
+                    } else {
+                        usage = Some(u);
+                    }
+                }
+                Ok(Some(StreamEvent::Done { .. })) | Ok(None) => break,
+                Ok(Some(StreamEvent::Error(err))) => {
+                    return Err(AuxiliaryCallError {
+                        message: format!("stream error: {}", err.message),
+                        retryable: err.retryable,
+                    });
+                }
+                Ok(Some(_)) => {}
+                Err(_) => {
+                    return Err(AuxiliaryCallError {
+                        message: format!(
+                            "auxiliary stream timed out after {}s",
+                            wall_timeout.as_secs()
+                        ),
+                        retryable: true,
+                    });
+                }
+            }
+        }
+    }
+    Ok((out, usage))
+}
 
 /// Fallback User-Agent when a provider config carries no explicit `user_agent`.
 /// Bare (no version) on purpose: this crate is versioned independently of the

@@ -262,6 +262,9 @@ pub struct CodingParts {
     /// (opening tail) and tool middleware (grep/glob/read_file result tail). Shared
     /// so a `/model` respawn keeps the same session counter.
     pub(crate) code_tools_first: Arc<crate::code_tools_first::CodeToolsFirstHook>,
+    /// Shared status reminder (turn_start date/active tasks + ToolMiddleware::after
+    /// mid-turn background crash alert drain).
+    pub(crate) status_reminder: Arc<StatusReminderHook>,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -836,13 +839,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // date (NO context-usage gauge — pressure is handled silently by auto-compaction).
     // Appended on `turn_start` to the BOTTOM of the current real user block, so every
     // provider sees one user message instead of a synthetic-user/query pair.
-    hooks.push(Arc::new(StatusReminderHook::with_runtime_state(
-        Arc::clone(&bash_runtime),
+    let status_reminder = Arc::new(StatusReminderHook::with_runtime_state(Arc::clone(
+        &bash_runtime,
     )));
+    hooks.push(status_reminder.clone());
     hooks.push(turn_execution_policy.clone());
-    hooks.push(Arc::new(
-        jeikcode_capabilities::session::WriteStateHook::new(),
-    ));
+    hooks.push(Arc::new(match &session {
+        Some(b) => {
+            jeikcode_capabilities::session::WriteStateHook::with_session(&b.id, &cfg.working_dir)
+        }
+        None => jeikcode_capabilities::session::WriteStateHook::with_dir(&cfg.working_dir),
+    }));
     // Per-session code_explore wander meter: the tool middleware is registered in
     // `assemble`, and this lifecycle handle keeps the session-end cleanup.
     let code_tools_first = Arc::new(crate::code_tools_first::CodeToolsFirstHook::new(
@@ -903,6 +910,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
         code_tools_first,
+        status_reminder,
         mcp_plan_grants: std::sync::Arc::new(
             jeikcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
@@ -1877,9 +1885,11 @@ pub fn assemble(
                 .with_no_fold_tools(no_fold),
         ));
     }
-    // After artifact folding so a wander reminder is not trimmed off a large
-    // grep/glob/read_file payload. Per-session meter lives on this shared handle.
-    builder = builder.middleware(parts.code_tools_first.clone());
+    // After artifact folding so a wander reminder and mid-turn background task alerts
+    // are not trimmed off a large tool payload.
+    builder = builder
+        .middleware(parts.status_reminder.clone())
+        .middleware(parts.code_tools_first.clone());
     let agent = builder.build();
     // Commit model attribution only after every fallible assembly step has
     // succeeded. ReassembleProvider stops the old agent before entering here,

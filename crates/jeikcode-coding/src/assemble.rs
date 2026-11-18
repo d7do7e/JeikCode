@@ -140,7 +140,7 @@ fn build_coding_agent_from_tools(
         )))
         .hook(turn_execution_policy.clone())
         .hook(Arc::new(
-            jeikcode_capabilities::session::WriteStateHook::new(),
+            jeikcode_capabilities::session::WriteStateHook::with_dir(cfg.working_dir.clone()),
         ))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
