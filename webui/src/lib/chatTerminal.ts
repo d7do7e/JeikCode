@@ -1235,3 +1235,10 @@ export function isStackedTurnBillingUsage(
   if (prompt <= contextLimit) return false;
   return cached >= prompt * 0.9;
 }
+
+export const MAX_TERMINAL_RECONNECT_ATTEMPTS = 5;
+
+export function nextTerminalReconnectDelayMs(attempt: number): number {
+  const idx = Math.max(0, Math.floor(attempt));
+  return Math.min(500 * Math.pow(2, idx), 8000);
+}

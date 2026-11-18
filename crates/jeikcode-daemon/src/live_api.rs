@@ -2852,12 +2852,11 @@ fn live_stream_from_registry(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = tx.send(LiveWireEvent::Error {
-                        message: format!(
-                            "registry live stream lagged by {skipped} events; reconnect"
-                        ),
-                    });
-                    break;
+                    tracing::warn!(skipped, "registry /live stream lagged");
+                    if tx.send(live_lag_warning_event(skipped)).is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -2889,6 +2888,16 @@ fn live_stream_from_registry(
         axum::http::HeaderValue::from_static("no"),
     );
     resp
+}
+
+fn live_lag_warning_event(skipped: u64) -> LiveWireEvent {
+    LiveWireEvent::Warning {
+        message: format!(
+            "live stream lagged by {skipped} events; resync snapshot if output looks incomplete"
+        ),
+        tokens_after: None,
+        message_id: None,
+    }
 }
 
 fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::response::Response {
@@ -2981,10 +2990,11 @@ fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::respo
                 }
                 Ok(_) => break,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = tx.send(LiveWireEvent::Error {
-                        message: format!("live stream lagged by {skipped} events; reconnect"),
-                    });
-                    break;
+                    tracing::warn!(skipped, "hub /live stream lagged");
+                    if tx.send(live_lag_warning_event(skipped)).is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -5917,6 +5927,17 @@ mod tests {
                 assert!(text.contains("hello from repo-a"));
             }
             _ => panic!("expected LiveWireEvent::UserMessage"),
+        }
+    }
+
+    #[test]
+    fn live_lag_warning_event_emits_resync_warning_instead_of_terminal_error() {
+        match live_lag_warning_event(12) {
+            LiveWireEvent::Warning { message, .. } => {
+                assert!(message.contains("12 events"), "{message}");
+                assert!(message.contains("resync snapshot"), "{message}");
+            }
+            _ => panic!("expected LiveWireEvent::Warning"),
         }
     }
 }

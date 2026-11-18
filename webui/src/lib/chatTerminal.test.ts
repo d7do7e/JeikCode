@@ -5,6 +5,8 @@ import {
   classifyChatDone,
   createLiveLifecycleState,
   isCurrentChatStream,
+  nextTerminalReconnectDelayMs,
+  MAX_TERMINAL_RECONNECT_ATTEMPTS,
   liveDetachDisposition,
   liveSessionSwitchDisposition,
   reduceChatRecovery,
@@ -1187,6 +1189,16 @@ test('长会话切换回来：缓存尾部的无下标 steer 与流式工具行�
     ['u-0', 'a-0', 'u-1645', 'a-1645', 'u-1656', 'a-1656-live'],
     '16:56 转向与流式尾巴必须保持在 16:45 之后，绝不能篡位到 16:45 上方',
   );
+});
+
+test('nextTerminalReconnectDelayMs caps bounded exponential backoff at 8000ms', () => {
+  assert.equal(MAX_TERMINAL_RECONNECT_ATTEMPTS, 5);
+  assert.equal(nextTerminalReconnectDelayMs(0), 500);
+  assert.equal(nextTerminalReconnectDelayMs(1), 1000);
+  assert.equal(nextTerminalReconnectDelayMs(2), 2000);
+  assert.equal(nextTerminalReconnectDelayMs(3), 4000);
+  assert.equal(nextTerminalReconnectDelayMs(4), 8000);
+  assert.equal(nextTerminalReconnectDelayMs(10), 8000);
 });
 
 

@@ -780,4 +780,106 @@ test('buildRestartRedirectUrl omits ?token= on same-port restart when WEBUI_TOKE
   }
 });
 
+test('watchChatSession tags 401 as AuthExpiredError and does not emit watch_closed when aborted mid-stream by watchdog', async () => {
+  const { watchChatSession } = await import('./api.ts');
+  const originalFetch = globalThis.fetch;
+
+  try {
+    // 1. 401 response sets AuthExpiredError
+    globalThis.fetch = (async () => new Response('unauthorized', { status: 401, statusText: 'Unauthorized' })) as typeof fetch;
+    await assert.rejects(
+      watchChatSession('sess-401', () => {}),
+      (err: any) => err instanceof Error && err.name === 'AuthExpiredError',
+    );
+
+    // 2. Clean EOF without terminal emits watch_closed
+    globalThis.fetch = (async () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"text","content":"hi"}\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as typeof fetch;
+    const seen: any[] = [];
+    await watchChatSession('sess-eof', (ev) => seen.push(ev));
+    assert.equal(seen[seen.length - 1]?.stop_reason, 'watch_closed');
+
+    // 3. Watchdog/wakeup abort (reader.cancel while parent signal is NOT aborted) throws retryable stalled error without watch_closed
+    const origNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+    const listeners = new Map<string, Set<() => void>>();
+    const origWin = (globalThis as any).window;
+    (globalThis as any).window = {
+      addEventListener: (ev: string, fn: () => void) => {
+        if (!listeners.has(ev)) listeners.set(ev, new Set());
+        listeners.get(ev)!.add(fn);
+      },
+      removeEventListener: (ev: string, fn: () => void) => {
+        listeners.get(ev)?.delete(fn);
+      },
+    };
+    try {
+      globalThis.fetch = (async () => {
+        const stream = new ReadableStream({
+          pull() {
+            return new Promise(() => {});
+          },
+          cancel() {},
+        });
+        return new Response(stream, { status: 200 });
+      }) as typeof fetch;
+
+      const stalledSeen: any[] = [];
+      const watchPromise = watchChatSession('sess-stall', (ev) => stalledSeen.push(ev));
+      await new Promise((r) => setTimeout(r, 20));
+      fakeNow += 30_000;
+      for (const fn of listeners.get('online') ?? []) fn();
+
+      await assert.rejects(
+        watchPromise,
+        (err: any) => err instanceof Error && err.message === 'chat watch stalled' && err.name !== 'AbortError',
+      );
+      assert.equal(stalledSeen.length, 0);
+
+      // 4. Real browser fetch/reader.read() rejecting with AbortError when streamAbort.signal aborts
+      // must also be converted to retryable 'chat watch stalled' (not AbortError).
+      globalThis.fetch = ((_url: RequestInfo | URL, init?: RequestInit) => {
+        const stream = new ReadableStream({
+          pull() {
+            return new Promise((_resolve, reject) => {
+              init?.signal?.addEventListener('abort', () => {
+                const abortErr = new Error('The operation was aborted.');
+                abortErr.name = 'AbortError';
+                reject(abortErr);
+              });
+            });
+          },
+        });
+        return Promise.resolve(new Response(stream, { status: 200 }));
+      }) as typeof fetch;
+
+      const browserAbortSeen: any[] = [];
+      const browserWatchPromise = watchChatSession('sess-browser-stall', (ev) => browserAbortSeen.push(ev));
+      await new Promise((r) => setTimeout(r, 20));
+      fakeNow += 30_000;
+      for (const fn of listeners.get('online') ?? []) fn();
+
+      await assert.rejects(
+        browserWatchPromise,
+        (err: any) => err instanceof Error && err.message === 'chat watch stalled' && err.name !== 'AbortError',
+      );
+      assert.equal(browserAbortSeen.length, 0);
+    } finally {
+      Date.now = origNow;
+      if (origWin === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = origWin;
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 

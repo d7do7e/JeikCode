@@ -1129,16 +1129,44 @@ export async function watchChatSession(
       streamAbort.abort();
     }
   }, 4000);
+  if (typeof (watchdog as any).unref === 'function') {
+    (watchdog as any).unref();
+  }
 
+  // 视口唤醒自愈：设备从休眠/熄屏恢复时立即检测是否超时，不等下一次 4s interval tick
+  const checkWakeup = () => {
+    if (typeof document !== 'undefined' && !document.hidden) {
+      if (Date.now() - lastActivity > 25000) {
+        streamAbort.abort();
+      }
+    }
+  };
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', checkWakeup);
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', checkWakeup);
+    window.addEventListener('online', checkWakeup);
+  }
+
+  let readerCancelHandler: (() => void) | null = null;
   try {
     const resp = await apiFetch(
       `/chat/watch?${params.toString()}`,
       { headers: authHeaders(), signal: streamAbort.signal },
     );
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      const error = new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      if (resp.status === 401) error.name = 'AuthExpiredError';
+      throw error;
     }
     const reader = resp.body!.getReader();
+    readerCancelHandler = () => {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+    };
+    streamAbort.signal.addEventListener('abort', readerCancelHandler, { once: true });
     const decoder = new TextDecoder();
     let buffer = '';
     let terminalSeen = false;
@@ -1189,6 +1217,11 @@ export async function watchChatSession(
       error.name = 'AbortError';
       throw error;
     }
+    // Watchdog / wakeup aborted the reader while parent signal stayed active:
+    // throw a retryable error instead of emitting a false `watch_closed` terminal.
+    if (streamAbort.signal.aborted) {
+      throw new Error('chat watch stalled');
+    }
     if (!terminalSeen) {
       onEvent({
         type: 'done',
@@ -1198,8 +1231,28 @@ export async function watchChatSession(
         stop_reason: 'watch_closed',
       } as SSEEvent);
     }
+  } catch (err) {
+    if (signal?.aborted) {
+      const error = new Error('chat watch aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
+    if (streamAbort.signal.aborted) {
+      throw new Error('chat watch stalled');
+    }
+    throw err;
   } finally {
     clearInterval(watchdog);
+    if (readerCancelHandler) {
+      streamAbort.signal.removeEventListener('abort', readerCancelHandler);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', checkWakeup);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', checkWakeup);
+      window.removeEventListener('online', checkWakeup);
+    }
     if (signal) signal.removeEventListener('abort', onParentAbort);
   }
 }

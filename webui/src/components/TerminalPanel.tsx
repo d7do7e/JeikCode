@@ -8,11 +8,16 @@ import {
   createTerminalSession,
   fetchTerminalList,
   closeTerminalSession,
+  getToken,
   sendTerminalInput,
 } from '../api';
 import { showToast } from './Toast';
 import { useT, useSettings } from '../settings';
 import { getPageZoom } from '../lib/pageZoom';
+import {
+  MAX_TERMINAL_RECONNECT_ATTEMPTS,
+  nextTerminalReconnectDelayMs,
+} from '../lib/chatTerminal';
 
 function measureTerminalGrid(term: Terminal, container: HTMLElement): { cols: number; rows: number } | null {
   const core = (term as unknown as {
@@ -425,6 +430,9 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         layoutSync?: (immediate: boolean, force?: boolean) => void;
         lastSentCols?: number;
         lastSentRows?: number;
+        manualClose?: boolean;
+        reconnectTimer?: ReturnType<typeof setTimeout> | null;
+        reconnectAttempts?: number;
       }
     >
   >(new Map());
@@ -432,6 +440,34 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   // 上次保存的 active tab，但焦点必须留给对话输入框，绝不能由挂载阶段抢走。
   const focusOnNextLayoutRef = useRef(false);
   const panelActiveRef = useRef(active !== false);
+  const hostPlatformRef = useRef<HostPlatform>(hostPlatform);
+  hostPlatformRef.current = hostPlatform;
+
+  const disposeTerminalRecord = useCallback((record: {
+    ro?: ResizeObserver;
+    ws: WebSocket | null;
+    term: Terminal;
+    manualClose?: boolean;
+    reconnectTimer?: ReturnType<typeof setTimeout> | null;
+  }) => {
+    record.manualClose = true;
+    if (record.reconnectTimer) {
+      clearTimeout(record.reconnectTimer);
+      record.reconnectTimer = null;
+    }
+    try { record.ro?.disconnect(); } catch {}
+    try { record.ws?.close(); } catch {}
+    try { record.term.dispose(); } catch {}
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const record of termMap.current.values()) {
+        disposeTerminalRecord(record);
+      }
+      termMap.current.clear();
+    };
+  }, [disposeTerminalRecord]);
 
   // 画面失效标记：面板隐藏或页面挂起时置位，回来后必须整体重绘一次。
   // 只在真的可能失效时才重绘，避免无谓的 DOM 重绘（重绘会重建行节点、清掉终端里的文本选区）。
@@ -605,6 +641,9 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         layoutSync?: (immediate: boolean, force?: boolean) => void;
         lastSentCols?: number;
         lastSentRows?: number;
+        manualClose?: boolean;
+        reconnectTimer?: ReturnType<typeof setTimeout> | null;
+        reconnectAttempts?: number;
       },
       isInitial = false
     ) => {
@@ -615,29 +654,16 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         return;
       }
       try {
+        if (record.reconnectTimer) {
+          clearTimeout(record.reconnectTimer);
+          record.reconnectTimer = null;
+        }
+        record.manualClose = false;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const tabShell = inferShellFromTab(tab, hostPlatform);
+        const tabShell = inferShellFromTab(tab, hostPlatformRef.current);
         const cols = Math.min(500, Math.max(2, record.term.cols || 80));
         const rows = Math.min(200, Math.max(1, record.term.rows || 24));
-        let token = '';
-        try {
-          token =
-            sessionStorage.getItem('jeikcode_webui_token') ||
-            localStorage.getItem('jeikcode_webui_token') ||
-            '';
-        } catch {}
-        if (!token) {
-          try {
-            const m = document.cookie.match(/jeikcode_webui(?:_\d+)?=([^;]+)/);
-            if (m && m[1]) token = m[1].trim();
-          } catch {}
-        }
-        if (!token) {
-          try {
-            const search = new URLSearchParams(window.location.search);
-            token = search.get('token') || '';
-          } catch {}
-        }
+        const token = getToken();
         const wsUrl = `${protocol}//${window.location.host}/terminal/ws?id=${encodeURIComponent(tab.id)}&cwd=${encodeURIComponent(cwd || '')}&shell=${encodeURIComponent(tabShell)}&cols=${cols}&rows=${rows}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
         const ws = new WebSocket(wsUrl);
         record.lastSentCols = 0;
@@ -647,6 +673,8 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         let receivedAnyData = false;
 
         ws.onopen = () => {
+          if (record.ws !== ws || record.manualClose) return;
+          record.reconnectAttempts = 0;
           record.layoutSync?.(true, true);
           if (isInitial) {
             const initialCmd = pendingCommandsRef.current.get(tab.id);
@@ -669,6 +697,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         };
 
         ws.onmessage = (event) => {
+          if (record.ws !== ws) return;
           receivedAnyData = true;
           // 防御性剔除 Windows ConPTY 残留的光标查询序列 (\x1b[6n / \x1b[?6n)，
           // 彻底阻断 xterm.js 自动生成 CPR 响应（\x1b[1;1R）导致向终端敲入 1R1R。
@@ -682,18 +711,33 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         };
 
         ws.onclose = () => {
-          // 保留当前连接对象状态，等待唤醒重连
+          if (record.ws !== ws || record.manualClose) return;
+          if (!termMap.current.has(tab.id)) return;
+          const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+          if (hidden) return;
+          const attempt = record.reconnectAttempts ?? 0;
+          if (attempt >= MAX_TERMINAL_RECONNECT_ATTEMPTS) {
+            if (!receivedAnyData) {
+              const promptChar = tabShell.includes('powershell') ? 'PS ' : tabShell.includes('cmd') ? '' : '$ ';
+              const cwdDisplay = (cwd || '.').replace(/\\/g, '/');
+              record.term.write(`\r\n\x1b[33m[JeikCode Terminal disconnected — reopen or focus to retry]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
+            }
+            return;
+          }
+          record.reconnectAttempts = attempt + 1;
+          const delayMs = nextTerminalReconnectDelayMs(attempt);
+          if (record.reconnectTimer) clearTimeout(record.reconnectTimer);
+          record.reconnectTimer = setTimeout(() => {
+            record.reconnectTimer = null;
+            if (record.manualClose || !termMap.current.has(tab.id)) return;
+            if (record.ws === ws || !record.ws || record.ws.readyState === WebSocket.CLOSED) {
+              connectTabSocket(tab, record, false);
+            }
+          }, delayMs);
         };
 
         ws.onerror = () => {
-          // 兜底提示：如果未能收到 WebSocket 数据，显示就绪提示符，绝不呈现全黑死寂窗口
-          setTimeout(() => {
-            if (!receivedAnyData && (!record.ws || record.ws.readyState !== WebSocket.OPEN)) {
-              const promptChar = tabShell.includes('powershell') ? 'PS ' : tabShell.includes('cmd') ? '' : '$ ';
-              const cwdDisplay = (cwd || '.').replace(/\\/g, '/');
-              record.term.write(`\r\n\x1b[32m[JeikCode Terminal - ${tabShell}]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
-            }
-          }, 800);
+          // Wait for onclose backoff/exhaustion so transient retries do not spam prompts.
         };
       } catch {}
     },
@@ -939,6 +983,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
       for (const tab of tabs) {
         const record = termMap.current.get(tab.id);
         if (record) {
+          record.reconnectAttempts = 0;
           if (!record.ws || record.ws.readyState === WebSocket.CLOSED || record.ws.readyState === WebSocket.CLOSING) {
             connectTabSocket(tab, record, false);
           }
@@ -956,9 +1001,11 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
     };
     document.addEventListener('visibilitychange', handleWakeup);
     window.addEventListener('focus', handleWakeup);
+    window.addEventListener('online', handleWakeup);
     return () => {
       document.removeEventListener('visibilitychange', handleWakeup);
       window.removeEventListener('focus', handleWakeup);
+      window.removeEventListener('online', handleWakeup);
     };
   }, [tabs, active, activeTabId, connectTabSocket, repaintAllTerminals]);
 
@@ -995,9 +1042,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           const validIds = new Set(enriched.map((t: TerminalTab) => t.id));
           for (const [id, rec] of termMap.current.entries()) {
             if (!validIds.has(id)) {
-              try { rec.ro?.disconnect(); } catch {}
-              try { rec.ws?.close(); } catch {}
-              try { rec.term.dispose(); } catch {}
+              disposeTerminalRecord(rec);
               termMap.current.delete(id);
             }
           }
@@ -1013,10 +1058,8 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           });
         } else {
           // 如果后端已被清空（如在其他浏览器删除了所有终端），本地清理并仅保留一个新创建的干净初始会话！
-          for (const [id, record] of termMap.current.entries()) {
-            try { record.ro?.disconnect(); } catch {}
-            try { record.ws?.close(); } catch {}
-            try { record.term.dispose(); } catch {}
+          for (const [_id, record] of termMap.current.entries()) {
+            disposeTerminalRecord(record);
           }
           termMap.current.clear();
           const newId = stableDefaultId;
@@ -1185,15 +1228,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
     }
     const record = termMap.current.get(tabId);
     if (record) {
-      try {
-        record.ro?.disconnect();
-      } catch {}
-      try {
-        record.ws?.close();
-      } catch {}
-      try {
-        record.term.dispose();
-      } catch {}
+      disposeTerminalRecord(record);
       termMap.current.delete(tabId);
     }
     const remaining = tabs.filter((t) => t.id !== tabId);
@@ -1217,9 +1252,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
     tabs.forEach((tab) => {
       const record = termMap.current.get(tab.id);
       if (record) {
-        try { record.ro?.disconnect(); } catch {}
-        try { record.ws?.close(); } catch {}
-        try { record.term.dispose(); } catch {}
+        disposeTerminalRecord(record);
         termMap.current.delete(tab.id);
       }
       void closeTerminalSession(tab.id);

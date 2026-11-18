@@ -3438,6 +3438,7 @@ export function Chat({
     attempt(0, 3);
   }
 
+  const detachedReattachAttemptsRef = useRef<Map<string, number>>(new Map());
   function startDetachedTick(
     projectHash: string,
     loadId: string,
@@ -3464,7 +3465,37 @@ export function Chat({
           stopDetachedHistoryPoll(loadId);
           return;
         }
-        if (stillActive === null || stillActive) return;
+        if (stillActive === null) return;
+        if (stillActive) {
+          const liveWatcher = sessionWatchersRef.current.get(loadId);
+          const hasLiveWatcher = !!liveWatcher && !liveWatcher.signal.aborted;
+          const attempts = detachedReattachAttemptsRef.current.get(loadId) ?? 0;
+          if (
+            !hasLiveWatcher &&
+            attempts < 3 &&
+            !hasRunningLocalSend(loadId) &&
+            !localTurnSessionsRef.current.has(loadId) &&
+            !isSessionTurnHandoverProtected(loadId)
+          ) {
+            try {
+              const actives = await getActiveChatSessions();
+              if (
+                activeIdRef.current === loadId &&
+                sessionGenerationRef.current === loadGeneration &&
+                Array.isArray(actives) &&
+                actives.includes(loadId)
+              ) {
+                detachedReattachAttemptsRef.current.set(loadId, attempts + 1);
+                stopDetachedHistoryPoll(loadId);
+                startDetachedHistoryPoll(projectHash, loadId, loadGeneration);
+                return;
+              }
+            } catch {
+              // Keep polling on transient probe failure.
+            }
+          }
+          return;
+        }
         {
           transitionChatRecovery({ type: 'authoritative_terminal' });
           const loadedDone = messagesRef.current;
@@ -3543,6 +3574,7 @@ export function Chat({
     }
     sessionWatchersRef.current.get(loadId)?.abort();
     sessionWatchersRef.current.delete(loadId);
+    detachedReattachAttemptsRef.current.delete(loadId);
     localActiveStreamsBySessionRef.current.delete(loadId);
     stopDetachedHistoryPoll(loadId);
     pendingSelfEchoRef.current = [];
@@ -3742,8 +3774,47 @@ export function Chat({
         }
       }
     }).catch((err) => {
-      if (err?.name === 'AbortError') return;
-      // 静默失败：不阻塞空闲态使用，下一次会话聚焦/刷新会重建。
+      if (idleWatchAbortRef.current === abort) {
+        idleWatchAbortRef.current = null;
+      }
+      if (err?.name === 'AbortError' || err?.name === 'AuthExpiredError') {
+        if (detachedWatchAbortRef.current === abort) {
+          detachedWatchAbortRef.current = null;
+        }
+        if (sessionWatchersRef.current.get(loadId) === abort) {
+          sessionWatchersRef.current.delete(loadId);
+        }
+        return;
+      }
+      if (activated && !terminalSeen) {
+        if (detachedWatchAbortRef.current === abort) {
+          detachedWatchAbortRef.current = null;
+        }
+        if (sessionWatchersRef.current.get(loadId) === abort) {
+          sessionWatchersRef.current.delete(loadId);
+        }
+        idleWatchFlashDisconnectsRef.current.delete(loadId);
+        settleToIdleWatch(projectHash, loadId, loadGeneration);
+        return;
+      }
+      const cur = idleWatchFlashDisconnectsRef.current.get(loadId) ?? { count: 0, lastFailedAt: 0 };
+      cur.count += 1;
+      cur.lastFailedAt = Date.now();
+      idleWatchFlashDisconnectsRef.current.set(loadId, cur);
+      if (cur.count >= 3) {
+        console.warn(`[watch] Idle watch error breaker triggered for ${loadId} after ${cur.count} failures.`);
+        return;
+      }
+      const retryDelay = Math.min(1000 * Math.pow(2, cur.count - 1), 8000);
+      if (idleWatchTimerRef.current) {
+        clearTimeout(idleWatchTimerRef.current);
+      }
+      idleWatchTimerRef.current = setTimeout(() => {
+        idleWatchTimerRef.current = null;
+        if (activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration) {
+          startIdleWatch(projectHash, loadId, loadGeneration);
+        }
+      }, retryDelay);
     });
   }
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
@@ -5619,15 +5690,12 @@ export function Chat({
                   // 普通窗口聚焦：执行一次权威快照同步，确保离开期间服务端跑完的新轮次立即上屏！
                   void syncSessionCacheFromDisk(projectHash, sid);
                 }
-                if (staleLiveState || hiddenForLong) {
-                  // 挂起/断网后待机 watch 多半已被系统戒断：强制重挂，
-                  // 否则对端新回合永远推不过来（不拉新量）。
+                if (staleLiveState || hiddenForLong || wasHidden || recoveredFromOffline) {
+                  // 挂起/熄屏/断网后待机 watch 可能已被系统静默戒断：清除短时间退避熔断并强制重挂，
+                  // 确保切回前台后对端新回合立即可推送上屏。
+                  idleWatchFlashDisconnectsRef.current.delete(sid);
+                  detachedReattachAttemptsRef.current.delete(sid);
                   stopIdleWatch();
-                  startIdleWatch(projectHash, sid, sessionGenerationRef.current, { replayIfLive: true });
-                } else if (recoveredFromOffline) {
-                  // Same recovery must also re-arm the standby watch if the
-                  // offline period silently killed it; startIdleWatch no-ops
-                  // when a live/idle watcher is already healthy.
                   startIdleWatch(projectHash, sid, sessionGenerationRef.current, { replayIfLive: true });
                 }
               }
@@ -9670,6 +9738,7 @@ export function Chat({
             // 服务端权威口径：`/chat/runtime` 同时覆盖 /chat 占用、live 回合与
             // `/loop`·`/goal` 控制器。只看 `/chat/active` 会在 loop 的 wakeup
             // 间隙误判空闲，把运行态熄灭（只能刷新恢复）。
+            let continuationWatcherAttached = false;
             const ensureLiveWatcherOnContinuation = () => {
               const w = sessionWatchersRef.current.get(settleSid);
               const wAlive = !!w && !w.signal.aborted;
@@ -9677,39 +9746,80 @@ export function Chat({
                 activeIdRef.current === settleSid &&
                 (abortRef.current !== null || activeStreamRequestIdRef.current !== null);
               if (!wAlive && !hasFgPost && settleHash) {
+                continuationWatcherAttached = true;
                 startDetachedHistoryPoll(settleHash, settleSid, settleGen, {
                   background: activeIdRef.current !== settleSid,
                 });
+              } else if (wAlive || hasFgPost) {
+                continuationWatcherAttached = true;
               }
             };
             const confirmIdle = (attempt: number) => {
+              if (
+                sessionGenerationRef.current !== settleGen ||
+                localTurnSessionsRef.current.has(settleSid) ||
+                (activeIdRef.current === settleSid &&
+                  (abortRef.current !== null || activeStreamRequestIdRef.current !== null))
+              ) {
+                return;
+              }
               void getChatRuntime(settleSid)
                 .then((runtime) => {
-                  if (sessionGenerationRef.current !== settleGen) return;
+                  if (
+                    sessionGenerationRef.current !== settleGen ||
+                    localTurnSessionsRef.current.has(settleSid)
+                  ) {
+                    return;
+                  }
                   if (serverRuntimeRunning(runtime)) {
                     // 新一轮/续轮已经接管：保留停止态，并确保观察流已重连（上一轮 done 会关闭旧流）。
                     ensureLiveWatcherOnContinuation();
-                    if (attempt > 0) window.setTimeout(() => confirmIdle(attempt - 1), 450);
+                    if (attempt > 0) {
+                      window.setTimeout(() => confirmIdle(attempt - 1), 450);
+                    } else if (
+                      activeIdRef.current === settleSid &&
+                      settleHash &&
+                      !sessionWatchersRef.current.get(settleSid)
+                    ) {
+                      startDetachedTick(settleHash, settleSid, settleGen);
+                    }
                     return;
                   }
+                  if (continuationWatcherAttached) return;
                   finishTerminal();
                 })
                 .catch(() => {
                   // 旧 daemon 没有 /chat/runtime：退回 /chat/active 的既有口径。
                   void getActiveChatSessions()
                     .then((actives) => {
-                      if (sessionGenerationRef.current !== settleGen) return;
-                      if (actives.includes(settleSid)) {
-                        ensureLiveWatcherOnContinuation();
-                        if (attempt > 0) window.setTimeout(() => confirmIdle(attempt - 1), 450);
+                      if (
+                        sessionGenerationRef.current !== settleGen ||
+                        localTurnSessionsRef.current.has(settleSid)
+                      ) {
                         return;
                       }
+                      if (actives.includes(settleSid)) {
+                        ensureLiveWatcherOnContinuation();
+                        if (attempt > 0) {
+                          window.setTimeout(() => confirmIdle(attempt - 1), 450);
+                        } else if (
+                          activeIdRef.current === settleSid &&
+                          settleHash &&
+                          !sessionWatchersRef.current.get(settleSid)
+                        ) {
+                          startDetachedTick(settleHash, settleSid, settleGen);
+                        }
+                        return;
+                      }
+                      if (continuationWatcherAttached) return;
                       finishTerminal();
                     })
-                    .catch(finishTerminal);
+                    .catch(() => {
+                      if (!continuationWatcherAttached) finishTerminal();
+                    });
                 });
             };
-            confirmIdle(1);
+            confirmIdle(4);
           }
 
           // 未被回合内并入的转向消息，还原为普通排队消息，回合结束后由 drain 自动发送；
@@ -11231,14 +11341,41 @@ export function Chat({
    * 后端 /chat/stop 经由 stop_and_wait 同步等待上一回合完全退出注册表，await 返回即代表槽位已释放，
    * 调用方可以 0 延迟发起新的投递（绝不 409 抢跑）。
    */
-  async function stopRunningTurn(currentSid: string | null, requestAlias: string | null): Promise<boolean> {
-    const stopPromises: Promise<boolean>[] = runningTurnStopAliases({
+  async function stopRunningTurnDetailed(
+    currentSid: string | null,
+    requestAlias: string | null,
+  ): Promise<{ stopped: boolean; error?: string }> {
+    const aliases = runningTurnStopAliases({
       requestAlias,
       sessionId: currentSid,
-    }).map((alias) => stopChat(alias).then((result) => stopAliasAllowsNextTurn(result), () => false));
-    if (stopPromises.length === 0) return true; // 无停止目标：本就空闲
-    const results = await Promise.all(stopPromises);
-    return results.every(Boolean);
+    });
+    if (aliases.length === 0) return { stopped: true }; // 无停止目标：本就空闲
+    let firstError: string | undefined;
+    const results = await Promise.all(
+      aliases.map((alias) =>
+        stopChat(alias).then(
+          (result) => {
+            const ok = stopAliasAllowsNextTurn(result);
+            if (!ok && !firstError) {
+              firstError = 'stop rejected by daemon';
+            }
+            return ok;
+          },
+          (err) => {
+            if (!firstError) {
+              firstError = err instanceof Error ? err.message : String(err);
+            }
+            return false;
+          },
+        ),
+      ),
+    );
+    return { stopped: results.every(Boolean), error: firstError };
+  }
+
+  async function stopRunningTurn(currentSid: string | null, requestAlias: string | null): Promise<boolean> {
+    const { stopped } = await stopRunningTurnDetailed(currentSid, requestAlias);
+    return stopped;
   }
 
   /**
@@ -12536,9 +12673,17 @@ export function Chat({
       showToast(t('chat.detachedStopped'), 'info');
     }
 
+    let stopConfirmed = true;
     try {
-      await stopRunningTurn(currentSid, requestAlias);
+      const stopRes = await stopRunningTurnDetailed(currentSid, requestAlias);
+      stopConfirmed = stopRes.stopped;
+      if (!stopRes.stopped) {
+        pushNoticeToLastAssistant(
+          t('chat.cancelFailed', { error: stopRes.error || 'daemon did not confirm stop' }),
+        );
+      }
     } catch (error) {
+      stopConfirmed = false;
       pushNoticeToLastAssistant(t('chat.cancelFailed', { error: String(error) }));
     } finally {
       finalizePendingToolsOnCanvas();
@@ -12566,7 +12711,12 @@ export function Chat({
         '';
       const loadGeneration = sessionGenerationRef.current;
       if (projectHash && currentSid && !skipCatchUp && !superseded) {
-        startIdleWatch(projectHash, currentSid, loadGeneration);
+        startIdleWatch(
+          projectHash,
+          currentSid,
+          loadGeneration,
+          stopConfirmed ? undefined : { replayIfLive: true },
+        );
         // 停止通道已 await 后端真实释放（快照已落盘）：立刻磁盘对账一次，
         // 把被 abort 掉的那条流可能丢掉的最后一段正文补回画布（无需刷新/失焦）。
         settleDiskCatchUp(projectHash, currentSid);
