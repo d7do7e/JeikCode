@@ -309,15 +309,31 @@ pub fn has_dirty_hkcu_path() -> bool {
 }
 
 #[cfg(windows)]
-pub fn migrate_hkcu_path(extra_dirs: &[PathBuf]) -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-    else {
-        return false;
-    };
-    let current: String = env.get_value("Path").unwrap_or_default();
+pub(crate) fn decode_reg_path_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut words = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        words.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    while words.last() == Some(&0) {
+        words.pop();
+    }
+    String::from_utf16(&words).ok()
+}
+
+#[cfg(windows)]
+pub(crate) fn encode_reg_path_bytes(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((value.len() + 1) * 2);
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes
+}
+
+pub(crate) fn merge_hkcu_path_entries(current: &str, extra_dirs: &[PathBuf]) -> String {
     let mut parts: Vec<String> = current
         .split(';')
         .filter(|p| {
@@ -328,10 +344,11 @@ pub fn migrate_hkcu_path(extra_dirs: &[PathBuf]) -> bool {
         .collect();
 
     for dir in extra_dirs.iter().rev() {
-        if !dir.is_dir() {
+        let cleaned = strip_windows_verbatim_path(dir);
+        if !cleaned.is_dir() {
             continue;
         }
-        let dir_str = dir.display().to_string();
+        let dir_str = cleaned.display().to_string();
         let lower = dir_str.to_ascii_lowercase();
         if lower.contains("temp")
             || lower.contains("staged")
@@ -348,8 +365,41 @@ pub fn migrate_hkcu_path(extra_dirs: &[PathBuf]) -> bool {
         }
     }
 
-    let new_path = parts.join(";");
-    if new_path != current && env.set_value("Path", &new_path).is_ok() {
+    parts.join(";")
+}
+
+#[cfg(windows)]
+pub fn migrate_hkcu_path(extra_dirs: &[PathBuf]) -> bool {
+    use winreg::enums::*;
+    use winreg::{RegKey, RegValue};
+    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+    else {
+        return false;
+    };
+    let (current, vtype) = match env.get_raw_value("Path") {
+        Ok(raw) => {
+            if raw.vtype != REG_SZ && raw.vtype != REG_EXPAND_SZ {
+                return false;
+            }
+            let Some(decoded) = decode_reg_path_bytes(&raw.bytes) else {
+                return false;
+            };
+            (decoded, raw.vtype)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), REG_EXPAND_SZ),
+        Err(_) => return false,
+    };
+
+    let new_path = merge_hkcu_path_entries(&current, extra_dirs);
+    if new_path == current {
+        return false;
+    }
+    let reg_val = RegValue {
+        bytes: encode_reg_path_bytes(&new_path),
+        vtype,
+    };
+    if env.set_raw_value("Path", &reg_val).is_ok() {
         broadcast_env_setting_change();
         return true;
     }
@@ -503,5 +553,44 @@ mod tests {
             strip_windows_verbatim_path(Path::new("/usr/local/bin/jeikcode")),
             PathBuf::from("/usr/local/bin/jeikcode")
         );
+    }
+
+    #[test]
+    fn merge_hkcu_path_entries_strips_verbatim_prefixes_and_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("JeikCodeDesktop");
+        let resources_dir = install_dir.join("resources");
+        std::fs::create_dir_all(&resources_dir).unwrap();
+
+        let verbatim_install = PathBuf::from(format!(r"\\?\{}", install_dir.display()));
+        let verbatim_resources = PathBuf::from(format!(r"\\?\{}", resources_dir.display()));
+        let existing = format!(
+            r"C:\Windows\System32;C:\Users\depc\.local\bin;{}",
+            resources_dir.display()
+        );
+        let merged = merge_hkcu_path_entries(&existing, &[verbatim_install, verbatim_resources]);
+        assert!(merged.contains(&install_dir.display().to_string()));
+        assert!(!merged.contains(r"\\?\"));
+        assert!(!merged.contains(r"\.local\bin"));
+        assert!(merged.contains(r"C:\Windows\System32"));
+        // resources_dir already existed (case-insensitively), so it is not duplicated
+        assert_eq!(
+            merged
+                .split(';')
+                .filter(|p| p.eq_ignore_ascii_case(&resources_dir.display().to_string()))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reg_path_utf16le_roundtrips_and_rejects_odd_bytes() {
+        let sample = r"%SystemRoot%\system32;C:\Tools\JeikCode";
+        let bytes = encode_reg_path_bytes(sample);
+        // Must end with UTF-16 NUL terminator (0x0000).
+        assert!(bytes.ends_with(&[0, 0]));
+        assert_eq!(decode_reg_path_bytes(&bytes).as_deref(), Some(sample));
+        assert_eq!(decode_reg_path_bytes(&[0x41]), None);
     }
 }

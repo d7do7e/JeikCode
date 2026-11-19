@@ -1,38 +1,13 @@
-; Define StrStr helper for searching needle ($INSTDIR) in haystack (Path)
-!ifndef STRSTR_FUNCTION_DEFINED
-!define STRSTR_FUNCTION_DEFINED
-Function StrStr
-  Exch $R1 ; $R1 = needle
-  Exch     ; swap $R1 and haystack
-  Exch $R2 ; $R2 = haystack
-  Push $R3
-  Push $R4
-  Push $R5
-  StrLen $R3 $R1
-  StrCpy $R4 0
-loop:
-  StrCpy $R5 $R2 $R3 $R4
-  StrCmp $R5 $R1 done
-  StrCmp $R5 "" done
-  IntOp $R4 $R4 + 1
-  Goto loop
-done:
-  StrCpy $R1 $R2 "" $R4
-  Pop $R5
-  Pop $R4
-  Pop $R3
-  Pop $R2
-  Exch $R1
-FunctionEnd
-!endif
+!macro JEIKCODE_KILL_INSTDIR_BINARIES
+  ; Terminate only JeikCode binaries running from $INSTDIR, never unrelated workspaces or installer ancestors
+  System::Call 'Kernel32::SetEnvironmentVariable(t "JEIKCODE_NSIS_INSTDIR", t "$INSTDIR")'
+  nsExec::Exec 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$root = $$env:JEIKCODE_NSIS_INSTDIR.TrimEnd([char]92) + [char]92; $$names = @(\"jeikcode-desktop.exe\",\"jeikcode.exe\",\"jeikcode-daemon.exe\",\"cli-bin.exe\"); $$procs = Get-CimInstance Win32_Process; $$byPid = @{}; foreach ($$p in $$procs) { $$byPid[[int]$$p.ProcessId] = $$p }; $$skip = @{}; $$cur = [int]$$PID; while ($$cur -gt 0 -and -not $$skip.ContainsKey($$cur)) { $$skip[$$cur] = $$true; if ($$byPid.ContainsKey($$cur)) { $$cur = [int]$$byPid[$$cur].ParentProcessId } else { break } }; foreach ($$p in $$procs) { if (-not $$skip.ContainsKey([int]$$p.ProcessId) -and $$p.Name -and ($$names -contains $$p.Name.ToLowerInvariant()) -and $$p.ExecutablePath -and $$p.ExecutablePath.StartsWith($$root, [System.StringComparison]::OrdinalIgnoreCase)) { Stop-Process -Id ([int]$$p.ProcessId) -Force -ErrorAction SilentlyContinue } }"'
+  System::Call 'Kernel32::SetEnvironmentVariable(t "JEIKCODE_NSIS_INSTDIR", n)'
+  Sleep 800
+!macroend
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Terminate all existing running instances of desktop and daemon before extracting files
-  nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "jeikcode-daemon.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "cli-bin.exe" /T'
-  Sleep 800
+  !insertmacro JEIKCODE_KILL_INSTDIR_BINARIES
 
   ; Clean up potentially locked old binaries in installation directory
   IfFileExists "$INSTDIR\resources\jeikcode.exe" 0 +2
@@ -47,42 +22,8 @@ FunctionEnd
   ; Refresh shell icon cache so existing cached placeholders/icons are cleared
   System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
-  ; Register $INSTDIR and $INSTDIR\resources into user PATH environment variable
-  ReadRegStr $0 HKCU "Environment" "Path"
-  StrCpy $2 0 ; $2 tracks whether PATH was modified
-
-  ${If} $0 == ""
-    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$INSTDIR\resources"
-    StrCpy $2 1
-  ${Else}
-    ; Boundary-safe lookup (";$0;") checks exact PATH entries so $INSTDIR\resources
-    ; cannot mask a missing $INSTDIR entry. NSIS StrCmp is case-insensitive.
-    Push ";$0;"
-    Push ";$INSTDIR;"
-    Call StrStr
-    Pop $1
-    ${If} $1 == ""
-      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
-      ReadRegStr $0 HKCU "Environment" "Path"
-      StrCpy $2 1
-    ${EndIf}
-
-    Push ";$0;"
-    Push ";$INSTDIR\resources;"
-    Call StrStr
-    Pop $1
-    ${If} $1 == ""
-      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$0"
-      ReadRegStr $0 HKCU "Environment" "Path"
-      StrCpy $2 1
-    ${EndIf}
-  ${EndIf}
-
-  ; Broadcast WM_SETTINGCHANGE with SMTO_ABORTIFHUNG (0x0002) to skip hung windows immediately
-  ; This prevents the installer from blocking 2-3 minutes at "Completed" waiting for hung processes.
-  ${If} $2 == 1
-    System::Call 'user32::SendMessageTimeoutW(p 0xFFFF, i 0x001A, p 0, w "Environment", i 0x0002, i 1000, *p 0)'
-  ${EndIf}
+  ; Register $INSTDIR and $INSTDIR\resources into user PATH via winreg (avoids NSIS 1024-char ReadRegStr truncation)
+  nsExec::Exec '"$INSTDIR\${MAINBINARYNAME}.exe" --register-path'
 
   ; Clean up legacy ~/.local/bin files if left by older dropper versions
   IfFileExists "$PROFILE\.local\bin\jeikcode.exe" 0 +2
@@ -97,12 +38,7 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  ; Terminate any running instances before uninstalling
-  nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "jeikcode-daemon.exe" /T'
-  nsExec::Exec 'taskkill /F /IM "cli-bin.exe" /T'
-  Sleep 800
+  !insertmacro JEIKCODE_KILL_INSTDIR_BINARIES
 !macroend
 
 !macro NSIS_HOOK_UNINSTALL

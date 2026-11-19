@@ -507,7 +507,50 @@ fn open_in_external_browser(url: &str) {
 }
 
 #[cfg(target_os = "windows")]
-fn ensure_single_instance_windows() -> bool {
+struct WindowsMutexGuard(usize);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsMutexGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe {
+                CloseHandle(self.0 as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsEventHandle(usize);
+
+#[cfg(target_os = "windows")]
+impl WindowsEventHandle {
+    fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.0 as *mut std::ffi::c_void
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsEventHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe {
+                CloseHandle(self.0 as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_single_instance_windows() -> Option<(WindowsMutexGuard, Option<WindowsEventHandle>)> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
@@ -546,8 +589,12 @@ fn ensure_single_instance_windows() -> bool {
     const ASFW_ANY: u32 = 0xFFFF_FFFF;
 
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, mutex_name.as_ptr()) };
+    if handle.is_null() {
+        return Some((WindowsMutexGuard(0), None));
+    }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
+            CloseHandle(handle);
             AllowSetForegroundWindow(ASFW_ANY);
             // 触发激活命名事件，由主实例主线程规范执行窗口还原与激活，
             // 绝不在外部进程跨进程直接调用 ShowWindow 篡改 HWND 导致 tao 内部 WindowFlags 失步。
@@ -557,46 +604,41 @@ fn ensure_single_instance_windows() -> bool {
                 CloseHandle(ev);
             }
         }
-        return true;
+        return None;
     }
-    let _ = handle;
-    false
+    // Create the activation event immediately while holding the primary mutex so a second
+    // instance launching during cold startup never signals an event before it is opened.
+    let ev = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, event_name.as_ptr()) };
+    let event_guard = if ev.is_null() {
+        None
+    } else {
+        Some(WindowsEventHandle(ev as usize))
+    };
+    Some((WindowsMutexGuard(handle as usize), event_guard))
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
-    use std::os::windows::ffi::OsStrExt;
-
+fn spawn_single_instance_activation_listener(
+    window: tauri::WebviewWindow,
+    event_handle: Option<WindowsEventHandle>,
+) {
     #[link(name = "kernel32")]
     extern "system" {
-        fn CreateEventW(
-            lpEventAttributes: *mut std::ffi::c_void,
-            bManualReset: i32,
-            bInitialState: i32,
-            lpName: *const u16,
-        ) -> *mut std::ffi::c_void;
         fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
     }
 
-    let event_name: Vec<u16> = std::ffi::OsStr::new("Local\\JeikCode_Desktop_Activate_Event")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let ev = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, event_name.as_ptr()) };
-    if ev.is_null() {
+    let Some(event_handle) = event_handle else {
         return;
-    }
-    let ev_addr = ev as usize;
+    };
     let window_for_thread = window.clone();
     std::thread::spawn(move || {
-        let handle = ev_addr as *mut std::ffi::c_void;
+        let _event_guard = event_handle;
         const WAIT_OBJECT_0: u32 = 0;
         loop {
             if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                 break;
             }
-            let rc = unsafe { WaitForSingleObject(handle, 400) };
+            let rc = unsafe { WaitForSingleObject(_event_guard.as_ptr(), 400) };
             if rc == WAIT_OBJECT_0 {
                 // 必须调度到主事件循环线程执行还原与聚焦，确保 tao 内部 WindowFlags::VISIBLE 100% 同步恢复
                 let win = window_for_thread.clone();
@@ -605,10 +647,31 @@ fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
                 });
             }
         }
-        unsafe {
-            CloseHandle(handle);
-        }
     });
+}
+
+fn should_register_path_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|a| a.as_ref() == "--register-path")
+}
+
+fn maybe_register_path_cli() -> Option<i32> {
+    if !should_register_path_args(std::env::args()) {
+        return None;
+    }
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        let cleaned_exe = strip_windows_verbatim_path(&exe);
+        if let Some(dir) = cleaned_exe.parent() {
+            let _ = migrate_hkcu_path(&[dir.to_path_buf(), dir.join("resources")]);
+        }
+    }
+    Some(0)
 }
 
 /// Fast-path for `--schedule-run <id>` when invoked by Windows Task Scheduler.
@@ -643,17 +706,22 @@ fn main() {
     if let Some(code) = maybe_run_scheduled_task_cli() {
         std::process::exit(code);
     }
+    if let Some(code) = maybe_register_path_cli() {
+        std::process::exit(code);
+    }
 
     #[cfg(target_os = "windows")]
-    if ensure_single_instance_windows() {
-        return;
-    }
+    let (_single_instance_mutex, mut single_instance_event) = match ensure_single_instance_windows()
+    {
+        Some(handles) => handles,
+        None => return,
+    };
 
     let child = Mutex::new(None);
     tauri::Builder::default()
         .manage(ChildSlot(child))
         .manage(TrayUiState(Mutex::new(None)))
-        .setup(|app| {
+        .setup(move |app| {
             let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
             let new_win_origin = Arc::clone(&webui_origin);
@@ -716,7 +784,7 @@ fn main() {
             let window = window_builder.build()?;
 
             #[cfg(target_os = "windows")]
-            spawn_single_instance_activation_listener(window.clone());
+            spawn_single_instance_activation_listener(window.clone(), single_instance_event.take());
 
             watch_host_presence(window.clone());
             #[cfg(not(target_os = "windows"))]
@@ -2072,5 +2140,19 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.0, 200);
         assert_eq!(decoded.1, "{\"service\":\"jeikcode-daemon\"}");
+    }
+
+    #[test]
+    fn should_register_path_args_detects_flag_after_argv0() {
+        assert!(super::should_register_path_args([
+            "jeikcode-desktop.exe",
+            "--register-path"
+        ]));
+        assert!(!super::should_register_path_args(["--register-path"]));
+        assert!(!super::should_register_path_args([
+            "jeikcode-desktop.exe",
+            "--schedule-run",
+            "daily-check"
+        ]));
     }
 }
