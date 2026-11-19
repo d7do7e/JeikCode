@@ -2870,7 +2870,7 @@ fn live_stream_from_registry(
     });
 
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
-    let (replay, mut rx) = match reg.subscribe_or_empty(&session_id, working_dir.clone(), None) {
+    let (replay, rx) = match reg.subscribe_or_empty(&session_id, working_dir.clone(), None) {
         Ok(pair) => pair,
         Err(error) => {
             return (
@@ -2891,27 +2891,7 @@ fn live_stream_from_registry(
         }
     }
 
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(sequenced) => {
-                    if let Some(w) = project_registry_event(&mut projector, sequenced) {
-                        if tx.send(w).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "registry /live stream lagged");
-                    if tx.send(live_lag_warning_event(skipped)).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    spawn_registry_live_forwarder(rx, tx, projector);
 
     let head_stream = futures::stream::iter(head).map(|wire| {
         let frame = live_wire_frame_json(&wire, true);
@@ -2938,6 +2918,79 @@ fn live_stream_from_registry(
         axum::http::HeaderValue::from_static("no"),
     );
     resp
+}
+
+fn spawn_registry_live_forwarder(
+    mut rx: broadcast::Receiver<jeikcode_coding::session_runtime_registry::SequencedSessionEvent>,
+    tx: mpsc::UnboundedSender<LiveWireEvent>,
+    mut projector: NativeLiveWireProjector,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let recv = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                recv = rx.recv() => recv,
+            };
+            match recv {
+                Ok(sequenced) => {
+                    if let Some(w) = project_registry_event(&mut projector, sequenced) {
+                        if tx.send(w).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "registry /live stream lagged");
+                    if tx.send(live_lag_warning_event(skipped)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn spawn_hub_live_forwarder(
+    mut rx: broadcast::Receiver<crate::live_hub::LiveObservation>,
+    tx: mpsc::UnboundedSender<LiveWireEvent>,
+    mut projector: NativeLiveWireProjector,
+    runtime_instance_id: String,
+    binding_id: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let recv = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                recv = rx.recv() => recv,
+            };
+            match recv {
+                Ok(observation) if observation.binding_id == binding_id => {
+                    if let Some(w) = projector.project_at_generation(
+                        Some(&runtime_instance_id),
+                        observation.generation,
+                        observation.event,
+                    ) {
+                        if tx.send(w).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "hub /live stream lagged");
+                    if tx.send(live_lag_warning_event(skipped)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn live_lag_warning_event(skipped: u64) -> LiveWireEvent {
@@ -3026,33 +3079,8 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
         }
     }
     let binding_id = join.binding.id;
-    let mut rx = join.receiver;
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(observation) if observation.binding_id == binding_id => {
-                    if let Some(w) = projector.project_at_generation(
-                        Some(&runtime_instance_id),
-                        observation.generation,
-                        observation.event,
-                    ) {
-                        if tx.send(w).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Ok(_) => break,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "hub /live stream lagged");
-                    if tx.send(live_lag_warning_event(skipped)).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let rx = join.receiver;
+    spawn_hub_live_forwarder(rx, tx, projector, runtime_instance_id, binding_id);
 
     let head_stream = futures::stream::iter(head).map(|wire| {
         let frame = live_wire_frame_json(&wire, true);
@@ -6055,6 +6083,49 @@ mod tests {
             }
             _ => panic!("expected LiveWireEvent::UserMessage"),
         }
+    }
+
+    #[tokio::test]
+    async fn live_sse_forwarders_exit_when_tx_closes_without_events() {
+        let (reg_tx, _reg_rx) = broadcast::channel::<
+            jeikcode_coding::session_runtime_registry::SequencedSessionEvent,
+        >(8);
+        let (out_tx1, out_rx1) = mpsc::unbounded_channel();
+        let h1 = spawn_registry_live_forwarder(
+            reg_tx.subscribe(),
+            out_tx1,
+            NativeLiveWireProjector {
+                session_id: "s1".into(),
+                ..Default::default()
+            },
+        );
+        tokio::task::yield_now().await;
+        assert!(!h1.is_finished());
+        drop(out_rx1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), h1)
+            .await
+            .expect("registry live forwarder must exit on tx.closed()")
+            .unwrap();
+
+        let (hub_tx, _hub_rx) = broadcast::channel::<crate::live_hub::LiveObservation>(8);
+        let (out_tx2, out_rx2) = mpsc::unbounded_channel();
+        let h2 = spawn_hub_live_forwarder(
+            hub_tx.subscribe(),
+            out_tx2,
+            NativeLiveWireProjector {
+                session_id: "s2".into(),
+                ..Default::default()
+            },
+            "rt-1".into(),
+            1,
+        );
+        tokio::task::yield_now().await;
+        assert!(!h2.is_finished());
+        drop(out_rx2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), h2)
+            .await
+            .expect("hub live forwarder must exit on tx.closed()")
+            .unwrap();
     }
 
     #[test]

@@ -590,6 +590,8 @@ pub(crate) async fn execute_git_workflow(
 
     let cleanup_chats = state.active_chats.clone();
     let cleanup_op = operation_id.clone();
+    let cleanup_session = session_id.clone();
+    let err_tx = fan_tx.clone();
     let terminal_sent_inner = terminal_sent.clone();
     let mcp_pool = state.mcp_pool.clone();
     let telemetry = state.telemetry.clone();
@@ -606,32 +608,43 @@ pub(crate) async fn execute_git_workflow(
     };
 
     tokio::spawn(async move {
-        let result = CurrentContext::scope(ctx, || async move {
-            process_chat_request(
-                chat_req,
-                fan_tx,
-                cancel_for_proc,
-                op_for_proc,
-                active_chats_for_proc,
-                mcp_pool,
-                telemetry,
-                pending_permissions,
-                pending_user_inputs,
-                false, // interactive_permission
-                false, // interactive_user_input
-                terminal_sent_inner,
-                true, // keep_raw_markdown
-                // Webhook-driven automation is API-owned: forced Auto, never the
-                // interactive global mode switch.
-                Some(crate::approval_mode::ApprovalMode::Auto),
-            )
-            .await
-        })
+        let inner = tokio::spawn(async move {
+            let res = CurrentContext::scope(ctx, || async move {
+                process_chat_request(
+                    chat_req,
+                    fan_tx,
+                    cancel_for_proc,
+                    op_for_proc,
+                    active_chats_for_proc,
+                    mcp_pool,
+                    telemetry,
+                    pending_permissions,
+                    pending_user_inputs,
+                    false, // interactive_permission
+                    false, // interactive_user_input
+                    terminal_sent_inner,
+                    true, // keep_raw_markdown
+                    // Webhook-driven automation is API-owned: forced Auto, never the
+                    // interactive global mode switch.
+                    Some(crate::approval_mode::ApprovalMode::Auto),
+                )
+                .await
+            })
+            .await;
+            if let Err(ref e) = res {
+                tracing::error!("[git_webhook] process_chat_request failed: {e}");
+            }
+            res
+        });
+        crate::finalize_chat_task(
+            inner,
+            &err_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            &cleanup_session,
+            &terminal_sent,
+        )
         .await;
-        if let Err(e) = result {
-            tracing::error!("[git_webhook] process_chat_request failed: {e}");
-        }
-        cleanup_chats.complete(&cleanup_op).await;
     });
 
     // 7. 收集审查输出结果

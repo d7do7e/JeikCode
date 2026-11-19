@@ -3943,29 +3943,7 @@ impl ActiveChatRegistry {
             watchers.retain(|_, tx| !tx.is_closed());
             let n = watchers.len();
             for (_cid, tx) in watchers {
-                let mut rx = bus.subscribe();
-                tokio::spawn(async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok((seq, event)) => {
-                                let terminal = matches!(
-                                    event,
-                                    ChatEvent::Done { .. }
-                                        | ChatEvent::Error { .. }
-                                        | ChatEvent::Stopped
-                                );
-                                if tx.send((seq, event)).is_err() {
-                                    break;
-                                }
-                                if terminal {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
+                spawn_chat_watch_bus_forwarder(bus.subscribe(), tx);
             }
             n
         } else {
@@ -5593,21 +5571,18 @@ where
     router.route("/events", get(global_events_stream))
 }
 
-/// GET /events — cross-instance invalidation stream (SSE).
-///
-/// The first frame is `{"type":"sync"}` so a connecting client performs one
-/// cold-start alignment; afterwards only real changes are pushed.
-async fn global_events_stream() -> axum::response::Response {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures::StreamExt as _;
-    use std::convert::Infallible;
-
-    let mut rx = global_events().subscribe();
-    let (tx, out_rx) = mpsc::unbounded_channel::<String>();
-    let _ = tx.send(serde_json::json!({ "type": "sync" }).to_string());
+fn spawn_global_events_forwarder(
+    mut rx: tokio::sync::broadcast::Receiver<GlobalWireEvent>,
+    tx: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
+            let recv = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                recv = rx.recv() => recv,
+            };
+            match recv {
                 Ok(event) => match serde_json::to_string(&event) {
                     Ok(json) => {
                         if tx.send(json).is_err() {
@@ -5620,7 +5595,22 @@ async fn global_events_stream() -> axum::response::Response {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
+}
+
+/// GET /events — cross-instance invalidation stream (SSE).
+///
+/// The first frame is `{"type":"sync"}` so a connecting client performs one
+/// cold-start alignment; afterwards only real changes are pushed.
+async fn global_events_stream() -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt as _;
+    use std::convert::Infallible;
+
+    let rx = global_events().subscribe();
+    let (tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let _ = tx.send(serde_json::json!({ "type": "sync" }).to_string());
+    spawn_global_events_forwarder(rx, tx);
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx)
         .map(|json| Ok::<Event, Infallible>(Event::default().data(json)));
@@ -15275,6 +15265,56 @@ pub(crate) async fn admit_chat_turn(
     })
 }
 
+struct GoalAdmitGuard {
+    active_chats: ActiveChatRegistry,
+    operation_id: String,
+    session_id: String,
+    pending_permissions: permission_bridge::PermissionResponders,
+    pending_user_inputs: permission_bridge::UserInputResponders,
+    completed: bool,
+}
+
+impl GoalAdmitGuard {
+    fn new(
+        active_chats: ActiveChatRegistry,
+        operation_id: String,
+        session_id: String,
+        pending_permissions: permission_bridge::PermissionResponders,
+        pending_user_inputs: permission_bridge::UserInputResponders,
+    ) -> Self {
+        Self {
+            active_chats,
+            operation_id,
+            session_id,
+            pending_permissions,
+            pending_user_inputs,
+            completed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for GoalAdmitGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pending_permissions
+                .unregister_session(&self.session_id);
+            self.pending_user_inputs
+                .unregister_session(&self.session_id);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let chats = self.active_chats.clone();
+                let op_id = self.operation_id.clone();
+                rt.spawn(async move {
+                    chats.complete(&op_id).await;
+                });
+            }
+        }
+    }
+}
+
 pub(crate) enum GoalBridgeCommand {
     Launch {
         condition: String,
@@ -15321,27 +15361,13 @@ pub(crate) async fn launch_or_resume_goal_bridge(
     let operation_id = admission.operation_id;
     let cancel_token = admission.cancellation;
 
-    struct GoalAdmitGuard {
-        active_chats: ActiveChatRegistry,
-        operation_id: String,
-        completed: bool,
-    }
-    impl Drop for GoalAdmitGuard {
-        fn drop(&mut self) {
-            if !self.completed {
-                let chats = self.active_chats.clone();
-                let op_id = self.operation_id.clone();
-                tokio::spawn(async move {
-                    chats.complete(&op_id).await;
-                });
-            }
-        }
-    }
-    let mut admit_guard = GoalAdmitGuard {
-        active_chats: state.active_chats.clone(),
-        operation_id: operation_id.clone(),
-        completed: false,
-    };
+    let admit_guard = GoalAdmitGuard::new(
+        state.active_chats.clone(),
+        operation_id.clone(),
+        session_id.clone(),
+        state.pending_permissions.clone(),
+        state.pending_user_inputs.clone(),
+    );
 
     if let Err(err) = crate::native_live::ensure_registry_runner(
         working_dir.clone(),
@@ -15480,9 +15506,9 @@ pub(crate) async fn launch_or_resume_goal_bridge(
     let bridge_session_id = session_id.clone();
     let bridge_working_dir = working_dir.clone();
     let bridge_op_id = operation_id.clone();
-    admit_guard.completed = true;
 
     tokio::spawn(async move {
+        let mut admit_guard = admit_guard;
         let mut projector = ChatRuntimeProjector::default();
         let mut terminal_sent = false;
         let mut in_turn = is_launch;
@@ -15729,6 +15755,7 @@ pub(crate) async fn launch_or_resume_goal_bridge(
         pending_permissions.unregister_session(&bridge_session_id);
         pending_user_inputs.unregister_session(&bridge_session_id);
         active_chats.complete(&bridge_op_id).await;
+        admit_guard.disarm();
     });
 
     Ok(initial_progress)
@@ -15971,7 +15998,7 @@ async fn chat_stream(
 
 /// Await the inner chat task, translating its outcome into SSE events and
 /// always calling `active_chats.complete()` afterwards — even on panic.
-async fn finalize_chat_task(
+pub(crate) async fn finalize_chat_task(
     inner: tokio::task::JoinHandle<anyhow::Result<()>>,
     event_tx: &mpsc::UnboundedSender<ChatEvent>,
     cleanup_chats: &ActiveChatRegistry,
@@ -16982,6 +17009,37 @@ struct ChatWatchQuery {
     client_id: Option<String>,
 }
 
+fn spawn_chat_watch_bus_forwarder(
+    mut bus_rx: tokio::sync::broadcast::Receiver<(u64, ChatEvent)>,
+    tx: mpsc::UnboundedSender<(u64, ChatEvent)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let recv = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                recv = bus_rx.recv() => recv,
+            };
+            match recv {
+                Ok((seq, event)) => {
+                    let terminal = matches!(
+                        event,
+                        ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+                    );
+                    if tx.send((seq, event)).is_err() {
+                        break;
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 /// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
 ///
 /// Emits the same `ChatEvent` JSON SSE frames as `POST /chat`, so the WebUI can
@@ -17122,28 +17180,7 @@ async fn chat_watch(
                 replay_head.truncate(cut + 1);
             }
             if terminal_at.is_none() {
-                tokio::spawn(async move {
-                    loop {
-                        match bus_rx.recv().await {
-                            Ok((seq, event)) => {
-                                let terminal = matches!(
-                                    event,
-                                    ChatEvent::Done { .. }
-                                        | ChatEvent::Error { .. }
-                                        | ChatEvent::Stopped
-                                );
-                                if tx.send((seq, event)).is_err() {
-                                    break;
-                                }
-                                if terminal {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
+                spawn_chat_watch_bus_forwarder(bus_rx, tx.clone());
             } else {
                 // No live pump: drop the sender so the SSE stream ends cleanly
                 // after the replayed terminal instead of hanging on keepalive.
@@ -17155,7 +17192,7 @@ async fn chat_watch(
                 .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, true)
                 .await
             {
-                WatchOutcome::Live(mut bus_rx) => {
+                WatchOutcome::Live(bus_rx) => {
                     // Race: turn admitted between the two lookups — no replay buffer
                     // snapshot, fall back to live-only + admitted user message.
                     tracing::debug!(
@@ -17166,30 +17203,7 @@ async fn chat_watch(
                         .active_chats
                         .replay_admitted_user(&session_id, &tx)
                         .await;
-                    tokio::spawn(async move {
-                        loop {
-                            match bus_rx.recv().await {
-                                Ok((seq, event)) => {
-                                    let terminal = matches!(
-                                        event,
-                                        ChatEvent::Done { .. }
-                                            | ChatEvent::Error { .. }
-                                            | ChatEvent::Stopped
-                                    );
-                                    if tx.send((seq, event)).is_err() {
-                                        break;
-                                    }
-                                    if terminal {
-                                        break;
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    continue
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    });
+                    spawn_chat_watch_bus_forwarder(bus_rx, tx.clone());
                 }
                 WatchOutcome::Standby => {
                     tracing::debug!(
@@ -17205,7 +17219,7 @@ async fn chat_watch(
             .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, false)
             .await
         {
-            WatchOutcome::Live(mut bus_rx) => {
+            WatchOutcome::Live(bus_rx) => {
                 tracing::debug!(
                     session_id = %session_id,
                     "chat_watch: STANDBY-ONLY attached live (admitted user + live)"
@@ -17218,28 +17232,7 @@ async fn chat_watch(
                     .active_chats
                     .replay_admitted_user(&session_id, &tx)
                     .await;
-                tokio::spawn(async move {
-                    loop {
-                        match bus_rx.recv().await {
-                            Ok((seq, event)) => {
-                                let terminal = matches!(
-                                    event,
-                                    ChatEvent::Done { .. }
-                                        | ChatEvent::Error { .. }
-                                        | ChatEvent::Stopped
-                                );
-                                if tx.send((seq, event)).is_err() {
-                                    break;
-                                }
-                                if terminal {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                });
+                spawn_chat_watch_bus_forwarder(bus_rx, tx.clone());
             }
             WatchOutcome::Standby => {
                 tracing::debug!(
@@ -30229,5 +30222,114 @@ mod server_lifecycle_tests {
 
         assert!(stop_app_server());
         drain_stopping_servers(&STOPPING_APP_SERVER).await;
+    }
+
+    #[tokio::test]
+    async fn sse_forwarder_and_standby_drain_exit_when_tx_closes_without_events() {
+        let (bus_tx, _bus_rx) = tokio::sync::broadcast::channel::<(u64, ChatEvent)>(16);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = spawn_chat_watch_bus_forwarder(bus_tx.subscribe(), tx);
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "forwarder should stay alive while rx is open"
+        );
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forwarder must exit promptly once tx closes without any bus events")
+            .unwrap();
+
+        // Exercise standby drain path: park a standby watcher, admit turn (drains standby),
+        // drop the standby receiver with zero bus events, and verify broadcast receiver count drops to 0.
+        let registry = ActiveChatRegistry::default();
+        let (standby_tx, standby_rx) = mpsc::unbounded_channel();
+        match registry
+            .subscribe_or_standby("standby-sess", Some("cid-1"), &standby_tx, true)
+            .await
+        {
+            WatchOutcome::Standby => {}
+            WatchOutcome::Live(_) => panic!("expected Standby"),
+        }
+        drop(standby_tx);
+        let admission = registry.admit(Some("standby-sess"), None).await.unwrap();
+        let bus_rx_count = || async {
+            registry
+                .inner
+                .read()
+                .await
+                .operations
+                .get(&admission.operation_id)
+                .map(|op| op.event_bus.receiver_count())
+                .unwrap_or(0)
+        };
+        assert_eq!(bus_rx_count().await, 1);
+        drop(standby_rx);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bus_rx_count().await > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("standby-drained forwarder must exit and drop bus receiver on tx.closed()");
+        registry.complete(&admission.operation_id).await;
+
+        // Exercise global_events_stream forwarder helper with zero broadcast events.
+        let (g_tx, _g_rx) = tokio::sync::broadcast::channel::<GlobalWireEvent>(8);
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let g_handle = spawn_global_events_forwarder(g_tx.subscribe(), out_tx);
+        tokio::task::yield_now().await;
+        assert!(!g_handle.is_finished());
+        drop(out_rx);
+        tokio::time::timeout(Duration::from_secs(1), g_handle)
+            .await
+            .expect("global_events forwarder must exit promptly once out_rx drops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_admit_guard_completes_and_unregisters_on_panic() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("goal-sess-1"), None).await.unwrap();
+        let perms = permission_bridge::PermissionResponders::new();
+        let inputs = permission_bridge::UserInputResponders::new();
+
+        let (perm_tx, _perm_rx) = tokio::sync::oneshot::channel();
+        perms.register(
+            "goal-sess-1".to_string(),
+            "perm-1".to_string(),
+            "bash".to_string(),
+            perm_tx,
+        );
+        let (input_tx, _input_rx) = tokio::sync::oneshot::channel();
+        inputs.register("goal-sess-1".to_string(), 7, input_tx);
+
+        let guard = GoalAdmitGuard::new(
+            registry.clone(),
+            admission.operation_id.clone(),
+            "goal-sess-1".into(),
+            perms.clone(),
+            inputs.clone(),
+        );
+        let panicked = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("simulated goal bridge panic");
+        });
+        assert!(panicked.await.unwrap_err().is_panic());
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            perms.deliver(
+                "goal-sess-1",
+                "perm-1",
+                permission_bridge::PermissionSubmission {
+                    decision: jeikcode_capabilities::tools::PermissionDecision::Deny,
+                    persist: false,
+                },
+            ),
+            permission_bridge::PermissionDelivery::Absent
+        ));
+        assert!(!inputs.deliver("goal-sess-1", 7, serde_json::json!({"text":"late"})));
+        assert!(registry.active_session_ids().await.is_empty());
     }
 }

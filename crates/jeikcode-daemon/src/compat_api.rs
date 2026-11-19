@@ -1136,40 +1136,46 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
 
     let cleanup_chats = active_chats.clone();
     let cleanup_op = operation_id.clone();
+    let cleanup_session = session_id.clone();
     let err_tx = fan_tx.clone();
+    let terminal_sent_outer = terminal_sent.clone();
     let interactive_permission = policy.interactive_permission;
     let interactive_user_input = policy.interactive_user_input;
     let http_cancel = cancel_token.clone();
     tokio::spawn(async move {
-        let result = CurrentContext::scope(ctx, || async move {
-            process_chat_request(
-                chat_req,
-                fan_tx,
-                cancel_token,
-                operation_id,
-                active_chats,
-                mcp_pool,
-                telemetry,
-                pending_permissions,
-                pending_user_inputs,
-                interactive_permission,
-                interactive_user_input,
-                terminal_sent_inner,
-                true,
-                // API turns always force Auto: the WebUI global mode switch must
-                // never leak into /v1/* behaviour.
-                policy.force_approval_mode,
-            )
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx, || async move {
+                process_chat_request(
+                    chat_req,
+                    fan_tx,
+                    cancel_token,
+                    operation_id,
+                    active_chats,
+                    mcp_pool,
+                    telemetry,
+                    pending_permissions,
+                    pending_user_inputs,
+                    interactive_permission,
+                    interactive_user_input,
+                    terminal_sent_inner,
+                    true,
+                    // API turns always force Auto: the WebUI global mode switch must
+                    // never leak into /v1/* behaviour.
+                    policy.force_approval_mode,
+                )
+                .await
+            })
             .await
-        })
+        });
+        crate::finalize_chat_task(
+            inner,
+            &err_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            &cleanup_session,
+            &terminal_sent_outer,
+        )
         .await;
-        if let Err(e) = result {
-            let _ = err_tx.send(ChatEvent::Error {
-                message: e.to_string(),
-                message_id: None,
-            });
-        }
-        cleanup_chats.complete(&cleanup_op).await;
     });
 
     if turn.stream {
