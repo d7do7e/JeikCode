@@ -39,14 +39,28 @@ const { messages, languageOptions } = load('./i18n.ts', {
 });
 const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]).sort();
 
-test('all three catalogs mirror English keys and placeholder occurrences', () => {
+test('all 11 catalogs mirror English keys and placeholder occurrences', () => {
   const keys = Object.keys(messages.en).sort();
   assert.ok(keys.length >= 650, 'catalog coverage must not shrink');
-  for (const lang of ['en', 'vi', 'zh']) {
-    assert.deepEqual(Object.keys(messages[lang]).sort(), keys);
+  const rawCatalogs = {
+    zh: messages.zh,
+    en: messages.en,
+    vi,
+    'zh-TW': zhTw,
+    ja,
+    ko,
+    ru,
+    fr,
+    es,
+    de,
+    ar,
+  };
+  assert.deepEqual(Object.keys(rawCatalogs).sort(), Object.keys(messages).sort());
+  for (const [lang, table] of Object.entries(rawCatalogs)) {
+    assert.deepEqual(Object.keys(table).sort(), keys, `${lang} raw key parity`);
     for (const key of keys) {
-      assert.ok(messages[lang][key].trim(), `${lang}:${key} is empty`);
-      assert.deepEqual(placeholders(messages[lang][key]), placeholders(messages.en[key]), `${lang}:${key}`);
+      assert.ok(table[key].trim(), `${lang}:${key} is empty`);
+      assert.deepEqual(placeholders(table[key]), placeholders(messages.en[key]), `${lang}:${key}`);
     }
   }
 });
@@ -88,6 +102,34 @@ test('Chat and diagram accessibility labels use translated catalog keys', () => 
   assert.ok(toast.includes(`aria-label={translate('common.dismiss')}`) || toast.includes(`aria-label={t('common.dismiss')}`), 'Toast dismiss aria-label');
   assert.ok(confirmDialog.includes('aria-label={effectiveCancel}'), 'ConfirmDialog close aria-label');
   assert.ok(!/aria-label="(?:Close|Dismiss)"/.test(sysSettings + gitPanel + modelSelector + toast + confirmDialog));
+});
+
+test('Sidebar, FileExplorer, and ConfirmDialog contain no hardcoded Chinese UI literals', () => {
+  const cjk = /[\u4e00-\u9fff]/;
+  for (const rel of ['./components/Sidebar.tsx', './components/FileExplorer.tsx', './components/ConfirmDialog.tsx']) {
+    const src = readFileSync(new URL(rel, import.meta.url), 'utf8');
+    const sf = ts.createSourceFile(rel, src, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
+    const hits = [];
+    const visit = (node) => {
+      if (
+        ts.isStringLiteral(node) ||
+        ts.isNoSubstitutionTemplateLiteral(node) ||
+        ts.isTemplateHead(node) ||
+        ts.isTemplateMiddle(node) ||
+        ts.isTemplateTail(node) ||
+        ts.isJsxText(node)
+      ) {
+        const text = node.text ?? '';
+        if (cjk.test(text)) {
+          const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+          hits.push(`${rel}:${line + 1}: ${text.trim()}`);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    assert.deepEqual(hits, [], `Hardcoded CJK UI literals found in ${rel}`);
+  }
 });
 
 test('language selectors share native self-names in English-first order', () => {

@@ -7,7 +7,7 @@ import { useT } from '../settings';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 export interface ConfirmDialogProps {
-  title: string;
+  title?: string;
   /** Already-translated body text. */
   body: string;
   confirmLabel?: string;
@@ -44,8 +44,9 @@ export function ConfirmDialog({
   onClose,
 }: ConfirmDialogProps) {
   const t = useT();
-  const effectiveConfirm = confirmLabel || t('common.confirm') || 'Confirm';
-  const effectiveCancel = cancelLabel || t('common.cancel') || 'Cancel';
+  const effectiveTitle = title || (alertOnly ? t('common.notice') : t('common.confirmAction'));
+  const effectiveConfirm = confirmLabel || t('common.confirm');
+  const effectiveCancel = cancelLabel || t('common.cancel');
   const displayIcon = icon ?? (danger ? '🗑' : '💡');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -138,7 +139,7 @@ export function ConfirmDialog({
       <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
         <div class="modal-header">
           <span style="font-size: 16px;">{displayIcon}</span>
-          <h3>{title}</h3>
+          <h3>{effectiveTitle}</h3>
           <button
             type="button"
             class="ghost-btn modal-close"
@@ -245,7 +246,7 @@ export function modalConfirm(options: {
     }
     setGlobalModalState({
       props: {
-        title: options.title || '确认操作',
+        title: options.title,
         body: options.body,
         icon: options.icon || (options.danger ? '⚠️' : '❓'),
         danger: options.danger ?? true,
@@ -279,7 +280,7 @@ export function modalPrompt(options: {
     }
     setGlobalModalState({
       props: {
-        title: options.title || '',
+        title: options.title,
         body: options.body || '',
         icon: options.icon || '✏️',
         danger: false,
@@ -315,7 +316,7 @@ export function modalAlert(options: {
     }
     setGlobalModalState({
       props: {
-        title: options.title || '提示',
+        title: options.title,
         body: options.body,
         icon: options.icon || 'ℹ️',
         danger: false,

@@ -349,8 +349,8 @@ function CapScopeToggles({
   const toggleBtn = (scope: CapScope, label: string, disabled: boolean, baseTitle: string) => {
     const key = `${item.kind}:${item.id}:${scope}`;
     const statusText = disabled
-      ? (scope === 'global' ? '全局：已禁用' : '项目：已禁用')
-      : (scope === 'global' ? '全局：已启用' : '项目：已启用');
+      ? (scope === 'global' ? t('cap.statusGlobalDisabled') : t('cap.statusProjectDisabled'))
+      : (scope === 'global' ? t('cap.statusGlobalEnabled') : t('cap.statusProjectEnabled'));
     const fullTitle = `${baseTitle} (${statusText})`;
     return (
       <div class="cap-scope-unit" title={fullTitle}>
@@ -1781,7 +1781,7 @@ export function Sidebar({
         !wasDisabled,
         cwd || undefined,
       );
-      if (!res.ok) setCapsError(res.error || 'toggle failed');
+      if (!res.ok) setCapsError(res.error || t('common.error'));
       // Give the runtime a beat to rebuild, then reconcile with the backend.
       await new Promise((resolve) => window.setTimeout(resolve, 300));
       refreshCapabilities();
@@ -2566,7 +2566,7 @@ export function Sidebar({
       <div
         class="sidebar-resizer"
         onMouseDown={handleResizerMouseDown as any}
-        title={t('sidebar.dragToResize') || 'Drag to resize'}
+        title={t('sidebar.dragToResize')}
       />
       <div class="sidebar-brand-row">
         <span class="sidebar-brand">
@@ -2606,7 +2606,7 @@ export function Sidebar({
           }}
         >
           <span class="sidebar-segment-icon">💬</span>
-          <span class="sidebar-segment-label">{t('sidebar.chats') || '对话'}</span>
+          <span class="sidebar-segment-label">{t('sidebar.chats')}</span>
         </button>
         <button
           type="button"
@@ -2617,7 +2617,7 @@ export function Sidebar({
           }}
         >
           <span class="sidebar-segment-icon">⏱</span>
-          <span class="sidebar-segment-label">{t('sidebar.tasks') || '任务'}</span>
+          <span class="sidebar-segment-label">{t('sidebar.tasks')}</span>
         </button>
         <button
           type="button"
@@ -2625,7 +2625,7 @@ export function Sidebar({
           onClick={() => setSidebarTab('files')}
         >
           <span class="sidebar-segment-icon">📁</span>
-          <span class="sidebar-segment-label">{t('sidebar.files') || '资源管理'}</span>
+          <span class="sidebar-segment-label">{t('sidebar.files')}</span>
         </button>
       </div>
 

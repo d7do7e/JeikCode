@@ -147,6 +147,8 @@ interface GroupedSearchResults {
 
 export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerProps) {
   const { t } = useSettings();
+  const tRef = useRef(t);
+  tRef.current = t;
   const rootPath = cwd || '.';
 
   const [tree, setTree] = useState<TreeNode[]>(() => getCachedTree(rootPath) || []);
@@ -403,7 +405,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       setCachedTree(rootPath, nodes);
       void saveCachedDirectoryTree(rootPath, nodes);
     } catch (err: any) {
-      showToast(err?.message || 'Failed to load file tree', 'error');
+      showToast(err?.message || tRef.current('explorer.loadTreeFailed'), 'error');
     } finally {
       setLoading(false);
     }
@@ -467,7 +469,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
         });
         node.loaded = true;
       } catch (err: any) {
-        showToast(err?.message || 'Failed to read directory', 'error');
+        showToast(err?.message || tRef.current('explorer.readDirFailed'), 'error');
       } finally {
         node.loading = false;
       }
@@ -564,11 +566,11 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       const allFilePaths = new Set(results.map((r) => r.file));
       setExpandedFiles(allFilePaths);
     } catch (err: any) {
-      showToast(err?.message || 'Search failed', 'error');
+      showToast(err?.message || t('explorer.searchFailed'), 'error');
     } finally {
       setSearchLoading(false);
     }
-  }, [searchQuery, rootPath]);
+  }, [searchQuery, rootPath, t]);
 
   // 按文件对搜索结果进行分组
   const groupedResults = useMemo(() => {
@@ -843,14 +845,14 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       <div class="file-explorer-header">
         <div class="file-explorer-title-row">
           <span class="file-explorer-title">
-            {searchMode === 'search' ? (t('explorer.search') || '搜索') : (t('explorer.title') || '资源管理器')}
+            {searchMode === 'search' ? t('explorer.search') : t('explorer.title')}
           </span>
           <div class="file-explorer-header-actions">
             <button
               type="button"
               class={'explorer-mode-btn' + (searchMode === 'tree' ? ' active' : '')}
               onClick={() => setSearchMode('tree')}
-              title={t('explorer.files') || '文件列表'}
+              title={t('explorer.files')}
             >
               📁
             </button>
@@ -861,7 +863,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                 setSearchMode('search');
                 setTimeout(() => searchInputRef.current?.focus(), 50);
               }}
-              title="全局搜索与替换 (Ctrl+F / Ctrl+H)"
+              title={t('explorer.searchReplaceTitle')}
             >
               🔍
             </button>
@@ -873,7 +875,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                 void saveCachedDirectoryTree(rootPath, []);
                 void loadRoot(true);
               }}
-              title="刷新文件树"
+              title={t('explorer.refreshTree')}
             >
               🔄
             </button>
@@ -887,7 +889,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
               <input
                 type="text"
                 class="vscode-search-field"
-                placeholder={t('explorer.filterPlaceholder') || '按名称或相对路径快速过滤定位…'}
+                placeholder={t('explorer.filterPlaceholder')}
                 value={filterQuery}
                 onInput={(e) => setFilterQuery((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
@@ -913,7 +915,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                     type="button"
                     class="search-clear-btn"
                     onClick={() => setFilterQuery('')}
-                    title="清空输入"
+                    title={t('explorer.clearInput')}
                   >
                     ×
                   </button>
@@ -932,7 +934,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                 ref={searchInputRef}
                 type="text"
                 class="vscode-search-field"
-                placeholder="搜索 (使用 ↑↓ 查看历史记录)"
+                placeholder={t('explorer.searchContent')}
                 value={searchQuery}
                 onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => e.key === 'Enter' && void executeGlobalSearch()}
@@ -947,7 +949,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                       setSearchResults([]);
                       searchInputRef.current?.focus();
                     }}
-                    title="清空输入"
+                    title={t('explorer.clearInput')}
                   >
                     ×
                   </button>
@@ -956,7 +958,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                   type="button"
                   class={'search-toggle-btn' + (matchCase ? ' active' : '')}
                   onClick={() => setMatchCase((v) => !v)}
-                  title="区分大小写 (Alt+C)"
+                  title={t('explorer.matchCaseTitle')}
                 >
                   Aa
                 </button>
@@ -964,7 +966,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                   type="button"
                   class={'search-toggle-btn' + (matchWholeWord ? ' active' : '')}
                   onClick={() => setMatchWholeWord((v) => !v)}
-                  title="全字匹配 (Alt+W)"
+                  title={t('explorer.matchWholeWordTitle')}
                 >
                   ab
                 </button>
@@ -972,7 +974,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                   type="button"
                   class={'search-toggle-btn' + (useRegex ? ' active' : '')}
                   onClick={() => setUseRegex((v) => !v)}
-                  title="使用正则表达式 (Alt+R)"
+                  title={t('explorer.useRegexTitle')}
                 >
                   .*
                 </button>
@@ -985,7 +987,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                 type="button"
                 class="replace-arrow-btn"
                 onClick={() => setReplaceOpen((v) => !v)}
-                title="切换替换"
+                title={t('explorer.toggleReplace')}
               >
                 {replaceOpen ? '▼' : '▶'}
               </button>
@@ -995,7 +997,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                     ref={replaceInputRef}
                     type="text"
                     class="vscode-search-field"
-                    placeholder="替换"
+                    placeholder={t('editor.replace')}
                     value={replaceQuery}
                     onInput={(e) => setReplaceQuery((e.target as HTMLInputElement).value)}
                   />
@@ -1008,7 +1010,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                           setReplaceQuery('');
                           replaceInputRef.current?.focus();
                         }}
-                        title="清空输入"
+                        title={t('explorer.clearInput')}
                       >
                         ×
                       </button>
@@ -1017,7 +1019,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                       type="button"
                       class={'search-toggle-btn' + (preserveCase ? ' active' : '')}
                       onClick={() => setPreserveCase((v) => !v)}
-                      title="保留大小写 (Alt+P)"
+                      title={t('explorer.preserveCaseTitle')}
                     >
                       AB
                     </button>
@@ -1025,7 +1027,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                       type="button"
                       class="search-toggle-btn"
                       onClick={() => showToast(t('editor.replaceAllSuccess', { n: 0 }), 'success')}
-                      title="全部替换 (Ctrl+Alt+Enter)"
+                      title={t('editor.replaceAllTitle')}
                     >
                       🔁
                     </button>
@@ -1044,12 +1046,12 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
             locateLoading ? (
               <div class="file-tree-loading">
                 <span class="git-spinner" />
-                <span>正在高性能搜索与路径定位中...</span>
+                <span>{t('explorer.locating')}</span>
               </div>
             ) : locateResults.length > 0 ? (
               <div class="file-locate-list">
                 <div class="file-locate-summary">
-                  <span>共找到 {locateResults.length} 个匹配项 (按 Enter 即可快速定位/打开)</span>
+                  <span>{t('explorer.locateCount', { n: locateResults.length })}</span>
                 </div>
                 {locateResults.map((item, idx) => {
                   const isSelected = idx === selectedLocateIdx;
@@ -1058,7 +1060,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                       key={item.path}
                       class={'file-locate-row' + (isSelected ? ' selected' : '')}
                       onClick={() => void handleSelectLocateItem(item)}
-                      title={`${item.path} (点击打开并定位)`}
+                      title={t('explorer.locateItemTitle', { path: item.path })}
                     >
                       <span class="file-tree-icon">{getFileIcon(item.name, item.is_dir, false)}</span>
                       <span class="file-locate-name">{item.name}</span>
@@ -1069,17 +1071,17 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                 })}
               </div>
             ) : (
-              <div class="file-tree-empty">未找到匹配的文件或路径</div>
+              <div class="file-tree-empty">{t('explorer.noLocateMatches')}</div>
             )
           ) : loading ? (
             <div class="file-tree-loading">
               <span class="git-spinner" />
-              <span>加载文件列表中...</span>
+              <span>{t('explorer.loadingTree')}</span>
             </div>
           ) : (
             <div class="file-tree-list">
               {tree.map((n) => renderNode(n, 0))}
-              {tree.length === 0 && <div class="file-tree-empty">无匹配文件</div>}
+              {tree.length === 0 && <div class="file-tree-empty">{t('explorer.noFiles')}</div>}
             </div>
           )
         ) : (
@@ -1088,19 +1090,19 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
             {searchLoading ? (
               <div class="file-tree-loading">
                 <span class="git-spinner" />
-                <span>全局搜索匹配中...</span>
+                <span>{t('explorer.searchInProgress')}</span>
               </div>
             ) : searchResults.length > 0 ? (
               <>
                 <div class="search-summary-bar">
-                  <span>{`${groupedResults.length} 文件中有 ${searchResults.length} 个结果`}</span>
+                  <span>{t('explorer.searchResultCount', { files: groupedResults.length, matches: searchResults.length })}</span>
                   <a
                     class="search-summary-action"
                     onClick={() => {
                       if (searchResults[0]) onOpenFile?.(searchResults[0].file, searchResults[0].line);
                     }}
                   >
-                    在编辑器中打开
+                    {t('explorer.openInEditor')}
                   </a>
                 </div>
 
@@ -1157,7 +1159,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
               </>
             ) : (
               <div class="file-tree-empty">
-                {searchQuery ? '未找到任何匹配结果' : '输入搜索词并按 Enter 开始全局搜索'}
+                {searchQuery ? t('explorer.noMatches') : t('explorer.searchPrompt')}
               </div>
             )}
           </div>
@@ -1255,8 +1257,8 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
           title={renameModal.node.is_dir ? t('explorer.renameFolderTitle') : t('explorer.renameFileTitle')}
           body={t('explorer.renamePrompt')}
           icon="✏️"
-          confirmLabel={t('common.confirm') || '确定'}
-          cancelLabel={t('common.cancel') || '取消'}
+          confirmLabel={t('common.confirm')}
+          cancelLabel={t('common.cancel')}
           danger={false}
           input={{
             defaultValue: renameModal.currentName,
@@ -1281,7 +1283,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
               : t('explorer.deleteSingleConfirm', { name: deleteModal.paths[0]?.split(/[\\/]/).pop() || deleteModal.paths[0] })
           }
           confirmLabel={t('explorer.delete')}
-          cancelLabel={t('common.cancel') || '取消'}
+          cancelLabel={t('common.cancel')}
           danger={true}
           onConfirm={() => executeDelete(deleteModal.paths)}
           onClose={() => setDeleteModal({ open: false, paths: [] })}
