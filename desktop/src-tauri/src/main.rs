@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use jeikcode_config::desktop_shared::{
@@ -299,61 +299,56 @@ fn cleanup_desktop_owned_children_windows() {
 }
 
 fn terminate_managed_child(app: &tauri::AppHandle) {
-    DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
-    if let Some(slot) = app.try_state::<ChildSlot>() {
-        let taken = slot.0.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(mut child) = taken {
-            #[cfg(unix)]
-            {
-                let pid = child.id() as i32;
-                if pid > 0 {
-                    extern "C" {
-                        fn kill(pid: i32, sig: i32) -> i32;
-                    }
-                    const SIGTERM: i32 = 15;
-                    unsafe {
-                        let _ = kill(-pid, SIGTERM);
-                    }
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    if DESKTOP_SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return;
     }
-    // 兜底 1：优先使用桌面壳当前拉起的真实 origin（处理端口冲突顺延后的实际端口），再回退配置端口
+    let taken = app
+        .try_state::<ChildSlot>()
+        .and_then(|slot| slot.0.lock().unwrap_or_else(|e| e.into_inner()).take());
     let live_origin = app
         .try_state::<LiveOriginSlot>()
         .and_then(|slot| slot.0.lock().unwrap_or_else(|e| e.into_inner()).clone());
-    let (cfg_host, cfg_port, token) = load_webui_listen();
-    let (target_host, target_port) = match live_origin {
-        Some(origin) => (origin.host, origin.port),
-        None => (cfg_host, cfg_port),
-    };
-    if target_port > 0 {
-        send_desktop_shutdown(&target_host, target_port, token.as_deref());
+    // 兜底 1：仅当本桌面壳实际拉起过子进程或记录过 live origin 时，才向 /shutdown 发送优雅关停请求，
+    // 避免启动失败页退出时误伤用户独立运行的 daemon。
+    if taken.is_some() || live_origin.is_some() {
+        let (cfg_host, cfg_port, token) = load_webui_listen();
+        let (target_host, target_port) = match live_origin {
+            Some(origin) => (origin.host, origin.port),
+            None => (cfg_host, cfg_port),
+        };
+        if target_port > 0 {
+            send_desktop_shutdown(&target_host, target_port, token.as_deref());
+        }
+    }
+    if let Some(managed) = taken {
+        managed.terminate_and_wait();
     }
     // 兜底 2：在 Windows 上，强力清理属于本桌面壳 PID 的后台子进程，彻底消除改参数重启后脱离的孤儿子进程
     #[cfg(target_os = "windows")]
     cleanup_desktop_owned_children_windows();
 }
 
-fn store_child_unless_shutting_down(
-    app: &tauri::AppHandle,
-    mut child: std::process::Child,
-) -> bool {
+fn clear_child_if_pid(app: &tauri::AppHandle, pid: u32) {
+    if let Some(slot) = app.try_state::<ChildSlot>() {
+        let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|c| c.pid == pid) {
+            *guard = None;
+        }
+    }
+}
+
+fn store_child_unless_shutting_down(app: &tauri::AppHandle, managed: ManagedChild) -> bool {
     if let Some(slot) = app.try_state::<ChildSlot>() {
         let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
         if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
             drop(guard);
-            let _ = child.kill();
-            let _ = child.wait();
+            managed.terminate_and_wait();
             return false;
         }
-        *guard = Some(child);
+        *guard = Some(managed);
         return true;
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    managed.terminate_and_wait();
     false
 }
 
@@ -393,8 +388,10 @@ fn handle_desktop_shell_action(
     }
     match url.path() {
         "/__desktop_action/hide_to_tray" => {
-            if let Some(window) = app.get_webview_window("main") {
-                hide_window_to_tray(&window);
+            if has_system_tray(app) {
+                if let Some(window) = app.get_webview_window("main") {
+                    hide_window_to_tray(&window);
+                }
             }
             true
         }
@@ -846,15 +843,20 @@ fn main() {
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     let action = load_close_action();
+                    let tray_available = has_system_tray(&app_handle_for_close);
                     match action.as_str() {
-                        "tray" => {
+                        "tray" if tray_available => {
                             api.prevent_close();
                             hide_window_to_tray(&close_window);
                         }
-                        "quit" => {
+                        "tray" | "quit" => {
                             terminate_managed_child(&app_handle_for_close);
                         }
                         _ => {
+                            if !tray_available {
+                                terminate_managed_child(&app_handle_for_close);
+                                return;
+                            }
                             api.prevent_close();
                             // 连点容错兜底：若 1.2 秒内再次点击 X，说明弹窗未能正常捕获或用户强行关闭，立即最小化到托盘
                             let mut last = last_close_for_event
@@ -891,14 +893,17 @@ fn main() {
                     }
                 }
             });
-            setup_system_tray(app).expect("初始化系统托盘图标失败");
+            if let Err(err) = setup_system_tray(app) {
+                eprintln!("warning: system tray unavailable: {err}");
+            }
 
             let handle = app.handle().clone();
             let boot_url_for_start = Arc::clone(&boot_url_slot);
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
-                    Ok((url, child, eof_rx, launch)) => {
-                        if !store_child_unless_shutting_down(&handle, child) {
+                    Ok((url, managed_child, exit_rx, launch)) => {
+                        let initial_pid = managed_child.pid;
+                        if !store_child_unless_shutting_down(&handle, managed_child) {
                             return;
                         }
                         // 必须先记下地址再导航，否则这次 WebUI 会被当成外链弹出浏览器。
@@ -912,7 +917,8 @@ fn main() {
                             window.clone(),
                             webui_origin.clone(),
                             boot_url_for_start,
-                            eof_rx,
+                            initial_pid,
+                            exit_rx,
                             launch,
                         );
                     }
@@ -1053,8 +1059,7 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
                 if let Some(window) = app.get_webview_window("main") {
                     let is_visible = window.is_visible().unwrap_or(false);
                     let is_minimized = window.is_minimized().unwrap_or(false);
-                    let is_focused = window.is_focused().unwrap_or(false);
-                    if is_visible && !is_minimized && is_focused {
+                    if should_hide_on_tray_click(is_visible, is_minimized) {
                         hide_window_to_tray(&window);
                     } else {
                         show_main_window(&window);
@@ -1075,7 +1080,170 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-struct ChildSlot(Mutex<Option<std::process::Child>>);
+fn has_system_tray(app: &tauri::AppHandle) -> bool {
+    app.try_state::<TrayUiState>()
+        .is_some_and(|state| state.0.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+}
+
+fn should_hide_on_tray_click(is_visible: bool, is_minimized: bool) -> bool {
+    is_visible && !is_minimized
+}
+
+struct ManagedChild {
+    pid: u32,
+    stdin: Option<std::process::ChildStdin>,
+    #[cfg(windows)]
+    kill_handle: usize,
+    exited: Arc<(Mutex<Option<Option<i32>>>, Condvar)>,
+}
+
+impl ManagedChild {
+    fn spawn_waiter(
+        mut child: std::process::Child,
+    ) -> (Self, std::sync::mpsc::Receiver<Option<i32>>) {
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        #[cfg(windows)]
+        let kill_handle = {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn DuplicateHandle(
+                    hSourceProcessHandle: *mut std::ffi::c_void,
+                    hSourceHandle: *mut std::ffi::c_void,
+                    hTargetProcessHandle: *mut std::ffi::c_void,
+                    lpTargetHandle: *mut *mut std::ffi::c_void,
+                    dwDesiredAccess: u32,
+                    bInheritHandle: i32,
+                    dwOptions: u32,
+                ) -> i32;
+            }
+            const PROCESS_TERMINATE: u32 = 0x0001;
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            let mut dup: *mut std::ffi::c_void = std::ptr::null_mut();
+            let ok = unsafe {
+                let proc = GetCurrentProcess();
+                DuplicateHandle(
+                    proc,
+                    child.as_raw_handle() as *mut std::ffi::c_void,
+                    proc,
+                    &mut dup,
+                    PROCESS_TERMINATE | SYNCHRONIZE,
+                    0,
+                    0,
+                )
+            };
+            if ok != 0 {
+                dup as usize
+            } else {
+                0
+            }
+        };
+        let exited = Arc::new((Mutex::new(None), Condvar::new()));
+        let exited_clone = Arc::clone(&exited);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = child.wait().ok().and_then(|status| status.code());
+            {
+                let (lock, cvar) = &*exited_clone;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(code);
+                cvar.notify_all();
+            }
+            let _ = exit_tx.send(code);
+        });
+        (
+            Self {
+                pid,
+                stdin,
+                #[cfg(windows)]
+                kill_handle,
+                exited,
+            },
+            exit_rx,
+        )
+    }
+
+    fn wait_exited_timeout(&self, timeout: Duration) -> Option<Option<i32>> {
+        let (lock, cvar) = &*self.exited;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = cvar
+            .wait_timeout_while(guard, timeout, |state| state.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
+    fn terminate_and_wait(mut self) {
+        // Close stdin first so the child's stdin-EOF lifeline exits immediately.
+        drop(self.stdin.take());
+        #[cfg(unix)]
+        {
+            if let Ok(pid) = i32::try_from(self.pid) {
+                if pid > 0 {
+                    extern "C" {
+                        fn kill(pid: i32, sig: i32) -> i32;
+                    }
+                    const SIGTERM: i32 = 15;
+                    const SIGKILL: i32 = 9;
+                    unsafe {
+                        if kill(-pid, SIGTERM) != 0 {
+                            let _ = kill(pid, SIGTERM);
+                        }
+                    }
+                    if self
+                        .wait_exited_timeout(Duration::from_millis(1200))
+                        .is_none()
+                    {
+                        unsafe {
+                            if kill(-pid, SIGKILL) != 0 {
+                                let _ = kill(pid, SIGKILL);
+                            }
+                        }
+                        let _ = self.wait_exited_timeout(Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if self
+                .wait_exited_timeout(Duration::from_millis(400))
+                .is_none()
+            {
+                if self.kill_handle != 0 {
+                    #[link(name = "kernel32")]
+                    extern "system" {
+                        fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32)
+                            -> i32;
+                    }
+                    unsafe {
+                        let _ = TerminateProcess(self.kill_handle as *mut std::ffi::c_void, 1);
+                    }
+                }
+                let _ = self.wait_exited_timeout(Duration::from_millis(800));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.kill_handle != 0 {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe {
+                let _ = CloseHandle(self.kill_handle as *mut std::ffi::c_void);
+            }
+            self.kill_handle = 0;
+        }
+    }
+}
+
+struct ChildSlot(Mutex<Option<ManagedChild>>);
 struct LiveOriginSlot(Arc<Mutex<Option<WebuiOrigin>>>);
 
 struct WebuiLaunch {
@@ -1133,8 +1301,8 @@ fn start_webui(
 ) -> Result<
     (
         String,
-        std::process::Child,
-        std::sync::mpsc::Receiver<()>,
+        ManagedChild,
+        std::sync::mpsc::Receiver<Option<i32>>,
         WebuiLaunch,
     ),
     String,
@@ -1154,7 +1322,8 @@ fn start_webui(
         home,
         bundled,
     };
-    let (url, child, eof_rx) = spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
+    let (url, managed_child, exit_rx) =
+        spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
     let probe_port = url
         .parse::<tauri::Url>()
         .ok()
@@ -1163,7 +1332,7 @@ fn start_webui(
     // Keep any temporary conflict-fallback port in memory only so user-configured
     // `webui-listen.json` port is never silently overwritten.
     launch.port = probe_port;
-    Ok((url, child, eof_rx, launch))
+    Ok((url, managed_child, exit_rx, launch))
 }
 
 #[cfg(windows)]
@@ -1264,7 +1433,7 @@ fn spawn_desktop_server(
     launch: &WebuiLaunch,
     exact_port: bool,
     url_timeout: Duration,
-) -> Result<(String, std::process::Child, std::sync::mpsc::Receiver<()>), String> {
+) -> Result<(String, ManagedChild, std::sync::mpsc::Receiver<Option<i32>>), String> {
     let mut cmd = Command::new(&launch.bin);
     cmd.arg("webui")
         .arg("--host")
@@ -1309,12 +1478,9 @@ fn spawn_desktop_server(
         .map_err(|e| format!("无法启动 {}：{e}", launch.bin.display()))?;
     assign_child_to_desktop_job(&child);
     let stderr = child.stderr.take();
-    let (url_result, eof_rx) = match stderr {
+    let url_result = match stderr {
         Some(pipe) => read_url(pipe, url_timeout),
-        None => {
-            let (_tx, rx) = std::sync::mpsc::channel();
-            (Ok(None), rx)
-        }
+        None => Ok(None),
     };
     let mut url = match url_result {
         Ok(Some(url)) => url,
@@ -1371,32 +1537,31 @@ fn spawn_desktop_server(
         let _ = child.wait();
         return Err("jeikcode webui 健康检查超时".to_string());
     }
-    Ok((url, child, eof_rx))
+    let (managed_child, exit_rx) = ManagedChild::spawn_waiter(child);
+    Ok((url, managed_child, exit_rx))
 }
 
 /// 纯事件驱动的子进程监管（0 轮询、0 死循环）：
-/// 线程平时完全阻塞在子进程 `stderr` 管道的内核 EOF 信号（`eof_rx.recv()`）上，0% CPU 占用；
-/// 仅当子进程因「自更新升级」或「小地球修改端口/地址立即重启」以显式退出码 `75` 退出（或首次闪退自愈）时，
-/// 才由桌面壳读取最新配置重新拉起并写回 `ChildSlot`，彻底消除状态失步与无限重启死循环。
+/// 线程直接阻塞等待子进程 `child.wait()` 退出信号（`exit_rx.recv()`），不受子进程衍生出的
+/// 后代进程继续持有 `stderr` 管道影响；仅当子进程因「自更新升级」或「小地球修改端口/地址立即重启」
+/// 以显式退出码 `75` 退出（或首次闪退自愈）时，才由桌面壳读取最新配置重新拉起并写回 `ChildSlot`。
 fn supervise_webui(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     origin: Arc<Mutex<Option<WebuiOrigin>>>,
     boot_url_slot: Arc<Mutex<Option<tauri::Url>>>,
-    mut eof_rx: std::sync::mpsc::Receiver<()>,
+    mut current_pid: u32,
+    mut exit_rx: std::sync::mpsc::Receiver<Option<i32>>,
     mut launch: WebuiLaunch,
 ) {
     std::thread::spawn(move || {
         let mut crash_recovered = false;
         loop {
-            // 阻塞等待当前子进程退出导致的管道 EOF 事件（0 轮询）
-            let _ = eof_rx.recv();
-            if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
-                return;
-            }
-            let Some(exit_code) = reap_exited_child(&app) else {
+            // 阻塞等待真实子进程退出事件（0 轮询，不依赖 stderr EOF）
+            let Ok(exit_code) = exit_rx.recv() else {
                 return;
             };
+            clear_child_if_pid(&app, current_pid);
             if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return;
             }
@@ -1455,8 +1620,9 @@ fn supervise_webui(
             };
 
             match spawned {
-                Ok((next_url, child, next_eof_rx)) => {
-                    if !store_child_unless_shutting_down(&app, child) {
+                Ok((next_url, managed_child, next_exit_rx)) => {
+                    let next_pid = managed_child.pid;
+                    if !store_child_unless_shutting_down(&app, managed_child) {
                         return;
                     }
                     let probe_port = next_url
@@ -1465,7 +1631,8 @@ fn supervise_webui(
                         .and_then(|parsed| parsed.port())
                         .unwrap_or(launch.port);
                     launch.port = probe_port;
-                    eof_rx = next_eof_rx;
+                    current_pid = next_pid;
+                    exit_rx = next_exit_rx;
                     open_webui_in_shell(&window, &origin, &next_url);
                 }
                 Err(err) => {
@@ -1475,19 +1642,6 @@ fn supervise_webui(
             }
         }
     });
-}
-
-fn reap_exited_child(app: &tauri::AppHandle) -> Option<Option<i32>> {
-    let slot = app.try_state::<ChildSlot>()?;
-    let mut child = slot
-        .0
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .take()?;
-    match child.wait() {
-        Ok(status) => Some(status.code()),
-        Err(_) => Some(None),
-    }
 }
 
 #[allow(dead_code)]
@@ -1570,12 +1724,8 @@ fn bundled_cli(app: &tauri::AppHandle) -> Option<PathBuf> {
 fn read_url(
     pipe: impl std::io::Read + Send + 'static,
     timeout: Duration,
-) -> (
-    Result<Option<String>, String>,
-    std::sync::mpsc::Receiver<()>,
-) {
+) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let (eof_tx, eof_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
         let mut pending = String::new();
@@ -1604,15 +1754,12 @@ fn read_url(
                 }
             }
         }
-        // 子进程已退出，stderr 管道关闭（EOF），立即事件通知 supervise_webui
-        let _ = eof_tx.send(());
     });
-    let res = match rx.recv_timeout(timeout) {
+    match rx.recv_timeout(timeout) {
         Ok(url) => Ok(Some(url)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("等待 WebUI 启动超时".into()),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
-    };
-    (res, eof_rx)
+    }
 }
 
 pub fn extract_webui_url(text: &str) -> Option<String> {
@@ -2328,5 +2475,81 @@ mod tests {
         assert!(!super::is_boot_page_url(&parse_url(
             "http://127.0.0.1:13457/index.html"
         )));
+    }
+
+    #[test]
+    fn should_hide_on_tray_click_ignores_focus_and_checks_visibility_and_minimized() {
+        assert!(super::should_hide_on_tray_click(true, false));
+        assert!(!super::should_hide_on_tray_click(true, true));
+        assert!(!super::should_hide_on_tray_click(false, false));
+        assert!(!super::should_hide_on_tray_click(false, true));
+    }
+
+    #[test]
+    fn managed_child_exit_fires_immediately_even_while_stderr_pipe_remains_open() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args([
+                "/C",
+                "echo http://127.0.0.1:13457/?token=test 1>&2 & start /B ping -n 3 127.0.0.1 >nul & exit 75",
+            ]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            use std::os::unix::process::CommandExt;
+            let mut c = Command::new("sh");
+            c.args([
+                "-c",
+                "echo http://127.0.0.1:13457/?token=test >&2; sleep 2 >/dev/null & exit 75",
+            ]);
+            c.process_group(0);
+            c
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn test child");
+        let stderr = child.stderr.take().expect("stderr pipe");
+        let url = super::read_url(stderr, Duration::from_secs(5))
+            .expect("read_url succeeds")
+            .expect("url parsed");
+        assert!(url.contains("token=test"));
+
+        let (managed, exit_rx) = super::ManagedChild::spawn_waiter(child);
+        // Must receive exit code 75 promptly without waiting 2s for the descendant holding stderr.
+        let code = exit_rx
+            .recv_timeout(Duration::from_millis(1200))
+            .expect("child exit notification must not block on inherited stderr");
+        assert_eq!(code, Some(75));
+        managed.terminate_and_wait();
+
+        // Verify terminate_and_wait terminates a live sleeping child cleanly without ESRCH stall.
+        #[cfg(windows)]
+        let mut live_cmd = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "6", "127.0.0.1"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut live_cmd = {
+            let mut c = Command::new("sleep");
+            c.arg("5");
+            c
+        };
+        live_cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let live_child = live_cmd.spawn().expect("spawn sleeping child");
+        let (live_managed, live_exit_rx) = super::ManagedChild::spawn_waiter(live_child);
+        live_managed.terminate_and_wait();
+        let _ = live_exit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminated child must exit promptly");
     }
 }
