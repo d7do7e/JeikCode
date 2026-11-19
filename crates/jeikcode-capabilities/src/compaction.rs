@@ -77,17 +77,11 @@ impl StubCompaction {
         }
     }
 
-    /// Upper bound `[sacred_floor, boundary)` eligible for stubbing: either the
-    /// turn-aligned `active_turn_start`, or — when a single long multi-round turn
-    /// has accumulated more than `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds — the
-    /// start of the last `MIN_INTRA_TURN_RECENT_ROUNDS` tool rounds inside the active turn.
-    pub(crate) fn stub_boundary(&self, msgs: &[Message], floor: usize) -> usize {
-        let turn_boundary = active_turn_start(msgs, self.keep_recent_turns);
-        if turn_boundary > floor {
-            return turn_boundary;
-        }
-        intra_turn_round_boundary(msgs, floor, MIN_INTRA_TURN_RECENT_ROUNDS)
-            .unwrap_or(turn_boundary)
+    /// Upper bound `[sacred_floor, boundary)` eligible for stubbing: strictly
+    /// turn-aligned via `active_turn_start` so `StubCompaction` only stubs closed
+    /// prior turns and never slides round-by-round inside an active turn.
+    pub(crate) fn stub_boundary(&self, msgs: &[Message], _floor: usize) -> usize {
+        active_turn_start(msgs, self.keep_recent_turns)
     }
 
     pub(crate) fn stub_rewrites_in_range(
@@ -96,11 +90,36 @@ impl StubCompaction {
         from: usize,
         to: usize,
     ) -> Vec<(usize, String)> {
+        self.stub_rewrites_in_range_inner(msgs, from, to, false)
+    }
+
+    /// Full-drain variant used only when a drain+summary is already resetting the
+    /// cache prefix, allowing superseded `read` outputs in the kept tail to fold.
+    pub(crate) fn stub_rewrites_in_range_for_drain(
+        &self,
+        msgs: &[Message],
+        from: usize,
+        to: usize,
+    ) -> Vec<(usize, String)> {
+        self.stub_rewrites_in_range_inner(msgs, from, to, true)
+    }
+
+    fn stub_rewrites_in_range_inner(
+        &self,
+        msgs: &[Message],
+        from: usize,
+        to: usize,
+        stub_superseded_reads: bool,
+    ) -> Vec<(usize, String)> {
         if to <= from {
             return Vec::new();
         }
         let id_to_tool = call_id_to_tool(msgs);
-        let superseded_reads = superseded_read_call_ids(msgs);
+        let superseded_reads = if stub_superseded_reads {
+            superseded_read_call_ids(msgs)
+        } else {
+            std::collections::HashSet::new()
+        };
         let superseded_skills = superseded_use_skill_call_ids(msgs);
         let mut rewrites: Vec<(usize, String)> = Vec::new();
         for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
@@ -486,7 +505,7 @@ impl OverflowCompaction {
                 return plan;
             }
         };
-        let rewrites = self.inner.stub_rewrites_in_range(
+        let rewrites = self.inner.stub_rewrites_in_range_for_drain(
             msgs,
             drain_to,
             self.inner.stub_boundary(msgs, drain_to),
@@ -1086,14 +1105,14 @@ fn auto_drain_would_help(
     let total_tokens: usize = view
         .messages
         .iter()
-        .map(|m| m.estimate_tokens_conservative() as usize)
+        .map(|m| m.estimate_tokens() as usize)
         .sum();
     if total_tokens == 0 {
         return false;
     }
     let drainable_tokens: usize = view.messages[floor..drain_to]
         .iter()
-        .map(|m| m.estimate_tokens_conservative() as usize)
+        .map(|m| m.estimate_tokens() as usize)
         .sum();
     let remaining_tokens_est = total_tokens.saturating_sub(drainable_tokens);
     // Token estimate of what survives the drain, by token share of the recorded usage.
@@ -1186,7 +1205,7 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
     };
     let active_tokens: usize = msgs[active..]
         .iter()
-        .map(|m| m.estimate_tokens_conservative() as usize)
+        .map(|m| m.estimate_tokens() as usize)
         .sum();
 
     // Intra-turn round-pair slicing: when the current active turn alone exceeds
@@ -1215,12 +1234,12 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
             let mut boundary = round_starts[max_cut_idx];
             let mut kept: usize = msgs[boundary..]
                 .iter()
-                .map(|m| m.estimate_tokens_conservative() as usize)
+                .map(|m| m.estimate_tokens() as usize)
                 .sum();
             for &r_start in round_starts[..max_cut_idx].iter().rev() {
                 let seg_tokens: usize = msgs[r_start..boundary]
                     .iter()
-                    .map(|m| m.estimate_tokens_conservative() as usize)
+                    .map(|m| m.estimate_tokens() as usize)
                     .sum();
                 if kept + seg_tokens > keep_budget_tokens {
                     break;
@@ -1241,7 +1260,7 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
         }
         let turn_tokens: usize = msgs[s..boundary]
             .iter()
-            .map(|m| m.estimate_tokens_conservative() as usize)
+            .map(|m| m.estimate_tokens() as usize)
             .sum();
         if kept + turn_tokens > keep_budget_tokens {
             break;
@@ -3206,7 +3225,7 @@ Dependencies verified.
     }
 
     #[tokio::test]
-    async fn stub_compaction_stubs_superseded_read_outputs_while_keeping_latest_read() {
+    async fn stub_compaction_keeps_superseded_reads_exempt_while_drain_stubs_them() {
         let read_body_1 = format!(
             "1→fn alpha() {{}}\n{}\nFile: src/lib.rs\nTotal Lines: 50 | Total Bytes: 1200\nShowing lines 1-50 | Complete file.\n",
             "x".repeat(800)
@@ -3252,12 +3271,88 @@ Dependencies verified.
             Message::user("turn 3 active"),
         ];
         let v = view(&msgs, 2);
-        let plan = StubCompaction::default().plan(&v).await;
-        let rewritten_indices: Vec<usize> = plan.rewrites.iter().map(|(idx, _)| *idx).collect();
+        let stub = StubCompaction::default();
+        let cache_preserving_plan = stub.plan(&v).await;
+        assert!(
+            cache_preserving_plan.rewrites.is_empty(),
+            "normal StubCompaction must keep superseded reads exempt so prefix cache is not busted: {:?}",
+            cache_preserving_plan.rewrites
+        );
+
+        let drain_rewrites = stub.stub_rewrites_in_range_for_drain(&msgs, 2, 5);
+        let rewritten_indices: Vec<usize> = drain_rewrites.iter().map(|(idx, _)| *idx).collect();
         assert_eq!(
             rewritten_indices,
             vec![3],
-            "superseded read r1 (idx 3) must be stubbed while non-superseded r_other (idx 4) and latest r2 (idx 7) stay exempt"
+            "drain-time stub_rewrites_in_range_for_drain must stub superseded r1 (idx 3) while keeping r_other (idx 4) and latest r2 (idx 7) exempt"
+        );
+
+        // Also verify full-drain manual_plan on a 4-turn fixture: Turn 0 drains, Turn 1's r1 lands
+        // in the kept closed-turn tail [drain_to .. active_turn_start) and is stubbed during drain.
+        let big_turn0 = "Q".repeat(60_000);
+        let msgs_4turn = vec![
+            Message::system("sys"),
+            Message::user("turn 0"),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "t0".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("t0", &big_turn0, false),
+            Message::user("turn 1"),
+            Message::assistant(
+                "",
+                vec![
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "r1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    },
+                    jeikcode_kernel::tool::ToolCall {
+                        id: "r_other".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src/other.rs"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result("r1", &read_body_1, false),
+            Message::tool_result("r_other", &other_read, false),
+            Message::user("turn 2"),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            ),
+            Message::tool_result("r2", &read_body_2, false),
+            Message::user("turn 3 active"),
+        ];
+        let strat = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        let manual = strat
+            .plan(&CompactionView {
+                messages: &msgs_4turn,
+                trigger: CompactTrigger::Manual { focus: None },
+                ctx_window: 60_000,
+                used_tokens: 45_000,
+                utilization: 0.75,
+                sacred_floor: 2,
+            })
+            .await;
+        assert_eq!(manual.drain_from, 2);
+        assert_eq!(manual.drain_to, 4);
+        let manual_rewrites: Vec<usize> = manual.rewrites.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(
+            manual_rewrites,
+            vec![6],
+            "manual_plan drain must stub superseded r1 (idx 6) in the kept closed-turn tail while leaving r_other (idx 7) and latest r2 (idx 10) intact"
         );
     }
 
@@ -3458,7 +3553,7 @@ Dependencies verified.
         );
         let big_grep = "G".repeat(1_200);
 
-        let mut msgs = vec![
+        let msgs = vec![
             Message::system("sys"),
             Message::user("build feature"),
             // Round 1: load plan-tribunal (v1) + grep
@@ -3497,19 +3592,17 @@ Dependencies verified.
             ),
             Message::tool_result("sk2", &guide_v2, false), // idx 6 (latest plan-tribunal -> exempt!)
             Message::tool_result("sk3", &guide_inquisitor, false), // idx 7 (latest exec-inquisitor -> exempt!)
-        ];
-        // Add 5 more tool rounds inside the same turn so Rounds 1 & 2 fall before intra-turn stub_boundary
-        for r in 3..=7 {
-            msgs.push(Message::assistant(
+            Message::user("turn 2 active"),
+            Message::assistant(
                 "",
                 vec![jeikcode_kernel::tool::ToolCall {
-                    id: format!("g{r}"),
+                    id: "g3".into(),
                     name: "grep".into(),
                     arguments: r#"{"pattern":"bar"}"#.into(),
                 }],
-            ));
-            msgs.push(Message::tool_result(format!("g{r}"), &big_grep, false));
-        }
+            ),
+            Message::tool_result("g3", &big_grep, false),
+        ];
 
         let v = view(&msgs, 2);
         let plan = StubCompaction::default().plan(&v).await;
@@ -3626,6 +3719,71 @@ Dependencies verified.
         // keep_budget == 0 with <= 4 rounds keeps the full active turn intact (zero-budget invariant).
         let zero_boundary = recent_keep_boundary(&msgs, 0, 1);
         assert_eq!(zero_boundary, 1);
+    }
+
+    #[tokio::test]
+    async fn stub_compaction_does_not_slide_intra_turn_boundary_inside_single_active_turn() {
+        let big_bash = "B".repeat(1_200);
+        let mut msgs = vec![Message::system("sys"), Message::user("single active turn")];
+        for r in 1..=8 {
+            msgs.push(Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: format!("b{r}"),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            ));
+            msgs.push(Message::tool_result(format!("b{r}"), &big_bash, false));
+        }
+        let plan = StubCompaction::default().plan(&view(&msgs, 2)).await;
+        assert!(
+            plan.rewrites.is_empty(),
+            "StubCompaction must never slide intra-turn round boundaries inside an active turn: {:?}",
+            plan.rewrites
+        );
+    }
+
+    #[test]
+    fn recent_keep_boundary_uses_standard_estimate_for_read_arrows() {
+        // 10,000 lines with `→` inflate conservative estimates above 23,500 tokens,
+        // while standard `estimate_tokens()` keeps this read-heavy turn under budget.
+        let read_output = (1..=10_000)
+            .map(|n| format!("{n}→"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::assistant(
+                "",
+                vec![jeikcode_kernel::tool::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }],
+            ),
+            Message::tool_result("c1", &read_output, false),
+            Message::user("turn 2"),
+            Message::assistant("ok", vec![]),
+        ];
+        let conservative_turn1: usize = msgs[1..4]
+            .iter()
+            .map(|m| m.estimate_tokens_conservative() as usize)
+            .sum();
+        let standard_turn1: usize = msgs[1..4]
+            .iter()
+            .map(|m| m.estimate_tokens() as usize)
+            .sum();
+        assert!(
+            conservative_turn1 > 21_000 && standard_turn1 < 21_000,
+            "conservative={conservative_turn1}, standard={standard_turn1}"
+        );
+        let boundary = recent_keep_boundary(&msgs, 21_000, 1);
+        assert_eq!(
+            boundary, 1,
+            "recent_keep_boundary must keep Turn 1 under standard estimate_tokens() instead of inflating on `→`"
+        );
     }
 }
 

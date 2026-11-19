@@ -348,6 +348,103 @@ impl IntraTurnReadLoopGuard {
     }
 }
 
+const TURN_UNCACHED_WARN_TOKENS: u64 = 2_000_000;
+const MAX_TURN_UNCACHED_INPUT_TOKENS: u64 = 4_000_000;
+const MIN_CACHE_COLLAPSE_BASELINE: u32 = 32_768;
+const MAX_CONSECUTIVE_CACHE_COLLAPSES: u32 = 3;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TokenBudgetObservation {
+    warning: Option<String>,
+    stop_reason: Option<String>,
+}
+
+/// Per-turn circuit breaker against runaway uncached token burn and unexpected
+/// mid-turn prompt-cache collapses (e.g., prefix mutations without a committed drain).
+#[derive(Debug)]
+struct TurnTokenBudgetGuard {
+    uncached_input_tokens: u64,
+    warned_uncached: bool,
+    last_observed_epoch: u64,
+    peak_cached_in_epoch: u32,
+    consecutive_cache_collapses: u32,
+}
+
+impl TurnTokenBudgetGuard {
+    fn new(cache_epoch: u64) -> Self {
+        Self {
+            uncached_input_tokens: 0,
+            warned_uncached: false,
+            last_observed_epoch: cache_epoch,
+            peak_cached_in_epoch: 0,
+            consecutive_cache_collapses: 0,
+        }
+    }
+
+    fn reset(&mut self, cache_epoch: u64) {
+        *self = Self::new(cache_epoch);
+    }
+
+    fn observe_round(
+        &mut self,
+        prompt: u32,
+        cached: u32,
+        cache_epoch: u64,
+    ) -> TokenBudgetObservation {
+        // Reset baseline BEFORE evaluating usage when a committed drain/compaction
+        // or fresh-epoch rollover intentionally changed the prefix.
+        if cache_epoch != self.last_observed_epoch {
+            self.last_observed_epoch = cache_epoch;
+            self.peak_cached_in_epoch = 0;
+            self.consecutive_cache_collapses = 0;
+        }
+
+        let uncached = prompt.saturating_sub(cached) as u64;
+        self.uncached_input_tokens = self.uncached_input_tokens.saturating_add(uncached);
+
+        // Skip cache-collapse detection when the provider omitted usage (`prompt == 0`).
+        if prompt > 0 {
+            if self.peak_cached_in_epoch >= MIN_CACHE_COLLAPSE_BASELINE
+                && cached < self.peak_cached_in_epoch / 2
+            {
+                self.consecutive_cache_collapses =
+                    self.consecutive_cache_collapses.saturating_add(1);
+            } else {
+                self.consecutive_cache_collapses = 0;
+            }
+            self.peak_cached_in_epoch = self.peak_cached_in_epoch.max(cached);
+        }
+
+        let mut warning = None;
+        if !self.warned_uncached && self.uncached_input_tokens >= TURN_UNCACHED_WARN_TOKENS {
+            self.warned_uncached = true;
+            warning = Some(format!(
+                "warning: single turn has consumed {} uncached input tokens (limit: {})",
+                self.uncached_input_tokens, MAX_TURN_UNCACHED_INPUT_TOKENS
+            ));
+        }
+
+        let stop_reason = if self.uncached_input_tokens >= MAX_TURN_UNCACHED_INPUT_TOKENS {
+            Some(format!(
+                "stopped: single turn exceeded {} uncached input tokens (burned {} tokens; circuit breaker)",
+                MAX_TURN_UNCACHED_INPUT_TOKENS, self.uncached_input_tokens
+            ))
+        } else if self.consecutive_cache_collapses >= MAX_CONSECUTIVE_CACHE_COLLAPSES {
+            Some(format!(
+                "stopped: unexpected prompt-cache collapse (>50% drop from {} cached tokens) repeated {} consecutive rounds without a committed compaction",
+                self.peak_cached_in_epoch, self.consecutive_cache_collapses
+            ))
+        } else {
+            None
+        };
+
+        TokenBudgetObservation {
+            warning,
+            stop_reason,
+        }
+    }
+}
+
 fn is_readonly_exploration_tool(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
@@ -1741,11 +1838,7 @@ impl RunningAgent {
                 } else if meta.tokens.prompt > 0 {
                     meta.tokens.prompt.saturating_add(meta.tokens.completion)
                 } else {
-                    convo
-                        .messages
-                        .iter()
-                        .map(|m| m.estimate_tokens_conservative())
-                        .sum()
+                    convo.messages.iter().map(|m| m.estimate_tokens()).sum()
                 };
                 (meta.ctx_window, used)
             })?;
@@ -1876,6 +1969,15 @@ impl RunningAgent {
         convo: &mut Conversation,
         trigger: CompactTrigger,
     ) -> CompactionRunOutcome {
+        self.run_compaction_with_floor(convo, trigger, None).await
+    }
+
+    async fn run_compaction_with_floor(
+        &self,
+        convo: &mut Conversation,
+        trigger: CompactTrigger,
+        used_tokens_floor: Option<u32>,
+    ) -> CompactionRunOutcome {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
         // Raw prompt tokens from the most recent assistant meta (default 0 if none yet).
@@ -1901,10 +2003,12 @@ impl RunningAgent {
         let estimated_tokens: u32 = convo
             .messages
             .iter()
-            .map(|m| m.estimate_tokens_conservative() as u64)
+            .map(|m| m.estimate_tokens() as u64)
             .sum::<u64>()
             .min(u32::MAX as u64) as u32;
-        used_tokens = used_tokens.max(estimated_tokens);
+        used_tokens = used_tokens
+            .max(estimated_tokens)
+            .max(used_tokens_floor.unwrap_or(0));
         // Size this compaction to the CURRENT model's WATERMARK budget (fall back to the
         // recorded window only when the live window is unknown), and recompute pressure
         // against it. A compaction running after a model switch must use the NEW window —
@@ -2944,6 +3048,7 @@ impl RunningAgent {
         let mut synthesis_used = false;
         let mut read_loop_guard = IntraTurnReadLoopGuard::default();
         let mut last_counted_drain_round: Option<u32> = None;
+        let mut token_budget_guard = TurnTokenBudgetGuard::new(convo.cache_epoch);
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -3085,6 +3190,7 @@ impl RunningAgent {
                 echo_nudged = false;
                 midturn_noop_gate = None;
                 read_loop_guard.reset_all();
+                token_budget_guard.reset(convo.cache_epoch);
                 // 用户成功转换 steer 转向状态：刷新重置轮次计数与上限，开启全新轮次预算！
                 round = 1;
                 round_cap = self.max_rounds;
@@ -3132,10 +3238,8 @@ impl RunningAgent {
             // block below still owns the hard backstop.
             if active_internal_continuation.is_none() && !(round == 1 && boundary_compacted) {
                 let window = self.provider.context_window();
-                let messages_tokens: u64 = messages
-                    .iter()
-                    .map(|m| m.estimate_tokens_conservative() as u64)
-                    .sum();
+                let messages_tokens: u64 =
+                    messages.iter().map(|m| m.estimate_tokens() as u64).sum();
                 let heuristic_prompt = messages_tokens
                     .saturating_add(tool_defs_est)
                     .min(u32::MAX as u64) as u32;
@@ -3147,7 +3251,7 @@ impl RunningAgent {
                         .iter()
                         .rev()
                         .take_while(|m| m.role != crate::message::Role::Assistant)
-                        .map(|m| m.estimate_tokens_conservative())
+                        .map(|m| m.estimate_tokens())
                         .sum()
                 } else {
                     0
@@ -3187,10 +3291,14 @@ impl RunningAgent {
                                 && estimated_prompt >= prev_prompt.saturating_add(16_384);
                             !(escalated_to_summary || grew_materially)
                         });
-                    if !gated_by_noop && (will_summarize || round > 1) {
+                    if !gated_by_noop && will_summarize {
                         let epoch_before = convo.cache_epoch;
                         let outcome = self
-                            .run_compaction(convo, CompactTrigger::Auto { utilization })
+                            .run_compaction_with_floor(
+                                convo,
+                                CompactTrigger::Auto { utilization },
+                                Some(estimated_prompt),
+                            )
                             .await;
                         if outcome.drained && last_counted_drain_round != Some(round) {
                             last_counted_drain_round = Some(round);
@@ -4349,8 +4457,37 @@ impl RunningAgent {
             // From the next boundary on, parked steers fold normally.
             initial_prompt_round = false;
             self.hooks.on_turn_progress(convo).await;
+            let budget_obs =
+                token_budget_guard.observe_round(usage.prompt, usage.cached, convo.cache_epoch);
             if in_final_synthesis {
                 self.finish_turn_with_compaction(convo, StopReason::MaxRounds, &turn_ctx)
+                    .await;
+                return;
+            }
+            if let Some(warn) = budget_obs.warning {
+                if budget_obs.stop_reason.is_none() {
+                    self.rt.emit(AgentEvent::Warning(warn));
+                }
+            }
+            if let Some(stop_msg) = budget_obs.stop_reason {
+                if !pending_calls.is_empty() {
+                    convo.backfill_interrupted_tool_results();
+                    self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                    Self::persist_turn_diagnostic(convo, &stop_msg);
+                    self.finish_turn_with_compaction(
+                        convo,
+                        StopReason::ToolLoopDetected,
+                        &turn_ctx,
+                    )
+                    .await;
+                    return;
+                }
+                if !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    continue;
+                }
+                self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                Self::persist_turn_diagnostic(convo, &stop_msg);
+                self.finish_turn_with_compaction(convo, StopReason::ToolLoopDetected, &turn_ctx)
                     .await;
                 return;
             }
@@ -8096,5 +8233,300 @@ mod synthetic_send_tests {
         assert!(guard.compaction_stop_message().is_none());
         guard.note_drain_compaction();
         assert!(guard.compaction_stop_message().is_some());
+    }
+
+    #[test]
+    fn turn_token_budget_guard_handles_uncached_cap_cache_collapses_epochs_and_zero_prompt() {
+        let mut guard = TurnTokenBudgetGuard::new(0);
+
+        // 1. Omitted provider usage (`prompt == 0`) must never trip cache-collapse detection.
+        assert_eq!(
+            guard.observe_round(0, 0, 0),
+            TokenBudgetObservation::default()
+        );
+
+        // 2. Establish >= 32,768 cached baseline.
+        let obs = guard.observe_round(100_000, 90_000, 0);
+        assert_eq!(obs, TokenBudgetObservation::default());
+
+        // 3. Two >50% cache drops do not stop yet; third consecutive drop trips circuit breaker.
+        assert!(guard
+            .observe_round(100_000, 10_000, 0)
+            .stop_reason
+            .is_none());
+        assert!(guard
+            .observe_round(100_000, 10_000, 0)
+            .stop_reason
+            .is_none());
+        let tripped = guard.observe_round(100_000, 10_000, 0);
+        assert!(
+            tripped
+                .stop_reason
+                .as_deref()
+                .is_some_and(|s| s.contains("unexpected prompt-cache collapse")),
+            "3rd consecutive >50% collapse must trip guard: {tripped:?}"
+        );
+
+        // 4. Epoch change BEFORE usage evaluation resets peak & consecutive collapse streak.
+        let obs_new_epoch = guard.observe_round(100_000, 10_000, 1);
+        assert!(
+            obs_new_epoch.stop_reason.is_none(),
+            "committed compaction epoch advance must reset cache collapse streak: {obs_new_epoch:?}"
+        );
+
+        // 5. Steer reset clears both uncached counter and collapse streak; 2M warns, 4M stops.
+        guard.reset(1);
+        let warn_obs = guard.observe_round(2_000_000, 0, 1);
+        assert!(warn_obs.warning.is_some());
+        assert!(warn_obs.stop_reason.is_none());
+
+        let stop_obs = guard.observe_round(2_000_000, 0, 1);
+        assert!(
+            stop_obs
+                .stop_reason
+                .as_deref()
+                .is_some_and(|s| s.contains("4000000 uncached input tokens")),
+            "4M cumulative uncached tokens must stop turn: {stop_obs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn midturn_does_not_run_stub_compaction_and_aligns_will_summarize_floor() {
+        use crate::message::{CompactionPlan, CompactionStrategy, CompactionView};
+        use crate::testkit::{EchoTool, MockProvider};
+        use crate::tool::ToolCall;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct MidturnVerifyStrategy {
+            will_summarize_flag: AtomicBool,
+            plan_calls: AtomicUsize,
+            last_plan_used_tokens: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionStrategy for MidturnVerifyStrategy {
+            async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+                self.plan_calls.fetch_add(1, Ordering::Relaxed);
+                self.last_plan_used_tokens
+                    .store(view.used_tokens as usize, Ordering::Relaxed);
+                CompactionPlan::noop()
+            }
+
+            fn will_summarize(&self, _view: &CompactionView<'_>) -> bool {
+                self.will_summarize_flag.load(Ordering::Relaxed)
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+
+        // Scenario A: `will_summarize == false` across 3 rounds at high prompt usage -> mid-turn
+        // `StubCompaction`-only must NEVER fire `plan()`.
+        let strat_no_summary = Arc::new(MidturnVerifyStrategy {
+            will_summarize_flag: AtomicBool::new(false),
+            plan_calls: AtomicUsize::new(0),
+            last_plan_used_tokens: AtomicUsize::new(0),
+        });
+        let provider_a = Arc::new(
+            MockProvider::new(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        arguments: r#"{"text":"hello"}"#.into(),
+                    }),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 500,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c2".into(),
+                        name: "echo".into(),
+                        arguments: r#"{"text":"world"}"#.into(),
+                    }),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 520,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 540,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1_000),
+        );
+        let mut handle_a = Agent::builder()
+            .provider(provider_a)
+            .tools(reg.mount(&["echo"]))
+            .compaction(strat_no_summary.clone())
+            .compact_threshold(0.5)
+            .compact_on_turn_end(false)
+            .build()
+            .spawn();
+        handle_a
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+        while let Some(ev) = handle_a.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle_a.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle_a.task.await;
+        assert_eq!(
+            strat_no_summary.plan_calls.load(Ordering::Relaxed),
+            0,
+            "mid-turn compaction must not invoke stub-only CompactionStrategy::plan when will_summarize is false"
+        );
+
+        // Scenario B: `will_summarize == true` -> mid-turn passes `estimated_prompt` floor into
+        // `run_compaction_with_floor` (including `tail_since_last_asst`).
+        let strat_summary = Arc::new(MidturnVerifyStrategy {
+            will_summarize_flag: AtomicBool::new(true),
+            plan_calls: AtomicUsize::new(0),
+            last_plan_used_tokens: AtomicUsize::new(0),
+        });
+        let big_echo = "E".repeat(400);
+        let provider_b = Arc::new(
+            MockProvider::new(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        arguments: format!(r#"{{"text":"{big_echo}"}}"#),
+                    }),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 400,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 500,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1_000),
+        );
+        let mut handle_b = Agent::builder()
+            .provider(provider_b)
+            .tools(reg.mount(&["echo"]))
+            .compaction(strat_summary.clone())
+            .compact_threshold(0.5)
+            .compact_on_turn_end(false)
+            .build()
+            .spawn();
+        handle_b
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+        while let Some(ev) = handle_b.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle_b.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle_b.task.await;
+        assert_eq!(strat_summary.plan_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            strat_summary.last_plan_used_tokens.load(Ordering::Relaxed) >= 400 + 100,
+            "run_compaction_with_floor must preserve provider_context + tail_since_last_asst (>=500), got {}",
+            strat_summary.last_plan_used_tokens.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_budget_guard_stops_turn_and_suppresses_continuations() {
+        use crate::testkit::MockProvider;
+
+        let continuations_called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct AlwaysContinueHook(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::hook::LifecycleHooks for AlwaysContinueHook {
+            async fn offer_typed_continuation(
+                &self,
+                _convo: &Conversation,
+            ) -> Option<crate::hook::Continuation> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(crate::hook::Continuation::generic("keep going"))
+            }
+        }
+
+        // Single no-tool round burning 4,000,000 uncached tokens while truncated=true and
+        // `offer_typed_continuation` would otherwise keep looping.
+        let provider = Arc::new(
+            MockProvider::new(vec![vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 4_000_000,
+                    completion: 50,
+                    cached: 0,
+                }),
+                StreamEvent::Done { truncated: true },
+            ]])
+            .with_ctx_window(10_000_000),
+        );
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(AlwaysContinueHook(continuations_called.clone())))
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            let done = matches!(ev, AgentEvent::TurnComplete { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert_eq!(
+            continuations_called.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "tripped token budget guard must suppress truncation and hook continuations"
+        );
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            AgentEvent::TurnComplete {
+                reason: StopReason::ToolLoopDetected
+            }
+        )));
     }
 }
