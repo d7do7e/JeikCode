@@ -218,3 +218,27 @@ test('mergeCachePatch resets inherited lastSeq when operationId changes and clea
   const clearedSeq = mergeCachePatch('p-op', 's-op', nextOp, { lastSeq: null });
   assert.equal(clearedSeq.lastSeq, undefined);
 });
+
+test('deleteSessionCache and clearAllSessionCache cancel pendingPersist writes', async () => {
+  const { deleteSessionCache, flushPendingPersist, pendingPersistSize } = await import('./sessionCache.ts');
+  await clearAllSessionCache();
+  assert.equal(pendingPersistSize(), 0);
+
+  writeSessionCache('p-del', 's-del', {
+    messages: [{ role: 'user', content: 'to be deleted' }],
+  });
+  assert.equal(pendingPersistSize(), 1);
+  await deleteSessionCache('p-del', 's-del');
+  assert.equal(pendingPersistSize(), 0, 'deleteSessionCache must drop queued pendingPersist entry');
+  await flushPendingPersist();
+  assert.equal(getMemorySession('p-del', 's-del'), null);
+
+  writeSessionCache('p-clr', 's-clr', {
+    messages: [{ role: 'user', content: 'to be cleared' }],
+  });
+  assert.equal(pendingPersistSize(), 1);
+  await clearAllSessionCache();
+  assert.equal(pendingPersistSize(), 0, 'clearAllSessionCache must drop all queued pendingPersist entries');
+  await flushPendingPersist();
+  assert.equal(getMemorySession('p-clr', 's-clr'), null);
+});

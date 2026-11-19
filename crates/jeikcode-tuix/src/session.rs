@@ -452,6 +452,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 

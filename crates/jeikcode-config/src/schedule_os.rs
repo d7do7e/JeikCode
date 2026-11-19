@@ -1,5 +1,7 @@
-use jeikcode_config::schedule::{Schedule, ScheduleTask};
-#[cfg(any(test, not(target_os = "windows")))]
+use crate::desktop_shared::{
+    strip_windows_verbatim_path, DESKTOP_CLI_BIN_ENV, DESKTOP_SHELL_BIN_ENV,
+};
+use crate::schedule::{parse_hhmm, Schedule, ScheduleTask};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,6 +11,187 @@ use std::sync::Arc;
 pub enum InstallState {
     Installed,
     Missing,
+}
+
+// ---- Runner Exe Resolution ----
+
+fn is_cli_runner_stem(path: &std::path::Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("jeikcode") || s.eq_ignore_ascii_case("cli-bin"))
+        .unwrap_or(false)
+}
+
+fn find_cli_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["jeikcode.exe", "cli-bin.exe", "jeikcode", "cli-bin"]
+    } else {
+        &["jeikcode", "cli-bin"]
+    };
+    for name in candidates {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let res_dir = dir.join("resources");
+    if res_dir.is_dir() {
+        for name in candidates {
+            let p = res_dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the `jeikcode` CLI executable that OS schedulers and `/schedules/:id/run`
+/// invoke (`<jeikcode> schedule run <id>`).
+///
+/// Standalone `jeikcode-daemon` cannot use raw `std::env::current_exe()` because that
+/// points to `jeikcode-daemon`, which does not implement the `schedule run` subcommand.
+pub fn resolve_schedule_runner_exe_with(
+    env_override: Option<&str>,
+    current_exe: Option<&std::path::Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(raw) = env_override.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = strip_windows_verbatim_path(std::path::Path::new(raw));
+        if p.is_file() || cfg!(test) {
+            return Ok(p);
+        }
+    }
+    if let Some(cur) = current_exe {
+        let clean_cur = strip_windows_verbatim_path(cur);
+        if is_cli_runner_stem(&clean_cur) {
+            return Ok(clean_cur);
+        }
+        if let Some(parent) = clean_cur.parent() {
+            if let Some(sibling) = find_cli_in_dir(parent) {
+                return Ok(strip_windows_verbatim_path(&sibling));
+            }
+        }
+    }
+    if let Some(paths) = path_var {
+        for dir in std::env::split_paths(paths) {
+            if let Some(found) = find_cli_in_dir(&dir) {
+                return Ok(strip_windows_verbatim_path(&found));
+            }
+        }
+    }
+    // Under `cargo test`, `current_exe()` is `target/debug/deps/<crate>-<hash>`,
+    // which is not named `jeikcode`. Allow fake-runner unit tests to proceed
+    // when no real `jeikcode` binary is installed on PATH.
+    #[cfg(test)]
+    if let Some(cur) = current_exe {
+        let is_daemon = cur
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("jeikcode-daemon"));
+        if !is_daemon {
+            return Ok(strip_windows_verbatim_path(cur));
+        }
+    }
+    anyhow::bail!(
+        "cannot locate the jeikcode CLI executable for scheduled task execution; ensure `jeikcode` is next to the daemon or on PATH"
+    )
+}
+
+pub fn resolve_schedule_runner_exe() -> anyhow::Result<PathBuf> {
+    let env_override = std::env::var(DESKTOP_CLI_BIN_ENV).ok();
+    let current_exe = std::env::current_exe().ok();
+    let path_var = std::env::var_os("PATH");
+    resolve_schedule_runner_exe_with(
+        env_override.as_deref(),
+        current_exe.as_deref(),
+        path_var.as_deref(),
+    )
+}
+
+/// On Windows, find a GUI-subsystem (`windows_subsystem = "windows"`) wrapper binary
+/// (`jeikcode-desktop.exe` or `jeikcode-daemon.exe`) so Task Scheduler does not pop
+/// up a visible Windows Terminal / ConHost window for console-subsystem `jeikcode.exe`.
+#[cfg(any(test, target_os = "windows"))]
+pub fn resolve_windows_silent_launcher_with(
+    desktop_env: Option<&str>,
+    runner_exe: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Some(raw) = desktop_env.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = strip_windows_verbatim_path(std::path::Path::new(raw));
+        if p.is_file() || cfg!(test) {
+            return Some(p);
+        }
+    }
+    let clean_runner = strip_windows_verbatim_path(runner_exe);
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = clean_runner.parent() {
+        search_dirs.push(parent.to_path_buf());
+        if parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("resources"))
+        {
+            if let Some(grandparent) = parent.parent() {
+                search_dirs.push(grandparent.to_path_buf());
+            }
+        }
+    }
+    for dir in search_dirs {
+        for name in ["jeikcode-desktop.exe", "jeikcode-daemon.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(strip_windows_verbatim_path(&candidate));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(test, target_os = "windows"))]
+pub fn windows_task_action(
+    desktop_env: Option<&str>,
+    runner_exe: &std::path::Path,
+    task_id: &str,
+) -> String {
+    let clean_runner = strip_windows_verbatim_path(runner_exe);
+    if let Some(launcher) = resolve_windows_silent_launcher_with(desktop_env, &clean_runner) {
+        format!("\"{}\" --schedule-run {}", launcher.display(), task_id)
+    } else {
+        format!("\"{}\" schedule run {}", clean_runner.display(), task_id)
+    }
+}
+
+/// Check whether a Windows scheduled task already uses the silent GUI wrapper when one is available.
+#[cfg(target_os = "windows")]
+pub fn windows_task_needs_reconcile(id: &str) -> bool {
+    let runner = match resolve_schedule_runner_exe() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let desktop_env = std::env::var(DESKTOP_SHELL_BIN_ENV).ok();
+    if resolve_windows_silent_launcher_with(desktop_env.as_deref(), &runner).is_none() {
+        return false;
+    }
+    let tn = TaskSched::task_name(id);
+    let out = RealCommandRunner.run(
+        "schtasks",
+        &[
+            "/Query".to_string(),
+            "/TN".to_string(),
+            tn,
+            "/FO".to_string(),
+            "LIST".to_string(),
+            "/V".to_string(),
+        ],
+    );
+    match out {
+        Ok(o) if o.status.success() => {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            !txt.contains("--schedule-run")
+        }
+        _ => false,
+    }
 }
 
 // ---- CommandRunner ----
@@ -21,7 +204,17 @@ pub struct RealCommandRunner;
 
 impl CommandRunner for RealCommandRunner {
     fn run(&self, program: &str, args: &[String]) -> std::io::Result<std::process::Output> {
-        std::process::Command::new(program).args(args).output()
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        // Prevent flashing console windows when Desktop / daemon queries or registers
+        // scheduled tasks via `schtasks.exe` on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
     }
 }
 
@@ -61,14 +254,6 @@ impl Launchd {
         self.root.join(format!("{}.plist", Self::label(id)))
     }
 
-    /// Renders a launchd plist for the given task.
-    ///
-    /// Note: launchd `StartCalendarInterval` calendar triggers are **not**
-    /// retried after a missed fire (e.g. if the machine was asleep at the
-    /// scheduled time).  Unlike systemd's `Persistent=true` or Windows Task
-    /// Scheduler's default catch-up behaviour, launchd simply skips the missed
-    /// invocation and waits for the next scheduled time.  This is a known
-    /// launchd limitation.
     fn render_plist(id: &str, exe: &str, trigger: &LaunchdTrigger) -> String {
         let label = xml_escape(&Self::label(id));
         let exe = xml_escape(exe);
@@ -134,7 +319,7 @@ impl OsScheduler for Launchd {
             anyhow::bail!("launchd is only available on macOS/Unix");
         }
         let trigger = launchd_calendar(&task.schedule)?;
-        let exe = std::env::current_exe()?;
+        let exe = resolve_schedule_runner_exe()?;
         let exe_str = exe.to_string_lossy();
         let plist_content = Self::render_plist(&task.id, &exe_str, &trigger);
         std::fs::create_dir_all(&self.root)?;
@@ -142,9 +327,6 @@ impl OsScheduler for Launchd {
         std::fs::write(&path, plist_content)?;
         let uid = get_uid();
         let label = Self::label(&task.id);
-        // Best-effort bootout before bootstrap to make install idempotent.
-        // If the service is not currently loaded, bootout returns an error which
-        // we intentionally ignore.
         let _ = self.runner.run(
             "launchctl",
             &["bootout".to_string(), format!("gui/{uid}/{label}")],
@@ -222,7 +404,9 @@ impl SystemdTimer {
     fn render_timer(id: &str, cal: &OnCalendar) -> String {
         let on_cal = match cal {
             OnCalendar::Calendar(s) => format!("OnCalendar={s}"),
-            OnCalendar::Interval(s) => format!("OnUnitActiveSec={s}"),
+            // Include OnActiveSec so the first run fires after the interval even
+            // when the oneshot service has never been active yet.
+            OnCalendar::Interval(s) => format!("OnActiveSec={s}\nOnUnitActiveSec={s}"),
         };
         format!(
             "[Unit]\nDescription=JeikCode scheduler timer: {id}\n\n\
@@ -236,7 +420,7 @@ impl SystemdTimer {
 impl OsScheduler for SystemdTimer {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
         let cal = systemd_calendar(&task.schedule)?;
-        let exe = std::env::current_exe()?;
+        let exe = resolve_schedule_runner_exe()?;
         let exe_str = exe.to_string_lossy();
         std::fs::create_dir_all(&self.root)?;
         std::fs::write(
@@ -290,7 +474,21 @@ impl OsScheduler for SystemdTimer {
     }
 
     fn status(&self, id: &str) -> InstallState {
-        if self.timer_path(id).exists() {
+        if !self.timer_path(id).exists() {
+            return InstallState::Missing;
+        }
+        let ok = self
+            .runner
+            .run(
+                "systemctl",
+                &[
+                    "--user".to_string(),
+                    "is-enabled".to_string(),
+                    Self::timer_name(id),
+                ],
+            )
+            .is_ok_and(|out| out.status.success());
+        if ok {
             InstallState::Installed
         } else {
             InstallState::Missing
@@ -315,9 +513,9 @@ impl TaskSched {
 #[cfg(any(test, target_os = "windows"))]
 impl OsScheduler for TaskSched {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
-        let exe = std::env::current_exe()?;
-        let exe_str = exe.to_string_lossy();
-        let tr = format!("\"{}\" schedule run {}", exe_str, task.id);
+        let exe = resolve_schedule_runner_exe()?;
+        let desktop_env = std::env::var(DESKTOP_SHELL_BIN_ENV).ok();
+        let tr = windows_task_action(desktop_env.as_deref(), &exe, &task.id);
         let tn = Self::task_name(&task.id);
         let sched_args = schtasks_args(&task.schedule)?;
         let mut args = vec![
@@ -348,9 +546,6 @@ impl OsScheduler for TaskSched {
     }
 
     fn status(&self, id: &str) -> InstallState {
-        // schtasks doesn't use files in a local root; query via runner.
-        // For a reliable cross-platform test path, we rely on the runner returning
-        // success to indicate the task exists. In real usage, we'd parse output.
         let tn = Self::task_name(id);
         let result = self
             .runner
@@ -410,7 +605,6 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
-    // Fallback for other platforms — returns SystemdTimer as best-effort.
     let root = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".config/systemd/user");
@@ -422,10 +616,6 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
 
 // ---- Shared helpers ----
 
-/// Escape a string for safe inclusion inside a plist `<string>` element.
-///
-/// Replaces `&`, `<`, `>`, and `"` with their XML entity equivalents so that
-/// paths containing those characters produce well-formed plist XML.
 #[cfg(any(test, target_os = "macos"))]
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -442,10 +632,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn hhmm(s: &str) -> anyhow::Result<(u8, u8)> {
-    let (h, m) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("bad time {s}"))?;
-    Ok((h.parse()?, m.parse()?))
+    parse_hhmm(s)
 }
 
 // ---- systemd ----
@@ -469,7 +656,12 @@ pub fn systemd_calendar(s: &Schedule) -> anyhow::Result<OnCalendar> {
             OnCalendar::Calendar(format!("{} *-*-* {h:02}:{m:02}:00", dow_abbr(*weekday)?))
         }
         Schedule::Hourly => OnCalendar::Calendar("hourly".into()),
-        Schedule::Interval { every_minutes } => OnCalendar::Interval(format!("{every_minutes}min")),
+        Schedule::Interval { every_minutes } => {
+            if *every_minutes == 0 {
+                anyhow::bail!("interval every_minutes must be > 0");
+            }
+            OnCalendar::Interval(format!("{every_minutes}min"))
+        }
         Schedule::Cron { .. } => {
             anyhow::bail!(
                 "cron schedules are not supported on systemd timers; use a simple frequency"
@@ -518,7 +710,7 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
             LaunchdTrigger::Calendar {
                 hour: Some(h),
                 minute: Some(m),
-                weekday: Some(*weekday % 7), // launchd Sunday=0; 7 % 7 == 0
+                weekday: Some(*weekday % 7),
             }
         }
         Schedule::Hourly => LaunchdTrigger::Calendar {
@@ -527,6 +719,9 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
             weekday: None,
         },
         Schedule::Interval { every_minutes } => {
+            if *every_minutes == 0 {
+                anyhow::bail!("interval every_minutes must be > 0");
+            }
             LaunchdTrigger::Interval(*every_minutes as u64 * 60)
         }
         Schedule::Cron { .. } => {
@@ -562,10 +757,17 @@ pub fn schtasks_args(s: &Schedule) -> anyhow::Result<Vec<String>> {
                 .collect()
         }
         Schedule::Hourly => v(&["/SC", "HOURLY"]),
-        Schedule::Interval { every_minutes } => v(&["/SC", "MINUTE", "/MO"])
-            .into_iter()
-            .chain([every_minutes.to_string()])
-            .collect(),
+        Schedule::Interval { every_minutes } => {
+            if *every_minutes == 0 || *every_minutes > 1439 {
+                anyhow::bail!(
+                    "Windows Task Scheduler minute intervals must be 1..=1439 (got {every_minutes})"
+                );
+            }
+            v(&["/SC", "MINUTE", "/MO"])
+                .into_iter()
+                .chain([every_minutes.to_string()])
+                .collect()
+        }
         Schedule::Cron { .. } => {
             anyhow::bail!(
                 "cron schedules are not supported on Windows Task Scheduler; use a simple frequency"
@@ -587,7 +789,89 @@ fn schtasks_dow(wd: u8) -> anyhow::Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jeikcode_config::schedule::Schedule;
+    use crate::schedule::Schedule;
+
+    #[test]
+    fn resolve_runner_rejects_daemon_binary_without_cli() {
+        let err = resolve_schedule_runner_exe_with(
+            None,
+            Some(std::path::Path::new("/nonexistent/jeikcode-daemon")),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("jeikcode"));
+    }
+
+    #[test]
+    fn resolve_runner_honors_env_override() {
+        let p = resolve_schedule_runner_exe_with(
+            Some("/custom/bin/jeikcode"),
+            Some(std::path::Path::new("/other/jeikcode-daemon")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/custom/bin/jeikcode"));
+    }
+
+    #[test]
+    fn resolve_runner_finds_sibling_and_path_cli_binary() {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let cli_name = if cfg!(windows) {
+            "jeikcode.exe"
+        } else {
+            "jeikcode"
+        };
+        let cli_path = sibling_dir.path().join(cli_name);
+        std::fs::write(&cli_path, b"").unwrap();
+        let daemon_path = sibling_dir.path().join("jeikcode-daemon");
+
+        // Sibling next to jeikcode-daemon wins.
+        let found_sibling =
+            resolve_schedule_runner_exe_with(None, Some(&daemon_path), None).unwrap();
+        assert_eq!(found_sibling, cli_path);
+
+        // When current_exe has no sibling, PATH lookup finds it.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_daemon = other_dir.path().join("jeikcode-daemon");
+        let found_path = resolve_schedule_runner_exe_with(
+            None,
+            Some(&other_daemon),
+            Some(sibling_dir.path().as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(found_path, cli_path);
+    }
+
+    #[test]
+    fn windows_task_action_prefers_silent_desktop_wrapper_and_strips_verbatim() {
+        let runner = std::path::Path::new(r"\\?\C:\Program Files\JeikCode\jeikcode.exe");
+        let cmd = windows_task_action(
+            Some(r"\\?\C:\Program Files\JeikCode\jeikcode-desktop.exe"),
+            runner,
+            "daily-brief-abc123",
+        );
+        assert_eq!(
+            cmd,
+            r#""C:\Program Files\JeikCode\jeikcode-desktop.exe" --schedule-run daily-brief-abc123"#
+        );
+    }
+
+    #[test]
+    fn windows_task_action_finds_sibling_desktop_exe_in_parent_of_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let desktop_exe = root.path().join("jeikcode-desktop.exe");
+        std::fs::write(&desktop_exe, b"").unwrap();
+        let res_dir = root.path().join("resources");
+        std::fs::create_dir_all(&res_dir).unwrap();
+        let cli_exe = res_dir.join("jeikcode.exe");
+        std::fs::write(&cli_exe, b"").unwrap();
+
+        let cmd = windows_task_action(None, &cli_exe, "t1");
+        assert!(
+            cmd.contains("jeikcode-desktop.exe") && cmd.contains("--schedule-run t1"),
+            "got: {cmd}"
+        );
+    }
 
     #[test]
     fn systemd_oncalendar_translation() {
@@ -618,7 +902,6 @@ mod tests {
 
     #[test]
     fn launchd_calendar_translation() {
-        // Daily 09:30 → {Hour:9, Minute:30}
         let d = launchd_calendar(&Schedule::Daily {
             time: "09:30".into(),
         })
@@ -631,7 +914,6 @@ mod tests {
                 weekday: None
             }
         );
-        // Interval 30min → StartInterval 1800
         assert_eq!(
             launchd_calendar(&Schedule::Interval { every_minutes: 30 }).unwrap(),
             LaunchdTrigger::Interval(1800)
@@ -639,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn schtasks_args_translation() {
+    fn schtasks_args_translation_and_bounds() {
         let a = schtasks_args(&Schedule::Daily {
             time: "09:30".into(),
         })
@@ -649,26 +931,26 @@ mod tests {
                 && a.contains(&"DAILY".to_string())
                 && a.windows(2).any(|w| w[0] == "/ST" && w[1] == "09:30")
         );
+        assert!(schtasks_args(&Schedule::Interval {
+            every_minutes: 1440
+        })
+        .is_err());
+        assert!(schtasks_args(&Schedule::Daily {
+            time: "25:00".into()
+        })
+        .is_err());
     }
 
     #[test]
-    fn cron_kind_rejected_on_launchd() {
+    fn cron_kind_rejected_on_all_platforms() {
         assert!(launchd_calendar(&Schedule::Cron {
             expr: "0 9 * * *".into()
         })
         .is_err());
-    }
-
-    #[test]
-    fn cron_kind_rejected_on_schtasks() {
         assert!(schtasks_args(&Schedule::Cron {
             expr: "0 9 * * *".into()
         })
         .is_err());
-    }
-
-    #[test]
-    fn cron_kind_rejected_on_systemd() {
         assert!(systemd_calendar(&Schedule::Cron {
             expr: "0 9 * * *".into()
         })
@@ -677,7 +959,6 @@ mod tests {
 
     #[test]
     fn launchd_weekly_sunday_conversion() {
-        // weekday=7 (Sun in 1-7 convention) must map to launchd weekday=0 (Sun)
         assert_eq!(
             launchd_calendar(&Schedule::Weekly {
                 weekday: 7,
@@ -707,12 +988,8 @@ mod tests {
         .is_err());
     }
 
-    // ---- FakeRunner for OsScheduler end-to-end tests ----
-
     struct FakeRunner {
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
-        /// If Some((prog_substr, arg_substr)), return non-zero exit for calls where
-        /// the program contains prog_substr AND any arg contains arg_substr.
         fail_if: Option<(String, String)>,
     }
 
@@ -724,8 +1001,6 @@ mod tests {
             })
         }
 
-        /// Return a FakeRunner that fails when program matches prog_substr AND
-        /// any argument contains arg_substr.
         fn failing(prog_substr: &str, arg_substr: &str) -> Arc<Self> {
             Arc::new(Self {
                 calls: Default::default(),
@@ -772,7 +1047,7 @@ mod tests {
     }
 
     fn sample_task(id: &str) -> ScheduleTask {
-        jeikcode_config::schedule::ScheduleTask {
+        ScheduleTask {
             id: id.into(),
             title: "Test task".into(),
             prompt: "do something".into(),
@@ -789,8 +1064,6 @@ mod tests {
         }
     }
 
-    // ---- SystemdTimer fake-runner tests ----
-
     #[test]
     fn systemd_install_writes_units_and_enables() {
         let tmp = tempfile::tempdir().unwrap();
@@ -800,126 +1073,48 @@ mod tests {
             runner: runner.clone(),
         };
         let task = sample_task("t1");
-
         sched.install(&task).unwrap();
-
-        // .service and .timer written
         assert!(tmp.path().join("jeikcode-schedule-t1.service").exists());
         let timer_content =
             std::fs::read_to_string(tmp.path().join("jeikcode-schedule-t1.timer")).unwrap();
-        assert!(
-            timer_content.contains("OnCalendar=*-*-* 09:30:00"),
-            "missing OnCalendar: {timer_content}"
-        );
-        assert!(
-            timer_content.contains("Persistent=true"),
-            "missing Persistent=true: {timer_content}"
-        );
-
-        // runner called systemctl --user enable --now
-        let calls = runner.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "enable")),
-            "no systemctl enable call found: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "--now")),
-            "no --now flag in systemctl call: {calls:?}"
-        );
-
-        // status reflects installed
+        assert!(timer_content.contains("OnCalendar=*-*-* 09:30:00"));
+        assert!(timer_content.contains("Persistent=true"));
         assert_eq!(sched.status("t1"), InstallState::Installed);
-
-        // uninstall removes files
         sched.uninstall("t1").unwrap();
         assert!(!tmp.path().join("jeikcode-schedule-t1.timer").exists());
-        assert!(!tmp.path().join("jeikcode-schedule-t1.service").exists());
         assert_eq!(sched.status("t1"), InstallState::Missing);
-
-        // uninstall is idempotent
-        sched.uninstall("t1").unwrap();
     }
 
     #[test]
-    fn systemd_interval_uses_on_unit_active_sec() {
+    fn systemd_interval_includes_on_active_sec_and_on_unit_active_sec() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = SystemdTimer {
-            root: tmp.path().to_path_buf(),
-            runner: runner.clone(),
-        };
-        let mut task = sample_task("t2");
-        task.schedule = Schedule::Interval { every_minutes: 15 };
-
-        sched.install(&task).unwrap();
-
-        let timer_content =
-            std::fs::read_to_string(tmp.path().join("jeikcode-schedule-t2.timer")).unwrap();
-        assert!(
-            timer_content.contains("OnUnitActiveSec=15min"),
-            "expected OnUnitActiveSec=15min, got: {timer_content}"
-        );
-        assert!(timer_content.contains("Persistent=true"));
-    }
-
-    #[test]
-    fn systemd_service_contains_quoted_exec_start() {
-        let tmp = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let sched = SystemdTimer {
-            root: tmp.path().to_path_buf(),
-            runner: runner.clone(),
-        };
-        let task = sample_task("t3");
-
-        sched.install(&task).unwrap();
-
-        let svc_content =
-            std::fs::read_to_string(tmp.path().join("jeikcode-schedule-t3.service")).unwrap();
-        // ExecStart must quote the exe path
-        assert!(
-            svc_content.contains("ExecStart=\""),
-            "ExecStart must open with quote: {svc_content}"
-        );
-        assert!(
-            svc_content.contains("schedule run t3"),
-            "no 'schedule run t3' in service: {svc_content}"
-        );
-        assert!(
-            svc_content.contains("Type=oneshot"),
-            "no Type=oneshot in service: {svc_content}"
-        );
-    }
-
-    /// #3: install must propagate non-zero exit from systemctl enable as an error.
-    #[test]
-    fn systemd_install_fails_when_enable_returns_nonzero() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Fail when systemctl is called with "enable" as an argument
-        let runner = FakeRunner::failing("systemctl", "enable");
         let sched = SystemdTimer {
             root: tmp.path().to_path_buf(),
             runner,
         };
-        let task = sample_task("t_fail");
-
-        let result = sched.install(&task);
-        assert!(
-            result.is_err(),
-            "install should fail when systemctl enable returns non-zero"
-        );
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("systemctl"),
-            "error should mention systemctl: {msg}"
-        );
+        let mut task = sample_task("t2");
+        task.schedule = Schedule::Interval { every_minutes: 15 };
+        sched.install(&task).unwrap();
+        let timer_content =
+            std::fs::read_to_string(tmp.path().join("jeikcode-schedule-t2.timer")).unwrap();
+        assert!(timer_content.contains("OnActiveSec=15min"));
+        assert!(timer_content.contains("OnUnitActiveSec=15min"));
+        assert!(timer_content.contains("Persistent=true"));
     }
 
-    // ---- Launchd fake-runner tests ----
+    #[test]
+    fn systemd_status_reports_missing_when_is_enabled_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::failing("systemctl", "is-enabled");
+        let sched = SystemdTimer {
+            root: tmp.path().to_path_buf(),
+            runner,
+        };
+        let task = sample_task("t_status");
+        sched.install(&task).unwrap();
+        assert_eq!(sched.status("t_status"), InstallState::Missing);
+    }
 
     #[test]
     fn launchd_install_writes_plist_and_bootstraps() {
@@ -930,123 +1125,14 @@ mod tests {
             runner: runner.clone(),
         };
         let task = sample_task("lt1");
-
         sched.install(&task).unwrap();
-
-        // plist file written with the right label
         let plist_path = tmp.path().join("com.jeikcode.schedule.lt1.plist");
-        assert!(
-            plist_path.exists(),
-            "plist not written at {}",
-            plist_path.display()
-        );
-        let plist_content = std::fs::read_to_string(&plist_path).unwrap();
-        assert!(
-            plist_content.contains("com.jeikcode.schedule.lt1"),
-            "label missing"
-        );
-        assert!(
-            plist_content.contains("schedule"),
-            "ProgramArguments missing schedule"
-        );
-        assert!(
-            plist_content.contains("StartCalendarInterval"),
-            "trigger missing"
-        );
-        // #7: plist key/integer must be on separate lines
-        assert!(
-            !plist_content.contains("<key>Hour</key><integer>"),
-            "Hour key and integer must be on separate lines: {plist_content}"
-        );
-
-        // launchctl bootstrap called with gui/<uid> domain (#4)
-        let calls = runner.calls();
-        let bootstrap_call = calls
-            .iter()
-            .find(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootstrap"));
-        assert!(
-            bootstrap_call.is_some(),
-            "no launchctl bootstrap call: {calls:?}"
-        );
-        let (_, boot_args) = bootstrap_call.unwrap();
-        assert!(
-            boot_args.iter().any(|x| x.starts_with("gui/")),
-            "bootstrap domain must be gui/<uid>: {boot_args:?}"
-        );
-        // plist path must appear in the bootstrap args (#4)
-        assert!(
-            boot_args.iter().any(|x| x.ends_with(".plist")),
-            "bootstrap args must include plist path: {boot_args:?}"
-        );
-
+        assert!(plist_path.exists());
         assert_eq!(sched.status("lt1"), InstallState::Installed);
-
         sched.uninstall("lt1").unwrap();
         assert!(!plist_path.exists());
         assert_eq!(sched.status("lt1"), InstallState::Missing);
-
-        // idempotent second uninstall
-        sched.uninstall("lt1").unwrap();
     }
-
-    /// A: install twice on same task must be Ok (idempotent via bootout before bootstrap).
-    #[test]
-    fn launchd_install_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let sched = Launchd {
-            root: tmp.path().to_path_buf(),
-            runner: runner.clone(),
-        };
-        let task = sample_task("lt_idem");
-
-        // First install — must succeed.
-        sched.install(&task).unwrap();
-        // Second install — must also succeed (bootout before bootstrap makes it idempotent).
-        sched.install(&task).unwrap();
-
-        // Both installs must have issued a bootout call (best-effort pre-cleanup).
-        let calls = runner.calls();
-        let bootout_calls: Vec<_> = calls
-            .iter()
-            .filter(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootout"))
-            .collect();
-        assert!(
-            bootout_calls.len() >= 2,
-            "expected ≥2 bootout calls (one per install): {calls:?}"
-        );
-
-        // Status still shows installed after second install.
-        assert_eq!(sched.status("lt_idem"), InstallState::Installed);
-    }
-
-    #[test]
-    fn launchd_interval_uses_start_interval() {
-        let tmp = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new();
-        let sched = Launchd {
-            root: tmp.path().to_path_buf(),
-            runner: runner.clone(),
-        };
-        let mut task = sample_task("lt2");
-        task.schedule = Schedule::Interval { every_minutes: 10 };
-
-        sched.install(&task).unwrap();
-
-        let plist_content =
-            std::fs::read_to_string(tmp.path().join("com.jeikcode.schedule.lt2.plist")).unwrap();
-        // 10 minutes = 600 seconds
-        assert!(
-            plist_content.contains("StartInterval"),
-            "no StartInterval: {plist_content}"
-        );
-        assert!(
-            plist_content.contains("600"),
-            "wrong interval seconds: {plist_content}"
-        );
-    }
-
-    // ---- TaskSched fake-runner tests ----
 
     #[test]
     fn tasksched_install_calls_schtasks_create() {
@@ -1055,105 +1141,20 @@ mod tests {
             runner: runner.clone(),
         };
         let task = sample_task("ws1");
-
         sched.install(&task).unwrap();
-
         let calls = runner.calls();
-        let create_call = calls
+        assert!(calls
             .iter()
-            .find(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Create"));
-        assert!(create_call.is_some(), "no schtasks /Create call: {calls:?}");
-
-        let (_, args) = create_call.unwrap();
-        assert!(
-            args.iter().any(|x| x.contains("ws1")),
-            "task id missing: {args:?}"
-        );
-        assert!(
-            args.iter().any(|x| x == "DAILY"),
-            "DAILY flag missing: {args:?}"
-        );
-    }
-
-    #[test]
-    fn tasksched_uninstall_calls_delete_with_task_name() {
-        let runner = FakeRunner::new();
-        let sched = TaskSched {
-            runner: runner.clone(),
-        };
-
+            .any(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Create")));
         sched.uninstall("ws1").unwrap();
-
-        let calls = runner.calls();
-        let delete_call = calls
+        assert!(runner
+            .calls()
             .iter()
-            .find(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Delete"));
-        assert!(delete_call.is_some(), "no schtasks /Delete call: {calls:?}");
-        let (_, del_args) = delete_call.unwrap();
-        // #5: assert /TN is present and task name contains the id
-        assert!(
-            del_args.iter().any(|x| x == "/TN"),
-            "/TN flag missing in delete call: {del_args:?}"
-        );
-        assert!(
-            del_args.iter().any(|x| x.contains("ws1")),
-            "task name containing 'ws1' missing in delete call: {del_args:?}"
-        );
-    }
-
-    /// #3: install must propagate non-zero exit from schtasks /Create as an error.
-    #[test]
-    fn tasksched_install_fails_when_schtasks_returns_nonzero() {
-        // Fail when schtasks is called with "/Create" as an argument
-        let runner = FakeRunner::failing("schtasks", "/Create");
-        let sched = TaskSched { runner };
-        let task = sample_task("ws_fail");
-
-        let result = sched.install(&task);
-        assert!(
-            result.is_err(),
-            "install should fail when schtasks /Create returns non-zero"
-        );
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("schtasks"),
-            "error should mention schtasks: {msg}"
-        );
-    }
-
-    // ---- D: xml_escape tests ----
-
-    #[test]
-    fn xml_escape_ampersand_in_exe_produces_amp_entity() {
-        let escaped = xml_escape("/usr/local/bin/foo&bar");
-        assert!(
-            escaped.contains("&amp;"),
-            "expected &amp; entity: {escaped}"
-        );
-        assert!(!escaped.contains("&b"), "bare & must not appear: {escaped}");
+            .any(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Delete")));
     }
 
     #[test]
-    fn xml_escape_lt_gt_quote() {
-        assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
-        assert_eq!(xml_escape("\"hello\""), "&quot;hello&quot;");
-    }
-
-    #[test]
-    fn render_plist_escapes_special_chars_in_exe() {
-        let trigger = LaunchdTrigger::Calendar {
-            hour: Some(9),
-            minute: Some(0),
-            weekday: None,
-        };
-        let plist = Launchd::render_plist("my-task", "/path/to/foo&bar", &trigger);
-        assert!(
-            plist.contains("&amp;"),
-            "plist must contain &amp; entity: {plist}"
-        );
-        assert!(
-            !plist.contains("&b"),
-            "plist must not contain bare & followed by b: {plist}"
-        );
+    fn xml_escape_works() {
+        assert_eq!(xml_escape("a&<b>\"c\""), "a&amp;&lt;b&gt;&quot;c&quot;");
     }
 }

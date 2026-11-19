@@ -1008,6 +1008,7 @@ pub async fn compact_snapshot(
     let mut conversation = Conversation {
         messages,
         cache_epoch: 0,
+        ..Default::default()
     };
     let floor = conversation.sacred_floor();
     let (recorded_window, used_tokens, _) = conversation.last_pressure();
@@ -7577,6 +7578,13 @@ fn resolve_reprepare_input(
                     }
                     if fresh.session_display_name.is_none() {
                         fresh.session_display_name = runtime.config.session_display_name.clone();
+                    }
+                    if fresh.session_origin == jeikcode_capabilities::session::SessionOrigin::Manual
+                    {
+                        fresh.session_origin = runtime.config.session_origin;
+                    }
+                    if fresh.session_schedule_id.is_none() {
+                        fresh.session_schedule_id = runtime.config.session_schedule_id.clone();
                     }
                     if let Some(routing) = fresh.subagent_config.clone() {
                         if fresh.subagent_fast_provider.is_none()

@@ -3109,7 +3109,15 @@ export function Chat({
         .then((active) => {
           if (terminalSeen || watchAbort.signal.aborted) return;
           if (!Array.isArray(active) || !active.includes(loadId)) {
+            if (
+              sessionWatchersRef.current.get(loadId) !== watchAbort ||
+              hasRunningLocalSend(loadId)
+            ) {
+              return;
+            }
             terminalSeen = true;
+            watchAbort.abort();
+            settleSessionRunningState(loadId);
             settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
             void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
           }

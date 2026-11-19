@@ -6,6 +6,7 @@ import { lazy, Suspense } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
+import { TasksPanel } from './components/TasksPanel';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { LegacyMigrationModal } from './components/LegacyMigrationModal';
@@ -165,6 +166,15 @@ export function App() {
     () =>
       onGlobalEvent((event) => {
         if (event.type === 'sync') {
+          getActiveChatSessions()
+            .then((ids) => {
+              setLiveRunningIds((prev) => {
+                const next = new Set(ids);
+                if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
+                return next;
+              });
+            })
+            .catch(() => {});
           if (sessionId) {
             void getChatPending(sessionId)
               .then((p: any) => {
@@ -189,11 +199,36 @@ export function App() {
         // 跨实例删除：任意端删了当前会话，本端必须回落地页。
         // （本地侧栏删除走 onSessionDeleted；这里补齐异地/其它标签页的路径。）
         if (event.type === 'session_deleted') {
+          setLiveRunningIds((prev) => {
+            if (!prev.has(event.session_id)) return prev;
+            const next = new Set(prev);
+            next.delete(event.session_id);
+            return next;
+          });
           handleSessionDeleted(event.session_id);
           return;
         }
         // 运行圈圈 / 完成对勾同源：全局 activity 广播携带内核权威终态。
+        if (event.type === 'runtime_activity') {
+          setLiveRunningIds((prev) => {
+            const has = prev.has(event.session_id);
+            if (event.running === has) return prev;
+            const next = new Set(prev);
+            if (event.running) next.add(event.session_id);
+            else next.delete(event.session_id);
+            return next;
+          });
+          return;
+        }
         if (event.type === 'activity') {
+          setLiveRunningIds((prev) => {
+            const has = prev.has(event.session_id);
+            if (event.running === has) return prev;
+            const next = new Set(prev);
+            if (event.running) next.add(event.session_id);
+            else next.delete(event.session_id);
+            return next;
+          });
           setJustCompletedIds((prev) =>
             nextCompletedBadgeIds(prev, {
               sessionId: event.session_id,
@@ -501,8 +536,28 @@ export function App() {
 
   // VSCode-style open diff tabs in the session header
   const [diffTabs, setDiffTabs] = useState<any[]>([]);
-  const [activeMainTabId, setActiveMainTabId] = useState<string>('chat');
+  const [activeMainTabId, setActiveMainTabId] = useState<string>(() => {
+    try {
+      if (!urlSessionRef.current && localStorage.getItem('jeikcode:sidebar_tab') === 'tasks') {
+        return 'tasks';
+      }
+    } catch {}
+    return 'chat';
+  });
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [creatingNewTask, setCreatingNewTask] = useState(false);
   const tabsContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onSwitchMainTab = (e: Event) => {
+      const target = (e as CustomEvent<string>).detail;
+      if (target === 'chat' || target === 'tasks') {
+        setActiveMainTabId(target);
+      }
+    };
+    window.addEventListener('jeikcode:switch_main_tab', onSwitchMainTab);
+    return () => window.removeEventListener('jeikcode:switch_main_tab', onSwitchMainTab);
+  }, []);
 
   // 顶部主标签栏滚轮水平滑动与激活标签自动居中 (在 activeMainTabId 声明之后定义，避免 TDZ 报错)
   const handleTabsWheel = (e: WheelEvent) => {
@@ -1313,6 +1368,13 @@ export function App() {
         completedIds={Array.from(justCompletedIds)}
         onOpenFile={handleOpenFile}
         activeFilePath={diffTabs.find((t) => t.id === activeMainTabId)?.filePath}
+        onOpenTasks={(taskId, creatingNew) => {
+          if (taskId !== undefined) setSelectedTaskId(taskId);
+          setCreatingNewTask(Boolean(creatingNew));
+          setActiveMainTabId('tasks');
+        }}
+        selectedTaskId={selectedTaskId}
+        activeMainTabId={activeMainTabId}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -1353,7 +1415,17 @@ export function App() {
           </button>
 
           {/* 移动端顶部：左上角会话与Diff标签下拉收纳框 */}
-          {activeSession?.name && !isLanding && isHeaderCompact ? (
+          {activeMainTabId === 'tasks' && isHeaderCompact ? (
+            <button
+              type="button"
+              class="session-title-btn active"
+              onClick={() => setActiveMainTabId('chat')}
+              title={t('tasks.backToChat')}
+            >
+              <span class="mobile-tab-icon">⏱</span>
+              <span class="session-title-text">{t('sidebar.tasks')}</span>
+            </button>
+          ) : activeSession?.name && !isLanding && isHeaderCompact ? (
             <div class="mobile-session-tab-dropdown-wrap" ref={mobileTabsDropdownRef}>
               <button
                 type="button"
@@ -1501,6 +1573,18 @@ export function App() {
                 <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
               </svg>
               <span class="session-title-text">{t('sidebar.newChat')}</span>
+            </button>
+          )}
+
+          {!isHeaderCompact && activeMainTabId === 'tasks' && (
+            <button
+              type="button"
+              class="session-title-btn active"
+              title={t('sidebar.tasks')}
+              onClick={() => setActiveMainTabId('tasks')}
+            >
+              <span>⏱</span>
+              <span class="session-title-text">{t('sidebar.tasks')}</span>
             </button>
           )}
 
@@ -1920,6 +2004,22 @@ export function App() {
             } catch {}
           }}
         >
+          {activeMainTabId === 'tasks' && (
+            <TasksPanel
+              cwd={cwd}
+              selectedTaskId={selectedTaskId}
+              onSelectTaskId={(id) => setSelectedTaskId(id)}
+              creatingNew={creatingNewTask}
+              onCreatingChange={(creating) => setCreatingNewTask(creating)}
+              onSelectSession={handleSelectSession}
+              onSessionDeleted={handleSessionDeleted}
+              onClose={() => setActiveMainTabId('chat')}
+            />
+          )}
+          <div
+            class="chat-body"
+            style={activeMainTabId === 'tasks' ? { display: 'none' } : undefined}
+          >
           <Chat
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}
@@ -1983,6 +2083,7 @@ export function App() {
             onLiveReview={onLiveReview}
             onBindReviewDismiss={onBindReviewDismiss}
           />
+          </div>
         </div>
       </div>
 

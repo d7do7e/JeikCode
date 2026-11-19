@@ -41,6 +41,7 @@ pub mod legacy_convert;
 pub mod live_hub;
 pub mod native_live;
 mod runtime_host;
+mod schedules_api;
 mod shell_open;
 mod sidebar_projects;
 mod steer_prompt;
@@ -1305,6 +1306,8 @@ mod session_window_tests {
             approval_mode: None,
             reasoning_effort: Some("high".into()),
             thinking_budget: Some(4096),
+            origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            schedule_id: None,
             presence: jeikcode_capabilities::session::CatalogPresence::NativeOnly,
         };
         let summary = catalog_entry_to_session_summary(&entry);
@@ -4686,6 +4689,9 @@ pub(crate) enum GlobalWireEvent {
     /// 跟随 `mode`；为 false 时各会话恢复自己的模式。
     #[serde(rename = "mode_global")]
     ModeGlobal { enabled: bool, mode: String },
+    /// 本地定时任务列表或运行状态变更（创建/修改/启停/删除/执行）。
+    #[serde(rename = "schedules_updated")]
+    SchedulesUpdated,
 }
 
 /// 一次模型参数变更里携带的思考强度/预算快照（两字段都序列化，`null` 即清空）。
@@ -7519,6 +7525,11 @@ pub struct SessionSummary {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_manual_session_origin")]
+    pub origin: jeikcode_capabilities::session::SessionOrigin,
+    /// Root scheduled-task ID when `origin == Scheduled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
     /// Internal protocol-key lookup only; never exposed on the session wire.
     #[serde(skip)]
     pub protocol_key: Option<String>,
@@ -7560,6 +7571,8 @@ fn catalog_entry_to_session_summary(
         preferred_model,
         reasoning_effort: entry.reasoning_effort.clone(),
         thinking_budget: entry.thinking_budget,
+        origin: entry.origin,
+        schedule_id: entry.schedule_id.clone(),
         protocol_key: None,
     }
 }
@@ -7619,6 +7632,9 @@ fn catalog_entry_is_visible(
     entry: &jeikcode_capabilities::session::CatalogEntry,
     active: Option<&jeikcode_capabilities::session::CatalogLocation>,
 ) -> bool {
+    if entry.origin == jeikcode_capabilities::session::SessionOrigin::Scheduled {
+        return false;
+    }
     if entry.message_count > 0 {
         return true;
     }
@@ -10114,7 +10130,10 @@ fn search_sessions_by_name_in_root(
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.message_count > 0)
+        .filter(|entry| {
+            entry.message_count > 0
+                && entry.origin != jeikcode_capabilities::session::SessionOrigin::Scheduled
+        })
         .collect();
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
@@ -10158,14 +10177,26 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 /// distinguish an active lease (`409`) from missing data (`404`) and an
 /// unexpected storage failure (`500`). Flattening everything into
 /// `io::Error::other` made that distinction impossible.
-fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
-    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)?;
+fn delete_session_file_in_root(
+    sessions_root: &std::path::Path,
+    project_hash: &str,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    crate::legacy_convert::delete_catalog_session_in_root(sessions_root, project_hash, session_id)?;
     // 跨实例增量：删行 + 让客户端丢弃该 id 的本地缓存。
     publish_global(GlobalWireEvent::SessionDeleted {
         session_id: session_id.to_string(),
         project_hash: project_hash.to_string(),
     });
     Ok(())
+}
+
+fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
+    delete_session_file_in_root(
+        &NativeSessionManager::sessions_root(),
+        project_hash,
+        session_id,
+    )
 }
 
 fn valid_project_bucket(project_bucket: &str) -> bool {
@@ -10448,69 +10479,70 @@ async fn repair_session(
     }
 }
 
-/// DELETE /projects/:hash/sessions/:id - Delete a session
-async fn delete_session(
-    State(state): State<AppState>,
-    axum::Extension(client_mode): axum::Extension<SessionMode>,
-    Path((hash, id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+pub(crate) async fn delete_session_checked_in_root(
+    state: &AppState,
+    client_mode: SessionMode,
+    sessions_root: std::path::PathBuf,
+    hash: &str,
+    id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let session_uuid = uuid::Uuid::parse_str(id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, client_mode, || async move {
-        if !valid_project_bucket(&hash) {
-            tracing::warn!(project_bucket = %hash, "rejected invalid session delete request");
-            return delete_session_api_error(
+    let hash_owned = hash.to_string();
+    let id_owned = id.to_string();
+    daemon_scope(state, session_uuid, client_mode, || async move {
+        if !valid_project_bucket(&hash_owned) {
+            tracing::warn!(project_bucket = %hash_owned, "rejected invalid session delete request");
+            return Err(delete_session_api_error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_SESSION",
                 "The project or session identifier is invalid.",
-            )
-            .into_response();
+            ));
         }
         // ViewBinding (WebUI/TUI 正在看哪个会话) is not ownership. Release the
         // idle execution runtime or registry runner that actually holds the
         // lease. Active turns stay fail-closed as SESSION_IN_USE.
-        match crate::native_live::release_idle_session_for_delete(&id).await {
+        match crate::native_live::release_idle_session_for_delete(&id_owned).await {
             Ok(()) => {}
             Err(crate::live_hub::HubError::ActiveTurn) => {
-                return delete_session_api_error(
+                return Err(delete_session_api_error(
                     StatusCode::CONFLICT,
                     "SESSION_IN_USE",
                     "This session has an active turn. Stop it, then try again.",
-                )
-                .into_response();
+                ));
             }
             Err(crate::live_hub::HubError::StaleBinding)
             | Err(crate::live_hub::HubError::RuntimeGenerationChanged { .. })
             | Err(crate::live_hub::HubError::Unbound) => {}
             Err(error) => {
                 tracing::warn!(
-                    project_bucket = %hash,
-                    session_id = %id,
+                    project_bucket = %hash_owned,
+                    session_id = %id_owned,
                     error = ?error,
                     "failed to release current session before delete"
                 );
-                return delete_session_api_error(
+                return Err(delete_session_api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "DELETE_FAILED",
                     "Failed to release the current session before deleting it.",
-                )
-                .into_response();
+                ));
             }
         }
 
-        let delete_hash = hash.clone();
-        let delete_id = id.clone();
-        let deleted =
-            tokio::task::spawn_blocking(move || delete_session_file(&delete_hash, &delete_id))
-                .await;
+        let delete_hash = hash_owned.clone();
+        let delete_id = id_owned.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            delete_session_file_in_root(&sessions_root, &delete_hash, &delete_id)
+        })
+        .await;
         match deleted {
             Ok(Ok(())) => {
                 // Global sidecars are session-id keyed and are not under the
                 // project bucket; delete them with the session.
-                jeikcode_capabilities::session::inputs::clear_global(&id);
-                jeikcode_capabilities::session::partial::clear_global(&id);
+                jeikcode_capabilities::session::inputs::clear_global(&id_owned);
+                jeikcode_capabilities::session::partial::clear_global(&id_owned);
                 let working_dir = state_clone.project.read().await.working_dir.clone();
-                let id_for_cleanup = id.clone();
+                let id_for_cleanup = id_owned.clone();
                 let active_chats_cleanup = state_clone.active_chats.clone();
                 // Session files are already gone. Reap MCP, kill session background tasks,
                 // and clean up session background log files asynchronously.
@@ -10537,38 +10569,67 @@ async fn delete_session(
                     error_kind: None,
                     error_data: None,
                 });
-                let msg = format!("Session {} deleted successfully", id);
-                (StatusCode::OK, Json(msg)).into_response()
+                Ok(())
             }
             Ok(Err(e)) => {
                 let response = classify_delete_session_error(&e);
                 if response.0 == StatusCode::INTERNAL_SERVER_ERROR {
                     tracing::error!(
-                        project_bucket = %hash,
-                        session_id = %id,
+                        project_bucket = %hash_owned,
+                        session_id = %id_owned,
                         error = ?e,
                         "failed to delete session"
                     );
                 }
-                response.into_response()
+                Err(response)
             }
             Err(error) => {
                 tracing::error!(
-                    project_bucket = %hash,
-                    session_id = %id,
+                    project_bucket = %hash_owned,
+                    session_id = %id_owned,
                     error = %error,
                     "session delete task failed"
                 );
-                delete_session_api_error(
+                Err(delete_session_api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "DELETE_FAILED",
                     "Failed to delete the session. Check the JeikCode logs for details.",
-                )
-                .into_response()
+                ))
             }
         }
     })
     .await
+}
+
+pub(crate) async fn delete_session_checked(
+    state: &AppState,
+    client_mode: SessionMode,
+    hash: &str,
+    id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    delete_session_checked_in_root(
+        state,
+        client_mode,
+        NativeSessionManager::sessions_root(),
+        hash,
+        id,
+    )
+    .await
+}
+
+/// DELETE /projects/:hash/sessions/:id - Delete a session
+async fn delete_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match delete_session_checked(&state, client_mode, &hash, &id).await {
+        Ok(()) => {
+            let msg = format!("Session {} deleted successfully", id);
+            (StatusCode::OK, Json(msg)).into_response()
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 /// Rename request body
@@ -22826,6 +22887,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     if let Some(cfg) = startup_config.as_ref() {
         jeikcode_config::proxy::apply_process_proxy_config(&cfg.network.proxy);
     }
+    schedules_api::spawn_windows_schedule_reconcile();
     // Tool text and upgrade copy in this process follow config.language.
     // A missing choice stays English, matching a fresh install.
     let ui_locale = startup_config
@@ -23226,6 +23288,26 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/providers/:name",
             patch(api_provider::patch_provider).delete(api_provider::delete_provider),
+        )
+        // Local Scheduled Tasks API
+        .route(
+            "/schedules",
+            get(schedules_api::list_schedules).post(schedules_api::create_schedule),
+        )
+        .route("/schedules/sync", post(schedules_api::sync_schedules))
+        .route(
+            "/schedules/:id",
+            axum::routing::put(schedules_api::update_schedule)
+                .delete(schedules_api::delete_schedule),
+        )
+        .route(
+            "/schedules/:id/toggle",
+            post(schedules_api::toggle_schedule),
+        )
+        .route("/schedules/:id/run", post(schedules_api::run_schedule_now))
+        .route(
+            "/schedules/:id/runs",
+            get(schedules_api::get_schedule_runs).delete(schedules_api::clear_schedule_runs),
         )
         .route(
             "/providers/:name/default",
@@ -26011,6 +26093,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -26076,6 +26160,55 @@ mod tests {
         assert_eq!(global[0].meta.name, "可搜索的历史标题");
         assert_eq!(search.len(), 1);
         assert_eq!(search[0].meta.id, session_id);
+    }
+
+    #[test]
+    fn scheduled_sessions_are_excluded_from_normal_listing_and_search() {
+        use jeikcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, SessionOrigin, StorageOwner,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+
+        for (sid, origin, name) in [
+            ("manual-1", SessionOrigin::Manual, "Manual Session"),
+            ("sched-1", SessionOrigin::Scheduled, "Scheduled Run"),
+        ] {
+            let lease = manager.acquire_lease(sid).unwrap();
+            let snapshot = jeikcode_kernel::message::SessionSnapshot::new(vec![
+                jeikcode_kernel::message::Message::user(name),
+            ]);
+            let mut meta = SessionMeta::new(sid, "/project", 10);
+            meta.owner = StorageOwner::Native;
+            meta.origin = origin;
+            meta.schedule_id = (origin == SessionOrigin::Scheduled).then(|| "daily-brief".into());
+            meta.message_count = 1;
+            meta.name = name.into();
+            meta.user_renamed = true;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
+        let per_project = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        let search = search_sessions_by_name_in_root(tmp.path(), "Scheduled").unwrap();
+        let runs = schedules_api::list_scheduled_runs_in_root(tmp.path(), "daily-brief").unwrap();
+
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].meta.id, "manual-1");
+        assert_eq!(per_project.len(), 1);
+        assert_eq!(per_project[0].id, "manual-1");
+        assert!(search.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].meta.id, "sched-1");
     }
 
     #[test]

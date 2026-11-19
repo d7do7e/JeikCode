@@ -32,7 +32,21 @@ pub const DESKTOP_ENV: &str = "JEIKCODE_DESKTOP";
 pub const DESKTOP_MANAGED_ENV: &str = "JEIKCODE_DESKTOP_MANAGED";
 pub const DESKTOP_PID_ENV: &str = "JEIKCODE_DESKTOP_PID";
 pub const DESKTOP_CLI_BIN_ENV: &str = "JEIKCODE_DESKTOP_CLI_BIN";
+pub const DESKTOP_SHELL_BIN_ENV: &str = "JEIKCODE_DESKTOP_BIN";
 pub const SERVER_TOKEN_ENV: &str = "JEIKCODE_SERVER_TOKEN";
+
+/// Strip the Windows verbatim prefix (`\\?\`) / verbatim-UNC prefix (`\\?\UNC\`)
+/// while preserving standard UNC paths (`\\server\share\...`).
+pub fn strip_windows_verbatim_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
 
 /// Returns `true` for `"localhost"` or any IPv4/IPv6 loopback address
 /// (including `127.0.0.0/8` and `[::1]` bracketed literals).
@@ -473,5 +487,21 @@ mod tests {
         assert!(keep.is_file());
         assert!(!stale.exists());
         assert!(unrelated.is_file());
+    }
+
+    #[test]
+    fn strip_windows_verbatim_path_preserves_unc_and_strips_drive_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_path(Path::new(r"\\?\C:\Users\depc\jeikcode.exe")),
+            PathBuf::from(r"C:\Users\depc\jeikcode.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_path(Path::new(r"\\?\UNC\server\share\jeikcode.exe")),
+            PathBuf::from(r"\\server\share\jeikcode.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_path(Path::new("/usr/local/bin/jeikcode")),
+            PathBuf::from("/usr/local/bin/jeikcode")
+        );
     }
 }

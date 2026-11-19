@@ -47,7 +47,9 @@ use super::approval::{
     ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 use super::resolve_path;
-use super::sensitive_path::path_is_sensitive;
+use super::sensitive_path::{
+    has_unresolved_parent_traversal, path_is_sensitive, resolved_filesystem_path,
+};
 use super::write_approval::{canonical_dir_key, path_in_temp_dir, path_in_workspace};
 
 /// Truncate a command for the diagnostic log at a char boundary (CJK-safe).
@@ -291,32 +293,195 @@ fn redirect_targets(toks: &[String]) -> Result<Vec<String>, ()> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveCmd {
+    None,
+    Found(usize),
+    Unresolvable,
+}
+
+fn wrapper_takes_value(wrapper: &str, tok: &str) -> bool {
+    match wrapper {
+        "nice" => matches!(tok, "-n" | "--adjustment"),
+        "env" => matches!(tok, "-u" | "--unset" | "-C" | "--chdir"),
+        "timeout" => matches!(tok, "-s" | "--signal" | "-k" | "--kill-after"),
+        "stdbuf" => matches!(tok, "-i" | "--input" | "-o" | "--output" | "-e" | "--error"),
+        "ionice" => matches!(
+            tok,
+            "-c" | "--class" | "-n" | "--classdata" | "-p" | "-P" | "-u"
+        ),
+        "sudo" | "doas" => matches!(
+            tok,
+            "-u" | "--user"
+                | "-g"
+                | "--group"
+                | "-h"
+                | "-p"
+                | "-C"
+                | "-D"
+                | "--chdir"
+                | "-r"
+                | "-t"
+                | "-U"
+        ),
+        _ => false,
+    }
+}
+
+fn wrapper_flag_is_known_noarg(wrapper: &str, tok: &str) -> bool {
+    // `--flag=val` or attached short forms (`-n10`, `-i0`, `-oL`, `-e0`, `-uFOO`, `-C/dir`, `-sKILL`, `-k5`)
+    if tok.contains('=') {
+        return true;
+    }
+    match wrapper {
+        "nice" => tok.starts_with("-n") && tok.len() > 2,
+        "env" => {
+            matches!(tok, "-i" | "--ignore-environment" | "-0" | "--null")
+                || (tok.starts_with("-u") && tok.len() > 2)
+                || (tok.starts_with("-C") && tok.len() > 2)
+        }
+        "timeout" => {
+            matches!(
+                tok,
+                "--preserve-status" | "--foreground" | "-v" | "--verbose"
+            ) || (tok.starts_with("-s") && tok.len() > 2)
+                || (tok.starts_with("-k") && tok.len() > 2)
+        }
+        "stdbuf" => {
+            (tok.starts_with("-i") || tok.starts_with("-o") || tok.starts_with("-e"))
+                && tok.len() > 2
+        }
+        "ionice" => {
+            matches!(tok, "-t" | "--ignore")
+                || ((tok.starts_with("-c")
+                    || tok.starts_with("-n")
+                    || tok.starts_with("-p")
+                    || tok.starts_with("-P")
+                    || tok.starts_with("-u"))
+                    && tok.len() > 2)
+        }
+        "sudo" | "doas" => matches!(
+            tok,
+            "-n" | "--non-interactive"
+                | "-E"
+                | "--preserve-env"
+                | "-H"
+                | "--set-home"
+                | "-P"
+                | "--preserve-groups"
+                | "-S"
+                | "--stdin"
+                | "-k"
+                | "-K"
+                | "-b"
+                | "--background"
+                | "-v"
+                | "-l"
+                | "-s"
+        ),
+        "time" | "command" | "builtin" => matches!(tok, "-p" | "-v" | "-V"),
+        _ => false,
+    }
+}
+
+fn wrapper_flag_changes_cwd(wrapper: &str, tok: &str) -> bool {
+    match wrapper {
+        "env" => {
+            tok == "-C"
+                || tok == "--chdir"
+                || tok.starts_with("--chdir=")
+                || (tok.starts_with("-C") && tok.len() > 2)
+        }
+        "sudo" => tok == "-D" || tok == "--chdir" || tok.starts_with("--chdir="),
+        _ => false,
+    }
+}
+
 /// The index of a segment's effective command token, skipping leading wrappers, flags, and
-/// `VAR=val` assignments. `None` if the segment is only wrappers/flags (no command).
-fn effective_command_index(toks: &[String]) -> Option<usize> {
+/// `VAR=val` assignments. Fails closed (`Unresolvable`) on unrecognized wrapper flag patterns
+/// or missing operands, and reports whether a wrapper changed cwd (`env -C` / `sudo -D`).
+fn effective_command_index(toks: &[String]) -> (EffectiveCmd, bool) {
     let mut i = 0;
+    let mut active_wrapper: Option<&'static str> = None;
+    let mut changed_cwd = false;
+
     while i < toks.len() {
         let t = &toks[i];
-        let b = base(strip_quotes(t));
-        if t.starts_with('-') || t.contains('=') {
+        let unquoted = strip_quotes(t);
+        if t.contains('=') && !unquoted.starts_with('-') {
             i += 1;
             continue;
         }
-        if WRAPPERS.contains(&b) {
+        if unquoted == "--" {
             i += 1;
-            // `timeout`/`stdbuf` take a mandatory operand (the duration / buffer spec) that is
-            // not the command — skip one non-flag token so it isn't mistaken for the command.
-            if matches!(b, "timeout" | "stdbuf" | "ionice") {
-                while i < toks.len() && (toks[i].starts_with('-') || toks[i].contains('=')) {
-                    i += 1;
-                }
-                i += 1; // the operand
+            active_wrapper = None;
+            continue;
+        }
+        if unquoted.starts_with('-') {
+            let Some(w) = active_wrapper else {
+                i += 1;
+                continue;
+            };
+            if wrapper_flag_changes_cwd(w, unquoted) {
+                changed_cwd = true;
             }
+            if wrapper_takes_value(w, unquoted) {
+                if i + 1 >= toks.len() {
+                    return (EffectiveCmd::Unresolvable, changed_cwd);
+                }
+                i += 2;
+                continue;
+            }
+            if wrapper_flag_is_known_noarg(w, unquoted) {
+                i += 1;
+                continue;
+            }
+            // Unrecognized wrapper flag (e.g. `env -S ...` or bundled `-nu`) — fail closed.
+            return (EffectiveCmd::Unresolvable, changed_cwd);
+        }
+
+        let b = base(unquoted);
+        if let Some(&w) = WRAPPERS.iter().find(|&&w| w == b) {
+            i += 1;
+            if matches!(w, "timeout" | "stdbuf" | "ionice") {
+                // Parse wrapper flags before the mandatory duration/mode operand (or command for stdbuf/ionice).
+                while i < toks.len() {
+                    let ft = strip_quotes(&toks[i]);
+                    if ft == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if ft.starts_with('-') {
+                        if wrapper_takes_value(w, ft) {
+                            if i + 1 >= toks.len() {
+                                return (EffectiveCmd::Unresolvable, changed_cwd);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        if wrapper_flag_is_known_noarg(w, ft) {
+                            i += 1;
+                            continue;
+                        }
+                        return (EffectiveCmd::Unresolvable, changed_cwd);
+                    }
+                    break;
+                }
+                if w == "timeout" {
+                    if i >= toks.len() {
+                        return (EffectiveCmd::Unresolvable, changed_cwd);
+                    }
+                    i += 1; // mandatory duration operand
+                }
+                active_wrapper = Some(w);
+                continue;
+            }
+            active_wrapper = Some(w);
             continue;
         }
-        return Some(i);
+        return (EffectiveCmd::Found(i), changed_cwd);
     }
-    None
+    (EffectiveCmd::None, changed_cwd)
 }
 
 /// Parse a destructive command's args into `(positional path operands, explicit -t dest)`,
@@ -469,7 +634,7 @@ pub(crate) fn mv_moves(command: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for seg in split_segments(joined.trim()) {
         let toks = tokenize(seg.trim());
-        let Some(ci) = effective_command_index(&toks) else {
+        let (EffectiveCmd::Found(ci), _) = effective_command_index(&toks) else {
             continue;
         };
         if command_word(&toks[ci]) != "mv" {
@@ -515,8 +680,19 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
         if toks.is_empty() {
             continue;
         }
-        let ci = effective_command_index(&toks);
-        let effcmd: Option<&str> = ci.map(|i| command_word(&toks[i]));
+        let (ci, wrapper_changed_cwd) = effective_command_index(&toks);
+        if wrapper_changed_cwd {
+            saw_cd = true;
+        }
+        let effcmd: Option<&str> = match ci {
+            EffectiveCmd::Found(idx) => Some(command_word(&toks[idx])),
+            EffectiveCmd::None => None,
+            EffectiveCmd::Unresolvable => {
+                any_destructive = true;
+                unresolvable = true;
+                None
+            }
+        };
 
         // Redirect writes (any command in this segment) — except inside a test/arithmetic
         // construct, where `>` is a comparison operator.
@@ -535,7 +711,7 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
             }
         }
 
-        if let Some(ci) = ci {
+        if let EffectiveCmd::Found(ci) = ci {
             let effcmd = effcmd.unwrap();
             // A `cd` moves the resolution base for later RELATIVE paths. Record it and fail
             // closed only if a cwd-DEPENDENT (relative) target is actually present (checked after
@@ -647,6 +823,39 @@ impl BashWorkspaceGate {
     }
 }
 
+enum ArgCwd {
+    None,
+    Some(String),
+    Invalid,
+}
+
+fn bash_arg_cwd(args: &str) -> ArgCwd {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return ArgCwd::None;
+    };
+    for key in ["cwd", "workdir", "working_dir"] {
+        if let Some(val) = v.get(key) {
+            if val.is_null() {
+                continue;
+            }
+            let Some(raw) = val.as_str() else {
+                return ArgCwd::Invalid;
+            };
+            let trimmed = raw.trim().replace('\\', "/");
+            if trimmed.is_empty() {
+                return ArgCwd::None;
+            }
+            return ArgCwd::Some(trimmed);
+        }
+    }
+    ArgCwd::None
+}
+
+fn resolve_target_str(raw: &str, base_cwd: &Path) -> String {
+    let clean = strip_quotes(raw.trim());
+    resolve_path(clean, base_cwd).to_string_lossy().into_owned()
+}
+
 #[async_trait]
 impl ToolMiddleware for BashWorkspaceGate {
     async fn before(
@@ -678,13 +887,31 @@ impl ToolMiddleware for BashWorkspaceGate {
             BashScan::Targets(t) => t,
         };
 
-        // Snapshot the live cwd (clone in one statement so the guard isn't held across an await —
+        let arg_cwd = bash_arg_cwd(&call.arguments);
+        let explicit_cwd = match arg_cwd {
+            ArgCwd::Invalid => {
+                tracing::warn!("bash gate: non-string cwd on destructive bash -> prompting driver");
+                return self.prompt_unremembered(call, tool, rt).await;
+            }
+            ArgCwd::Some(ref raw) if has_dynamic_token(raw) => {
+                tracing::warn!("bash gate: dynamic cwd on destructive bash -> prompting driver");
+                return self.prompt_unremembered(call, tool, rt).await;
+            }
+            ArgCwd::Some(raw) => Some(raw),
+            ArgCwd::None => None,
+        };
+
+        // Snapshot the live ws_cwd (clone in one statement so the guard isn't held across an await —
         // the future must stay Send). A poisoned lock means we can't resolve relative targets:
         // still block an ABSOLUTE sensitive target; otherwise defer.
-        let cwd = match self.cwd.read().ok().map(|g| g.clone()) {
+        let ws_cwd = match self.cwd.read().ok().map(|g| g.clone()) {
             Some(c) => c,
             None => {
-                return if targets.iter().any(|t| path_is_sensitive(Path::new(t))) {
+                let any_abs_sensitive = targets.iter().any(|t| path_is_sensitive(Path::new(t)))
+                    || explicit_cwd
+                        .as_deref()
+                        .is_some_and(|c| path_is_sensitive(Path::new(c)));
+                return if any_abs_sensitive {
                     self.prompt_unremembered(call, tool, rt).await
                 } else {
                     BeforeOutcome::Proceed
@@ -692,63 +919,83 @@ impl ToolMiddleware for BashWorkspaceGate {
             }
         };
 
-        // Sensitive TARGET → prompt EVERY time, never remembered (mirror WriteApprovalGate).
-        // Classified on the resolved target (not a substring of the whole command) so a benign
-        // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
-        if targets
-            .iter()
-            .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
-        {
-            tracing::warn!(command = %log_truncate_bash(&command, 300), "bash gate: sensitive target -> prompting driver");
-            return self.prompt_unremembered(call, tool, rt).await;
-        }
-
         // Classification canonicalizes paths (filesystem I/O) — run OFF the async worker, bounded,
         // so a hung mount can't freeze the kernel's turn loop (Esc/Ctrl-C stay live). On timeout we
-        // degrade to "not in workspace" → a normal prompt (safe, never hangs).
-        // `mv` (source, dest) pairs — for the "moved OUT of the workspace = deleted" check below.
+        // degrade to unresolvable/not-in-workspace → prompt (safe, never hangs).
         let mv_pairs = mv_moves(&command);
-        let (all_in_workspace, out_keys) = {
+        let (has_sensitive, all_in_workspace, out_keys) = {
             let targets = targets.clone();
             let mv_pairs = mv_pairs.clone();
-            let cwd = cwd.clone();
-            let fallback = (false, Vec::<String>::new());
+            let ws_cwd = ws_cwd.clone();
+            let explicit_cwd = explicit_cwd.clone();
+            let fallback = (false, false, Vec::<String>::new());
             super::run_bounded(super::gate_fs_timeout(), fallback, move || {
-                // Written/deleted TARGETS that land OUTSIDE the workspace (path canonicalizes —
-                // filesystem I/O). Temp-dir targets (codex parity: /tmp + $TMPDIR are
-                // default-writable) count as in-workspace: `cargo build > /tmp/x.json` is benign
-                // scratch, not a write to a user-owned directory outside the workspace.
-                let mut out: Vec<String> = targets
+                let effective_cwd = match explicit_cwd.as_deref() {
+                    Some(raw) => resolve_path(raw, &ws_cwd),
+                    None => ws_cwd.clone(),
+                };
+                if has_unresolved_parent_traversal(&effective_cwd)
+                    || path_is_sensitive(&effective_cwd)
+                    || path_is_sensitive(&resolved_filesystem_path(&effective_cwd))
+                {
+                    return (true, false, Vec::new());
+                }
+
+                // Resolve every relative target against `effective_cwd` (not `ws_cwd`), then
+                // evaluate sensitivity + workspace containment against `ws_cwd`.
+                let resolved_targets: Vec<String> = targets
                     .iter()
-                    .filter(|t| !(path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd)))
+                    .map(|t| resolve_target_str(t, &effective_cwd))
+                    .collect();
+
+                if targets
+                    .iter()
+                    .zip(resolved_targets.iter())
+                    .any(|(raw, abs)| {
+                        let p = resolve_path(strip_quotes(raw.trim()), &effective_cwd);
+                        has_unresolved_parent_traversal(&p)
+                            || path_is_sensitive(&p)
+                            || path_is_sensitive(&resolved_filesystem_path(&p))
+                            || path_is_sensitive(Path::new(abs))
+                    })
+                {
+                    return (true, false, Vec::new());
+                }
+
+                let mut out: Vec<String> = resolved_targets
+                    .iter()
+                    .filter(|abs| {
+                        !(path_in_workspace(abs, &ws_cwd) || path_in_temp_dir(abs, &ws_cwd))
+                    })
                     .cloned()
                     .collect();
-                // A `mv` carrying an in-workspace file to a dest NOT in the workspace PROPER removes
-                // it from the workspace — an equivalent delete. Temp does NOT rescue the dest here
-                // (moving a workspace file to /tmp still deletes it from the workspace), so a
-                // rejected `rm` can't be laundered through `mv <ws_file> /tmp/backup`. Treat that
-                // dest as out-of-workspace so the move prompts. `!out.contains` avoids a duplicate
-                // when the same dest is already a scan target (`mv ws /outside/x`).
-                for (src, dst) in &mv_pairs {
-                    if path_in_workspace(src, &cwd)
-                        && !path_in_workspace(dst, &cwd)
-                        && !out.contains(dst)
+
+                for (src_raw, dst_raw) in &mv_pairs {
+                    let src_abs = resolve_target_str(src_raw, &effective_cwd);
+                    let dst_abs = resolve_target_str(dst_raw, &effective_cwd);
+                    if path_in_workspace(&src_abs, &ws_cwd)
+                        && !path_in_workspace(&dst_abs, &ws_cwd)
+                        && !out.contains(&dst_abs)
                     {
-                        out.push(dst.clone());
+                        out.push(dst_abs);
                     }
                 }
                 let all_in = out.is_empty();
-                // Per-out-target directory grant keys, deduped (multiple targets can share a dir).
                 let mut keys: Vec<String> = out
                     .iter()
-                    .map(|t| format!("bashdir::{}", canonical_dir_key(t, &cwd)))
+                    .map(|t| format!("bashdir::{}", canonical_dir_key(t, &ws_cwd)))
                     .collect();
                 keys.sort();
                 keys.dedup();
-                (all_in, keys)
+                (false, all_in, keys)
             })
             .await
         };
+
+        if has_sensitive {
+            tracing::warn!(command = %log_truncate_bash(&command, 300), "bash gate: sensitive target or cwd -> prompting driver");
+            return self.prompt_unremembered(call, tool, rt).await;
+        }
 
         // All targets in-workspace → unchanged behavior (single-file rm stays Safe→runs; a
         // recursive rm is Risky and still reaches ApprovalMiddleware after this Proceed).
@@ -1472,5 +1719,46 @@ mod tests {
             gate.before(&mut call, &tool, &silent_rt()).await.is_deny(),
             "destructive out-of-workspace rm must remain gated after repair"
         );
+    }
+
+    #[tokio::test]
+    async fn external_cwd_with_relative_rm_is_gated_and_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool = bash_tool();
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "rm notes.txt",
+                "cwd": "/jeikcode-test-outside-cwd"
+            })
+            .to_string(),
+        };
+        assert!(
+            gate.before(&mut call, &tool, &silent_rt()).await.is_deny(),
+            "relative rm inside an external `cwd` must be caught as out-of-workspace"
+        );
+    }
+
+    #[test]
+    fn wrapper_value_flags_do_not_hide_destructive_commands() {
+        for cmd in [
+            "nice -n 10 rm /outside/x.txt",
+            "env -u HOME rm /outside/x.txt",
+            "timeout -s KILL 5 rm /outside/x.txt",
+            "stdbuf -o L rm /outside/x.txt",
+            "ionice -c 2 -n 7 rm /outside/x.txt",
+        ] {
+            assert_eq!(
+                scan(cmd),
+                BashScan::Targets(vec!["/outside/x.txt".into()]),
+                "failed for: {cmd}"
+            );
+        }
+        // `env -C /outside rm x.txt` moves relative target base -> Unresolvable (fail-closed)
+        assert_eq!(scan("env -C /outside rm x.txt"), BashScan::Unresolvable);
+        // Unknown wrapper flag pattern fails closed rather than silently returning NotDestructive.
+        assert_eq!(scan("env -S 'rm /outside/x.txt'"), BashScan::Unresolvable);
     }
 }

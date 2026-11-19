@@ -315,30 +315,83 @@ pub fn path_is_sensitive(path: &Path) -> bool {
         .is_some_and(|ext| SECRET_EXTS.iter().any(|c| ext.eq_ignore_ascii_case(c)))
 }
 
-/// Resolve one of the built-in local read tools to the filesystem root it will touch.
-/// External/MCP tools intentionally return `None`: their path semantics belong to the
+fn normalize_relative_glob_prefix(pattern: &str) -> Option<String> {
+    let normalized = pattern.replace('\\', "/");
+    let mut p = normalized.as_str();
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest;
+    }
+    let scan_end = p.find(['*', '?', '[', '{']).unwrap_or(p.len());
+    let sep = p[..scan_end].rfind('/')?;
+    let prefix = p[..sep].trim();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_string())
+    }
+}
+
+/// Resolve all local filesystem roots/targets that a built-in read tool will touch.
+/// External/MCP tools intentionally return empty: their path semantics belong to the
 /// provider, while the raw marker guard above still protects explicit credential strings.
-fn local_read_target(tool: &str, args: &str, cwd: &Path) -> Option<PathBuf> {
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+fn local_read_targets(tool: &str, args: &str, cwd: &Path) -> Vec<PathBuf> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
     let string = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
     match tool {
         "read" | "read_file" => string("path")
             .or_else(|| string("file_path"))
-            .map(|raw| super::resolve_path(raw, cwd)),
-        "grep" | "code_explore" => {
+            .map(|raw| vec![super::resolve_path(raw, cwd)])
+            .unwrap_or_default(),
+        "grep" => {
+            let mut targets = Vec::new();
+            if let Some(paths_val) = value.get("paths") {
+                match paths_val {
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty())
+                            {
+                                targets.push(super::resolve_path(&s.replace('\\', "/"), cwd));
+                            }
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            targets.push(super::resolve_path(&trimmed.replace('\\', "/"), cwd));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if targets.is_empty() {
+                let raw = string("path").unwrap_or(".");
+                targets.push(super::resolve_path(&raw.replace('\\', "/"), cwd));
+            }
+            targets
+        }
+        "code_explore" => {
             let raw = string("path").unwrap_or(".");
-            Some(super::resolve_path(raw, cwd))
+            vec![super::resolve_path(raw, cwd)]
         }
         "glob" => {
-            let pattern = string("pattern")?;
+            let Some(pattern) = string("pattern") else {
+                return Vec::new();
+            };
             if let Some((base, _)) = super::glob::split_absolute_base(pattern) {
-                Some(base)
+                vec![base]
             } else {
-                let raw = string("path").unwrap_or(".");
-                Some(super::resolve_path(raw, cwd))
+                let raw_base = string("path").unwrap_or(".");
+                let base_dir = super::resolve_path(raw_base, cwd);
+                let mut targets = vec![base_dir.clone()];
+                if let Some(prefix) = normalize_relative_glob_prefix(pattern) {
+                    targets.push(super::resolve_path(&prefix, &base_dir));
+                }
+                targets
             }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -410,19 +463,33 @@ fn codegraph_sensitive_match(cwd: &Path, target: &Path) -> bool {
     crate::ignore_policy::IgnorePolicy::is_sensitive_at(cwd, target)
 }
 
-fn local_read_target_sensitivity(tool: &str, args: &str, cwd: &Path) -> Option<(bool, PathBuf)> {
-    let target = local_read_target(tool, args, cwd)?;
-    let identity = resolved_filesystem_path(&target);
-    let marker_args = serde_json::json!({
-        "file_path": crate::pathnorm::to_display(&identity),
-    })
-    .to_string();
-    Some((
-        path_is_sensitive(&identity)
+fn local_read_target_sensitivity(tool: &str, args: &str, cwd: &Path) -> Option<(bool, String)> {
+    let targets = local_read_targets(tool, args, cwd);
+    if targets.is_empty() {
+        return None;
+    }
+    let mut any_sensitive = false;
+    let mut identities = Vec::with_capacity(targets.len());
+    for target in targets {
+        if has_unresolved_parent_traversal(&target) {
+            any_sensitive = true;
+        }
+        let identity = resolved_filesystem_path(&target);
+        let marker_args = serde_json::json!({
+            "file_path": crate::pathnorm::to_display(&identity),
+        })
+        .to_string();
+        if path_is_sensitive(&identity)
             || references_sensitive_path(&marker_args)
-            || codegraph_sensitive_match(cwd, &identity),
-        identity,
-    ))
+            || codegraph_sensitive_match(cwd, &identity)
+        {
+            any_sensitive = true;
+        }
+        identities.push(crate::pathnorm::path_case_key(&identity));
+    }
+    identities.sort();
+    identities.dedup();
+    Some((any_sensitive, identities.join("|")))
 }
 
 /// Require approval before an otherwise-`Safe` tool reads a sensitive path.
@@ -511,15 +578,15 @@ impl ToolMiddleware for SensitivePathGate {
                 .await;
 
                 match classified {
-                    Some((is_sensitive, identity)) => {
+                    Some((is_sensitive, identity_key)) => {
                         sensitive |= is_sensitive;
-                        canonical_identity = Some(crate::pathnorm::path_case_key(&identity));
+                        canonical_identity = Some(identity_key);
                     }
                     None => {
                         // `None` can mean malformed args (the tool will reject them) or an FS
                         // classification timeout. Only a well-formed built-in target is security
                         // relevant; distinguish it without touching the filesystem again.
-                        if local_read_target(tool.name(), &call.arguments, &cwd).is_some() {
+                        if !local_read_targets(tool.name(), &call.arguments, &cwd).is_empty() {
                             sensitive = true;
                             rememberable = false;
                         }
@@ -809,24 +876,24 @@ mod tests {
     fn extracts_only_builtin_local_read_targets() {
         let cwd = Path::new("workspace");
         assert_eq!(
-            local_read_target("read", r#"{"path":"src/main.rs"}"#, cwd),
-            Some(cwd.join("src/main.rs"))
+            local_read_targets("read", r#"{"path":"src/main.rs"}"#, cwd),
+            vec![cwd.join("src/main.rs")]
         );
         assert_eq!(
-            local_read_target("read_file", r#"{"file_path":"src/main.rs"}"#, cwd),
-            Some(cwd.join("src/main.rs"))
+            local_read_targets("read_file", r#"{"file_path":"src/main.rs"}"#, cwd),
+            vec![cwd.join("src/main.rs")]
         );
         assert_eq!(
-            local_read_target("grep", r#"{"pattern":"needle"}"#, cwd),
-            Some(cwd.to_path_buf())
+            local_read_targets("grep", r#"{"pattern":"needle"}"#, cwd),
+            vec![cwd.to_path_buf()]
         );
         assert_eq!(
-            local_read_target("glob", r#"{"pattern":"*.rs","path":"src"}"#, cwd),
-            Some(cwd.join("src"))
+            local_read_targets("glob", r#"{"pattern":"*.rs","path":"src"}"#, cwd),
+            vec![cwd.join("src")]
         );
         assert_eq!(
-            local_read_target("code_explore", r#"{"query":"auth","path":"src/auth"}"#, cwd),
-            Some(cwd.join("src/auth"))
+            local_read_targets("code_explore", r#"{"query":"auth","path":"src/auth"}"#, cwd),
+            vec![cwd.join("src/auth")]
         );
     }
 
@@ -922,5 +989,38 @@ mod tests {
         assert!(references_sensitive_path(
             r#"{"command":"cat ~/.jeikcode/auth/token.json"}"#
         ));
+    }
+
+    #[test]
+    fn grep_paths_array_and_relative_glob_prefix_resolve_sensitive_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let secret_dir = dir.path().join("custom_secrets");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let pem = secret_dir.join("prod.pem");
+        std::fs::write(&pem, "KEY").unwrap();
+
+        let grep_args = serde_json::json!({
+            "pattern": "KEY",
+            "paths": [pem.to_string_lossy()]
+        })
+        .to_string();
+        let (is_sens, _) = local_read_target_sensitivity("grep", &grep_args, &ws).unwrap();
+        assert!(
+            is_sens,
+            "grep `paths` array target must be flagged sensitive"
+        );
+
+        // Relative glob prefix pointing outside workspace into a sensitive folder (via .. or symlink)
+        let glob_args = serde_json::json!({
+            "pattern": "../custom_secrets/*.pem"
+        })
+        .to_string();
+        let targets = local_read_targets("glob", &glob_args, &ws);
+        assert!(
+            targets.iter().any(|p| p.ends_with("custom_secrets")),
+            "relative glob prefix must be extracted for sensitivity check: {targets:?}"
+        );
     }
 }

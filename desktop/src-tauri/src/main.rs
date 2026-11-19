@@ -16,11 +16,14 @@ use std::time::{Duration, Instant};
 use jeikcode_config::desktop_shared::{
     cleanup_legacy_dropper_files, desktop_settings_path, is_loopback_host, load_close_action,
     load_webui_listen, migrate_hkcu_path, save_close_action_at, save_webui_listen_pref,
-    DESKTOP_CLI_BIN_ENV, DESKTOP_ENV, DESKTOP_MANAGED_ENV, DESKTOP_PID_ENV, RESTART_EXACT_PORT_ENV,
-    RESTART_LISTEN_PORT_ENV, RESTART_REQUESTED_EXIT_CODE, SERVER_TOKEN_ENV,
+    strip_windows_verbatim_path, DESKTOP_CLI_BIN_ENV, DESKTOP_ENV, DESKTOP_MANAGED_ENV,
+    DESKTOP_PID_ENV, DESKTOP_SHELL_BIN_ENV, RESTART_EXACT_PORT_ENV, RESTART_LISTEN_PORT_ENV,
+    RESTART_REQUESTED_EXIT_CODE, SERVER_TOKEN_ENV,
 };
 use jeikcode_config::i18n::resolve_locale_from_disk;
 use jeikcode_config::locale::Locale;
+use jeikcode_config::schedule::valid_id;
+use jeikcode_config::schedule_os::resolve_schedule_runner_exe;
 use jeikcode_config::util::real_home_dir;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -608,7 +611,39 @@ fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
     });
 }
 
+/// Fast-path for `--schedule-run <id>` when invoked by Windows Task Scheduler.
+/// Runs `jeikcode.exe schedule run <id>` with `CREATE_NO_WINDOW` and null stdio so
+/// scheduled background tasks never flash or open a terminal window.
+fn maybe_run_scheduled_task_cli() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--schedule-run" {
+            let id = match args.next() {
+                Some(id) if valid_id(&id) => id,
+                _ => return Some(2),
+            };
+            let exe = match resolve_schedule_runner_exe() {
+                Ok(p) => p,
+                Err(_) => return Some(1),
+            };
+            let mut cmd = Command::new(exe);
+            cmd.args(["schedule", "run", &id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            suppress_console(&mut cmd);
+            let code = cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+            return Some(code);
+        }
+    }
+    None
+}
+
 fn main() {
+    if let Some(code) = maybe_run_scheduled_task_cli() {
+        std::process::exit(code);
+    }
+
     #[cfg(target_os = "windows")]
     if ensure_single_instance_windows() {
         return;
@@ -1094,7 +1129,13 @@ fn spawn_desktop_server(
         cmd.env(RESTART_LISTEN_PORT_ENV, launch.port.to_string());
     }
     if let Some(ref bundled) = launch.bundled {
-        cmd.env(DESKTOP_CLI_BIN_ENV, bundled);
+        cmd.env(DESKTOP_CLI_BIN_ENV, strip_windows_verbatim_path(bundled));
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        cmd.env(
+            DESKTOP_SHELL_BIN_ENV,
+            strip_windows_verbatim_path(&self_exe),
+        );
     }
     // 开启 stdin 管道作为跨平台生命线（ChildSlot 持有 ChildStdin 写端；一旦桌面壳退出，
     // OS 内核立即关闭管道，子进程阻塞 read 瞬间收到 EOF 退出，0 轮询）。
@@ -1411,8 +1452,7 @@ pub fn extract_webui_url(text: &str) -> Option<String> {
 }
 
 fn health_ready(port: u16) -> bool {
-    http_loopback_request(port, "GET", "/health", None)
-        .is_some_and(|(status, _)| status == 200)
+    http_loopback_request(port, "GET", "/health", None).is_some_and(|(status, _)| status == 200)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1443,9 +1483,10 @@ fn decode_http_response(raw: &[u8]) -> Option<(u16, String)> {
         .nth(1)?
         .parse::<u16>()
         .ok()?;
-    let is_chunked = head
-        .lines()
-        .any(|line| line.to_ascii_lowercase().contains("transfer-encoding: chunked"));
+    let is_chunked = head.lines().any(|line| {
+        line.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    });
     let decoded_body = if is_chunked {
         let mut out_bytes = Vec::new();
         let mut rest = body_bytes;
@@ -1561,11 +1602,7 @@ fn prepare_desktop_port_for_launch(port: u16, bin: &Path, saved_token: Option<&s
         return pick_free_loopback_port(port).unwrap_or(port);
     }
     let local_hash = local_binary_sha256(bin);
-    if !daemon_health_is_stale(
-        &health,
-        env!("CARGO_PKG_VERSION"),
-        local_hash.as_deref(),
-    ) {
+    if !daemon_health_is_stale(&health, env!("CARGO_PKG_VERSION"), local_hash.as_deref()) {
         return port;
     }
 
@@ -1729,10 +1766,10 @@ mod tests {
 
     use super::{
         daemon_health_is_stale, decode_http_response, external_browser_url, extract_webui_url,
-        generate_csprng_token, host_window_away, is_authorized_shell_action_url,
-        navigation_action, new_window_action, parse_active_sessions_idle, remember_webui_origin,
-        resolve_desktop_cli, tray_locale_from_query, tray_texts_for_locale, window_url,
-        DaemonHealthInfo, LinkAction, Locale, WebuiOrigin,
+        generate_csprng_token, host_window_away, is_authorized_shell_action_url, navigation_action,
+        new_window_action, parse_active_sessions_idle, remember_webui_origin, resolve_desktop_cli,
+        tray_locale_from_query, tray_texts_for_locale, window_url, DaemonHealthInfo, LinkAction,
+        Locale, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {

@@ -145,8 +145,49 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode, Option<St
     )
 }
 
-#[tokio::main]
-async fn main() {
+fn maybe_run_scheduled_task_cli() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--schedule-run" {
+            let id = match args.next() {
+                Some(id) if jeikcode_config::schedule::valid_id(&id) => id,
+                _ => return Some(2),
+            };
+            let exe = match jeikcode_config::schedule_os::resolve_schedule_runner_exe() {
+                Ok(p) => p,
+                Err(_) => return Some(1),
+            };
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(["schedule", "run", &id])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let code = cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn main() {
+    if let Some(code) = maybe_run_scheduled_task_cli() {
+        std::process::exit(code);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     // Before anything spawns a child process: a Git-Bash launch leaves TMP/TEMP/TMPDIR as
     // POSIX paths, which native tools resolve as `<drive>:\tmp`.
     jeikcode_capabilities::special_dirs::sanitize_process_temp_env();

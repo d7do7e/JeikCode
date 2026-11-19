@@ -233,6 +233,8 @@ pub struct CatalogEntry {
     pub approval_mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub thinking_budget: Option<u32>,
+    pub origin: SessionOrigin,
+    pub schedule_id: Option<String>,
     pub presence: CatalogPresence,
 }
 
@@ -455,6 +457,9 @@ pub struct SessionMeta {
     /// that sessions written before this field existed deserialize correctly.
     #[serde(default)]
     pub origin: SessionOrigin,
+    /// Optional scheduled-task ID (`~/.jeikcode/schedules/<id>.json`) that spawned this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
     /// Model/selection id last chosen for this session. Independent of the
     /// process-wide `config.toml` default so concurrent sessions can keep
     /// different models.
@@ -498,6 +503,7 @@ impl SessionMeta {
             detached_unattributed_tokens: 0,
             compacted_context_tokens: None,
             origin: SessionOrigin::Manual,
+            schedule_id: None,
             preferred_model: None,
             reasoning_effort: None,
             thinking_budget: None,
@@ -1612,6 +1618,7 @@ impl SessionManager {
         let mut convo = Conversation {
             messages: inflight.snapshot.messages,
             cache_epoch: inflight.snapshot.cache_epoch,
+            delivered_context_hashes: inflight.snapshot.delivered_context_hashes,
         };
         let has_pending = self
             .load_pending_permission(lease.id())
@@ -4069,6 +4076,8 @@ fn catalog_entry(
             approval_mode: native.approval_mode.clone(),
             reasoning_effort: native.reasoning_effort.clone(),
             thinking_budget: native.thinking_budget,
+            origin: native.origin,
+            schedule_id: native.schedule_id.clone(),
             presence: if legacy.is_some() {
                 CatalogPresence::Both
             } else {
@@ -4089,6 +4098,8 @@ fn catalog_entry(
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::LegacyOnly,
         }),
         (None, None) => None,

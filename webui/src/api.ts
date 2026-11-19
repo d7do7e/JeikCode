@@ -1483,6 +1483,8 @@ export interface SessionMeta {
   /** Per-session reasoning effort; absent means "inherit the provider default". */
   reasoning_effort?: string | null;
   thinking_budget?: number | null;
+  origin?: 'manual' | 'scheduled' | 'protocol';
+  schedule_id?: string | null;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -2846,7 +2848,9 @@ export type GlobalWireEvent =
   /** 会话审批模式变更（跨实例全局广播） */
   | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode }
   /** 全局模式开关变更：开启后所有会话统一跟随 `mode`。 */
-  | { type: 'mode_global'; enabled: boolean; mode: ApprovalMode };
+  | { type: 'mode_global'; enabled: boolean; mode: ApprovalMode }
+  /** 本地定时任务列表或运行状态变更。 */
+  | { type: 'schedules_updated' };
 
 const GLOBAL_EVENTS_IDLE_TIMEOUT_MS = 30_000;
 
@@ -3924,6 +3928,183 @@ export async function testGitBinding(
     }
     return { success: false, error: errorMsg || `HTTP ${resp.status}` };
   }
+  return resp.json();
+}
+
+// --- Scheduled Tasks API ---
+
+export type ScheduleSpec =
+  | { kind: 'daily'; time: string }
+  | { kind: 'weekly'; weekday: number; time: string }
+  | { kind: 'hourly' }
+  | { kind: 'interval'; every_minutes: number }
+  | { kind: 'cron'; expr: string };
+
+export type SchedulePermissionMode = 'plan' | 'accept_edits' | 'auto';
+export type ScheduleNotifyLevel = 'off' | 'important' | 'all';
+
+export interface ScheduleTaskItem {
+  id: string;
+  title: string;
+  prompt: string;
+  cwd: string;
+  schedule: ScheduleSpec;
+  permission_mode: SchedulePermissionMode;
+  notify: ScheduleNotifyLevel;
+  enabled: boolean;
+  created_at: number;
+  last_run_at?: number | null;
+  last_status?: string | null;
+  next_run_at?: number | null;
+  os_status: 'registered' | 'missing' | 'unknown';
+  is_running: boolean;
+}
+
+export interface SchedulesListResponse {
+  tasks: ScheduleTaskItem[];
+  os_platform: 'windows' | 'macos' | 'linux' | 'other';
+  os_supported: boolean;
+  supports_cron: boolean;
+  max_interval_minutes?: number | null;
+}
+
+export interface CreateSchedulePayload {
+  title: string;
+  prompt: string;
+  cwd?: string;
+  schedule: ScheduleSpec;
+  permission_mode: SchedulePermissionMode;
+  notify: ScheduleNotifyLevel;
+  enabled?: boolean;
+}
+
+export interface UpdateSchedulePayload {
+  title?: string;
+  prompt?: string;
+  cwd?: string;
+  schedule?: ScheduleSpec;
+  permission_mode?: SchedulePermissionMode;
+  notify?: ScheduleNotifyLevel;
+  enabled?: boolean;
+}
+
+export interface ScheduleMutationResponse {
+  success: boolean;
+  task?: ScheduleTaskItem;
+  os_warning?: string | null;
+  error?: string;
+}
+
+export interface ScheduleSyncResponse {
+  success: boolean;
+  installed: number;
+  uninstalled: number;
+  error_count: number;
+  errors: string[];
+}
+
+async function parseApiError(resp: Response): Promise<string> {
+  try {
+    const data = await resp.json();
+    if (data && typeof data.error === 'string' && data.error.trim()) return data.error;
+    if (data && typeof data.message === 'string' && data.message.trim()) return data.message;
+  } catch {
+    const text = await resp.text().catch(() => '');
+    if (text.trim()) return text.trim();
+  }
+  return `HTTP ${resp.status}`;
+}
+
+export async function getSchedules(): Promise<SchedulesListResponse> {
+  const resp = await apiFetch('/schedules', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function createSchedule(payload: CreateSchedulePayload): Promise<ScheduleMutationResponse> {
+  const resp = await apiFetch('/schedules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function updateSchedule(
+  id: string,
+  payload: UpdateSchedulePayload,
+): Promise<ScheduleMutationResponse> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function toggleSchedule(
+  id: string,
+  enabled?: boolean,
+): Promise<ScheduleMutationResponse> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}/toggle`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(enabled === undefined ? {} : { enabled }),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function deleteSchedule(id: string): Promise<{ success: boolean }> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function syncSchedules(): Promise<ScheduleSyncResponse> {
+  const resp = await apiFetch('/schedules/sync', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function runScheduleNow(id: string): Promise<{ success: boolean; started: boolean; id: string }> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export async function getScheduleRuns(id: string): Promise<SessionMetaWithProject[]> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}/runs`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
+  return resp.json();
+}
+
+export interface ClearScheduleRunsResponse {
+  success: boolean;
+  deleted: number;
+  skipped_active: number;
+  failed: number;
+}
+
+export async function clearScheduleRuns(id: string): Promise<ClearScheduleRunsResponse> {
+  const resp = await apiFetch(`/schedules/${encodeURIComponent(id)}/runs`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(await parseApiError(resp));
   return resp.json();
 }
 

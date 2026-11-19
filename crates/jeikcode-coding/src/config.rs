@@ -277,6 +277,11 @@ pub struct CodingAgentConfig {
     /// user_title). Pinned with `user_renamed=true` so first-prompt seeding and
     /// AI session naming never overwrite it.
     pub session_display_name: Option<String>,
+    /// Origin stored in newly created session metadata (`Manual` by default,
+    /// `Scheduled` for `jeikcode schedule run <id>`).
+    pub session_origin: jeikcode_capabilities::session::SessionOrigin,
+    /// Optional scheduled-task id linked to newly created `Scheduled` sessions.
+    pub session_schedule_id: Option<String>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<jeikcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
@@ -371,6 +376,10 @@ pub struct CodingRuntimeConfig {
     /// user_title). Applied only when the native runtime creates the session meta;
     /// existing sessions keep their stored name.
     pub session_display_name: Option<String>,
+    /// Origin stored in newly created session metadata (`Manual` by default).
+    pub session_origin: jeikcode_capabilities::session::SessionOrigin,
+    /// Optional scheduled-task id linked to newly created `Scheduled` sessions.
+    pub session_schedule_id: Option<String>,
     /// Tool-result compression threshold in bytes (`[tools.tool_output] max_bytes`).
     /// `None` → built-in default (64 KiB); `Some(0)` disables compression.
     pub tool_output_max_bytes: Option<usize>,
@@ -497,6 +506,8 @@ impl CodingRuntimeConfig {
             initial_mesh_name: None,
             initial_mode,
             session_display_name: None,
+            session_origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            session_schedule_id: None,
             // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
             tool_output_max_bytes: std::env::var("JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES")
                 .ok()
@@ -550,6 +561,8 @@ impl CodingRuntimeConfig {
         config.initial_mesh_name = self.initial_mesh_name.clone();
         config.initial_mode = self.initial_mode;
         config.session_display_name = self.session_display_name.clone();
+        config.session_origin = self.session_origin;
+        config.session_schedule_id = self.session_schedule_id.clone();
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.compact_threshold = self.compact_threshold;
@@ -966,6 +979,8 @@ impl CodingAgentConfig {
             initial_mesh_name: None,
             initial_mode: crate::RuntimeMode::default(),
             session_display_name: None,
+            session_origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            session_schedule_id: None,
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
@@ -1493,6 +1508,8 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("goal_max_tokens", &self.goal_max_tokens)
             .field("chat_options", &self.chat_options)
             .field("supports_vision", &self.supports_vision)
+            .field("session_origin", &self.session_origin)
+            .field("session_schedule_id", &self.session_schedule_id)
             .field("telemetry", &self.telemetry.is_some())
             .finish_non_exhaustive()
     }

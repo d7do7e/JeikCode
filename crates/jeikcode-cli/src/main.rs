@@ -14,7 +14,6 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
 
 mod schedule_cmd;
-mod schedule_os;
 mod server_cmd;
 mod telemetry_cmd;
 mod vision;

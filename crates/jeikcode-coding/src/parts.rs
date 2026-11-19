@@ -606,6 +606,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let now = jeikcode_capabilities::session::now_ms();
             let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
             meta.owner = StorageOwner::Native;
+            meta.origin = cfg.session_origin;
+            meta.schedule_id = cfg.session_schedule_id.clone();
             // OpenAI / Anthropic / compat `user` (or user_title): pin as
             // user_renamed so first-prompt seed and AI naming never overwrite.
             apply_pinned_session_display_name(
@@ -639,6 +641,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let now = jeikcode_capabilities::session::now_ms();
             let mut meta = SessionMeta::new(id, cfg.working_dir.to_string_lossy().as_ref(), now);
             meta.owner = StorageOwner::Native;
+            meta.origin = cfg.session_origin;
+            meta.schedule_id = cfg.session_schedule_id.clone();
             apply_pinned_session_display_name(
                 &mut meta,
                 cfg.session_display_name
@@ -3186,6 +3190,37 @@ mod tests {
         assert_eq!(meta.name, "alice_a");
         assert!(meta.user_renamed);
         assert_eq!(meta.message_count, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn staged_fresh_scheduled_session_persists_origin_and_schedule_id() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        cfg.session_origin = jeikcode_capabilities::session::SessionOrigin::Scheduled;
+        cfg.session_schedule_id = Some("daily-brief-abc123".into());
+        cfg.session_display_name = Some("[Scheduled] Daily brief".into());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+
+        let mut parts =
+            prepare_with_plugin_hooks_reusing_lease(&cfg, opts, Vec::new(), None, true, None)
+                .await
+                .unwrap();
+        parts
+            .publish_staged_session_with_first_input(Some("run scheduled task prompt"))
+            .unwrap();
+        let binding = parts.session.as_ref().unwrap();
+        let meta = binding.manager.read_meta(&binding.id).unwrap();
+        assert_eq!(
+            meta.origin,
+            jeikcode_capabilities::session::SessionOrigin::Scheduled
+        );
+        assert_eq!(meta.schedule_id.as_deref(), Some("daily-brief-abc123"));
+        assert_eq!(meta.name, "[Scheduled] Daily brief");
+        assert!(meta.user_renamed);
     }
 
     #[tokio::test]

@@ -49,6 +49,9 @@ pub mod system_proxy;
 /// Local scheduled-task model, file store, and next-run calculator.
 pub mod schedule;
 
+/// Cross-platform OS scheduler adapters (Windows Task Scheduler, Linux systemd, macOS launchd).
+pub mod schedule_os;
+
 /// Shared desktop/daemon/CLI contracts, listen preferences, and settings I/O.
 pub mod desktop_shared;
 

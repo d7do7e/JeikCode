@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
-use crate::schedule_os::{InstallState, OsScheduler};
-use jeikcode_config::schedule::{self, Schedule, ScheduleTask};
+use jeikcode_config::schedule::{self, build_task, validate_task_fields, Schedule, ScheduleTask};
+use jeikcode_config::schedule_os::{self, InstallState, OsScheduler};
 
 // ── CLI enum ──────────────────────────────────────────────────────────────────
 
@@ -105,10 +105,7 @@ fn parse_schedule(
     cron: Option<&str>,
 ) -> Result<Schedule> {
     if let Some(t) = daily {
-        // Validate HH:MM format minimally.
-        if !t.contains(':') {
-            anyhow::bail!("--daily expects HH:MM format, got {:?}", t);
-        }
+        jeikcode_config::schedule::parse_hhmm(t).with_context(|| "--daily expects HH:MM")?;
         return Ok(Schedule::Daily {
             time: t.to_string(),
         });
@@ -124,9 +121,8 @@ fn parse_schedule(
         if !(1..=7).contains(&weekday) {
             anyhow::bail!("--weekly weekday must be 1..7, got {}", weekday);
         }
-        if !time.contains(':') {
-            anyhow::bail!("--weekly time must be HH:MM, got {:?}", time);
-        }
+        jeikcode_config::schedule::parse_hhmm(time)
+            .with_context(|| "--weekly time must be HH:MM")?;
         return Ok(Schedule::Weekly {
             weekday,
             time: time.to_string(),
@@ -162,68 +158,6 @@ fn parse_schedule(
     )
 }
 
-/// Build a [`ScheduleTask`] from raw CLI arguments.  Pure function — no I/O.
-///
-/// `id` = `slug(title)-<first 6 chars of a new UUIDv4>`.
-pub fn build_task(
-    title: &str,
-    prompt: &str,
-    cwd: &str,
-    sched: Schedule,
-    permission_mode: &str,
-    notify: &str,
-) -> ScheduleTask {
-    let slug = slug(title);
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let id = format!("{}-{}", slug, &suffix[..6]);
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    ScheduleTask {
-        id,
-        title: title.to_string(),
-        prompt: prompt.to_string(),
-        cwd: cwd.to_string(),
-        schedule: sched,
-        permission_mode: permission_mode.to_string(),
-        notify: notify.to_string(),
-        enabled: true,
-        created_at,
-        last_run_at: None,
-        last_status: None,
-    }
-}
-
-/// Convert a title string to a slug usable as part of an id.
-///
-/// Only ASCII alphanumeric characters are kept; everything else is collapsed
-/// into a single `-` separator.  Non-ASCII characters (e.g. CJK) are dropped
-/// entirely so that launchd labels remain valid ASCII.  If the result would be
-/// empty (e.g. a purely non-ASCII title) the fallback `"task"` is returned.
-/// The output is lowercased and truncated to 32 characters.
-fn slug(s: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = true; // suppress leading dash
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    // strip trailing dash
-    let out = out.trim_end_matches('-').to_string();
-    if out.is_empty() {
-        "task".to_string()
-    } else {
-        out.chars().take(32).collect()
-    }
-}
-
 // ── Inner handlers (accept &dyn OsScheduler for testability) ─────────────────
 
 /// Core logic for `schedule add` after the task has been built and saved.
@@ -241,8 +175,11 @@ fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
     Ok(())
 }
 
-/// Core logic for `schedule remove`: uninstall (best-effort) then delete.
+/// Core logic for `schedule remove`: validate id, uninstall (best-effort), then delete.
 fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+    if !schedule::valid_id(id) {
+        anyhow::bail!("invalid scheduled task id {:?}", id);
+    }
     // best-effort — don't abort if already absent
     let _ = os.uninstall(id);
     schedule::remove(id).with_context(|| format!("failed to remove task {:?}", id))?;
@@ -251,9 +188,11 @@ fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 
 /// Core logic for `schedule enable`.
 fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
-    task.enabled = true;
-    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
+    let task = schedule::update_task(id, |t| -> std::io::Result<()> {
+        t.enabled = true;
+        Ok(())
+    })
+    .with_context(|| format!("task {:?} not found", id))?;
     if let Err(e) = os.install(&task) {
         eprintln!(
             "[schedule] warning: OS scheduler registration failed for {id}: {e}\n\
@@ -265,9 +204,11 @@ fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 
 /// Core logic for `schedule disable`.
 fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
-    task.enabled = false;
-    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
+    schedule::update_task(id, |t| -> std::io::Result<()> {
+        t.enabled = false;
+        Ok(())
+    })
+    .with_context(|| format!("task {:?} not found", id))?;
     // best-effort
     let _ = os.uninstall(id);
     Ok(())
@@ -350,10 +291,11 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                     .to_string_lossy()
                     .into_owned()
             });
+            validate_task_fields(&title, &prompt, &cwd, &sched, &mode, &notify)?;
             let task = build_task(&title, &prompt, &cwd, sched, &mode, &notify);
             schedule::save(&task)
                 .with_context(|| format!("failed to save scheduled task {:?}", task.id))?;
-            let os = crate::schedule_os::current()?;
+            let os = schedule_os::current()?;
             handle_add_with(os.as_ref(), &task)?;
             println!("  Added task {} ({})", task.id, task.title);
             Ok(0)
@@ -368,7 +310,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             // Degrade gracefully: if the OS scheduler is not available (e.g.
             // no home directory), still print the task list with an unknown
             // registration status rather than failing the whole command.
-            let os = crate::schedule_os::current().ok();
+            let os = schedule_os::current().ok();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -394,21 +336,21 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
         }
 
         ScheduleCli::Remove { id } => {
-            let os = crate::schedule_os::current()?;
+            let os = schedule_os::current()?;
             handle_remove_with(os.as_ref(), &id)?;
             println!("  Removed task {}", id);
             Ok(0)
         }
 
         ScheduleCli::Enable { id } => {
-            let os = crate::schedule_os::current()?;
+            let os = schedule_os::current()?;
             handle_enable_with(os.as_ref(), &id)?;
             println!("  Enabled task {}", id);
             Ok(0)
         }
 
         ScheduleCli::Disable { id } => {
-            let os = crate::schedule_os::current()?;
+            let os = schedule_os::current()?;
             handle_disable_with(os.as_ref(), &id)?;
             println!("  Disabled task {}", id);
             Ok(0)
@@ -417,7 +359,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
         ScheduleCli::Run { id } => run_task(&id).await,
 
         ScheduleCli::Sync => {
-            let os = crate::schedule_os::current()?;
+            let os = schedule_os::current()?;
             let errors = handle_sync_with(os.as_ref())?;
             Ok(if errors > 0 { 1 } else { 0 })
         }
@@ -456,18 +398,28 @@ pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
 /// function returns non-zero.
 async fn run_task(id: &str) -> Result<i32> {
     use jeikcode_capabilities::session::manager::SessionOrigin;
-    use jeikcode_capabilities::session::SessionManager;
     use jeikcode_coding::ProviderBootstrap;
     use jeikcode_config::config::Config;
 
     // 1. Load task record.
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
+    let task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
 
     // 2. Skip if disabled.
     if !task.enabled {
         println!("  schedule run: task {} is disabled, skipping", task.id);
         return Ok(0);
     }
+
+    // 2b. Acquire cross-process per-task run lock before touching status or spawning runtime.
+    let Some(_run_lock) = schedule::try_acquire_run_lock(&task.id)
+        .with_context(|| format!("failed to acquire run lock for task {:?}", task.id))?
+    else {
+        println!(
+            "  schedule run: task {} is already running, skipping",
+            task.id
+        );
+        return Ok(0);
+    };
 
     // 3. Load user config from default path.
     let config_path = Config::default_path();
@@ -488,9 +440,7 @@ async fn run_task(id: &str) -> Result<i32> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        task.last_run_at = Some(now);
-        task.last_status = Some("error".to_string());
-        let _ = schedule::save(&task);
+        let _ = schedule::update_run_status(&task.id, now, "error");
         return Ok(1);
     }
 
@@ -498,17 +448,22 @@ async fn run_task(id: &str) -> Result<i32> {
     //    Scheduled tasks never do a full bypass (dangerously_skip_permissions=false).
     //    The strict_unattended approver in run_native_headless blocks any dangerous/
     //    out-of-workspace bash regardless of permission_mode — no human is present.
+    //    Stamp session_origin / session_schedule_id / session_display_name BEFORE
+    //    spawning so staged_fresh carries them directly when the session is persisted.
     let mode = mode_from_str(&task.permission_mode);
-    let runtime_cfg = crate::runtime_config_from(
+    let mut runtime_cfg = crate::runtime_config_from(
         &config, &cwd, None, None,  // no per-task telemetry arc needed
         false, // dangerously_skip_permissions=false — scheduled: never full bypass
         false, // headless: fail-closed approval timeout
     );
+    runtime_cfg.session_origin = SessionOrigin::Scheduled;
+    runtime_cfg.session_schedule_id = Some(task.id.clone());
+    runtime_cfg.session_display_name = Some(format!("[Scheduled] {}", task.title));
 
     // 6. Spawn runtime (Fresh session — no resume).
     // Headless path always uses ProviderBootstrap::Required so it fails fast
     // when no provider is configured, mirroring the `-p` / `--prompt` flow.
-    let (runtime, agent, _cont) = crate::spawn_native_cli_runtime(
+    let (runtime, _agent, _cont) = crate::spawn_native_cli_runtime(
         &runtime_cfg,
         None,
         ProviderBootstrap::Required,
@@ -517,17 +472,7 @@ async fn run_task(id: &str) -> Result<i32> {
     )
     .await?;
 
-    // 7. Mark session origin = Scheduled.
-    if let Some(ref session_info) = runtime.session {
-        let sid = session_info.id.clone();
-        let manager = SessionManager::for_project(&agent.working_dir);
-        // Best-effort — don't abort the run if meta update fails.
-        let _ = manager.update_meta(&sid, |m| {
-            m.origin = SessionOrigin::Scheduled;
-        });
-    }
-
-    // 8. Set the runtime mode after spawn.
+    // 7. Set the runtime mode after spawn.
     //    Scheduled tasks cap Auto at AcceptEdits so the middleware layer does not
     //    blanket-approve dangerous bash — the strict approver in run_native_headless
     //    provides the second safety net.  Plan and AcceptEdits pass through unchanged.
@@ -572,14 +517,12 @@ async fn run_task(id: &str) -> Result<i32> {
     )
     .await?;
 
-    // 11. Write back last_run_at and last_status.
+    // 11. Write back last_run_at and last_status without clobbering concurrent task edits.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    task.last_run_at = Some(now);
-    task.last_status = Some(last_status_for(exit_code).to_string());
-    let _ = schedule::save(&task);
+    let _ = schedule::update_run_status(&task.id, now, last_status_for(exit_code));
 
     Ok(exit_code)
 }
@@ -698,23 +641,23 @@ mod tests {
 
     #[test]
     fn slug_handles_special_chars() {
-        assert_eq!(slug("Hello World!"), "hello-world");
-        assert_eq!(slug("  leading-trailing  "), "leading-trailing");
+        assert_eq!(schedule::slug("Hello World!"), "hello-world");
+        assert_eq!(schedule::slug("  leading-trailing  "), "leading-trailing");
         // purely punctuation → "task" fallback
-        assert_eq!(slug("!!!"), "task");
+        assert_eq!(schedule::slug("!!!"), "task");
         // long title gets truncated
         let long = "a".repeat(50);
-        assert_eq!(slug(&long).len(), 32);
+        assert_eq!(schedule::slug(&long).len(), 32);
     }
 
     // B: ASCII-only slug — non-ASCII characters (CJK etc.) must be dropped.
     #[test]
     fn slug_non_ascii_title_falls_back_to_task() {
         // Purely CJK: no ASCII alphanumeric → fallback "task"
-        let s = slug("重要任务");
+        let s = schedule::slug("重要任务");
         assert_eq!(s, "task", "pure non-ASCII slug must be 'task', got: {s}");
         // Mixed ASCII + CJK: only ASCII letters survive
-        let s2 = slug("My重要Task");
+        let s2 = schedule::slug("My重要Task");
         assert!(
             s2.chars().all(|c| c.is_ascii()),
             "slug must be all-ASCII: {s2}"
@@ -725,7 +668,7 @@ mod tests {
 
     #[test]
     fn slug_ascii_alphanumeric_preserved() {
-        assert_eq!(slug("My Task 2"), "my-task-2");
+        assert_eq!(schedule::slug("My Task 2"), "my-task-2");
     }
 
     #[test]
@@ -811,8 +754,8 @@ mod tests {
 
     // ── FakeScheduler — records install/uninstall calls ───────────────────────
 
-    use crate::schedule_os::{InstallState, OsScheduler};
     use jeikcode_config::schedule::ScheduleTask;
+    use jeikcode_config::schedule_os::{InstallState, OsScheduler};
     use std::sync::{Mutex, OnceLock};
 
     /// Global lock to serialize tests that mutate JEIKCODE_HOME / the schedule store.

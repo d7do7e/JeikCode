@@ -31,6 +31,7 @@ import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
 import { FileExplorer } from './FileExplorer';
+import { TasksSidebar } from './TasksSidebar';
 import { getPageZoom } from '../lib/pageZoom';
 import { menuPointFromEvent } from '../lib/menuPosition';
 
@@ -93,6 +94,10 @@ interface SidebarProps {
   /** 从资源管理器打开文件 */
   onOpenFile?: (filePath: string) => void;
   activeFilePath?: string | null;
+  /** Open the scheduled tasks management view in the main stage. */
+  onOpenTasks?: (taskId?: string | null, creatingNew?: boolean) => void;
+  selectedTaskId?: string | null;
+  activeMainTabId?: string;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -153,6 +158,16 @@ function CloudIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+    </svg>
+  );
+}
+
+/** Clock glyph for opening/switching to the scheduled tasks view. */
+function TasksRailIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <polyline points="12 7 12 12 15.5 14" />
     </svg>
   );
 }
@@ -488,6 +503,9 @@ export function Sidebar({
   completedIds,
   onOpenFile,
   activeFilePath,
+  onOpenTasks,
+  selectedTaskId,
+  activeMainTabId,
 }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
@@ -502,20 +520,25 @@ export function Sidebar({
   const t = useT();
   const { theme, setTheme, lang, setLang, githubLogo, autoGitSync, setAutoGitSync } = useSettings();
   const SIDEBAR_TAB_STORAGE_KEY = 'jeikcode:sidebar_tab';
-  // Sidebar View Tab: 'chats' (会话与项目) vs 'files' (资源管理器)，刷新自动记忆最后选择
-  const [sidebarTab, setSidebarTabState] = useState<'chats' | 'files'>(() => {
+  // Sidebar View Tab: 'chats' | 'tasks' | 'files'，刷新自动记忆最后选择
+  const [sidebarTab, setSidebarTabState] = useState<'chats' | 'tasks' | 'files'>(() => {
     try {
       const saved = localStorage.getItem(SIDEBAR_TAB_STORAGE_KEY);
-      if (saved === 'chats' || saved === 'files') return saved;
+      if (saved === 'chats' || saved === 'tasks' || saved === 'files') return saved;
     } catch {}
     return 'chats';
   });
-  const setSidebarTab = (tab: 'chats' | 'files') => {
+  const setSidebarTab = (tab: 'chats' | 'tasks' | 'files') => {
     setSidebarTabState(tab);
     try {
       localStorage.setItem(SIDEBAR_TAB_STORAGE_KEY, tab);
     } catch {}
   };
+  useEffect(() => {
+    if (activeMainTabId === 'tasks' && sidebarTab !== 'tasks') {
+      setSidebarTab('tasks');
+    }
+  }, [activeMainTabId]);
   const [appVersion, setAppVersion] = useState(bakedAppVersion());
   // 首屏快照：列表/项目/选中行直接画上次那一份，随后服务端数据就地校准。
   const initialSidebarSnapshotRef = useRef<SidebarSnapshot | null | undefined>(undefined);
@@ -824,6 +847,7 @@ export function Sidebar({
     return onGlobalEvent((event) => {
       if (event.type === 'session_upsert') {
         const row = event.session;
+        if (row.origin === 'scheduled') return;
         setSessions((cur) => mergeSessionRow(cur, row));
         setProjectSessionsMap((prev) => {
           const list = prev[row.project_hash];
@@ -2471,6 +2495,21 @@ export function Sidebar({
           >
             <CloudIcon />
           </button>
+          {/* 切换到定时任务视图 */}
+          <button
+            class={'rail-btn' + (sidebarTab === 'tasks' ? ' active' : '')}
+            onClick={() => {
+              setSidebarTab('tasks');
+              onOpenTasks?.(selectedTaskId ?? null, false);
+              if (collapsed && onToggleCollapse) {
+                onToggleCollapse();
+              }
+            }}
+            title={t('sidebar.recentTasks')}
+            aria-label={t('sidebar.recentTasks')}
+          >
+            <TasksRailIcon />
+          </button>
           {/* 回到最近的一次资源管理器状态 */}
           <button
             class={'rail-btn' + (sidebarTab === 'files' ? ' active' : '')}
@@ -2552,7 +2591,7 @@ export function Sidebar({
         </span>
       </div>
 
-      {/* 顶部双子胶囊切页：对话与项目 vs 资源管理器 (解决多项目会话与文件树拥挤痛点) */}
+      {/* 顶部三段胶囊切页：对话 / 任务 / 资源管理 */}
       <div class="sidebar-segment-tabs">
         <button
           type="button"
@@ -2560,27 +2599,50 @@ export function Sidebar({
           onClick={() => {
             setSidebarTab('chats');
             window.dispatchEvent(new CustomEvent('jeikcode:switch_main_tab', { detail: 'chat' }));
-            const recent = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
-            if (recent) {
-              onSelect(recent);
+            if (activeSessionId) {
+              const recent = sessions.find((s) => s.id === activeSessionId);
+              if (recent) onSelect(recent);
             }
           }}
         >
-          <span>💬</span>
-          <span>{t('sidebar.chats') || '对话'}</span>
+          <span class="sidebar-segment-icon">💬</span>
+          <span class="sidebar-segment-label">{t('sidebar.chats') || '对话'}</span>
+        </button>
+        <button
+          type="button"
+          class={'sidebar-segment-btn' + (sidebarTab === 'tasks' ? ' active' : '')}
+          onClick={() => {
+            setSidebarTab('tasks');
+            onOpenTasks?.(selectedTaskId ?? null, false);
+          }}
+        >
+          <span class="sidebar-segment-icon">⏱</span>
+          <span class="sidebar-segment-label">{t('sidebar.tasks') || '任务'}</span>
         </button>
         <button
           type="button"
           class={'sidebar-segment-btn' + (sidebarTab === 'files' ? ' active' : '')}
           onClick={() => setSidebarTab('files')}
         >
-          <span>📁</span>
-          <span>{t('sidebar.files') || '资源管理'}</span>
+          <span class="sidebar-segment-icon">📁</span>
+          <span class="sidebar-segment-label">{t('sidebar.files') || '资源管理'}</span>
         </button>
       </div>
 
       {sidebarTab === 'files' ? (
         <FileExplorer cwd={cwd} onOpenFile={onOpenFile} activeFilePath={activeFilePath} />
+      ) : sidebarTab === 'tasks' ? (
+        <TasksSidebar
+          selectedTaskId={selectedTaskId}
+          onSelectTask={(id) => {
+            onOpenTasks?.(id, false);
+            onCloseDrawer?.();
+          }}
+          onNewTask={() => {
+            onOpenTasks?.(null, true);
+            onCloseDrawer?.();
+          }}
+        />
       ) : (
         <>
           <div class="sidebar-actions">

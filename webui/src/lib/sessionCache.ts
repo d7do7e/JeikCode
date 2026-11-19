@@ -556,19 +556,31 @@ function setMemorySession(projectHash: string, sessionId: string, data: CachedSe
 // 写（唯一入口）
 // ============================================================================
 
-async function persistEntry(entry: CachedSessionData): Promise<void> {
+async function persistEntry(entry: CachedSessionData, startEpoch?: number): Promise<void> {
+  const key = makeKey(entry.projectHash, entry.sessionId);
+  if ((startEpoch !== undefined && cacheEpoch !== startEpoch) || !memoryCache.has(key)) {
+    return;
+  }
   const db = await getDB();
   if (!db) return;
+  if ((startEpoch !== undefined && cacheEpoch !== startEpoch) || !memoryCache.has(key)) {
+    return;
+  }
   try {
     const tx = db.transaction(STORE_SESSIONS, 'readwrite');
     tx.objectStore(STORE_SESSIONS).put({
-      key: makeKey(entry.projectHash, entry.sessionId),
+      key,
       ...entry,
     });
     scheduleSessionCacheEviction();
   } catch (err) {
     console.warn('[SessionCache] Failed to write to IndexedDB:', err);
   }
+}
+
+/** 仅测试用：当前待异步落盘的条目数。 */
+export function pendingPersistSize(): number {
+  return pendingPersist.size;
 }
 
 /**
@@ -582,6 +594,7 @@ async function persistEntry(entry: CachedSessionData): Promise<void> {
  */
 const pendingPersist = new Map<string, CachedSessionData>();
 let persistScheduled = false;
+let cacheEpoch = 0;
 
 function scheduleFlush(): void {
   if (persistScheduled) return;
@@ -599,10 +612,14 @@ function scheduleFlush(): void {
 /** 立即把所有待落盘条目写入 L2（页面隐藏/切会话/卸载前调用）。 */
 export async function flushPendingPersist(): Promise<void> {
   if (pendingPersist.size === 0) return;
-  const entries = [...pendingPersist.values()];
+  const startEpoch = cacheEpoch;
+  const entries = [...pendingPersist.entries()];
   pendingPersist.clear();
-  for (const entry of entries) {
-    await persistEntry(entry);
+  for (const [key, entry] of entries) {
+    // 若在 flush 异步 await 期间发生了 clearAllSessionCache 或 deleteSessionCache，
+    // 跳过已失效条目，防止已删除的会话回写 IndexedDB 复活。
+    if (cacheEpoch !== startEpoch || !memoryCache.has(key)) continue;
+    await persistEntry(entry, startEpoch);
   }
 }
 
@@ -697,6 +714,7 @@ export async function deleteSessionCache(
   sessionId: string,
 ): Promise<void> {
   const key = makeKey(projectHash, sessionId);
+  pendingPersist.delete(key);
   memoryCache.delete(key);
   knownRevisions.delete(key);
   const db = await getDB();
@@ -713,6 +731,8 @@ export async function deleteSessionCache(
  * Ctrl + F5 强制清理：一网打尽清空所有 L1 内存与 L2 IndexedDB 缓存
  */
 export async function clearAllSessionCache(): Promise<void> {
+  cacheEpoch += 1;
+  pendingPersist.clear();
   memoryCache.clear();
   knownRevisions.clear();
   fileMemoryCache.clear();

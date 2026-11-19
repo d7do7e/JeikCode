@@ -544,6 +544,7 @@ fn convert_legacy_session_with_diagnostic(
         detached_unattributed_tokens: 0,
         compacted_context_tokens: None,
         origin: SessionOrigin::Manual,
+        schedule_id: None,
         preferred_model: None,
         reasoning_effort: None,
         thinking_budget: None,
@@ -1504,7 +1505,7 @@ fn append_catalog_presentation_in_root(
     Ok(count)
 }
 
-fn delete_catalog_session_in_root(
+pub fn delete_catalog_session_in_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,
     id: &str,
@@ -3475,6 +3476,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -3580,6 +3583,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -3625,6 +3630,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -3809,6 +3816,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -3854,6 +3863,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::LegacyOnly,
         };
 
@@ -3893,6 +3904,8 @@ mod tests {
             approval_mode: None,
             reasoning_effort: None,
             thinking_budget: None,
+            origin: SessionOrigin::Manual,
+            schedule_id: None,
             presence: CatalogPresence::LegacyOnly,
         };
 

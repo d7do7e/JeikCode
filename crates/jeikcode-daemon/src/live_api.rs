@@ -956,6 +956,8 @@ pub(crate) fn chat_runtime_config(
         initial_mesh_name: None,
         initial_mode: jeikcode_coding::RuntimeMode::default(),
         session_display_name: None,
+        session_origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+        session_schedule_id: None,
         // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
         // Mirrors `CodingRuntimeConfig::from_config` so the daemon path honors the
         // same compression thresholds as CLI/TUI.

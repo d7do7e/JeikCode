@@ -22,6 +22,7 @@
 //!     `Map` (sorted on serialize) with no timestamps/uuids, so the same
 //!     `(system, messages, tools)` always serialize identically.
 
+use super::openai_compat::{build_http_client, SwappableClient};
 use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 use super::retry::{self, RetryPolicy};
 use async_trait::async_trait;
@@ -129,7 +130,7 @@ impl AnthropicConfig {
 pub struct AnthropicProvider {
     cfg: AnthropicConfig,
     policy: ReasoningPolicy,
-    client: reqwest::Client,
+    client: std::sync::Arc<SwappableClient>,
     url: String,
     /// Stable per-conversation id bound ONCE by the kernel; see the field on
     /// `OpenAiCompatProvider`. `OnceLock` — constant for the provider's life.
@@ -152,25 +153,14 @@ impl AnthropicProvider {
 
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
         let policy = Self::resolve_policy(&cfg);
-        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-            .connect_timeout(cfg.connect_timeout)
-            // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
-            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-            // Product UA for gateway attribution (parity with core's build_http_client).
-            .user_agent(
-                cfg.user_agent
-                    .as_deref()
-                    .unwrap_or(super::DEFAULT_USER_AGENT),
-            );
-        if cfg.skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        let client = builder.build().map_err(|e| ProviderError {
-            retryable: false,
-            message: format!("http client build failed: {e}"),
-            ..Default::default()
-        })?;
+        let connect_timeout = cfg.connect_timeout;
+        let skip_tls_verify = cfg.skip_tls_verify;
+        let user_agent = cfg.user_agent.clone();
         let url = messages_endpoint_url(&cfg.base_url);
+        let initial_tls12 = jeikcode_config::tls::should_cap_url(&url);
+        let client = std::sync::Arc::new(SwappableClient::new(initial_tls12, move |tls12| {
+            build_http_client(connect_timeout, skip_tls_verify, user_agent.clone(), tls12)
+        })?);
         Ok(Self {
             cfg,
             policy,
@@ -223,6 +213,7 @@ impl LlmProvider for AnthropicProvider {
         let idle = self.cfg.idle_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let mut reopen_budget = retry::StreamReopenBudget::new();
         let resp = open_stream(
             &client,
             &url,
@@ -239,12 +230,9 @@ impl LlmProvider for AnthropicProvider {
         let s = async_stream::stream! {
             // A body that dies before replay-sensitive output reaches the consumer is
             // safe to redo wholesale. Metadata may repeat; content and tool data may not.
-            // 1 initial open + up to 2 transparent reopens — a gateway resetting
-            // connections under load can drop more than one attempt before a
-            // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 6;
-            let mut stream_attempt = 1u32;
-            let mut reconnect_attempts = 0u32;
+            // Fast transient drops reopen up to 6 attempts; slow attempts (>=10s) surface
+            // to the kernel after attempt 1 so the user sees a warning instead of waiting
+            // silently for minutes.
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = AnthropicSseDecoder::new();
@@ -304,28 +292,56 @@ impl LlmProvider for AnthropicProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
-                                reconnect_attempts += 1;
+                            if !emitted_replay_sensitive && reopen_budget.can_reopen_fast(&e) {
+                                let delay = retry::compute_backoff(reopen_budget.attempt(), &policy);
+                                reopen_budget.begin_reopen();
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
-                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                tokio::time::sleep(delay).await;
+                                if retry::is_stale_connection_error(&e)
+                                    || retry::chain_has_tls_corruption(&e)
                                 {
-                                    stream_attempt += 1;
-                                    resp = fresh;
-                                    continue 'reopen;
+                                    if let Err(rebuild_error) = client.rebuild(
+                                        jeikcode_config::tls::should_cap_url(&url),
+                                    ) {
+                                        yield StreamEvent::Error(rebuild_error);
+                                        return;
+                                    }
+                                }
+                                match open_stream(
+                                    &client,
+                                    &url,
+                                    &body,
+                                    &api_key,
+                                    &anthropic_version,
+                                    &session_id,
+                                    &policy,
+                                    rate_limit_retry_owner,
+                                    open_timeout,
+                                )
+                                .await
+                                {
+                                    Ok(fresh) => {
+                                        reopen_budget.commit_reopen();
+                                        resp = fresh;
+                                        continue 'reopen;
+                                    }
+                                    Err(open_err) => {
+                                        yield StreamEvent::Error(open_err);
+                                        return;
+                                    }
                                 }
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: !emitted_replay_sensitive
+                                    && reopen_budget.should_retry_in_kernel(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {
                                         retry::StreamReadRecovery::PartialResponse
                                     } else {
                                         retry::StreamReadRecovery::RetryExhausted {
-                                            attempts: reconnect_attempts,
+                                            attempts: reopen_budget.reconnect_attempts(),
                                         }
                                     },
                                 ),
@@ -367,7 +383,7 @@ impl LlmProvider for AnthropicProvider {
 /// transport) per `policy`. Shared by the initial open and the mid-stream
 /// re-open so both paths behave identically.
 async fn open_stream(
-    client: &reqwest::Client,
+    client: &SwappableClient,
     url: &str,
     body: &Value,
     api_key: &str,
@@ -378,14 +394,17 @@ async fn open_stream(
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut tls12_probe = false;
     loop {
-        let mut req = client
+        let http = client.get();
+        let mut req = http
             .post(url)
             .header("x-api-key", api_key)
             .header("anthropic-version", anthropic_version)
             .json(body);
         // Stable session id → gateway prefix-cache affinity. Empty ⇒ omitted.
         req = super::apply_session_affinity(req, session_id);
+        let was_capped = tls12_probe || jeikcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
         // silent-gateway wait, never a slow streaming body.
         let send = match retry::send_with_ttfb(req, open_timeout).await {
@@ -402,6 +421,10 @@ async fn open_stream(
         };
         match send {
             Ok(resp) => {
+                if tls12_probe {
+                    jeikcode_config::tls::latch_managed_tls12();
+                    tls12_probe = false;
+                }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)
@@ -436,8 +459,19 @@ async fn open_stream(
             }
             Err(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    let tls_corruption = retry::chain_has_tls_corruption(&e);
+                    let try_tls12 = jeikcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || tls_corruption,
+                    );
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
+                    if try_tls12 || retry::is_stale_connection_error(&e) || tls_corruption {
+                        let capped = try_tls12 || was_capped;
+                        client.rebuild(capped)?;
+                        tls12_probe = capped;
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -885,14 +919,15 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
             // Anthropic fails hard (400) — so we filter on `provider`, honoring the
             // [`ReasoningBlock`](jeikcode_kernel::message::ReasoningBlock) INVARIANT. A `None`
             // provider is treated as foreign (never echoed).
-            for b in m
-                .reasoning_blocks
-                .iter()
-                .filter(|b| b.provider.as_deref() == Some("anthropic"))
-            {
+            for b in m.reasoning_blocks.iter().filter(|b| {
+                matches!(
+                    b.provider.as_deref(),
+                    Some("anthropic") | Some("anthropic_redacted")
+                )
+            }) {
                 has_thinking_blocks = true;
                 let opaque = b.opaque.as_deref().unwrap_or_default();
-                if b.text.is_empty() {
+                if b.text.is_empty() || b.provider.as_deref() == Some("anthropic_redacted") {
                     parts.push(json!({ "type": "redacted_thinking", "data": opaque }));
                 } else {
                     parts.push(
@@ -902,11 +937,15 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
             }
         } else {
             // Third-party gateway (Gemini, DeepSeek, New API, One API, etc.):
-            // Gateways do not enforce Anthropic's private key signature HMAC.
+            // Gateways do not enforce Anthropic's private key signature HMAC, and
+            // Gemini gateways expect signature-only blocks on `thinking` (with
+            // `signature`), reserving `redacted_thinking` for genuine redacted blocks.
             for b in &m.reasoning_blocks {
                 has_thinking_blocks = true;
                 let opaque = b.opaque.as_deref().unwrap_or_default();
-                if b.text.is_empty() && !opaque.is_empty() {
+                if b.provider.as_deref() == Some("anthropic_redacted")
+                    || (b.text.is_empty() && b.provider.is_none() && !opaque.is_empty())
+                {
                     parts.push(json!({ "type": "redacted_thinking", "data": opaque }));
                 } else {
                     parts.push(
@@ -1325,7 +1364,7 @@ impl AnthropicSseDecoder {
                     "redacted_thinking" => {
                         out.push(StreamEvent::ReasoningSignature {
                             opaque: b.redacted_data,
-                            provider: "anthropic".into(),
+                            provider: "anthropic_redacted".into(),
                             id: None,
                         });
                     }
@@ -2940,5 +2979,82 @@ mod tests {
             "usable text before EOF should not emit Error: {events:?}"
         );
         let _ = handle.join();
+    }
+
+    #[test]
+    fn third_party_gateway_keeps_signature_only_thinking_separate_from_redacted() {
+        let mut dec = AnthropicSseDecoder::new();
+        let sse = format!(
+            "{}{}{}{}{}{}",
+            line(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            ),
+            line(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"gem-sig-1"}}),
+            ),
+            line(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+            line(
+                "content_block_start",
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc-claude-1"}}),
+            ),
+            line(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":1}),
+            ),
+            line("message_stop", json!({"type":"message_stop"})),
+        );
+        let events = dec.feed(sse.as_bytes());
+        let mut blocks = Vec::new();
+        for ev in events {
+            if let StreamEvent::ReasoningSignature {
+                opaque,
+                provider,
+                id,
+            } = ev
+            {
+                blocks.push(ReasoningBlock {
+                    text: String::new(),
+                    opaque: Some(opaque),
+                    provider: Some(provider),
+                    id,
+                });
+            }
+        }
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(blocks[1].provider.as_deref(), Some("anthropic_redacted"));
+
+        let mut a = Message::assistant("answer", vec![]);
+        a.reasoning_blocks = blocks;
+
+        // Third-party gateway (!is_official): signature-only `thinking` stays `thinking`,
+        // while genuine `redacted_thinking` stays `redacted_thinking`.
+        let (_s, out_gw) = super::format_messages(&[Message::user("hi"), a.clone()], true, false);
+        let gw_content = out_gw[1]["content"].as_array().unwrap();
+        assert_eq!(
+            gw_content[0],
+            json!({"type":"thinking","thinking":"","signature":"gem-sig-1"})
+        );
+        assert_eq!(
+            gw_content[1],
+            json!({"type":"redacted_thinking","data":"enc-claude-1"})
+        );
+
+        // Official Anthropic (is_official=true) also keeps both cleanly.
+        let (_s, out_off) = super::format_messages(&[Message::user("hi"), a], true, true);
+        let off_content = out_off[1]["content"].as_array().unwrap();
+        assert_eq!(
+            off_content[0],
+            json!({"type":"redacted_thinking","data":"gem-sig-1"})
+        );
+        assert_eq!(
+            off_content[1],
+            json!({"type":"redacted_thinking","data":"enc-claude-1"})
+        );
     }
 }

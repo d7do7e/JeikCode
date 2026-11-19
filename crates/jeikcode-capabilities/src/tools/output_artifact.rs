@@ -62,13 +62,27 @@ impl ArtifactStore {
         if !path.exists() {
             std::fs::create_dir_all(&self.dir)?;
             let stored = encode_for_storage(bytes);
-            // Write to a temp sibling then rename → readers never see a partial file.
-            let tmp = self.dir.join(format!("{id}.tmp"));
-            std::fs::write(&tmp, stored.as_ref())?;
-            std::fs::rename(&tmp, &path)?;
-            if let Some(wd) = &self.watchdog {
-                // Capacity is disk capacity: count the compressed bytes actually stored.
-                wd.record_addition(stored.len() as u64);
+            // Stage in a per-call unique temp sibling (ending in `.tmp` so the watchdog
+            // skips it) and persist_noclobber so concurrent puts of identical bytes never
+            // collide or double-count disk usage.
+            let mut tmp = tempfile::Builder::new()
+                .prefix(&format!("{id}."))
+                .suffix(".tmp")
+                .tempfile_in(&self.dir)?;
+            std::io::Write::write_all(&mut tmp, stored.as_ref())?;
+            match tmp.persist_noclobber(&path) {
+                Ok(_) => {
+                    if let Some(wd) = &self.watchdog {
+                        // Capacity is disk capacity: count the compressed bytes actually stored.
+                        wd.record_addition(stored.len() as u64);
+                    }
+                }
+                Err(err)
+                    if err.error.kind() == std::io::ErrorKind::AlreadyExists || path.exists() =>
+                {
+                    // Another concurrent writer persisted the identical content-addressed file.
+                }
+                Err(err) => return Err(err.error),
             }
         }
         Ok(id)
@@ -967,5 +981,23 @@ mod tests {
         let new_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(new_mtime > old_mtime);
         assert!(new_mtime >= std::time::SystemTime::now() - std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn concurrent_identical_puts_succeed_without_tmp_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new_standalone(dir.path()));
+        let payload = "repeated identical payload\n".repeat(120);
+        let handles: Vec<_> = (0..12)
+            .map(|_| {
+                let s = store.clone();
+                let data = payload.clone();
+                std::thread::spawn(move || s.put(data.as_bytes()).unwrap())
+            })
+            .collect();
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(ids.windows(2).all(|w| w[0] == w[1]));
+        let recovered = store.get(&ids[0], 0, payload.len()).unwrap().unwrap();
+        assert_eq!(recovered, payload.as_bytes());
     }
 }
