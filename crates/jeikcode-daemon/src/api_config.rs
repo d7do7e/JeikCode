@@ -1004,7 +1004,7 @@ fn load_webui_listen_pref() -> Option<WebuiListenPref> {
     load_webui_listen_pref_at(&webui_listen_pref_path())
 }
 
-fn saved_listen_port() -> Option<u16> {
+pub(crate) fn saved_listen_port() -> Option<u16> {
     load_webui_listen_pref()
         .map(|pref| pref.port)
         .filter(|port| *port != 0)

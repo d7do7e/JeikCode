@@ -78,6 +78,12 @@ fn is_launched_webui(url: &tauri::Url, origin: &WebuiOrigin) -> bool {
         || (is_loopback_host(host) && is_loopback_host(&origin.host))
 }
 
+fn is_boot_page_url(url: &tauri::Url) -> bool {
+    is_shell_internal_url(url)
+        && matches!(url.scheme(), "http" | "https" | "tauri")
+        && url.path().ends_with("index.html")
+}
+
 /// 顶层导航：只有壳页面和这次的 WebUI 留在窗口里。
 /// `http://localhost:3000` 这类本机开发服务改由系统浏览器打开，避免盖掉当前界面。
 fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkAction {
@@ -178,21 +184,39 @@ fn hide_window_to_tray(window: &tauri::WebviewWindow) {
     publish_host_away(window, true);
 }
 
-fn send_desktop_shutdown(port: u16, token: Option<&str>) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+fn loopback_socket_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    let v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+    if trimmed == "::1" {
+        vec![v6]
+    } else if trimmed == "::" {
+        vec![v6, v4]
+    } else if trimmed.eq_ignore_ascii_case("localhost") {
+        vec![v4, v6]
+    } else {
+        vec![v4]
+    }
+}
+
+fn send_desktop_shutdown(host: &str, port: u16, token: Option<&str>) {
+    for addr in loopback_socket_addrs(host, port) {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+        let auth_header = match token {
+            Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+            _ => String::new(),
+        };
+        let host_header = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+        let req = format!(
+            "POST /shutdown HTTP/1.1\r\nHost: {host_header}\r\n{auth_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(req.as_bytes());
         return;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-    let auth_header = match token {
-        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
-        _ => String::new(),
-    };
-    let req = format!(
-        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
-    );
-    let _ = stream.write_all(req.as_bytes());
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -296,10 +320,17 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
             let _ = child.wait();
         }
     }
-    // 兜底 1：读取当前配置端口，向 /shutdown 发送优雅关停请求（即使子进程句柄丢失也能通知关停）
-    let (_host, port, token) = load_webui_listen();
-    if port > 0 {
-        send_desktop_shutdown(port, token.as_deref());
+    // 兜底 1：优先使用桌面壳当前拉起的真实 origin（处理端口冲突顺延后的实际端口），再回退配置端口
+    let live_origin = app
+        .try_state::<LiveOriginSlot>()
+        .and_then(|slot| slot.0.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let (cfg_host, cfg_port, token) = load_webui_listen();
+    let (target_host, target_port) = match live_origin {
+        Some(origin) => (origin.host, origin.port),
+        None => (cfg_host, cfg_port),
+    };
+    if target_port > 0 {
+        send_desktop_shutdown(&target_host, target_port, token.as_deref());
     }
     // 兜底 2：在 Windows 上，强力清理属于本桌面壳 PID 的后台子进程，彻底消除改参数重启后脱离的孤儿子进程
     #[cfg(target_os = "windows")]
@@ -718,13 +749,16 @@ fn main() {
     };
 
     let child = Mutex::new(None);
+    let webui_origin = Arc::new(Mutex::new(None));
+    let boot_url_slot: Arc<Mutex<Option<tauri::Url>>> = Arc::new(Mutex::new(None));
     tauri::Builder::default()
         .manage(ChildSlot(child))
+        .manage(LiveOriginSlot(Arc::clone(&webui_origin)))
         .manage(TrayUiState(Mutex::new(None)))
         .setup(move |app| {
-            let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
             let new_win_origin = Arc::clone(&webui_origin);
+            let page_load_boot_url = Arc::clone(&boot_url_slot);
             let nav_app_handle = app.handle().clone();
             let new_win_app_handle = app.handle().clone();
             let window_builder = tauri::WebviewWindowBuilder::new(
@@ -735,8 +769,14 @@ fn main() {
             .title("JeikCode Desktop")
             .inner_size(1280.0, 800.0)
             .resizable(true)
-            .on_page_load(|window, payload| {
+            .on_page_load(move |window, payload| {
                 if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                    if is_boot_page_url(payload.url()) {
+                        let mut base = payload.url().clone();
+                        base.set_query(None);
+                        base.set_fragment(None);
+                        *page_load_boot_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(base);
+                    }
                     if let Some(away) = read_host_away(&window) {
                         publish_host_away(&window, away);
                     }
@@ -782,6 +822,13 @@ fn main() {
             #[cfg(target_os = "windows")]
             let window_builder = window_builder.disable_drag_drop_handler().drag_and_drop(false);
             let window = window_builder.build()?;
+            if let Ok(mut initial_url) = window.url() {
+                if is_boot_page_url(&initial_url) {
+                    initial_url.set_query(None);
+                    initial_url.set_fragment(None);
+                    *boot_url_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(initial_url);
+                }
+            }
 
             #[cfg(target_os = "windows")]
             spawn_single_instance_activation_listener(window.clone(), single_instance_event.take());
@@ -847,6 +894,7 @@ fn main() {
             setup_system_tray(app).expect("初始化系统托盘图标失败");
 
             let handle = app.handle().clone();
+            let boot_url_for_start = Arc::clone(&boot_url_slot);
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
                     Ok((url, child, eof_rx, launch)) => {
@@ -863,16 +911,13 @@ fn main() {
                             handle.clone(),
                             window.clone(),
                             webui_origin.clone(),
+                            boot_url_for_start,
                             eof_rx,
                             launch,
                         );
                     }
                     Err(err) => {
-                        let text =
-                            serde_json::to_string(&err).unwrap_or_else(|_| "\"启动失败\"".into());
-                        let _ = window.eval(&format!(
-                            "document.getElementById('status').textContent = {text}"
-                        ));
+                        show_boot_error(&window, &boot_url_for_start, &err);
                     }
                 }
             });
@@ -1031,6 +1076,7 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 }
 
 struct ChildSlot(Mutex<Option<std::process::Child>>);
+struct LiveOriginSlot(Arc<Mutex<Option<WebuiOrigin>>>);
 
 struct WebuiLaunch {
     bin: PathBuf,
@@ -1039,6 +1085,47 @@ struct WebuiLaunch {
     token: String,
     home: PathBuf,
     bundled: Option<PathBuf>,
+}
+
+fn resolve_restart_token(
+    latest_token: Option<String>,
+    previous_token: &str,
+    intentional_restart: bool,
+) -> String {
+    if intentional_restart {
+        // Intentional restart: honor cleared disk token so `startup_webui_token`
+        // rotates cleanly instead of pinning the superseded token.
+        latest_token.unwrap_or_default()
+    } else {
+        latest_token.unwrap_or_else(|| previous_token.to_string())
+    }
+}
+
+fn build_boot_error_url(boot_url: &tauri::Url, err: &str) -> tauri::Url {
+    let mut target = boot_url.clone();
+    target.set_fragment(None);
+    target.query_pairs_mut().clear().append_pair("error", err);
+    target
+}
+
+fn show_boot_error(
+    window: &tauri::WebviewWindow,
+    boot_url_slot: &Mutex<Option<tauri::Url>>,
+    err: &str,
+) {
+    if let Some(boot_url) = boot_url_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        let target = build_boot_error_url(&boot_url, err);
+        let _ = window.navigate(target);
+        return;
+    }
+    let text = serde_json::to_string(err).unwrap_or_else(|_| "\"启动失败\"".into());
+    let _ = window.eval(&format!(
+        "var status = document.getElementById('status'); if (status) status.textContent = {text};"
+    ));
 }
 
 fn start_webui(
@@ -1055,9 +1142,10 @@ fn start_webui(
     let bundled = bundled_cli(app);
     let bin = resolve_desktop_cli(bundled.as_deref());
     let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let (host, raw_port, saved_token) = load_webui_listen();
-    let port = prepare_desktop_port_for_launch(raw_port, &bin, saved_token.as_deref());
-    let token = saved_token.unwrap_or_else(|| mint_desktop_token(&host, port));
+    let (host, configured_port, saved_token) = load_webui_listen();
+    let port =
+        prepare_desktop_port_for_launch(&host, configured_port, &bin, saved_token.as_deref());
+    let token = saved_token.unwrap_or_else(|| mint_desktop_token(&host, configured_port));
     let mut launch = WebuiLaunch {
         bin,
         host,
@@ -1072,10 +1160,9 @@ fn start_webui(
         .ok()
         .and_then(|parsed| parsed.port())
         .unwrap_or(launch.port);
-    if probe_port != launch.port {
-        launch.port = probe_port;
-        let _ = save_webui_listen_pref(Some(&launch.host), probe_port, Some(&launch.token));
-    }
+    // Keep any temporary conflict-fallback port in memory only so user-configured
+    // `webui-listen.json` port is never silently overwritten.
+    launch.port = probe_port;
     Ok((url, child, eof_rx, launch))
 }
 
@@ -1249,19 +1336,40 @@ fn spawn_desktop_server(
     // The process listens on 0.0.0.0. This window is on this computer, so it
     // opens 127.0.0.1. Other devices use the LAN addresses in the panel.
     url = window_url(&url);
-    let probe_port = url
+    let (probe_host, probe_port) = url
         .parse::<tauri::Url>()
         .ok()
-        .and_then(|parsed| parsed.port())
-        .unwrap_or(launch.port);
+        .map(|parsed| {
+            (
+                parsed.host_str().unwrap_or(&launch.host).to_string(),
+                parsed.port().unwrap_or(launch.port),
+            )
+        })
+        .unwrap_or_else(|| (launch.host.clone(), launch.port));
     let ready_deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < ready_deadline && !health_ready(probe_port) {
+    let mut ready = false;
+    loop {
         if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
             return Err("desktop shutting down".to_string());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("jeikcode webui 启动后立即退出（{status}）"));
+        }
+        if health_ready(&probe_host, probe_port) {
+            ready = true;
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(40));
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("jeikcode webui 健康检查超时".to_string());
     }
     Ok((url, child, eof_rx))
 }
@@ -1274,6 +1382,7 @@ fn supervise_webui(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     origin: Arc<Mutex<Option<WebuiOrigin>>>,
+    boot_url_slot: Arc<Mutex<Option<tauri::Url>>>,
     mut eof_rx: std::sync::mpsc::Receiver<()>,
     mut launch: WebuiLaunch,
 ) {
@@ -1296,6 +1405,11 @@ fn supervise_webui(
             if !intentional_restart {
                 // 非主动请求重启的异常退出：仅允许最多一次自愈拉起，绝不陷入死循环
                 if crash_recovered {
+                    let msg = match exit_code {
+                        Some(code) => format!("jeikcode webui 异常退出（退出码 {code}）"),
+                        None => "jeikcode webui 异常退出".to_string(),
+                    };
+                    show_boot_error(&window, &boot_url_slot, &msg);
                     return;
                 }
                 crash_recovered = true;
@@ -1311,7 +1425,8 @@ fn supervise_webui(
             } else {
                 launch.port
             };
-            let effective_token = latest_token.unwrap_or_else(|| launch.token.clone());
+            let effective_token =
+                resolve_restart_token(latest_token, &launch.token, intentional_restart);
             launch.bin = resolve_desktop_cli(launch.bundled.as_deref());
             launch.host = latest_host;
             launch.port = effective_port;
@@ -1349,23 +1464,12 @@ fn supervise_webui(
                         .ok()
                         .and_then(|parsed| parsed.port())
                         .unwrap_or(launch.port);
-                    if probe_port != launch.port {
-                        launch.port = probe_port;
-                        let _ = save_webui_listen_pref(
-                            Some(&launch.host),
-                            probe_port,
-                            Some(&launch.token),
-                        );
-                    }
+                    launch.port = probe_port;
                     eof_rx = next_eof_rx;
                     open_webui_in_shell(&window, &origin, &next_url);
                 }
                 Err(err) => {
-                    let text =
-                        serde_json::to_string(&err).unwrap_or_else(|_| "\"重启失败\"".into());
-                    let _ = window.eval(&format!(
-                        "var status = document.getElementById('status'); if (status) status.textContent = {text};"
-                    ));
+                    show_boot_error(&window, &boot_url_slot, &err);
                     return;
                 }
             }
@@ -1387,13 +1491,13 @@ fn reap_exited_child(app: &tauri::AppHandle) -> Option<Option<i32>> {
 }
 
 #[allow(dead_code)]
-fn wait_until_health(port: u16, budget: Duration) -> bool {
+fn wait_until_health(host: &str, port: u16, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
             return false;
         }
-        if health_ready(port) {
+        if health_ready(host, port) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -1519,8 +1623,9 @@ pub fn extract_webui_url(text: &str) -> Option<String> {
     url.contains("token=").then(|| url.to_string())
 }
 
-fn health_ready(port: u16) -> bool {
-    http_loopback_request(port, "GET", "/health", None).is_some_and(|(status, _)| status == 200)
+fn health_ready(host: &str, port: u16) -> bool {
+    http_loopback_request(host, port, "GET", "/health", None)
+        .is_some_and(|(status, _)| status == 200)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1584,27 +1689,38 @@ fn decode_http_response(raw: &[u8]) -> Option<(u16, String)> {
 }
 
 fn http_loopback_request(
+    host: &str,
     port: u16,
     method: &str,
     path: &str,
     bearer: Option<&str>,
 ) -> Option<(u16, String)> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
-    if let Some(token) = bearer.map(str::trim).filter(|t| !t.is_empty()) {
-        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    for addr in loopback_socket_addrs(host, port) {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+        let host_header = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n");
+        if let Some(token) = bearer.map(str::trim).filter(|t| !t.is_empty()) {
+            req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        if method == "POST" {
+            req.push_str("Content-Length: 0\r\n");
+        }
+        req.push_str("\r\n");
+        if stream.write_all(req.as_bytes()).is_err() {
+            continue;
+        }
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        if let Some(decoded) = decode_http_response(&raw) {
+            return Some(decoded);
+        }
     }
-    if method == "POST" {
-        req.push_str("Content-Length: 0\r\n");
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut raw = Vec::new();
-    let _ = stream.read_to_end(&mut raw);
-    decode_http_response(&raw)
+    None
 }
 
 fn local_binary_sha256(bin: &Path) -> Option<String> {
@@ -1635,15 +1751,21 @@ fn parse_active_sessions_idle(status: u16, body: &str) -> bool {
         && serde_json::from_str::<Vec<String>>(body.trim()).is_ok_and(|list| list.is_empty())
 }
 
-fn pick_free_loopback_port(starting_after: u16) -> Option<u16> {
+fn pick_free_loopback_port(host: &str, starting_after: u16) -> Option<u16> {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let bind_ip: &str = if trimmed == "::1" || trimmed == "::" {
+        "::1"
+    } else {
+        "127.0.0.1"
+    };
     let start = starting_after.saturating_add(1).max(1024);
     for offset in 0..100u16 {
         let candidate = start.saturating_add(offset);
-        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+        if std::net::TcpListener::bind((bind_ip, candidate)).is_ok() {
             return Some(candidate);
         }
     }
-    std::net::TcpListener::bind(("127.0.0.1", 0))
+    std::net::TcpListener::bind((bind_ip, 0))
         .ok()
         .and_then(|l| l.local_addr().ok().map(|a| a.port()))
 }
@@ -1653,47 +1775,52 @@ fn pick_free_loopback_port(starting_after: u16) -> Option<u16> {
 /// binary, cleanly shut it down when `/chat/active` is idle; if busy or
 /// unauthorized, pick a free port instead of killing active sessions or serving
 /// an outdated daemon.
-fn prepare_desktop_port_for_launch(port: u16, bin: &Path, saved_token: Option<&str>) -> u16 {
+fn prepare_desktop_port_for_launch(
+    host: &str,
+    port: u16,
+    bin: &Path,
+    saved_token: Option<&str>,
+) -> u16 {
     if port == 0 {
         return 0;
     }
-    let Some((status, body)) = http_loopback_request(port, "GET", "/health", None) else {
+    let Some((status, body)) = http_loopback_request(host, port, "GET", "/health", None) else {
         return port;
     };
     if status != 200 {
-        return pick_free_loopback_port(port).unwrap_or(port);
+        return pick_free_loopback_port(host, port).unwrap_or(port);
     }
     let Ok(health) = serde_json::from_str::<DaemonHealthInfo>(body.trim()) else {
-        return pick_free_loopback_port(port).unwrap_or(port);
+        return pick_free_loopback_port(host, port).unwrap_or(port);
     };
     if health.service != "jeikcode-daemon" {
-        return pick_free_loopback_port(port).unwrap_or(port);
+        return pick_free_loopback_port(host, port).unwrap_or(port);
     }
     let local_hash = local_binary_sha256(bin);
     if !daemon_health_is_stale(&health, env!("CARGO_PKG_VERSION"), local_hash.as_deref()) {
         return port;
     }
 
-    let idle = http_loopback_request(port, "GET", "/chat/active", saved_token)
+    let idle = http_loopback_request(host, port, "GET", "/chat/active", saved_token)
         .is_some_and(|(s, b)| parse_active_sessions_idle(s, &b));
     if !idle {
-        return pick_free_loopback_port(port).unwrap_or(port);
+        return pick_free_loopback_port(host, port).unwrap_or(port);
     }
 
-    let shutdown_ok = http_loopback_request(port, "POST", "/shutdown", saved_token)
+    let shutdown_ok = http_loopback_request(host, port, "POST", "/shutdown", saved_token)
         .is_some_and(|(s, _)| (200..300).contains(&s));
     if !shutdown_ok {
-        return pick_free_loopback_port(port).unwrap_or(port);
+        return pick_free_loopback_port(host, port).unwrap_or(port);
     }
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if http_loopback_request(port, "GET", "/health", None).is_none() {
+        if http_loopback_request(host, port, "GET", "/health", None).is_none() {
             return port;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    pick_free_loopback_port(port).unwrap_or(port)
+    pick_free_loopback_port(host, port).unwrap_or(port)
 }
 
 fn fill_os_random_bytes(buf: &mut [u8]) -> bool {
@@ -2154,5 +2281,52 @@ mod tests {
             "--schedule-run",
             "daily-check"
         ]));
+    }
+
+    #[test]
+    fn resolve_restart_token_honors_cleared_token_only_on_intentional_restart() {
+        assert_eq!(super::resolve_restart_token(None, "sk-old", true), "");
+        assert_eq!(
+            super::resolve_restart_token(Some("sk-new".into()), "sk-old", true),
+            "sk-new"
+        );
+        assert_eq!(
+            super::resolve_restart_token(None, "sk-old", false),
+            "sk-old"
+        );
+    }
+
+    #[test]
+    fn loopback_socket_addrs_and_boot_error_url_support_v4_v6_and_schemes() {
+        let v6 = super::loopback_socket_addrs("::1", 13457);
+        assert_eq!(v6.len(), 1);
+        assert!(v6[0].is_ipv6());
+
+        let any_v6 = super::loopback_socket_addrs("[::]", 13457);
+        assert_eq!(any_v6.len(), 2);
+        assert!(any_v6[0].is_ipv6());
+        assert!(any_v6[1].is_ipv4());
+
+        let v4 = super::loopback_socket_addrs("127.0.0.1", 13457);
+        assert_eq!(v4.len(), 1);
+        assert!(v4[0].is_ipv4());
+
+        let win_boot = parse_url("http://tauri.localhost/index.html");
+        let err_win = super::build_boot_error_url(&win_boot, "bind failed: 13457");
+        assert_eq!(err_win.scheme(), "http");
+        assert_eq!(err_win.host_str(), Some("tauri.localhost"));
+        assert!(err_win.as_str().contains("error=bind+failed"));
+
+        let mac_boot = parse_url("tauri://localhost/index.html");
+        let err_mac = super::build_boot_error_url(&mac_boot, "timeout");
+        assert_eq!(err_mac.scheme(), "tauri");
+        assert_eq!(err_mac.query(), Some("error=timeout"));
+
+        assert!(super::is_boot_page_url(&win_boot));
+        assert!(super::is_boot_page_url(&mac_boot));
+        assert!(!super::is_boot_page_url(&parse_url("about:blank")));
+        assert!(!super::is_boot_page_url(&parse_url(
+            "http://127.0.0.1:13457/index.html"
+        )));
     }
 }

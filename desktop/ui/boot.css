@@ -43,8 +43,11 @@ h1 {
 }
 #status {
   margin: 0;
+  max-width: 80vw;
   font-size: 14px;
   letter-spacing: 0.04em;
+  text-align: center;
+  overflow-wrap: anywhere;
   opacity: 0.72;
 }
 @keyframes boot-spin {

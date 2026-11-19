@@ -12615,6 +12615,39 @@ mod session_token_usage_tests {
         assert_eq!(usage.cached, 20_000);
         assert!(usage.cached_estimated);
     }
+
+    #[test]
+    fn desktop_early_loopback_host_respects_ipv6_bindings() {
+        assert_eq!(super::desktop_early_loopback_host("::1"), "[::1]");
+        assert_eq!(super::desktop_early_loopback_host("[::1]"), "[::1]");
+        assert_eq!(super::desktop_early_loopback_host("::"), "[::1]");
+        assert_eq!(super::desktop_early_loopback_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(super::desktop_early_loopback_host("0.0.0.0"), "127.0.0.1");
+    }
+
+    #[test]
+    fn webui_pref_port_to_persist_preserves_desktop_configured_port_on_fallback() {
+        // Pre-spawn fallback: desktop saved 13457, launched on 13458 (`requested == actual == 13458`).
+        assert_eq!(
+            super::webui_pref_port_to_persist(true, Some(13457), 13458, 13458),
+            Some(13457)
+        );
+        // Bind-scanning fallback: saved 13457, requested 13457, actual 13459.
+        assert_eq!(
+            super::webui_pref_port_to_persist(true, Some(13457), 13457, 13459),
+            Some(13457)
+        );
+        // First run with no saved port keeps requested/actual when matching.
+        assert_eq!(
+            super::webui_pref_port_to_persist(true, None, 13457, 13457),
+            Some(13457)
+        );
+        // Non-desktop CLI mode persists the actual bound port as before.
+        assert_eq!(
+            super::webui_pref_port_to_persist(false, Some(13457), 13457, 13458),
+            Some(13458)
+        );
+    }
 }
 
 #[derive(Deserialize)]
@@ -21723,6 +21756,37 @@ fn startup_webui_token(
     Ok(token)
 }
 
+fn desktop_early_loopback_host(bound_host: &str) -> &'static str {
+    let trimmed = bound_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if trimmed == "::1" || trimmed == "::" {
+        "[::1]"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+fn webui_pref_port_to_persist(
+    desktop_managed: bool,
+    saved_port: Option<u16>,
+    requested_port: u16,
+    actual_port: u16,
+) -> Option<u16> {
+    if !desktop_managed {
+        return Some(actual_port);
+    }
+    let configured = saved_port.filter(|p| *p != 0).unwrap_or(requested_port);
+    if actual_port == configured {
+        Some(actual_port)
+    } else {
+        // Desktop conflict fallback shifted the port before or during bind: keep the
+        // user's configured port intact on disk while still persisting a rotated token.
+        (configured != 0).then_some(configured)
+    }
+}
+
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
 /// 返回给用户展示的状态串。在 `jeikcode` 主程序（已有 tokio runtime）内调用。
@@ -21818,22 +21882,34 @@ pub async fn ensure_webui(
         Ok(token) => token,
         Err(err) => return err,
     };
-    // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），同步写回配置，
-    // 确保 webui-listen.json 里的端口与实际绑定的端口一致，界面输入框不会残留冲突前的旧端口。
-    let _ = api_config::save_webui_listen_pref(
-        Some(bound_host.clone()),
-        actual_port,
-        Some(token.clone()),
-    );
+    // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），在 CLI 模式下同步写回配置；
+    // 桌面托管模式发生临时端口顺延（含父进程启动前探测避让或 bind_scanning 顺延）时保留用户配置端口，
+    // 仅同步最新 token，避免临时冲突覆写用户配置。
+    let desktop_managed = std::env::var_os("JEIKCODE_DESKTOP").is_some();
+    let saved_port = if desktop_managed {
+        api_config::saved_listen_port()
+    } else {
+        None
+    };
+    if let Some(port_to_save) =
+        webui_pref_port_to_persist(desktop_managed, saved_port, port, actual_port)
+    {
+        let _ = api_config::save_webui_listen_pref(
+            Some(bound_host.clone()),
+            port_to_save,
+            Some(token.clone()),
+        );
+    }
     // 选择自动打开浏览器用的本机地址：
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
     let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::" || bound_host == "[::]";
-    // 桌面窗口只用 127.0.0.1。先把这条地址刷出 stderr，再去做局域网探测，
+    // 桌面窗口只用本地回环。先把这条地址刷出 stderr，再去做局域网探测，
     // 避免第一次启动时 UDP 选路或防火墙提示把启动页卡住。
-    if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
-        let mut early = format!("http://127.0.0.1:{actual_port}/?token={token}");
+    if desktop_managed {
+        let early_host = desktop_early_loopback_host(&bound_host);
+        let mut early = format!("http://{early_host}:{actual_port}/?token={token}");
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
             let short: String = id.chars().take(8).collect();
             early.push_str("&session=");
