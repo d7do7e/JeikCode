@@ -1506,6 +1506,34 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn resume_goal(&self) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ResumeGoal {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn adjust_goal_rounds(
+        &self,
+        adjustment: GoalRoundAdjustment,
+    ) -> Result<Option<u32>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::UpdateGoalRounds {
+                generation: runtime_state_generation(state),
+                adjustment,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn set_mesh_name(&self, name: Option<String>) -> Result<Option<String>, String> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();

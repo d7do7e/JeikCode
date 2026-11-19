@@ -386,7 +386,7 @@ pub(crate) fn residual_user_input_decline(
     one
 }
 
-fn native_runtime_mode(mode: ApprovalMode) -> jeikcode_coding::RuntimeMode {
+pub(crate) fn native_runtime_mode(mode: ApprovalMode) -> jeikcode_coding::RuntimeMode {
     match mode {
         ApprovalMode::Plan => jeikcode_coding::RuntimeMode::Plan,
         ApprovalMode::Auto => jeikcode_coding::RuntimeMode::Auto,
@@ -461,7 +461,7 @@ fn observe_existing_chat_turn(
     })
 }
 
-async fn reassemble_observed_provider_if_needed(
+pub(crate) async fn reassemble_observed_provider_if_needed(
     session_id: &str,
     handle: &jeikcode_coding::CodingRuntimeHandle,
     next: &jeikcode_coding::CodingAgentConfig,
@@ -1910,6 +1910,9 @@ pub(crate) enum LiveWireEvent {
         /// 当前工作目录，让 App 端能展示项目名。
         #[serde(rename = "working_dir")]
         working_dir: String,
+        /// Active skills loaded in the session transcript (`use_skill` calls and compaction anchors).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        loaded_skills: Vec<String>,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
@@ -2091,6 +2094,12 @@ pub(crate) enum LiveWireEvent {
         /// 与 `Warning` 相同的回合锚点：限流提示属于发生限流的那一轮。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+    },
+    #[serde(rename = "goal_progress")]
+    GoalProgress {
+        session_id: String,
+        #[serde(flatten)]
+        progress: crate::GoalProgressWire,
     },
 }
 
@@ -2611,6 +2620,13 @@ impl NativeLiveWireProjector {
                     message: format!("undo failed: {error}"),
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
+                crate::note_goal_progress(&self.session_id, &progress);
+                LiveWireEvent::GoalProgress {
+                    session_id: self.session_id.clone(),
+                    progress: crate::GoalProgressWire::from(&progress),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(_) => return None,
         })
     }
@@ -2811,6 +2827,8 @@ fn live_stream_from_registry(
         .collect();
     crate::stamp_turn_elapsed_on_last_assistants(&mut snapshot_messages, &[]);
     crate::attach_display_images(&mut snapshot_messages, &working_dir, &session_id);
+    let loaded_skills =
+        jeikcode_capabilities::compaction::extract_active_skills_in_span(&snapshot.messages);
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         message_count: snapshot_count,
@@ -2821,6 +2839,7 @@ fn live_stream_from_registry(
         provider,
         mode: live_current_mode_wire(),
         working_dir: working_dir.to_string_lossy().to_string(),
+        loaded_skills,
     });
 
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
@@ -2904,7 +2923,7 @@ fn live_lag_warning_event(skipped: u64) -> LiveWireEvent {
     }
 }
 
-fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::response::Response {
+fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response::Response {
     let snapshot_wd = join.binding.working_dir.clone();
     let mut snapshot = (*join.snapshot).clone();
     // `/live` is another resume entrypoint: overlay any per-token checkpoint from
@@ -2951,6 +2970,8 @@ fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::respo
         &snapshot_wd,
         &join.binding.session_id,
     );
+    let loaded_skills =
+        jeikcode_capabilities::compaction::extract_active_skills_in_span(&snapshot.messages);
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         message_count: snapshot_count,
@@ -2961,6 +2982,7 @@ fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::respo
         provider: join.binding.provider.clone(),
         mode: live_current_mode_wire(),
         working_dir: snapshot_wd.to_string_lossy().to_string(),
+        loaded_skills,
     });
     let mut projector = NativeLiveWireProjector {
         session_id: join.binding.session_id.clone(),
@@ -4363,19 +4385,67 @@ pub(crate) async fn live_user_input(
 pub(crate) struct LiveCommandReq {
     /// 形如 `/status` 的斜杠命令行（带不带前导 `/` 都接受）。
     pub command: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// POST /live/command —— 手机 App 请求桌面 TUI 执行一条斜杠命令。
 /// 白名单（只读信息类）在 TUI 侧校验；输出经 /live 的 `command_output` 事件
 /// 广播回来。返回 `{"accepted": bool}`：false 表示没有 TUI 附着（headless），
-/// 命令无人执行。
+/// 命令无人执行；若是 `/goal ...` 在 headless 模式下则由 daemon fallback 执行。
 pub(crate) async fn live_command(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<LiveCommandReq>,
 ) -> impl IntoResponse {
     let line = req.command.trim().to_string();
-    let ok = !line.is_empty() && crate::native_live::send_remote_command(line);
-    Json(serde_json::json!({ "accepted": ok }))
+    if line.is_empty() {
+        return Json(serde_json::json!({ "accepted": false }));
+    }
+    if crate::native_live::send_remote_command(line.clone()) {
+        return Json(serde_json::json!({ "accepted": true }));
+    }
+    let normalized = line.strip_prefix('/').unwrap_or(&line).trim();
+    let (cmd, arg) = normalized
+        .split_once(char::is_whitespace)
+        .map(|(c, a)| (c.trim(), a.trim()))
+        .unwrap_or((normalized, ""));
+    if cmd.eq_ignore_ascii_case("goal") {
+        let fallback_wd = { state.project.read().await.working_dir.clone() };
+        let wd = req
+            .working_dir
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| live_current_working_dir(&fallback_wd));
+        let sid = parse_session_id(req.session_id)
+            .or_else(crate::native_live::live_running_session_id)
+            .or_else(|| crate::native_live::binding().ok().map(|b| b.session_id));
+        let provider = req
+            .provider
+            .clone()
+            .or_else(|| Some(live_current_provider()));
+        match crate::commands::exec_goal(&state, &wd, sid.as_deref(), provider.as_deref(), arg)
+            .await
+        {
+            Ok(result) => {
+                return Json(serde_json::json!({
+                    "accepted": true,
+                    "result": result,
+                }));
+            }
+            Err(err) => {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+    Json(serde_json::json!({ "accepted": false }))
 }
 
 /// POST /live/cancel —— 取消当前正在运行的 turn(停止生成)。

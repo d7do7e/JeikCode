@@ -78,7 +78,7 @@ const STEER_NATURAL_DRAIN_GRACE_MS = 1500;
  * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
  */
 const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
-import { postChatPrompt, stopChat, postChatSteer, admitChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatRuntime, getChatPending, watchChatSession, SSEEvent, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveProvider, postLiveMode, getApprovalMode, getApprovalModeState, ApprovalMode, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, getCommands, CommandInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, claimChatQueue, releaseChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
+import { postChatPrompt, stopChat, postChatSteer, admitChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatRuntime, getChatPending, watchChatSession, SSEEvent, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveProvider, postLiveMode, getApprovalMode, getApprovalModeState, ApprovalMode, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, getCommands, CommandInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, setDefaultProvider, uploadSessionFiles, type CommandResult, type GoalProgressInfo, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, claimChatQueue, releaseChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { pullSession } from '../lib/sessionPull';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import {
@@ -136,9 +136,13 @@ import {
   buildCommandMap,
   dispatchSlashCommand,
   buildSlashMenuItems,
+  buildGoalMenuItems,
+  detectGoalSubmenuContext,
   formatMcpStatusText,
   FRONTEND_COMMANDS,
+  type GoalSubmenuContext,
   type SlashHandlers,
+  type SlashMenuItem,
 } from '../lib/slashCommands';
 import { messageSearchableFullText as searchableMessageText, textMatchesSearch, toolMatchesSearch } from '../lib/canvasSearch';
 import { normalizeCanvas as normalizeCanvasRows, reduceCanvas, type CanvasAction } from '../lib/canvas/canvasStore';
@@ -794,10 +798,18 @@ export function Chat({
       revision?: number;
       started_at?: number | null;
       compaction_started_at?: number | null;
+      goal?: GoalProgressInfo | null;
     } | null | undefined,
     opts?: { ensureIdleWatch?: boolean },
   ) {
     if (!sid || activeIdRef.current !== sid) return;
+    if (runtime && Object.prototype.hasOwnProperty.call(runtime, 'goal')) {
+      if (runtime.goal && (runtime.goal.condition || runtime.goal.active)) {
+        setSessionGoalProgress(sid, runtime.goal);
+      } else if (goalProgressBySessionRef.current.has(sid)) {
+        setSessionGoalProgress(sid, null);
+      }
+    }
     if (typeof runtime?.revision === 'number') {
       const known = runtimeRevisionBySessionRef.current.get(sid) ?? -1;
       if (runtime.revision < known) return;
@@ -2103,6 +2115,41 @@ export function Chat({
   // The /skills command opens a pure skills browser (no commands). Set while that
   // browser is showing; cleared as soon as the user types (normal mixed filtering).
   const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
+  const [slashGoalContext, setSlashGoalContext] = useState<GoalSubmenuContext | null>(null);
+  const [goalProgress, setGoalProgress] = useState<GoalProgressInfo | null>(null);
+  const goalProgressBySessionRef = useRef(new Map<string, GoalProgressInfo | null>());
+  const [loadedSkills, setLoadedSkills] = useState<string[]>([]);
+  const loadedSkillsBySessionRef = useRef(new Map<string, string[]>());
+
+  function setSessionGoalProgress(sid: string | null | undefined, progress: GoalProgressInfo | null) {
+    if (sid) {
+      if (progress) goalProgressBySessionRef.current.set(sid, progress);
+      else goalProgressBySessionRef.current.delete(sid);
+    }
+    const active = activeIdRef.current ?? sessionId;
+    if (!sid || sid === active) {
+      setGoalProgress(progress);
+    }
+  }
+
+  function setSessionLoadedSkills(sid: string | null | undefined, skills: string[]) {
+    const deduped = Array.from(new Set(skills.map((s) => s.trim()).filter(Boolean)));
+    if (sid) loadedSkillsBySessionRef.current.set(sid, deduped);
+    const active = activeIdRef.current ?? sessionId;
+    if (!sid || sid === active) {
+      setLoadedSkills(deduped);
+    }
+  }
+
+  function appendSessionLoadedSkill(sid: string | null | undefined, rawName: string) {
+    const trimmed = rawName.trim();
+    if (!trimmed) return;
+    const bare = trimmed.includes(':') ? trimmed.slice(trimmed.lastIndexOf(':') + 1) : trimmed;
+    const key = sid ?? activeIdRef.current ?? sessionId;
+    const prev = key ? (loadedSkillsBySessionRef.current.get(key) ?? []) : loadedSkills;
+    if (prev.includes(bare)) return;
+    setSessionLoadedSkills(key, [...prev, bare]);
+  }
   const [atOpen, setAtOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
@@ -4594,6 +4641,8 @@ export function Chat({
       cancelTurnNavScroll();
       setTurnNavQuery('');
       setActiveTurnId(null);
+      setGoalProgress(sessionId ? (goalProgressBySessionRef.current.get(sessionId) ?? null) : null);
+      setLoadedSkills(sessionId ? (loadedSkillsBySessionRef.current.get(sessionId) ?? []) : []);
       turnNavPinUntilRef.current = 0;
       const cachedOffset = sessionId ? (historyOffsetBySessionRef.current.get(sessionId) ?? 0) : 0;
       const cachedTotal = sessionId ? (historyTotalBySessionRef.current.get(sessionId) ?? 0) : 0;
@@ -4974,6 +5023,13 @@ export function Chat({
         if (hydratedRuntime?.turn_id && serverRuntimeRunning(hydratedRuntime)) {
           noteTurnOperation(loadId, hydratedRuntime.turn_id);
         }
+        if (hydratedRuntime && Object.prototype.hasOwnProperty.call(hydratedRuntime, 'goal')) {
+          if (hydratedRuntime.goal && (hydratedRuntime.goal.condition || hydratedRuntime.goal.active)) {
+            setSessionGoalProgress(loadId, hydratedRuntime.goal);
+          } else {
+            setSessionGoalProgress(loadId, null);
+          }
+        }
 
         let nextHint: string | null = null;
         let resumeClockFrom: number | undefined;
@@ -4990,6 +5046,9 @@ export function Chat({
         }
         if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
           serverCapsRef.current = sessionResult.value.caps ?? [];
+          if (Array.isArray(sessionResult.value.loaded_skills)) {
+            setSessionLoadedSkills(loadId, sessionResult.value.loaded_skills);
+          }
           // 能力协商：新 daemon 声明 `id` 后，前端关闭所有文本兜底。
           // 能力协商已收编为身份唯一，无需再写全局开关。
           const preferred = sessionResult.value.preferred_model;
@@ -8482,6 +8541,34 @@ export function Chat({
             pushCommandNotice(`${t('cmd.todo.header')}\n${res.items.map((i) => `${mark(i.status)} ${i.content}`).join('\n')}`);
             return;
           }
+          if (res.kind === 'goal') {
+            const goalSid = res.session_id ?? compactSid;
+            if (!compactSid && res.session_id) {
+              activeIdRef.current = res.session_id;
+              loadedForRef.current = res.session_id;
+              onSessionId(res.session_id);
+            }
+            if (res.action === 'stop') {
+              setSessionGoalProgress(goalSid, null);
+            } else if (res.progress) {
+              setSessionGoalProgress(goalSid, res.progress);
+            }
+            if ((res.action === 'started' || res.action === 'resume') && goalSid) {
+              localTurnSessionsRef.current.add(goalSid);
+              onTurnRunningChange?.(goalSid, true);
+              setBusyAndClock(true, Date.now());
+              busyRef.current = true;
+              const watchHash =
+                compactHash ||
+                activeSession?.project_hash ||
+                viewedProjectHashRef.current ||
+                projectHashBySessionRef.current.get(goalSid) ||
+                '';
+              startDetachedHistoryPoll(watchHash, goalSid, sessionGenerationRef.current, { localReattach: true });
+            }
+            pushCommandNotice(res.message);
+            return;
+          }
         } finally {
           if (isCompact) {
             setSessionCompacting(compactSid, false);
@@ -9136,6 +9223,12 @@ export function Chat({
       case 'command_output':
         pushCommandNotice(event.text);
         break;
+      case 'goal_progress': {
+        const targetSid = event.session_id ?? activeIdRef.current ?? sessionId;
+        const { type: _t, session_id: _s, ...progress } = event;
+        setSessionGoalProgress(targetSid, progress);
+        break;
+      }
       case 'session_renamed':
         if (!activeIdRef.current || event.session_id === activeIdRef.current) {
           onSessionRenamed?.(event.name);
@@ -9464,6 +9557,30 @@ export function Chat({
           success: event.success,
           durationMs: event.duration_ms,
         });
+        if (event.name === 'use_skill' && event.success) {
+          for (let i = messagesRef.current.length - 1; i >= 0; i--) {
+            const m = messagesRef.current[i];
+            if (m.role === 'assistant' && m.parts) {
+              const tp = m.parts.find((p) => p.kind === 'tool' && 'tool' in p && p.tool?.id === event.id);
+              if (tp && 'tool' in tp && tp.tool) {
+                let parsedArgs: { name?: unknown } | undefined;
+                if (typeof tp.tool.args === 'string') {
+                  try {
+                    parsedArgs = JSON.parse(tp.tool.args) as { name?: unknown };
+                  } catch {
+                    parsedArgs = undefined;
+                  }
+                } else {
+                  parsedArgs = tp.tool.args as { name?: unknown } | undefined;
+                }
+                if (typeof parsedArgs?.name === 'string') {
+                  appendSessionLoadedSkill(activeIdRef.current ?? sessionId, parsedArgs.name);
+                }
+                break;
+              }
+            }
+          }
+        }
         if (isTodoTool(event.name)) {
           const replayTodoFrame = (event as { replay?: boolean }).replay === true;
           const todoSid = activeIdRef.current;
@@ -12445,9 +12562,11 @@ export function Chat({
       mobile: isMobileComposer(),
     });
 
-    // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
+    // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能，或 /goal 二级补全）
     if (slashOpen) {
-      const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashUserCommands ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
+      const mergedItems = slashGoalContext
+        ? buildGoalMenuItems(slashGoalContext.token, slashGoalContext.firstToken, t as (k: string) => string)
+        : buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashUserCommands ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
@@ -12460,20 +12579,13 @@ export function Chat({
       }
       if (e.key === 'Enter' && mergedItems.length > 0) {
         e.preventDefault();
-        const selected = mergedItems[slashIndex];
-        const cmdDef = selected.kind === 'command' ? FRONTEND_COMMANDS.find((c) => c.name === selected.name) : undefined;
-        // 如果是无必选参数的命令（如 /init, /plan, /build, /new, /clear 等），按下回车直接执行
-        if (selected.kind === 'command' && cmdDef && !cmdDef.argHint) {
-          setSlashOpen(false);
-          setInput('');
-          void sendMessage(`/${selected.name}`);
-          return;
-        }
-        insertSkill(selected.name);
+        const selected = mergedItems[Math.min(slashIndex, mergedItems.length - 1)];
+        selectSlashMenuItem(selected);
         return;
       }
       if (e.key === 'Escape') {
         setSlashOpen(false);
+        setSlashGoalContext(null);
         return;
       }
     }
@@ -12836,12 +12948,56 @@ export function Chat({
     const next = before.slice(0, slashIdx) + `/${name} ` + after;
     setInput(next);
     setSlashOpen(false);
+    setSlashGoalContext(null);
     requestAnimationFrame(() => {
       ta.focus();
       const newPos = slashIdx + name.length + 2;
       ta.setSelectionRange(newPos, newPos);
       resizeComposer(ta);
+      if (name === 'goal') {
+        setSlashGoalContext({ token: '', tokenStart: newPos, firstToken: true });
+        setSlashIndex(0);
+        setSlashOpen(true);
+      }
     });
+  }
+
+  function selectSlashMenuItem(selected: SlashMenuItem) {
+    if (selected.kind === 'goal' && slashGoalContext) {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const pos = ta.selectionStart ?? ta.value.length;
+      const before = ta.value.slice(0, pos);
+      const after = ta.value.slice(pos);
+      const insertText = selected.insertText ?? selected.name;
+      const next = before.slice(0, slashGoalContext.tokenStart) + insertText + after;
+      setSlashOpen(false);
+      setSlashGoalContext(null);
+      if (selected.executeImmediately && !after.trim()) {
+        setInput('');
+        void sendMessage(next.trim());
+        return;
+      }
+      setInput(next);
+      requestAnimationFrame(() => {
+        ta.focus();
+        const newPos = slashGoalContext.tokenStart + insertText.length;
+        ta.setSelectionRange(newPos, newPos);
+        resizeComposer(ta);
+      });
+      return;
+    }
+    const cmdDef = selected.kind === 'command'
+      ? FRONTEND_COMMANDS.find((c) => c.name === selected.name)
+      : undefined;
+    if (selected.kind === 'command' && cmdDef && !cmdDef.argHint) {
+      setSlashOpen(false);
+      setSlashGoalContext(null);
+      setInput('');
+      void sendMessage(`/${selected.name}`);
+      return;
+    }
+    insertSkill(selected.name);
   }
 
   // 把当前 @ 段替换为相对路径 rel，不自动追加空格，目录可继续下钻补全。
@@ -12899,6 +13055,19 @@ export function Chat({
 
     const pos = ta.selectionStart ?? val.length;
     const before = val.slice(0, pos);
+
+    // 二级 /goal 子命令与参数补全（一旦输入自由目标描述则自动退出，回车直接提交）
+    const goalCtx = detectGoalSubmenuContext(before, t as (k: string) => string);
+    if (goalCtx) {
+      setAtOpen(false);
+      setSlashGoalContext(goalCtx);
+      setSlashQuery('');
+      setSlashIndex(0);
+      setSlashOpen(true);
+      setSlashSkillsOnly(false);
+      return;
+    }
+    setSlashGoalContext(null);
 
     // 检测光标前是否有 /（行首 或 空格后）
     const slashIdx = before.lastIndexOf('/');
@@ -13323,6 +13492,96 @@ export function Chat({
         </div>
       )}
       <AttachmentTray attach={pendingAttach} onRemove={removePendingAttach} />
+      {goalProgress && (goalProgress.active || goalProgress.phase === 'paused' || goalProgress.phase === 'paused_at_cap' || goalProgress.phase === 'satisfied') && (
+        <div class={`goal-status-banner phase-${goalProgress.phase ?? (goalProgress.active ? 'pursuing' : 'ended')}`}>
+          <div class="goal-status-main">
+            <span class="goal-phase-pill">
+              {(() => {
+                const phase = goalProgress.phase ?? (goalProgress.active ? 'pursuing' : 'ended');
+                switch (phase) {
+                  case 'paused': return t('goal.phase.paused');
+                  case 'paused_at_cap': return t('goal.phase.paused_at_cap');
+                  case 'satisfied': return t('goal.phase.satisfied');
+                  case 'ended': return t('goal.phase.ended');
+                  default: return t('goal.phase.pursuing');
+                }
+              })()}
+            </span>
+            <span class="goal-meta-text">
+              {t('goal.round', {
+                round: String((goalProgress.round ?? 0) + 1),
+                cap: goalProgress.max_rounds ? String(goalProgress.max_rounds) : '∞',
+              })}
+              {typeof goalProgress.elapsed_secs === 'number'
+                ? ` · ${Math.floor(goalProgress.elapsed_secs / 60)}m ${String(goalProgress.elapsed_secs % 60).padStart(2, '0')}s`
+                : ''}
+              {typeof goalProgress.tokens_used === 'number' && goalProgress.tokens_used > 0
+                ? ` · ${formatTokenMetric(goalProgress.tokens_used)} tok`
+                : ''}
+            </span>
+            {goalProgress.condition && (
+              <span class="goal-condition-text" title={goalProgress.condition}>
+                {goalProgress.condition}
+              </span>
+            )}
+          </div>
+          <div class="goal-status-actions">
+            {goalProgress.phase === 'pursuing' || (goalProgress.active && !goalProgress.phase) ? (
+              <>
+                <button
+                  type="button"
+                  class="goal-action-btn"
+                  onClick={() => void slashHandlers.execServerCommand('goal', 'pause')}
+                >
+                  {t('goal.btn.pause')}
+                </button>
+                <button
+                  type="button"
+                  class="goal-action-btn is-danger"
+                  onClick={() => void slashHandlers.execServerCommand('goal', 'stop')}
+                >
+                  {t('goal.btn.stop')}
+                </button>
+              </>
+            ) : goalProgress.phase === 'paused' || goalProgress.phase === 'paused_at_cap' ? (
+              <>
+                {goalProgress.phase === 'paused_at_cap' && (
+                  <button
+                    type="button"
+                    class="goal-action-btn"
+                    onClick={() => void slashHandlers.execServerCommand('goal', 'rounds +50')}
+                  >
+                    {t('goal.btn.addRounds')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  class="goal-action-btn is-primary"
+                  onClick={() => void slashHandlers.execServerCommand('goal', 'resume')}
+                >
+                  {t('goal.btn.resume')}
+                </button>
+                <button
+                  type="button"
+                  class="goal-action-btn is-danger"
+                  onClick={() => void slashHandlers.execServerCommand('goal', 'stop')}
+                >
+                  {t('goal.btn.stop')}
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                class="goal-action-btn"
+                onClick={() => setSessionGoalProgress(activeIdRef.current ?? sessionId, null)}
+                aria-label={t('goal.btn.dismiss')}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {atOpen && (
         <AtMentionMenu
           rows={atRows}
@@ -13340,9 +13599,10 @@ export function Chat({
           userCommands={slashUserCommands ?? []}
           query={slashQuery}
           skillsOnly={slashSkillsOnly}
+          goalContext={slashGoalContext}
           index={slashIndex}
           onHover={setSlashIndex}
-          onSelect={insertSkill}
+          onSelect={selectSlashMenuItem}
         />
       )}
       {/* 文本输入框主体：靠左对齐，单行起步随输入多行自适应 */}
@@ -13399,6 +13659,15 @@ export function Chat({
         </div>
 
         <div class="input-footer-actions">
+          {loadedSkills.length > 0 && (
+            <span
+              class="loaded-skills-chip notranslate"
+              translate={false}
+              title={loadedSkills.join(', ')}
+            >
+              ✦ {loadedSkills.length === 1 ? t('chat.loadedSkill') : t('chat.loadedSkills')}: {loadedSkills.join(', ')}
+            </span>
+          )}
           {tokens && (
             <div class="composer-meta-group">
               {(() => {

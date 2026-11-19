@@ -883,7 +883,7 @@ Output exactly this Markdown structure, in this order, every section present:
 - [languages/frameworks/libraries/tools/patterns, or (none)]
 
 ## 5. Files & Code Sections
-- [path: why it matters; include the most recent full snippets of code written/changed]
+- [Files Inspected & Key `file:line` Findings: list each file path, line ranges already read, and concrete findings so you do NOT re-read the same slices after compaction; include the most recent full snippets of code written/changed]
 
 ## 6. Errors & Fixes
 - [error/failing command/test, root cause, exact fix; quote user feedback verbatim]
@@ -914,7 +914,7 @@ Output exactly this Markdown structure, in this order, every section present:
 ## 13. Relevant Files
 - [path: why it matters, or (none)]
 
-Rules: terse bullets, never prose paragraphs. Preserve exact file paths, commands, error \
+Rules: terse bullets, never prose paragraphs. Preserve exact file paths, line ranges already inspected, `file:line` findings, commands, error \
 strings, and identifiers. Keep every section even when empty.";
 
 /// Build the USER-message text for the summary call. With a `previous_anchor` it instructs
@@ -2808,6 +2808,10 @@ Dependencies verified.
         assert!(
             c.to_lowercase().contains("create"),
             "must instruct a fresh create"
+        );
+        assert!(
+            p.contains("Files Inspected") && p.contains("file:line"),
+            "SUMMARY_TEMPLATE must preserve Files Inspected & file:line findings across compaction"
         );
     }
 

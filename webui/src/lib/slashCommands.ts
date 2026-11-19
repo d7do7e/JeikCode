@@ -120,6 +120,12 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'diff', descKey: 'cmd.diff.desc', run: (a, h) => h.execServerCommand('diff', a) },
   { name: 'cost', descKey: 'cmd.cost.desc', run: (a, h) => h.execServerCommand('cost', a) },
   { name: 'todo', descKey: 'cmd.todo.desc', run: (a, h) => h.execServerCommand('todo', a) },
+  {
+    name: 'goal',
+    descKey: 'cmd.goal.desc',
+    argHint: '<condition|subcommand>',
+    run: (a, h) => h.execServerCommand('goal', a),
+  },
 ];
 
 export function reviewPrompt(arg: string): string {
@@ -176,7 +182,101 @@ export async function dispatchSlashCommand(
 export interface SlashMenuItem {
   name: string;
   description: string;
-  kind: 'command' | 'skill';
+  kind: 'command' | 'skill' | 'goal';
+  /** For two-level `/goal ` completions: exact replacement suffix or flag token. */
+  insertText?: string;
+  /** True for zero-argument `/goal status|pause|resume|stop|help` items that run on Enter/click. */
+  executeImmediately?: boolean;
+}
+
+export interface GoalSubcommandDef {
+  label: string;
+  insertText: string;
+  descKey: string;
+  executeImmediately?: boolean;
+  isFlag?: boolean;
+}
+
+export const GOAL_SUBCOMMANDS: GoalSubcommandDef[] = [
+  { label: '/goal status', insertText: 'status', descKey: 'cmd.goal.sub.status', executeImmediately: true },
+  { label: '/goal pause', insertText: 'pause', descKey: 'cmd.goal.sub.pause', executeImmediately: true },
+  { label: '/goal resume', insertText: 'resume', descKey: 'cmd.goal.sub.resume', executeImmediately: true },
+  { label: '/goal stop', insertText: 'stop', descKey: 'cmd.goal.sub.stop', executeImmediately: true },
+  { label: '/goal rounds <+N|N>', insertText: 'rounds ', descKey: 'cmd.goal.sub.rounds' },
+  { label: '/goal shift <prompt>', insertText: 'shift ', descKey: 'cmd.goal.sub.shift' },
+  { label: '/goal help', insertText: 'help', descKey: 'cmd.goal.sub.help', executeImmediately: true },
+  { label: '--continuous', insertText: '--continuous ', descKey: 'cmd.goal.flag.continuous', isFlag: true },
+  { label: '--max-rounds N', insertText: '--max-rounds ', descKey: 'cmd.goal.flag.maxRounds', isFlag: true },
+  { label: '--max-tokens N', insertText: '--max-tokens ', descKey: 'cmd.goal.flag.maxTokens', isFlag: true },
+  { label: '--rollback-on-stall', insertText: '--rollback-on-stall ', descKey: 'cmd.goal.flag.rollback', isFlag: true },
+  { label: '--fresh-epoch', insertText: '--fresh-epoch ', descKey: 'cmd.goal.flag.freshEpoch', isFlag: true },
+];
+
+export interface GoalSubmenuContext {
+  /** Token being typed after `/goal ...` (everything after the last whitespace, or after `/goal `). */
+  token: string;
+  /** Character offset in `beforeCursor` where `token` starts (for splice replacement). */
+  tokenStart: number;
+  /** True when typing the first token immediately after `/goal `. */
+  firstToken: boolean;
+}
+
+/**
+ * Detect whether the cursor is inside a `/goal ...` two-level autocomplete zone.
+ * Returns null as soon as the user enters a free-form goal prompt so Enter submits normally.
+ */
+export function detectGoalSubmenuContext(
+  beforeCursor: string,
+  t?: (key: string) => string,
+): GoalSubmenuContext | null {
+  const m = /(?:^|\s)\/goal\s+([^\n]*)$/.exec(beforeCursor);
+  if (!m) return null;
+  const rest = m[1];
+  const restStart = beforeCursor.length - rest.length;
+  if (rest === '') {
+    return { token: '', tokenStart: restStart, firstToken: true };
+  }
+  if (!/\s/.test(rest)) {
+    const q = rest.toLowerCase();
+    const hasMatch = GOAL_SUBCOMMANDS.some((item) =>
+      item.insertText.toLowerCase().startsWith(q) || item.label.toLowerCase().includes(q),
+    );
+    if (!hasMatch) return null;
+    if (t && buildGoalMenuItems(rest, true, t).length === 0) return null;
+    return { token: rest, tokenStart: restStart, firstToken: true };
+  }
+  const lastSpace = rest.search(/\s[^\s]*$/);
+  const trailing = lastSpace >= 0 ? rest.slice(lastSpace + 1) : '';
+  if (!trailing.startsWith('--')) return null;
+  return {
+    token: trailing,
+    tokenStart: restStart + (lastSpace >= 0 ? lastSpace + 1 : 0),
+    firstToken: false,
+  };
+}
+
+export function buildGoalMenuItems(
+  token: string,
+  firstToken: boolean,
+  t: (key: string) => string,
+): SlashMenuItem[] {
+  const q = token.toLowerCase();
+  return GOAL_SUBCOMMANDS.filter((item) => {
+    if (!firstToken && !item.isFlag) return false;
+    if (q.startsWith('-')) {
+      if (!item.isFlag) return false;
+      return item.insertText.toLowerCase().includes(q) || item.label.toLowerCase().includes(q);
+    }
+    if (!q) return true;
+    if (item.isFlag) return false;
+    return item.insertText.toLowerCase().startsWith(q);
+  }).map((item) => ({
+    name: item.label,
+    description: t(item.descKey),
+    kind: 'goal' as const,
+    insertText: item.insertText,
+    executeImmediately: item.executeImmediately,
+  }));
 }
 
 export interface McpStatusLine {

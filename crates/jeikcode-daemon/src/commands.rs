@@ -93,6 +93,14 @@ pub(crate) enum CommandResult {
     Todo {
         items: Vec<TodoItemJson>,
     },
+    Goal {
+        action: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<crate::GoalProgressWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -909,6 +917,299 @@ fn todo_items_from_board(session_id: &str) -> Vec<TodoItemJson> {
         .collect()
 }
 
+fn goal_launch_missing_prompt(condition: &str) -> bool {
+    let trimmed = condition.trim();
+    trimmed.is_empty() || (trimmed.starts_with("--") && !trimmed.contains(char::is_whitespace))
+}
+
+fn parse_goal_rounds_arg(raw: &str) -> Option<jeikcode_coding::GoalRoundAdjustment> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(delta_str) = trimmed.strip_prefix('+') {
+        let delta = delta_str
+            .trim()
+            .replace(['_', ','], "")
+            .parse::<u32>()
+            .ok()?;
+        (delta > 0).then_some(jeikcode_coding::GoalRoundAdjustment::Add(delta))
+    } else {
+        let total = trimmed.replace(['_', ','], "").parse::<u32>().ok()?;
+        Some(jeikcode_coding::GoalRoundAdjustment::Set(total))
+    }
+}
+
+fn format_goal_status_message(progress: &crate::GoalProgressWire) -> String {
+    let round = progress.round + 1;
+    let mins = progress.elapsed_secs / 60;
+    let secs = progress.elapsed_secs % 60;
+    let cap_label = progress
+        .max_rounds
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "∞".to_string());
+    let reason = progress
+        .last_reason
+        .as_deref()
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    format!(
+        "Goal [{phase}] round {round}/{cap_label} · {mins}m {secs:02}s · {tokens} tok{reason}\n{cond}",
+        phase = progress.phase,
+        tokens = progress.tokens_used,
+        cond = progress.condition,
+    )
+}
+
+pub(crate) async fn exec_goal(
+    state: &AppState,
+    working_dir: &Path,
+    session_id: Option<&str>,
+    provider: Option<&str>,
+    arg: &str,
+) -> anyhow::Result<CommandResult> {
+    let trimmed = arg.trim();
+    let (head, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .map(|(h, r)| (h, r.trim()))
+        .unwrap_or((trimmed, ""));
+    let head_lower = head.to_ascii_lowercase();
+
+    if matches!(head_lower.as_str(), "help" | "?" | "-h" | "--help") {
+        let message = [
+            "Usage: /goal <condition>",
+            "  /goal status              Show current goal progress",
+            "  /goal pause               Pause active goal after current round",
+            "  /goal resume              Resume paused goal",
+            "  /goal stop | clear        Stop and clear active goal",
+            "  /goal rounds <+N|N>       Add N rounds or set max rounds (0 = unbounded)",
+            "  /goal shift <prompt>      Shift goal direction immediately",
+            "Flags: --continuous  --max-rounds N  --max-tokens N  --rollback-on-stall  --fresh-epoch",
+        ]
+        .join("\n");
+        return Ok(CommandResult::Goal {
+            action: "help".into(),
+            message,
+            progress: session_id.and_then(crate::goal_controller_snapshot),
+            session_id: session_id.map(str::to_string),
+        });
+    }
+
+    if head_lower == "shift" && rest.is_empty() {
+        return Ok(CommandResult::Goal {
+            action: "help".into(),
+            message: "Usage: /goal shift <new goal condition>".into(),
+            progress: session_id.and_then(crate::goal_controller_snapshot),
+            session_id: session_id.map(str::to_string),
+        });
+    }
+
+    match head_lower.as_str() {
+        "" | "status" => {
+            let sid = session_id.map(str::trim).filter(|s| !s.is_empty());
+            let progress = sid.and_then(crate::goal_controller_snapshot);
+            let message = match &progress {
+                Some(p) => format_goal_status_message(p),
+                None => "No active goal in this session. Use /goal <condition> to start.".into(),
+            };
+            Ok(CommandResult::Goal {
+                action: "status".into(),
+                message,
+                progress,
+                session_id: sid.map(str::to_string),
+            })
+        }
+        "pause" => {
+            let sid = session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("session_id required for /goal pause"))?;
+            let Some(handle) = crate::native_live::existing_runner_handle(sid) else {
+                return Ok(CommandResult::Goal {
+                    action: "pause".into(),
+                    message: "No active goal runtime in this session.".into(),
+                    progress: None,
+                    session_id: Some(sid.to_string()),
+                });
+            };
+            handle
+                .pause_goal()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to pause goal: {e}"))?;
+            Ok(CommandResult::Goal {
+                action: "pause".into(),
+                message: "Goal paused.".into(),
+                progress: crate::goal_controller_snapshot(sid),
+                session_id: Some(sid.to_string()),
+            })
+        }
+        "resume" => {
+            let sid = session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("session_id required for /goal resume"))?;
+            let current = crate::goal_controller_snapshot(sid);
+            match current.as_ref().map(|p| p.phase.as_str()) {
+                Some("pursuing") => {
+                    return Ok(CommandResult::Goal {
+                        action: "resume".into(),
+                        message: "Goal is already running.".into(),
+                        progress: current,
+                        session_id: Some(sid.to_string()),
+                    });
+                }
+                Some("paused") | Some("paused_at_cap") => {}
+                _ => {
+                    return Ok(CommandResult::Goal {
+                        action: "resume".into(),
+                        message: "No paused goal to resume.".into(),
+                        progress: current,
+                        session_id: Some(sid.to_string()),
+                    });
+                }
+            }
+            let progress = crate::launch_or_resume_goal_bridge(
+                state,
+                sid.to_string(),
+                working_dir.to_path_buf(),
+                provider.map(str::to_string),
+                crate::GoalBridgeCommand::Resume,
+            )
+            .await?;
+            Ok(CommandResult::Goal {
+                action: "resume".into(),
+                message: "Goal resumed.".into(),
+                progress,
+                session_id: Some(sid.to_string()),
+            })
+        }
+        "rounds" => {
+            let sid = session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("session_id required for /goal rounds"))?;
+            let Some(adj) = parse_goal_rounds_arg(rest) else {
+                return Ok(CommandResult::Goal {
+                    action: "rounds".into(),
+                    message: "Usage: /goal rounds <+N|N> (0 = unbounded)".into(),
+                    progress: crate::goal_controller_snapshot(sid),
+                    session_id: Some(sid.to_string()),
+                });
+            };
+            let Some(handle) = crate::native_live::existing_runner_handle(sid) else {
+                return Ok(CommandResult::Goal {
+                    action: "rounds".into(),
+                    message: "No active goal runtime in this session.".into(),
+                    progress: None,
+                    session_id: Some(sid.to_string()),
+                });
+            };
+            let updated_cap = handle
+                .adjust_goal_rounds(adj)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to update goal rounds: {e}"))?;
+            let mut progress = crate::goal_controller_snapshot(sid);
+            if let Some(p) = progress.as_mut() {
+                p.max_rounds = updated_cap;
+            }
+            let cap_label = updated_cap
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unbounded".into());
+            Ok(CommandResult::Goal {
+                action: "rounds".into(),
+                message: format!("Goal max rounds updated to {cap_label}."),
+                progress,
+                session_id: Some(sid.to_string()),
+            })
+        }
+        "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+            let sid = session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("session_id required for /goal stop"))?;
+            if let Some(handle) = crate::native_live::existing_runner_handle(sid) {
+                let _ = handle.stop_goal().await;
+            }
+            if state
+                .active_chats
+                .operation_for_session(sid)
+                .await
+                .is_some()
+            {
+                let _ = state
+                    .active_chats
+                    .stop_and_wait(sid.to_string(), Some(std::time::Duration::from_secs(2)))
+                    .await;
+            }
+            crate::clear_goal_controller_state(sid);
+            Ok(CommandResult::Goal {
+                action: "stop".into(),
+                message: "Goal stopped and cleared.".into(),
+                progress: None,
+                session_id: Some(sid.to_string()),
+            })
+        }
+        _ => {
+            let config = jeikcode_config::config::Config::load(
+                &jeikcode_config::config::Config::default_path(),
+            )
+            .unwrap_or_default();
+            let defaults = jeikcode_coding::GoalLaunchDefaults {
+                rollback_on_stall: config.coding.goal_rollback_on_stall,
+                fresh_epoch: config.coding.goal_fresh_epoch,
+            };
+            let (condition, options) =
+                jeikcode_coding::parse_goal_launch_with_defaults(trimmed, defaults);
+            if goal_launch_missing_prompt(&condition) {
+                return Ok(CommandResult::Goal {
+                    action: "help".into(),
+                    message: "Goal prompt is required. Usage: /goal <condition>".into(),
+                    progress: session_id.and_then(crate::goal_controller_snapshot),
+                    session_id: session_id.map(str::to_string),
+                });
+            }
+            let sid = session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let progress = crate::launch_or_resume_goal_bridge(
+                state,
+                sid.clone(),
+                working_dir.to_path_buf(),
+                provider.map(str::to_string),
+                crate::GoalBridgeCommand::Launch {
+                    condition: condition.clone(),
+                    options: options.clone(),
+                },
+            )
+            .await?;
+            let max_rounds_label = options
+                .max_rounds
+                .or(config.coding.goal_max_rounds)
+                .or_else(jeikcode_coding::config::goal_max_rounds_env)
+                .map(|n| {
+                    if n == 0 {
+                        "∞".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "300".to_string());
+            Ok(CommandResult::Goal {
+                action: "started".into(),
+                message: format!(
+                    "Goal started (max rounds: {max_rounds_label}, rollback on stall: {}, fresh epoch: {}): {condition}",
+                    if options.rollback_on_stall { "on" } else { "off" },
+                    if options.fresh_epoch { "on" } else { "off" },
+                ),
+                progress,
+                session_id: Some(sid),
+            })
+        }
+    }
+}
+
 pub(crate) async fn run_command(
     State(state): State<AppState>,
     Json(req): Json<CommandReq>,
@@ -971,6 +1272,16 @@ pub(crate) async fn run_command(
             req.project_hash.as_deref(),
             req.session_id.as_deref(),
         ),
+        "goal" => {
+            exec_goal(
+                &state,
+                &working_dir,
+                req.session_id.as_deref(),
+                req.provider.as_deref(),
+                &req.arg,
+            )
+            .await
+        }
         other => Err(anyhow::anyhow!("unknown command: {other}")),
     };
     match result {
@@ -1420,7 +1731,7 @@ mod tests {
             content: "finished task".into(),
             status: jeikcode_capabilities::tools::todo::TodoStatus::Completed,
         }];
-        jeikcode_capabilities::tools::commit_todo_board(&session_id, &items);
+        let committed = jeikcode_capabilities::tools::commit_todo_board(&session_id, &items);
 
         let projected = todo_items_from_board(&session_id);
         assert_eq!(projected.len(), 1);
@@ -1429,7 +1740,7 @@ mod tests {
             jeikcode_capabilities::tools::read_todo_board(&session_id)
                 .unwrap()
                 .items,
-            items,
+            committed.items,
         );
         jeikcode_capabilities::tools::purge_todo_board(&session_id);
     }
@@ -1465,5 +1776,47 @@ mod tests {
             CommandResult::Diff { stat } => assert!(stat.contains("a.txt"), "stat was: {stat}"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn goal_command_helpers_parse_rounds_and_prompt_presence() {
+        assert_eq!(
+            parse_goal_rounds_arg("+25"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Add(25))
+        );
+        assert_eq!(
+            parse_goal_rounds_arg("100"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Set(100))
+        );
+        assert_eq!(
+            parse_goal_rounds_arg("0"),
+            Some(jeikcode_coding::GoalRoundAdjustment::Set(0))
+        );
+        assert_eq!(parse_goal_rounds_arg(""), None);
+        assert!(goal_launch_missing_prompt(""));
+        assert!(goal_launch_missing_prompt("--max-rounds"));
+        assert!(!goal_launch_missing_prompt("all tests pass"));
+    }
+
+    #[test]
+    fn format_goal_status_message_includes_phase_round_and_condition() {
+        let progress = crate::GoalProgressWire {
+            active: true,
+            phase: "pursuing".into(),
+            terminal: None,
+            round: 2,
+            max_rounds: Some(10),
+            elapsed_secs: 65,
+            tokens_used: 1500,
+            max_tokens: None,
+            condition: "make tests pass".into(),
+            last_reason: None,
+            continuous: false,
+        };
+        let msg = format_goal_status_message(&progress);
+        assert!(msg.contains("Goal [pursuing] round 3/10"));
+        assert!(msg.contains("1m 05s"));
+        assert!(msg.contains("1500 tok"));
+        assert!(msg.contains("make tests pass"));
     }
 }

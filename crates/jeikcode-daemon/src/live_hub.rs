@@ -1428,7 +1428,7 @@ impl LiveViewHub {
             }
             CodingRuntimeEvent::GoalChanged(progress) => {
                 if let Some(sid) = state.execution_session_id() {
-                    crate::note_goal_state(sid, progress.active);
+                    crate::note_goal_progress(sid, progress);
                 }
                 runtime_edge = true;
             }

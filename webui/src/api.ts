@@ -561,6 +561,7 @@ export type SSEEvent =
   | { type: 'session_assigned'; session_id: string }
   /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
   | { type: 'session_start'; session_id?: string; cursor: number; caps?: string[] }
+  | ({ type: 'goal_progress'; session_id?: string } & GoalProgressInfo)
   | { type: 'user'; content: string; display_text?: string; internal?: boolean; editable?: boolean; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number; client_input_id?: string; images?: ImageData[] }
   | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number; part_rev?: number }
@@ -601,6 +602,20 @@ export type SSEEvent =
   /** 本会话待发卡片队列的权威全量快照（`push_to_session_queue` 等带内来源）。 */
   | { type: 'queue_updated'; session_id: string; items: QueuedMessageApiItem[] }
   | SessionMutationEvent;
+
+export interface GoalProgressInfo {
+  active: boolean;
+  phase?: 'pursuing' | 'paused' | 'paused_at_cap' | 'satisfied' | 'ended' | string;
+  terminal?: 'met' | 'stopped' | 'failed' | 'cancelled' | string | null;
+  round?: number;
+  max_rounds?: number | null;
+  elapsed_secs?: number;
+  tokens_used?: number;
+  max_tokens?: number | null;
+  condition?: string;
+  last_reason?: string | null;
+  continuous?: boolean;
+}
 
 export interface ModelInfo {
   /** Selection id / 模型别名（配置键）。 */
@@ -1593,6 +1608,8 @@ export interface SessionDetail {
   todos_revision?: number;
   /** Process-unique daemon instance. Todo revisions restart with the daemon. */
   daemon_instance_id?: string;
+  /** Active skills loaded in the session transcript (`use_skill` calls and compaction anchors). */
+  loaded_skills?: string[];
 }
 
 /** Token footer snapshot from session turn_stats (GET /projects/:hash/sessions/:id).
@@ -2965,6 +2982,7 @@ export type CommandResult =
   | { kind: 'diff'; stat: string }
   | { kind: 'cost'; total_tokens: number; turn_count: number }
   | { kind: 'todo'; items: { status: string; content: string }[] }
+  | { kind: 'goal'; action: string; message: string; progress?: GoalProgressInfo | null; session_id?: string | null }
   | { kind: 'error'; message: string };
 
 export async function postCommand(body: {

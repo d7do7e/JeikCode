@@ -278,3 +278,38 @@ test('formatMcpStatusText lists servers and blocked count', () => {
   assert.match(text, /mcp\.blockedUntrusted/);
 });
 
+import { buildGoalMenuItems, detectGoalSubmenuContext } from './slashCommands.ts';
+
+test('/goal dispatches to execServerCommand("goal", arg)', async () => {
+  const { h, calls } = fakeHandlers();
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  const r1 = await dispatchSlashCommand('/goal status', map, h);
+  assert.deepEqual(r1, { handled: true });
+  const r2 = await dispatchSlashCommand('/goal --max-rounds 10 fix tests', map, h);
+  assert.deepEqual(r2, { handled: true });
+  assert.deepEqual(calls, ['exec:goal:status', 'exec:goal:--max-rounds 10 fix tests']);
+});
+
+test('two-level /goal autocomplete matches subcommands, flags, and dismisses free-form prompts', () => {
+  const ctxEmpty = detectGoalSubmenuContext('/goal ', (k) => k);
+  assert.deepEqual(ctxEmpty, { token: '', tokenStart: 6, firstToken: true });
+  const allItems = buildGoalMenuItems(ctxEmpty!.token, ctxEmpty!.firstToken, (k) => k);
+  assert.ok(allItems.some((i) => i.name === '/goal status' && i.executeImmediately));
+  assert.ok(allItems.some((i) => i.name === '--max-rounds N' && !i.executeImmediately));
+
+  const ctxPrefix = detectGoalSubmenuContext('/goal st', (k) => k);
+  assert.deepEqual(ctxPrefix, { token: 'st', tokenStart: 6, firstToken: true });
+  const stItems = buildGoalMenuItems(ctxPrefix!.token, ctxPrefix!.firstToken, (k) => k);
+  assert.deepEqual(stItems.map((i) => i.insertText), ['status', 'stop']);
+
+  // Free-form prompt dismisses submenu so Enter submits normally
+  assert.equal(detectGoalSubmenuContext('/goal implement auth', (k) => k), null);
+
+  // Trailing --flag re-opens flag completions
+  const ctxFlag = detectGoalSubmenuContext('/goal fix tests --max', (k) => k);
+  assert.deepEqual(ctxFlag, { token: '--max', tokenStart: 16, firstToken: false });
+  const flagItems = buildGoalMenuItems(ctxFlag!.token, ctxFlag!.firstToken, (k) => k);
+  assert.deepEqual(flagItems.map((i) => i.insertText), ['--max-rounds ', '--max-tokens ']);
+});
+
+

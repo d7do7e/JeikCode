@@ -952,7 +952,8 @@ fn start_webui(
     let bundled = bundled_cli(app);
     let bin = resolve_desktop_cli(bundled.as_deref());
     let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let (host, port, saved_token) = load_webui_listen();
+    let (host, raw_port, saved_token) = load_webui_listen();
+    let port = prepare_desktop_port_for_launch(raw_port, &bin, saved_token.as_deref());
     let token = saved_token.unwrap_or_else(|| mint_desktop_token(&host, port));
     let mut launch = WebuiLaunch {
         bin,
@@ -1410,24 +1411,184 @@ pub fn extract_webui_url(text: &str) -> Option<String> {
 }
 
 fn health_ready(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
-        return false;
+    http_loopback_request(port, "GET", "/health", None)
+        .is_some_and(|(status, _)| status == 200)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonHealthInfo {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    service: String,
+    #[serde(default)]
+    binary_hash: String,
+}
+
+fn decode_http_response(raw: &[u8]) -> Option<(u16, String)> {
+    let (head_bytes, body_bytes) = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| (&raw[..pos], &raw[pos + 4..]))
+        .or_else(|| {
+            raw.windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|pos| (&raw[..pos], &raw[pos + 2..]))
+        })?;
+    let head = String::from_utf8_lossy(head_bytes);
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    let is_chunked = head
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("transfer-encoding: chunked"));
+    let decoded_body = if is_chunked {
+        let mut out_bytes = Vec::new();
+        let mut rest = body_bytes;
+        while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+            let size_line = String::from_utf8_lossy(&rest[..pos]);
+            let tail = &rest[pos + 2..];
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let Ok(chunk_len) = usize::from_str_radix(size_hex, 16) else {
+                break;
+            };
+            if chunk_len == 0 {
+                break;
+            }
+            if tail.len() < chunk_len {
+                out_bytes.extend_from_slice(tail);
+                break;
+            }
+            out_bytes.extend_from_slice(&tail[..chunk_len]);
+            let after = &tail[chunk_len..];
+            rest = after.strip_prefix(b"\r\n").unwrap_or(after);
+        }
+        String::from_utf8_lossy(&out_bytes).into_owned()
+    } else {
+        String::from_utf8_lossy(body_bytes).into_owned()
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-    if stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
+    Some((status, decoded_body))
+}
+
+fn http_loopback_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Option<(u16, String)> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    if let Some(token) = bearer.map(str::trim).filter(|t| !t.is_empty()) {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if method == "POST" {
+        req.push_str("Content-Length: 0\r\n");
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    decode_http_response(&raw)
+}
+
+fn local_binary_sha256(bin: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(bin).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn daemon_health_is_stale(
+    health: &DaemonHealthInfo,
+    expected_version: &str,
+    expected_binary_hash: Option<&str>,
+) -> bool {
+    if health.service != "jeikcode-daemon" {
         return false;
     }
-    let mut buf = [0u8; 80];
-    let Ok(n) = stream.read(&mut buf) else {
-        return false;
+    if health.version != expected_version {
+        return true;
+    }
+    expected_binary_hash.is_some_and(|local| {
+        !health.binary_hash.is_empty() && !local.is_empty() && health.binary_hash != local
+    })
+}
+
+fn parse_active_sessions_idle(status: u16, body: &str) -> bool {
+    status == 200
+        && serde_json::from_str::<Vec<String>>(body.trim()).is_ok_and(|list| list.is_empty())
+}
+
+fn pick_free_loopback_port(starting_after: u16) -> Option<u16> {
+    let start = starting_after.saturating_add(1).max(1024);
+    for offset in 0..100u16 {
+        let candidate = start.saturating_add(offset);
+        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return Some(candidate);
+        }
+    }
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok().map(|a| a.port()))
+}
+
+/// Before spawning a desktop-managed daemon, inspect any daemon already listening
+/// on `port`. If its `/health` version or `binary_hash` differs from our CLI
+/// binary, cleanly shut it down when `/chat/active` is idle; if busy or
+/// unauthorized, pick a free port instead of killing active sessions or serving
+/// an outdated daemon.
+fn prepare_desktop_port_for_launch(port: u16, bin: &Path, saved_token: Option<&str>) -> u16 {
+    if port == 0 {
+        return 0;
+    }
+    let Some((status, body)) = http_loopback_request(port, "GET", "/health", None) else {
+        return port;
     };
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+    if status != 200 {
+        return pick_free_loopback_port(port).unwrap_or(port);
+    }
+    let Ok(health) = serde_json::from_str::<DaemonHealthInfo>(body.trim()) else {
+        return pick_free_loopback_port(port).unwrap_or(port);
+    };
+    if health.service != "jeikcode-daemon" {
+        return pick_free_loopback_port(port).unwrap_or(port);
+    }
+    let local_hash = local_binary_sha256(bin);
+    if !daemon_health_is_stale(
+        &health,
+        env!("CARGO_PKG_VERSION"),
+        local_hash.as_deref(),
+    ) {
+        return port;
+    }
+
+    let idle = http_loopback_request(port, "GET", "/chat/active", saved_token)
+        .is_some_and(|(s, b)| parse_active_sessions_idle(s, &b));
+    if !idle {
+        return pick_free_loopback_port(port).unwrap_or(port);
+    }
+
+    let shutdown_ok = http_loopback_request(port, "POST", "/shutdown", saved_token)
+        .is_some_and(|(s, _)| (200..300).contains(&s));
+    if !shutdown_ok {
+        return pick_free_loopback_port(port).unwrap_or(port);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if http_loopback_request(port, "GET", "/health", None).is_none() {
+            return port;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    pick_free_loopback_port(port).unwrap_or(port)
 }
 
 fn fill_os_random_bytes(buf: &mut [u8]) -> bool {
@@ -1567,10 +1728,11 @@ mod tests {
     };
 
     use super::{
-        external_browser_url, extract_webui_url, generate_csprng_token, host_window_away,
-        is_authorized_shell_action_url, navigation_action, new_window_action,
-        remember_webui_origin, resolve_desktop_cli, tray_locale_from_query, tray_texts_for_locale,
-        window_url, LinkAction, Locale, WebuiOrigin,
+        daemon_health_is_stale, decode_http_response, external_browser_url, extract_webui_url,
+        generate_csprng_token, host_window_away, is_authorized_shell_action_url,
+        navigation_action, new_window_action, parse_active_sessions_idle, remember_webui_origin,
+        resolve_desktop_cli, tray_locale_from_query, tray_texts_for_locale, window_url,
+        DaemonHealthInfo, LinkAction, Locale, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -1843,5 +2005,35 @@ mod tests {
         assert!(a.starts_with("sk-"));
         assert_eq!(a.len(), 35);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stale_daemon_detection_checks_version_binary_hash_and_active_idle() {
+        let current = DaemonHealthInfo {
+            version: "7.5.1".to_string(),
+            service: "jeikcode-daemon".to_string(),
+            binary_hash: "abc123".to_string(),
+        };
+        assert!(!daemon_health_is_stale(&current, "7.5.1", Some("abc123")));
+        assert!(daemon_health_is_stale(&current, "7.5.2", Some("abc123")));
+        assert!(daemon_health_is_stale(&current, "7.5.1", Some("def456")));
+
+        let other = DaemonHealthInfo {
+            version: "1.0.0".to_string(),
+            service: "other-service".to_string(),
+            binary_hash: "xyz".to_string(),
+        };
+        assert!(!daemon_health_is_stale(&other, "7.5.1", Some("abc123")));
+
+        assert!(parse_active_sessions_idle(200, "[]"));
+        assert!(!parse_active_sessions_idle(200, "[\"sess-1\"]"));
+        assert!(!parse_active_sessions_idle(401, "[]"));
+
+        let decoded = decode_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"service\":\"jeikcode-daemon\"}",
+        )
+        .unwrap();
+        assert_eq!(decoded.0, 200);
+        assert_eq!(decoded.1, "{\"service\":\"jeikcode-daemon\"}");
     }
 }

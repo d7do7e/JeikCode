@@ -1213,6 +1213,7 @@ mod session_window_tests {
             todos: Vec::new(),
             todos_revision: 0,
             daemon_instance_id: "test-instance".into(),
+            loaded_skills: Vec::new(),
         };
         let wire = serde_json::to_value(&detail).unwrap();
         assert_eq!(
@@ -1251,6 +1252,40 @@ mod session_window_tests {
                 .unwrap(),
             etag
         );
+    }
+
+    #[test]
+    fn goal_progress_wire_and_controller_snapshot_roundtrip() {
+        let sid = format!("daemon-goal-snap-{}", std::process::id());
+        let progress = jeikcode_coding::GoalProgress {
+            active: true,
+            terminal: None,
+            phase: jeikcode_coding::GoalPhase::PausedAtCap,
+            round: 9,
+            max_rounds: Some(10),
+            elapsed_secs: 42,
+            tokens_used: 2048,
+            max_tokens: Some(10000),
+            condition: "tests green".into(),
+            last_reason: Some("round cap reached".into()),
+            options: jeikcode_coding::GoalOptions::default(),
+        };
+        note_goal_progress(&sid, &progress);
+        let snap = goal_controller_snapshot(&sid).expect("goal snapshot recorded");
+        assert!(snap.active);
+        assert_eq!(snap.phase, "paused_at_cap");
+        assert_eq!(snap.round, 9);
+        assert_eq!(snap.max_rounds, Some(10));
+        assert_eq!(snap.condition, "tests green");
+        let wire = serde_json::to_value(ChatEvent::GoalProgress {
+            session_id: sid.clone(),
+            progress: snap,
+        })
+        .unwrap();
+        assert_eq!(wire["type"], "goal_progress");
+        assert_eq!(wire["phase"], "paused_at_cap");
+        clear_goal_controller_state(&sid);
+        assert!(goal_controller_snapshot(&sid).is_none());
     }
 
     #[test]
@@ -3065,6 +3100,9 @@ pub struct SessionDetail {
     /// start a new revision epoch instead of rejecting the fresh empty snapshot.
     #[serde(default)]
     pub daemon_instance_id: String,
+    /// Active skills loaded in the session transcript (`use_skill` calls and compaction anchors).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_skills: Vec<String>,
 }
 
 fn is_manual_session_origin(origin: &jeikcode_capabilities::session::SessionOrigin) -> bool {
@@ -3233,11 +3271,20 @@ pub(crate) fn session_token_usage_from_session(
     // 刚提交的压缩是比「最后一条助手消息的 usage」更新的上下文事实：后者仍是
     // 压缩前的 prompt 大小。新回合 / undo / 显式变更会清空该字段。
     if let Some(compacted) = meta.compacted_context_tokens.filter(|tokens| *tokens > 0) {
+        let ctx_window = last_assistant_request_usage(&snapshot.messages)
+            .and_then(|(_, _, _, window)| (window > 0).then_some(window))
+            .or_else(|| {
+                meta.turn_stats
+                    .iter()
+                    .rev()
+                    .find(|stat| stat.position_valid && stat.ctx_window > 0)
+                    .map(|stat| stat.ctx_window as usize)
+            });
         return Some(footer_from_last_request(
             compacted as usize,
             0,
             0,
-            None,
+            ctx_window,
             false,
         ));
     }
@@ -5292,12 +5339,67 @@ mod compaction_phase_tests {
 ///
 /// 每轮至少刷新一次 `updated_at`；超过 [`CONTROLLER_STALE_AFTER`] 未刷新即视为
 /// 控制器已消失，避免 runtime 崩溃/重启后永久占住运行态。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalProgressWire {
+    pub active: bool,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+    pub round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    pub elapsed_secs: u64,
+    pub tokens_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    pub condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+    pub continuous: bool,
+}
+
+impl From<&jeikcode_coding::GoalProgress> for GoalProgressWire {
+    fn from(progress: &jeikcode_coding::GoalProgress) -> Self {
+        let phase = match progress.phase {
+            jeikcode_coding::GoalPhase::Pursuing => "pursuing",
+            jeikcode_coding::GoalPhase::Paused => "paused",
+            jeikcode_coding::GoalPhase::PausedAtCap => "paused_at_cap",
+            jeikcode_coding::GoalPhase::Satisfied => "satisfied",
+            jeikcode_coding::GoalPhase::Ended => "ended",
+        }
+        .to_string();
+        let terminal = progress.terminal.map(|t| {
+            match t {
+                jeikcode_coding::GoalTerminal::Met => "met",
+                jeikcode_coding::GoalTerminal::Stopped => "stopped",
+                jeikcode_coding::GoalTerminal::Failed => "failed",
+                jeikcode_coding::GoalTerminal::Cancelled => "cancelled",
+            }
+            .to_string()
+        });
+        Self {
+            active: progress.active,
+            phase,
+            terminal,
+            round: progress.round,
+            max_rounds: progress.max_rounds,
+            elapsed_secs: progress.elapsed_secs,
+            tokens_used: progress.tokens_used,
+            max_tokens: progress.max_tokens,
+            condition: progress.condition.clone(),
+            last_reason: progress.last_reason.clone(),
+            continuous: progress.options.continuous,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ControllerState {
     loop_active: bool,
     goal_active: bool,
     loop_round: u32,
     loop_label: String,
+    goal: Option<GoalProgressWire>,
     updated_at: Option<std::time::Instant>,
 }
 
@@ -5351,7 +5453,45 @@ fn note_goal_state(session_id: &str, active: bool) {
     guard.retain(|_, state| fresh_controller_state(state));
     let state = guard.entry(session_id.to_string()).or_default();
     state.goal_active = active;
+    if !active {
+        if let Some(goal) = state.goal.as_mut() {
+            goal.active = false;
+            if goal.phase == "pursuing" {
+                goal.phase = "ended".to_string();
+            }
+        }
+    }
     state.updated_at = Some(std::time::Instant::now());
+}
+
+pub(crate) fn note_goal_progress(session_id: &str, progress: &jeikcode_coding::GoalProgress) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let mut guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, state| fresh_controller_state(state));
+    let state = guard.entry(session_id.to_string()).or_default();
+    state.goal_active = progress.active;
+    state.goal = Some(GoalProgressWire::from(progress));
+    state.updated_at = Some(std::time::Instant::now());
+}
+
+pub(crate) fn clear_goal_controller_state(session_id: &str) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let mut guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = guard.get_mut(session_id) {
+        state.goal_active = false;
+        state.goal = None;
+        state.updated_at = Some(std::time::Instant::now());
+    }
 }
 
 fn controller_state_for(session_id: &str) -> Option<ControllerState> {
@@ -5362,6 +5502,10 @@ fn controller_state_for(session_id: &str) -> Option<ControllerState> {
         .get(session_id)
         .filter(|state| fresh_controller_state(state))
         .cloned()
+}
+
+pub(crate) fn goal_controller_snapshot(session_id: &str) -> Option<GoalProgressWire> {
+    controller_state_for(session_id).and_then(|state| state.goal)
 }
 
 /// 这个会话是否仍有已武装的运行时控制器（`/loop` 或 `/goal`）。
@@ -5634,6 +5778,29 @@ pub(crate) fn fanout_chat_events_for_session(
     session_id: Option<String>,
     working_dir: Option<std::path::PathBuf>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
+    fanout_chat_events_inner(Some(primary), bus, replay, session_id, working_dir, true)
+}
+
+/// Like [`fanout_chat_events_for_session`], for drivers already consuming events
+/// from `SessionRuntimeRegistry` (such as `/goal` bridge tasks) so events are
+/// not echoed back into the registry.
+pub(crate) fn fanout_chat_events_for_observed_session(
+    bus: tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
+    replay: Option<Arc<std::sync::Mutex<ReplayLog>>>,
+    session_id: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
+) -> mpsc::UnboundedSender<ChatEvent> {
+    fanout_chat_events_inner(None, bus, replay, session_id, working_dir, false)
+}
+
+fn fanout_chat_events_inner(
+    primary: Option<mpsc::UnboundedSender<ChatEvent>>,
+    bus: tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
+    replay: Option<Arc<std::sync::Mutex<ReplayLog>>>,
+    session_id: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
+    mirror_to_registry: bool,
+) -> mpsc::UnboundedSender<ChatEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     tokio::spawn(async move {
         let mut current_sid = session_id;
@@ -5813,8 +5980,10 @@ pub(crate) fn fanout_chat_events_for_session(
                 ChatEvent::SessionRenamed { session_id, .. } => Some(session_id.as_str()),
                 _ => current_sid.as_deref(),
             };
-            if let Some(sid) = effective_sid {
-                mirror_chat_event_to_registry(sid, &event);
+            if mirror_to_registry {
+                if let Some(sid) = effective_sid {
+                    mirror_chat_event_to_registry(sid, &event);
+                }
             }
             let seq = if let Some(ref replay) = replay {
                 let mut guard = replay
@@ -5826,7 +5995,9 @@ pub(crate) fn fanout_chat_events_for_session(
                 no_replay_seq
             };
             let _ = bus.send((seq, event.clone()));
-            let _ = primary.send(event);
+            if let Some(ref primary) = primary {
+                let _ = primary.send(event);
+            }
             // 终态必须先写入 replay 并投递到 /chat/watch 总线，随后才能在全局 /events 上广播
             // running: false 与执行磁盘扫描，避免前端收到 Activity 信号时 /chat/watch 尚未收到 Done。
             if let Some(activity) = deferred_activity {
@@ -8482,6 +8653,9 @@ async fn get_session_detail(
             } else {
                 messages
             };
+            let loaded_skills = jeikcode_capabilities::compaction::extract_active_skills_in_span(
+                &session.snapshot.messages,
+            );
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -8516,6 +8690,7 @@ async fn get_session_detail(
                 todos,
                 todos_revision,
                 daemon_instance_id: state.daemon_instance_id.to_string(),
+                loaded_skills,
             };
             session_detail_response(&headers, detail)
         }
@@ -8554,6 +8729,7 @@ async fn get_session_detail(
                 todos: Vec::new(),
                 todos_revision: 0,
                 daemon_instance_id: state.daemon_instance_id.to_string(),
+                loaded_skills: Vec::new(),
             };
             session_detail_response(&headers, detail)
         }
@@ -12036,6 +12212,13 @@ pub enum ChatEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         ts: Option<u64>,
     },
+    /// `/goal` autonomous loop progress update.
+    #[serde(rename = "goal_progress")]
+    GoalProgress {
+        session_id: String,
+        #[serde(flatten)]
+        progress: GoalProgressWire,
+    },
 }
 
 /// Notification label for a `/chat` `done` event.
@@ -12331,6 +12514,7 @@ mod session_token_usage_tests {
         assert_eq!(compacted.prompt, 1_234);
         assert_eq!(compacted.completion, 0);
         assert_eq!(compacted.total, 1_234);
+        assert_eq!(compacted.ctx_window, Some(1_000_000));
     }
 }
 
@@ -14075,14 +14259,18 @@ impl ChatRuntimeProjector {
                 Vec::new()
             }
             CodingRuntimeEvent::GoalChanged(progress) => {
-                crate::note_goal_state(permission_session_id, progress.active);
+                crate::note_goal_progress(permission_session_id, &progress);
+                let wire = crate::GoalProgressWire::from(&progress);
                 crate::publish_global(crate::GlobalWireEvent::Activity {
                     session_id: permission_session_id.to_string(),
                     running: progress.active,
                     terminal: None,
                     status: None,
                 });
-                Vec::new()
+                vec![ChatEvent::GoalProgress {
+                    session_id: permission_session_id.to_string(),
+                    progress: wire,
+                }]
             }
             CodingRuntimeEvent::CompactionStarted { .. } => {
                 // 内核事件在 runtime 层已经转换成 CodingRuntimeEvent::CompactionStarted
@@ -14520,8 +14708,7 @@ impl ChatRuntimeProjector {
             | Agent::Request { .. }
             | Agent::Snapshot { .. }
             | Agent::TurnComplete { .. }
-            | Agent::Cancelled
-            | Agent::Compacted { .. } => Vec::new(),
+            | Agent::Cancelled => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -14782,6 +14969,465 @@ pub(crate) async fn admit_chat_turn(
         fan_tx,
         terminal_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
+}
+
+pub(crate) enum GoalBridgeCommand {
+    Launch {
+        condition: String,
+        options: jeikcode_coding::GoalOptions,
+    },
+    Resume,
+}
+
+/// Start or resume `/goal` on a `SessionRuntimeRegistry`-owned runtime and
+/// bridge its events into `ActiveChatRegistry` so WebUI `/chat/watch`,
+/// `/chat/runtime`, `/chat/active`, `/chat/stop`, `/chat/permission`, and
+/// `/chat/user-input` treat it identically to a `/chat` turn.
+pub(crate) async fn launch_or_resume_goal_bridge(
+    state: &AppState,
+    session_id: String,
+    working_dir: PathBuf,
+    provider_name: Option<String>,
+    cmd: GoalBridgeCommand,
+) -> anyhow::Result<Option<GoalProgressWire>> {
+    use jeikcode_capabilities::tools::{
+        request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, ApprovalResponse,
+        PermissionDecision, APPROVAL_KIND,
+    };
+    use jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry;
+
+    let config =
+        jeikcode_config::config::Config::load(&jeikcode_config::config::Config::default_path())?;
+    let resolved_provider = live_api::resolve_provider_name(&config, provider_name.as_deref());
+    if !config.selection_exists(&resolved_provider) {
+        anyhow::bail!("provider '{resolved_provider}' not found");
+    }
+    let effective_mode = if state.yolo {
+        approval_mode::ApprovalMode::Auto
+    } else {
+        live_api::live_session_approval_mode(Some(&session_id))
+    };
+    let runtime_mode = live_api::native_runtime_mode(effective_mode);
+
+    let admission = state
+        .active_chats
+        .admit(Some(&session_id), None)
+        .await
+        .map_err(|_| anyhow::anyhow!("session {session_id:?} is currently busy"))?;
+    let operation_id = admission.operation_id;
+    let cancel_token = admission.cancellation;
+
+    struct GoalAdmitGuard {
+        active_chats: ActiveChatRegistry,
+        operation_id: String,
+        completed: bool,
+    }
+    impl Drop for GoalAdmitGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                let chats = self.active_chats.clone();
+                let op_id = self.operation_id.clone();
+                tokio::spawn(async move {
+                    chats.complete(&op_id).await;
+                });
+            }
+        }
+    }
+    let mut admit_guard = GoalAdmitGuard {
+        active_chats: state.active_chats.clone(),
+        operation_id: operation_id.clone(),
+        completed: false,
+    };
+
+    if let Err(err) = crate::native_live::ensure_registry_runner(
+        working_dir.clone(),
+        state.telemetry.clone(),
+        resolved_provider.clone(),
+        runtime_mode,
+        session_id.clone(),
+    )
+    .await
+    {
+        anyhow::bail!("{err}");
+    }
+
+    let handle = crate::native_live::existing_runner_handle(&session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id:?} runtime handle unavailable"))?;
+
+    let coding_cfg =
+        crate::kernel_runtime::coding_config_from_runtime(&live_api::live_runtime_config(
+            &config,
+            &resolved_provider,
+            &working_dir,
+            state.telemetry.clone(),
+        ));
+    if let Err(err) =
+        live_api::reassemble_observed_provider_if_needed(&session_id, &handle, &coding_cfg).await
+    {
+        anyhow::bail!("{err}");
+    }
+    if let Err(err) = handle.set_mode(runtime_mode).await {
+        anyhow::bail!("failed to set runtime mode: {err}");
+    }
+
+    let reg = SessionRuntimeRegistry::global();
+    let (_replay, mut rx) = reg
+        .attach_and_subscribe_runtime(
+            session_id.clone(),
+            working_dir.clone(),
+            handle.clone(),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (event_bus, replay) = state
+        .active_chats
+        .event_bus_with_replay(&operation_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("goal operation bus missing"))?;
+    let fan_tx = fanout_chat_events_for_observed_session(
+        event_bus,
+        Some(replay),
+        Some(session_id.clone()),
+        Some(working_dir.clone()),
+    );
+
+    let is_launch = matches!(&cmd, GoalBridgeCommand::Launch { .. });
+    let initial_progress: Option<GoalProgressWire>;
+    match cmd {
+        GoalBridgeCommand::Launch { condition, options } => {
+            let client_input_id = jeikcode_kernel::message::new_message_id();
+            let now_ms = u64::try_from(jeikcode_capabilities::session::now_ms()).unwrap_or(0);
+            state
+                .active_chats
+                .record_user_message(
+                    &operation_id,
+                    condition.clone(),
+                    condition.clone(),
+                    Some(now_ms),
+                    Vec::new(),
+                )
+                .await;
+            let _ = fan_tx.send(ChatEvent::User {
+                content: condition.clone(),
+                display_text: Some(condition.clone()),
+                internal: Some(false),
+                editable: Some(true),
+                session_id: Some(session_id.clone()),
+                created_at: Some(now_ms),
+                message_id: Some(client_input_id.clone()),
+                order: None,
+                turn_ordinal: None,
+                client_input_id: Some(client_input_id.clone()),
+                images: None,
+            });
+            handle
+                .start_goal_with_options(condition.clone(), options.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start goal: {e}"))?;
+            if let Err(e) = handle
+                .submit(jeikcode_coding::UserInput {
+                    text: condition.clone(),
+                    images: Vec::new(),
+                    id: Some(client_input_id),
+                })
+                .await
+            {
+                let _ = handle.stop_goal().await;
+                anyhow::bail!("failed to submit goal prompt: {e}");
+            }
+            initial_progress = Some(GoalProgressWire {
+                active: true,
+                phase: "pursuing".to_string(),
+                terminal: None,
+                round: 0,
+                max_rounds: options.max_rounds,
+                elapsed_secs: 0,
+                tokens_used: 0,
+                max_tokens: options.max_tokens,
+                condition,
+                last_reason: None,
+                continuous: options.continuous,
+            });
+        }
+        GoalBridgeCommand::Resume => {
+            handle
+                .resume_goal()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to resume goal: {e}"))?;
+            initial_progress = goal_controller_snapshot(&session_id).map(|mut g| {
+                g.active = true;
+                g.phase = "pursuing".to_string();
+                g
+            });
+        }
+    }
+
+    let policy = ChatTurnPolicy::resolve(
+        state.yolo,
+        ChatTurnOrigin::Native,
+        SessionMode::Webui,
+        state.is_token_enforced(),
+        &state.bind_host,
+    );
+    let active_chats = state.active_chats.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let pending_user_inputs = state.pending_user_inputs.clone();
+    let bridge_session_id = session_id.clone();
+    let bridge_working_dir = working_dir.clone();
+    let bridge_op_id = operation_id.clone();
+    admit_guard.completed = true;
+
+    tokio::spawn(async move {
+        let mut projector = ChatRuntimeProjector::default();
+        let mut terminal_sent = false;
+        let mut in_turn = is_launch;
+        let mut goal_pursuing = true;
+        let mut cancelled = false;
+
+        loop {
+            let envelope = tokio::select! {
+                _ = cancel_token.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    let _ = handle.stop_goal().await;
+                    let _ = handle.cancel().await;
+                    continue;
+                }
+                recv = rx.recv() => match recv {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            };
+
+            let Some(rt_event) = envelope.runtime else {
+                continue;
+            };
+
+            match rt_event {
+                CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
+                    let Ok(approval) =
+                        serde_json::from_value::<ApprovalRequest>(request.payload.clone())
+                    else {
+                        let _ = handle.respond(request.id, serde_json::Value::Null).await;
+                        continue;
+                    };
+                    let current_mode =
+                        live_api::live_session_approval_mode(Some(&bridge_session_id));
+                    if !policy.interactive_permission
+                        || current_mode == approval_mode::ApprovalMode::Auto
+                    {
+                        let decision = if current_mode == approval_mode::ApprovalMode::Auto {
+                            PermissionDecision::AllowOnce
+                        } else {
+                            live_api::fallback_approval_decision(current_mode)
+                        };
+                        let resp = match decision {
+                            PermissionDecision::AllowOnce => ApprovalResponse::allow(),
+                            PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
+                            _ => ApprovalResponse::deny(),
+                        };
+                        let _ = handle
+                            .respond(
+                                request.id,
+                                serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
+                            )
+                            .await;
+                        continue;
+                    }
+                    let manager = jeikcode_capabilities::session::SessionManager::for_project(
+                        &bridge_working_dir,
+                    );
+                    let approval_id = manager
+                        .load_pending_permission(&bridge_session_id)
+                        .ok()
+                        .flatten()
+                        .filter(|p| p.call_id == approval.call_id && p.tool_name == approval.tool)
+                        .map(|p| permission_bridge::approval_id_for_pending(&p))
+                        .unwrap_or_else(|| format!("goal-{}-{}", request.id, approval.call_id));
+                    let (tx, perm_rx) = tokio::sync::oneshot::channel();
+                    pending_permissions.register(
+                        bridge_session_id.clone(),
+                        approval_id.clone(),
+                        approval.tool.clone(),
+                        tx,
+                    );
+                    let mut surfaced = request.clone();
+                    if let Some(payload) = surfaced.payload.as_object_mut() {
+                        payload.insert(
+                            "approval_id".into(),
+                            serde_json::Value::String(approval_id.clone()),
+                        );
+                    }
+                    for chat_ev in projector
+                        .project_runtime(CodingRuntimeEvent::Request(surfaced), &bridge_session_id)
+                    {
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                    let perm_handle = handle.clone();
+                    let perm_cancel = cancel_token.clone();
+                    let perm_bridge = pending_permissions.clone();
+                    let perm_sid = bridge_session_id.clone();
+                    let perm_aid = approval_id.clone();
+                    tokio::spawn(async move {
+                        let decision = tokio::select! {
+                            _ = perm_cancel.cancelled() => {
+                                perm_bridge.expire(&perm_sid, &perm_aid);
+                                jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(&perm_sid);
+                                None
+                            }
+                            res = perm_rx => match res {
+                                Ok(env) => {
+                                    let sub = env.submission();
+                                    let resp = match sub.decision {
+                                        PermissionDecision::AllowOnce => ApprovalResponse::allow(),
+                                        PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
+                                        _ => ApprovalResponse::deny(),
+                                    };
+                                    Some((env, serde_json::to_value(resp).unwrap_or(serde_json::Value::Null)))
+                                }
+                                Err(_) => None,
+                            }
+                        };
+                        match decision {
+                            Some((env, val)) => {
+                                if perm_handle.respond(request.id, val).await.is_ok() {
+                                    env.acknowledge();
+                                } else {
+                                    perm_bridge.expire(&perm_sid, &perm_aid);
+                                }
+                            }
+                            None => {
+                                let _ = perm_handle
+                                    .respond(request.id, serde_json::Value::Null)
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                CodingRuntimeEvent::Request(request) if request.kind == REQUEST_USER_INPUT_KIND => {
+                    if !policy.interactive_user_input {
+                        let val = live_api::residual_user_input_decline(
+                            &request.payload,
+                            "Interactive user input is unavailable here.",
+                        );
+                        let _ = handle.respond(request.id, val).await;
+                        continue;
+                    }
+                    let (tx, input_rx) = tokio::sync::oneshot::channel();
+                    pending_user_inputs.register(bridge_session_id.clone(), request.id, tx);
+                    for chat_ev in projector.project_runtime(
+                        CodingRuntimeEvent::Request(request.clone()),
+                        &bridge_session_id,
+                    ) {
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                    let ui_handle = handle.clone();
+                    let ui_cancel = cancel_token.clone();
+                    let ui_bridge = pending_user_inputs.clone();
+                    let ui_sid = bridge_session_id.clone();
+                    tokio::spawn(async move {
+                        let value = tokio::select! {
+                            _ = ui_cancel.cancelled() => serde_json::Value::Null,
+                            res = input_rx => res.unwrap_or(serde_json::Value::Null),
+                        };
+                        ui_bridge.unregister(&ui_sid, request.id);
+                        let _ = ui_handle.respond(request.id, value).await;
+                    });
+                }
+                CodingRuntimeEvent::GoalChanged(progress) => {
+                    goal_pursuing = progress.active;
+                    for chat_ev in projector.project_runtime(
+                        CodingRuntimeEvent::GoalChanged(progress.clone()),
+                        &bridge_session_id,
+                    ) {
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                    if !progress.active && !in_turn {
+                        if !terminal_sent {
+                            terminal_sent = true;
+                            let done_ev = ChatEvent::Done {
+                                tokens: projector.total_tokens,
+                                tool_calls: projector.tool_call_count,
+                                session_id: bridge_session_id.clone(),
+                                stop_reason: Some("stopped".into()),
+                                message: progress.last_reason.clone(),
+                                message_id: projector.notice_anchor(),
+                            };
+                            active_chats.mark_terminal(&bridge_op_id, &done_ev).await;
+                            let _ = fan_tx.send(done_ev);
+                        }
+                        break;
+                    }
+                }
+                CodingRuntimeEvent::TurnFinished(completion) => {
+                    in_turn = false;
+                    let is_err = matches!(
+                        completion,
+                        jeikcode_coding::TurnCompletion::SnapshotUnavailable { .. }
+                    );
+                    let keep_open = goal_pursuing && !is_err;
+                    for chat_ev in projector.project_runtime(
+                        CodingRuntimeEvent::TurnFinished(completion),
+                        &bridge_session_id,
+                    ) {
+                        if matches!(
+                            chat_ev,
+                            ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+                        ) {
+                            if keep_open {
+                                // More goal rounds follow; keep the active operation
+                                // and WebUI watcher alive, resetting `terminal_seen`
+                                // for the next round.
+                                projector.terminal_seen = false;
+                                continue;
+                            }
+                            terminal_sent = true;
+                            active_chats.mark_terminal(&bridge_op_id, &chat_ev).await;
+                        }
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                    publish_session_upsert(&bridge_working_dir, &bridge_session_id);
+                    if !keep_open {
+                        break;
+                    }
+                }
+                CodingRuntimeEvent::RuntimeStopped(_) => {
+                    for chat_ev in projector.project_runtime(rt_event, &bridge_session_id) {
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                    if !terminal_sent {
+                        terminal_sent = true;
+                        active_chats
+                            .mark_terminal(&bridge_op_id, &ChatEvent::Stopped)
+                            .await;
+                        let _ = fan_tx.send(ChatEvent::Stopped);
+                    }
+                    break;
+                }
+                other => {
+                    if matches!(
+                        other,
+                        CodingRuntimeEvent::Agent(
+                            jeikcode_kernel::event::AgentEvent::UserMessage { .. }
+                        )
+                    ) {
+                        in_turn = true;
+                        publish_session_upsert(&bridge_working_dir, &bridge_session_id);
+                    }
+                    for chat_ev in projector.project_runtime(other, &bridge_session_id) {
+                        let _ = fan_tx.send(chat_ev);
+                    }
+                }
+            }
+        }
+
+        pending_permissions.unregister_session(&bridge_session_id);
+        pending_user_inputs.unregister_session(&bridge_session_id);
+        active_chats.complete(&bridge_op_id).await;
+    });
+
+    Ok(initial_progress)
 }
 
 /// POST /chat - Stream chat response with SSE
@@ -19254,7 +19900,11 @@ async fn chat_runtime(
             "round": controller.loop_round,
             "label": controller.loop_label,
         },
-        "goal": { "active": controller.goal_active },
+        "goal": match &controller.goal {
+            Some(goal) => serde_json::to_value(goal)
+                .unwrap_or_else(|_| serde_json::json!({ "active": controller.goal_active })),
+            None => serde_json::json!({ "active": controller.goal_active }),
+        },
         "last_terminal": meta.as_ref().and_then(|entry| entry.last_terminal.clone()),
         "terminal_seq": meta.as_ref().map(|entry| entry.terminal_seq).unwrap_or(0),
     }))
@@ -20652,10 +21302,26 @@ async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
         if resp.status().is_success() {
             if let Ok(text) = resp.text().await {
                 if text.contains("jeikcode-daemon") {
+                    // Never terminate an external daemon that is still running active turns/goals.
+                    let active_url = format!("http://127.0.0.1:{port}/chat/active");
+                    let mut active_req = client.get(&active_url);
+                    let token = api_config::saved_listen_token();
+                    if let Some(ref t) = token {
+                        active_req = active_req.bearer_auth(t);
+                    }
+                    if let Ok(active_resp) = active_req.send().await {
+                        if active_resp.status().is_success() {
+                            if let Ok(ids) = active_resp.json::<Vec<String>>().await {
+                                if !ids.is_empty() {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     let shutdown_url = format!("http://127.0.0.1:{port}/shutdown");
                     let mut req = client.post(&shutdown_url);
-                    if let Some(token) = api_config::saved_listen_token() {
-                        req = req.bearer_auth(token);
+                    if let Some(t) = token {
+                        req = req.bearer_auth(t);
                     }
                     let _ = req.send().await;
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

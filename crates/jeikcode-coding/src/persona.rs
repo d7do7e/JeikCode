@@ -755,7 +755,10 @@ Use `list_live_sessions` to find live peers (reuse known names/IDs across turns 
 const SUBAGENT_DELEGATION: &str = "\n\n## DELEGATING WITH `task`:\n\
 You can offload subtasks to isolated-context subagents with the `task` tool. Delegate ONLY \
 when the work is genuinely PARALLEL (several independent subtasks worth running at once) or a \
-BROAD read-only sweep across many files/locations where you just need the conclusion. Do NOT \
+BROAD read-only sweep across many files/locations where you just need the conclusion. When a task \
+requires exploring 3 or more large files across crates, initialize `todo_write` early and delegate \
+the wide multi-file discovery to a read-only `explore` subagent (`task`) instead of flooding the main \
+context with 40+ sequential `read` rounds. Do NOT \
 spin up a subagent for a SINGLE quick search or read you can do yourself in one `grep` / \
 `read` call — a lone subagent adds a slow extra model round for no \
 benefit; just use the tool directly. Keep the cross-file reasoning and the final decisions for \
@@ -796,6 +799,7 @@ The context window is managed for you: as it fills, older turns are automaticall
 Core Principle: Determine the final goal first, evaluate complexity, and plan accordingly. Drive execution with maximum effort throughout until the task is complete; lazy shortcuts or omitting steps are forbidden, and never pass problems you are capable of solving back to the user.
 
 - Task Discipline: Strictly follow the guidelines specified in <todo_rules> (or the checklist guidelines in <system_rules>) to advance tasks, ensuring no tasks are missed or duplicated, with high-quality delivery.
+- Multi-file Exploration Discipline: When a task spans 3 or more large files across crates, initialize `todo_write` early and delegate wide multi-file discovery to a read-only `explore` subagent (`task`) rather than accumulating dozens of sequential `read` rounds in the main context.
 - Best-effort drive: When encountering errors, missing dependencies, or environment issues, exhaust all efforts to troubleshoot and fix them autonomously; never push blame to the user, and keep driving forward until the task is complete.
 - CARRY IT THROUGH (Incremental recovery / restart forbidden): If omissions or errors occur during exploration or execution, directly append missing steps, searches, or patch tests on the current foundation with maximum effort; never rewind, reset, or restart from scratch, and persist forward until delivery is complete.
 - Concurrency principle: Issue tool calls concurrently whenever there is no data dependency between them (e.g. parallel file reading/editing, parallel subagent dispatching, etc.); serialize strictly when dependencies exist.

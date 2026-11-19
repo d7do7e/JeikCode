@@ -219,6 +219,182 @@ const REPEAT_LOOP_NUDGE: &str =
 /// reminders is enough to call it stuck without dying on the first retry.
 const ECHO_NUDGE_AT: u32 = 3;
 const ECHO_STOP_AT: u32 = 5;
+const READONLY_SOFT_STEER_ROUNDS: usize = 12;
+const DUP_READ_SLICE_SOFT_STEER_HITS: usize = 4;
+const READONLY_HARD_STOP_ROUNDS: usize = 22;
+const COMPACTIONS_WITHOUT_MUTATION_STOP: usize = 2;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CompactionRunOutcome {
+    committed: bool,
+    drained: bool,
+}
+
+#[derive(Debug, Default)]
+struct IntraTurnReadLoopGuard {
+    consecutive_readonly_rounds: usize,
+    compactions_since_last_mutation: usize,
+    seen_read_slices: std::collections::HashSet<(String, u64, u64)>,
+    duplicate_read_hits: usize,
+    readonly_soft_steered: bool,
+    dup_slice_soft_steered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadLoopAction {
+    Continue,
+    SoftSteer(&'static str),
+    HardStop,
+}
+
+impl IntraTurnReadLoopGuard {
+    fn reset_all(&mut self) {
+        self.consecutive_readonly_rounds = 0;
+        self.compactions_since_last_mutation = 0;
+        self.seen_read_slices.clear();
+        self.duplicate_read_hits = 0;
+        self.readonly_soft_steered = false;
+        self.dup_slice_soft_steered = false;
+    }
+
+    fn note_drain_compaction(&mut self) {
+        self.compactions_since_last_mutation =
+            self.compactions_since_last_mutation.saturating_add(1);
+    }
+
+    fn compaction_stop_message(&self) -> Option<String> {
+        (self.compactions_since_last_mutation >= COMPACTIONS_WITHOUT_MUTATION_STOP).then(|| {
+            format!(
+                "stopped: context compacted {} times in a single turn without any edit or action tool execution (read-and-compact loop guard)",
+                self.compactions_since_last_mutation
+            )
+        })
+    }
+
+    fn observe_round<'a, I>(&mut self, calls: I) -> ReadLoopAction
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, bool)>,
+    {
+        let mut saw_any = false;
+        let mut any_mutation = false;
+        let mut all_readonly = true;
+
+        for (name, args, executed) in calls {
+            saw_any = true;
+            if executed && is_mutating_or_action_tool(name) {
+                any_mutation = true;
+            }
+            if !is_readonly_exploration_tool(name) {
+                all_readonly = false;
+            }
+            if let Some(slice) = extract_read_slice_key(name, args) {
+                if !self.seen_read_slices.insert(slice) {
+                    self.duplicate_read_hits = self.duplicate_read_hits.saturating_add(1);
+                }
+            }
+        }
+
+        if !saw_any {
+            return ReadLoopAction::Continue;
+        }
+
+        if any_mutation {
+            self.reset_all();
+            return ReadLoopAction::Continue;
+        }
+
+        if all_readonly {
+            self.consecutive_readonly_rounds = self.consecutive_readonly_rounds.saturating_add(1);
+        } else {
+            self.consecutive_readonly_rounds = 0;
+            self.readonly_soft_steered = false;
+        }
+
+        if self.consecutive_readonly_rounds >= READONLY_HARD_STOP_ROUNDS
+            || self.compactions_since_last_mutation >= COMPACTIONS_WITHOUT_MUTATION_STOP
+        {
+            return ReadLoopAction::HardStop;
+        }
+
+        if self.consecutive_readonly_rounds >= READONLY_SOFT_STEER_ROUNDS
+            && !self.readonly_soft_steered
+        {
+            self.readonly_soft_steered = true;
+            return ReadLoopAction::SoftSteer(
+                "You have spent 12+ consecutive rounds on read-only exploration without making any edits or actions. Stop broad reading now: lock your concrete plan in `todo_write` and start `edit`/`write` changes, or delegate remaining multi-file discovery to a read-only `explore` subagent (`task`).",
+            );
+        }
+
+        if self.duplicate_read_hits >= DUP_READ_SLICE_SOFT_STEER_HITS
+            && !self.dup_slice_soft_steered
+        {
+            self.dup_slice_soft_steered = true;
+            return ReadLoopAction::SoftSteer(
+                "You have re-read identical `(path, offset, limit)` file slices 4+ times in this turn. Stop re-reading already-inspected slices; rely on your prior findings, lock your plan in `todo_write`, and begin editing or delegate wide searches to an `explore` subagent (`task`).",
+            );
+        }
+
+        ReadLoopAction::Continue
+    }
+
+    fn hard_stop_message(&self) -> String {
+        if let Some(msg) = self.compaction_stop_message() {
+            return msg;
+        }
+        format!(
+            "stopped: {} consecutive read-only exploration rounds without any edit or action tool execution (duplicate read slices: {})",
+            self.consecutive_readonly_rounds, self.duplicate_read_hits
+        )
+    }
+}
+
+fn is_readonly_exploration_tool(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "read" | "read_file" | "grep" | "glob" | "code_explore"
+    )
+}
+
+fn is_mutating_or_action_tool(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "edit"
+            | "edit_file"
+            | "write"
+            | "write_file"
+            | "patch"
+            | "apply_patch"
+            | "bash"
+            | "run_command"
+            | "todo_write"
+            | "task"
+    )
+}
+
+fn extract_read_slice_key(name: &str, raw_args: &str) -> Option<(String, u64, u64)> {
+    if !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "read" | "read_file"
+    ) {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(raw_args).ok()?;
+    let path = val
+        .get("path")
+        .or_else(|| val.get("file_path"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    let offset = val
+        .get("offset")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64)))
+        .unwrap_or(1);
+    let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some((path, offset, limit))
+}
 fn echo_loop_nudge() -> String {
     i18n::format_agent_echo_loop_nudge()
 }
@@ -1695,7 +1871,11 @@ impl RunningAgent {
         });
     }
 
-    async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
+    async fn run_compaction(
+        &self,
+        convo: &mut Conversation,
+        trigger: CompactTrigger,
+    ) -> CompactionRunOutcome {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
         // Raw prompt tokens from the most recent assistant meta (default 0 if none yet).
@@ -1780,7 +1960,7 @@ impl RunningAgent {
                         "committed compaction did not produce a candidate",
                     ),
                 });
-                return;
+                return CompactionRunOutcome::default();
             };
             let candidate_snapshot = self.capture_snapshot(candidate);
             if let Some(checkpoint) = &self.compaction_checkpoint {
@@ -1789,7 +1969,7 @@ impl RunningAgent {
                         trigger: trigger_for_event,
                         error,
                     });
-                    return;
+                    return CompactionRunOutcome::default();
                 }
             }
             snapshot = Some(candidate_snapshot);
@@ -1805,6 +1985,10 @@ impl RunningAgent {
             committed: report.committed,
             snapshot,
         });
+        CompactionRunOutcome {
+            committed: report.committed,
+            drained: report.committed && report.removed > 0,
+        }
     }
     async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
         let mut convo = match &self.resume {
@@ -2758,6 +2942,8 @@ impl RunningAgent {
         // One-shot tool-less final synthesis pass when `graceful_final_synthesis` is enabled.
         let mut in_final_synthesis = false;
         let mut synthesis_used = false;
+        let mut read_loop_guard = IntraTurnReadLoopGuard::default();
+        let mut last_counted_drain_round: Option<u32> = None;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -2898,6 +3084,7 @@ impl RunningAgent {
                 echo_rounds = 0;
                 echo_nudged = false;
                 midturn_noop_gate = None;
+                read_loop_guard.reset_all();
                 // 用户成功转换 steer 转向状态：刷新重置轮次计数与上限，开启全新轮次预算！
                 round = 1;
                 round_cap = self.max_rounds;
@@ -3002,8 +3189,13 @@ impl RunningAgent {
                         });
                     if !gated_by_noop && (will_summarize || round > 1) {
                         let epoch_before = convo.cache_epoch;
-                        self.run_compaction(convo, CompactTrigger::Auto { utilization })
+                        let outcome = self
+                            .run_compaction(convo, CompactTrigger::Auto { utilization })
                             .await;
+                        if outcome.drained && last_counted_drain_round != Some(round) {
+                            last_counted_drain_round = Some(round);
+                            read_loop_guard.note_drain_compaction();
+                        }
                         if convo.cache_epoch != epoch_before {
                             midturn_noop_gate = None;
                         } else {
@@ -3054,8 +3246,13 @@ impl RunningAgent {
                     && attempts < MAX_OVERFLOW_ATTEMPTS
                 {
                     let before = est(&convo.messages);
-                    self.run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
+                    let outcome = self
+                        .run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
                         .await;
+                    if outcome.drained && last_counted_drain_round != Some(round) {
+                        last_counted_drain_round = Some(round);
+                        read_loop_guard.note_drain_compaction();
+                    }
                     attempts += 1;
                     if est(&convo.messages) >= before {
                         break; // nothing drained (sacred floor / single huge input) — warn below
@@ -3067,6 +3264,13 @@ impl RunningAgent {
                         && messages[..stored_wire.len()] == stored_wire[..];
                     Conversation::repair_pairing(&mut messages);
                 }
+            }
+            if let Some(stop_msg) = read_loop_guard.compaction_stop_message() {
+                self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                Self::persist_turn_diagnostic(convo, &stop_msg);
+                self.finish_turn(convo, StopReason::ToolLoopDetected, &turn_ctx)
+                    .await;
+                return;
             }
             // PRE-SEND over-window advisory (at most ONCE per turn — the
             // `over_window_warned` latch survives the empty-retry / provider-retry
@@ -3203,13 +3407,18 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::Warning(format!(
                         "context overflow on round {round} (attempt {overflow_attempt}); compacting and retrying"
                     )));
-                    self.run_compaction(
-                        convo,
-                        CompactTrigger::Overflow {
-                            attempt: overflow_attempt,
-                        },
-                    )
-                    .await;
+                    let outcome = self
+                        .run_compaction(
+                            convo,
+                            CompactTrigger::Overflow {
+                                attempt: overflow_attempt,
+                            },
+                        )
+                        .await;
+                    if outcome.drained && last_counted_drain_round != Some(round) {
+                        last_counted_drain_round = Some(round);
+                        read_loop_guard.note_drain_compaction();
+                    }
                     overflow_attempt += 1;
                     round -= 1; // a RETRY of the same logical round, not a new one
                     continue;
@@ -4912,6 +5121,7 @@ impl RunningAgent {
                 last_echo_sig = None;
                 echo_rounds = 0;
                 echo_nudged = false;
+                read_loop_guard.reset_all();
                 continue;
             }
 
@@ -5037,6 +5247,36 @@ impl RunningAgent {
             {
                 repeat_nudged = true;
                 convo.push(Message::synthetic_user(REPEAT_LOOP_NUDGE.to_string()));
+            }
+
+            let read_loop_action = read_loop_guard.observe_round(plans.iter().filter_map(|plan| {
+                match plan {
+                    CallPlan::Execute { tool, call, .. } => {
+                        Some((tool.name(), call.arguments.as_str(), true))
+                    }
+                    CallPlan::Result { result, .. } => call_keys_by_id
+                        .get(&result.call_id)
+                        .map(|(name, args)| (name.as_str(), args.as_str(), false)),
+                    CallPlan::CoalesceInto { call, .. } => {
+                        Some((call.name.as_str(), call.arguments.as_str(), false))
+                    }
+                    CallPlan::Skip => None,
+                }
+            }));
+            match read_loop_action {
+                ReadLoopAction::Continue => {}
+                ReadLoopAction::SoftSteer(nudge) => {
+                    self.rt.emit(AgentEvent::Warning(nudge.to_string()));
+                    convo.push(Message::synthetic_user(nudge));
+                }
+                ReadLoopAction::HardStop => {
+                    let message = read_loop_guard.hard_stop_message();
+                    self.rt.emit(AgentEvent::Warning(message.clone()));
+                    Self::persist_turn_diagnostic(convo, &message);
+                    self.finish_turn(convo, StopReason::ToolLoopDetected, &turn_ctx)
+                        .await;
+                    return;
+                }
             }
         }
     }
@@ -7781,5 +8021,80 @@ mod synthetic_send_tests {
         convo.push(goal_turn);
         // frozen_prefix_end stops before autonomous_turn even before the first real user.
         assert_eq!(convo.frozen_prefix_end(), 2);
+    }
+
+    #[test]
+    fn intra_turn_read_loop_guard_steers_stops_and_resets_on_mutation() {
+        let mut guard = IntraTurnReadLoopGuard::default();
+        for round in 1..12 {
+            let args = format!(r#"{{"path":"src/lib.rs","offset":{round},"limit":50}}"#);
+            assert_eq!(
+                guard.observe_round([("read", args.as_str(), true)]),
+                ReadLoopAction::Continue,
+                "round {round} should continue below soft steer threshold"
+            );
+        }
+        assert!(matches!(
+            guard.observe_round([(
+                "read",
+                r#"{"path":"src/lib.rs","offset":12,"limit":50}"#,
+                true
+            )]),
+            ReadLoopAction::SoftSteer(_)
+        ));
+        for round in 13..22 {
+            let args = format!(r#"{{"path":"src/lib.rs","offset":{round},"limit":50}}"#);
+            assert_eq!(
+                guard.observe_round([("read", args.as_str(), true)]),
+                ReadLoopAction::Continue
+            );
+        }
+        assert_eq!(
+            guard.observe_round([(
+                "read",
+                r#"{"path":"src/lib.rs","offset":22,"limit":50}"#,
+                true
+            )]),
+            ReadLoopAction::HardStop
+        );
+
+        // Mutation resets counters and duplicate-slice ledger.
+        assert_eq!(
+            guard.observe_round([("edit", r#"{"path":"src/lib.rs"}"#, true)]),
+            ReadLoopAction::Continue
+        );
+        assert_eq!(guard.consecutive_readonly_rounds, 0);
+        assert_eq!(guard.compactions_since_last_mutation, 0);
+        assert_eq!(guard.duplicate_read_hits, 0);
+
+        // Duplicate slice threshold (4 hits) triggers SoftSteer.
+        let same_slice = r#"{"path":"src/main.rs","offset":1,"limit":80}"#;
+        assert_eq!(
+            guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::Continue
+        );
+        assert_eq!(
+            guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::Continue
+        );
+        assert_eq!(
+            guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::Continue
+        );
+        assert_eq!(
+            guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::Continue
+        );
+        assert!(matches!(
+            guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::SoftSteer(_)
+        ));
+
+        // 2 drain compactions without mutation trigger HardStop.
+        guard.reset_all();
+        guard.note_drain_compaction();
+        assert!(guard.compaction_stop_message().is_none());
+        guard.note_drain_compaction();
+        assert!(guard.compaction_stop_message().is_some());
     }
 }

@@ -1665,6 +1665,7 @@ dependencies = [
  "jeikcode-config",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "winreg",

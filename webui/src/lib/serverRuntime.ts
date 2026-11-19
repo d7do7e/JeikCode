@@ -1,3 +1,5 @@
+import type { GoalProgressInfo } from '../api';
+
 /**
  * serverRuntime.ts — 「有没有人在干活」的唯一服务端权威与 busy 的派生规则。
  *
@@ -91,7 +93,7 @@ export interface ServerChatRuntime {
   compaction_started_at?: number | null;
   turn_id?: string | null;
   loop?: { active?: boolean; round?: number; label?: string } | null;
-  goal?: { active?: boolean } | null;
+  goal?: GoalProgressInfo | null;
   last_terminal?: string | null;
   terminal_seq?: number;
 }
