@@ -294,7 +294,16 @@ struct RemoteAccessStatus {
     launch_mode: &'static str,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccessStatus {
+    remote_status_with_pref(state, token, &webui_listen_pref_path())
+}
+
+fn remote_status_with_pref(
+    state: &crate::AppState,
+    token: Option<String>,
+    pref_path: &std::path::Path,
+) -> RemoteAccessStatus {
     // Copy the bind out and drop the mutex before any address lookup.
     // `extra_remote` is a std mutex: calling back into this function while
     // the guard is still held deadlocks the worker, and the WebUI Apply
@@ -324,6 +333,9 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
         Vec::new()
     };
     let url = urls.first().cloned();
+    let next_port = load_webui_listen_pref_at(pref_path)
+        .map(|pref| pref.port)
+        .filter(|saved| *saved != 0 && *saved != port);
     RemoteAccessStatus {
         host,
         port,
@@ -333,7 +345,7 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
         url,
         urls,
         firewall: None,
-        next_port: saved_listen_port().filter(|saved| *saved != port),
+        next_port,
         next_host: None,
         launch_mode: jeikcode_updater::detect_launch_mode().as_str(),
     }
@@ -590,104 +602,117 @@ fn interface_network_blob() -> Vec<u8> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn mac_ifconfig_bytes() -> Vec<u8> {
-    let mut child = match std::process::Command::new("ifconfig")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
+#[derive(Debug)]
+struct CommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandDrainError {
+    SpawnFailed,
+    TimedOut,
+}
+
+const MAX_CAPTURED_PIPE_BYTES: usize = 4 * 1024 * 1024;
+
+fn spawn_capped_pipe_reader<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() < MAX_CAPTURED_PIPE_BYTES {
+                        let remaining = MAX_CAPTURED_PIPE_BYTES - buf.len();
+                        buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                    }
+                    // Continue draining until EOF so the child never blocks on a full pipe.
+                }
+            }
+        }
+        buf
+    })
+}
+
+fn run_command_with_timeout_drain(
+    mut cmd: std::process::Command,
+    limit: std::time::Duration,
+) -> Result<CommandOutput, CommandDrainError> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|_| CommandDrainError::SpawnFailed)?;
+    let stdout_handle = child.stdout.take().map(spawn_capped_pipe_reader);
+    let stderr_handle = child.stderr.take().map(spawn_capped_pipe_reader);
     let started = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < std::time::Duration::from_millis(1500) => {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < limit => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Vec::new();
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                return Err(CommandDrainError::TimedOut);
             }
         }
-    }
-    child
-        .wait_with_output()
-        .map(|output| output.stdout)
+    };
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    Ok(CommandOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_ifconfig_bytes() -> Vec<u8> {
+    let cmd = std::process::Command::new("ifconfig");
+    run_command_with_timeout_drain(cmd, std::time::Duration::from_millis(1500))
+        .map(|out| out.stdout)
         .unwrap_or_default()
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
 fn linux_ip_addr_bytes() -> Vec<u8> {
-    let child = std::process::Command::new("ip")
-        .args(["-o", "addr"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_) => match std::process::Command::new("ifconfig")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        },
-    };
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < std::time::Duration::from_millis(1500) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
+    let mut ip_cmd = std::process::Command::new("ip");
+    ip_cmd.args(["-o", "addr"]);
+    match run_command_with_timeout_drain(ip_cmd, std::time::Duration::from_millis(1500)) {
+        Ok(out) => out.stdout,
+        Err(CommandDrainError::SpawnFailed) => {
+            let ifcfg = std::process::Command::new("ifconfig");
+            run_command_with_timeout_drain(ifcfg, std::time::Duration::from_millis(1500))
+                .map(|out| out.stdout)
+                .unwrap_or_default()
         }
+        Err(CommandDrainError::TimedOut) => Vec::new(),
     }
-    child
-        .wait_with_output()
-        .map(|output| output.stdout)
-        .unwrap_or_default()
 }
 
 #[cfg(windows)]
 fn windows_ipconfig_bytes() -> Vec<u8> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = match std::process::Command::new("ipconfig")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < std::time::Duration::from_millis(1500) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-    child
-        .wait_with_output()
-        .map(|output| output.stdout)
+    let mut cmd = std::process::Command::new("ipconfig");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    run_command_with_timeout_drain(cmd, std::time::Duration::from_millis(1500))
+        .map(|out| out.stdout)
         .unwrap_or_default()
 }
 
@@ -912,22 +937,35 @@ fn try_add_firewall_rule(exe: &str) -> bool {
     ])
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn build_firewall_elevated_script(exe: &str) -> String {
+    let escaped = exe.replace('\'', "''");
+    format!(
+        "netsh advfirewall firewall delete rule name=JeikCode | Out-Null\r\nnetsh advfirewall firewall add rule name=JeikCode dir=in action=allow program='{escaped}' enable=yes profile=any\r\n"
+    )
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn encode_powershell_utf16_command(script: &str) -> String {
+    use base64::Engine as _;
+    let utf16_bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16_bytes)
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn build_firewall_elevated_launch_command(exe: &str) -> String {
+    let script = build_firewall_elevated_script(exe);
+    let encoded = encode_powershell_utf16_command(&script);
+    format!(
+        "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-EncodedCommand','{encoded}'"
+    )
+}
+
 #[cfg(all(windows, not(test)))]
 fn spawn_elevated_firewall_rule(exe: &str) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let path = std::env::temp_dir().join("jeikcode-firewall.ps1");
-    let escaped = exe.replace('\'', "''");
-    let body = format!(
-        "netsh advfirewall firewall delete rule name=JeikCode | Out-Null\r\nnetsh advfirewall firewall add rule name=JeikCode dir=in action=allow program='{escaped}' enable=yes profile=any\r\n"
-    );
-    if std::fs::write(&path, body).is_err() {
-        return false;
-    }
-    let script = path.display().to_string().replace('\'', "''");
-    let launch = format!(
-        "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{script}'"
-    );
+    let launch = build_firewall_elevated_launch_command(exe);
     std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &launch])
         .creation_flags(CREATE_NO_WINDOW)
@@ -937,11 +975,9 @@ fn spawn_elevated_firewall_rule(exe: &str) -> bool {
 
 #[cfg(all(windows, not(test)))]
 fn netsh_text(args: &[&str]) -> Option<String> {
-    let mut child = netsh_command(args).spawn().ok()?;
-    if !wait_child(&mut child, std::time::Duration::from_millis(1500)) {
-        return None;
-    }
-    let output = child.wait_with_output().ok()?;
+    let output =
+        run_command_with_timeout_drain(netsh_command(args), std::time::Duration::from_millis(1500))
+            .ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Some(text)
@@ -949,14 +985,8 @@ fn netsh_text(args: &[&str]) -> Option<String> {
 
 #[cfg(all(windows, not(test)))]
 fn netsh_status(args: &[&str]) -> bool {
-    let mut child = match netsh_command(args).spawn() {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    if !wait_child(&mut child, std::time::Duration::from_millis(1500)) {
-        return false;
-    }
-    child.wait().map(|status| status.success()).unwrap_or(false)
+    run_command_with_timeout_drain(netsh_command(args), std::time::Duration::from_millis(1500))
+        .is_ok_and(|output| output.success)
 }
 
 #[cfg(all(windows, not(test)))]
@@ -964,30 +994,8 @@ fn netsh_command(args: &[&str]) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut command = std::process::Command::new("netsh");
+    command.args(args).creation_flags(CREATE_NO_WINDOW);
     command
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    command
-}
-
-#[cfg(all(windows, not(test)))]
-fn wait_child(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) if started.elapsed() < limit => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
 }
 
 use jeikcode_config::desktop_shared::{
@@ -1028,12 +1036,38 @@ pub(crate) fn save_webui_listen_pref(
     )
 }
 
+async fn remote_status_async(
+    state: &crate::AppState,
+    token: Option<String>,
+) -> Result<RemoteAccessStatus, axum::http::StatusCode> {
+    let state = state.clone();
+    #[cfg(test)]
+    let pref_path = webui_listen_pref_path();
+    tokio::task::spawn_blocking(move || {
+        let mut status = remote_status_with_pref(&state, token, {
+            #[cfg(test)]
+            {
+                &pref_path
+            }
+            #[cfg(not(test))]
+            {
+                &webui_listen_pref_path()
+            }
+        });
+        let _ = &mut status;
+        status
+    })
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// The running socket stays as it is. A matching port registers the token now.
 /// A different port is only remembered for the next `0.0.0.0` start.
 /// Checking "no token" changes this process and is not written down.
-fn apply_launch_settings(
+fn apply_launch_settings_blocking(
     state: &crate::AppState,
     body: &RemoteAccessBody,
+    pref_path: &std::path::Path,
 ) -> Result<RemoteAccessStatus, String> {
     if body.port == 0 {
         return Err("port must be 1-65535".to_string());
@@ -1061,7 +1095,7 @@ fn apply_launch_settings(
                 apply_remote_auth(state, true);
             }
         } else {
-            save_webui_listen_pref(host_opt, body.port, None)?;
+            save_webui_listen_pref_at(pref_path, host_opt.as_deref(), body.port, None)?;
         }
     } else {
         let token = body.token.trim();
@@ -1080,9 +1114,9 @@ fn apply_launch_settings(
             state.webui_tokens.set_display(&token);
             apply_remote_auth(state, false);
         }
-        save_webui_listen_pref(host_opt, body.port, Some(token))?;
+        save_webui_listen_pref_at(pref_path, host_opt.as_deref(), body.port, Some(&token))?;
     }
-    let mut status = remote_status(state, None);
+    let mut status = remote_status_with_pref(state, None, pref_path);
     if port_changed || host_changed {
         if port_changed {
             status.next_port = Some(body.port);
@@ -1091,12 +1125,29 @@ fn apply_launch_settings(
             status.next_host = Some(body.host.clone());
         }
         if !body.no_token {
-            if let Some(pref) = load_webui_listen_pref() {
+            if let Some(pref) = load_webui_listen_pref_at(pref_path) {
                 status.token = pref.token;
             }
         }
     }
     Ok(status)
+}
+
+async fn apply_launch_settings(
+    state: &crate::AppState,
+    body: RemoteAccessBody,
+) -> Result<RemoteAccessStatus, (axum::http::StatusCode, String)> {
+    let state = state.clone();
+    let pref_path = webui_listen_pref_path();
+    tokio::task::spawn_blocking(move || apply_launch_settings_blocking(&state, &body, &pref_path))
+        .await
+        .map_err(|err| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("remote access task panicked: {err}"),
+            )
+        })?
+        .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err))
 }
 
 /// GET /api/remote-access — current temporary listener, if one is open.
@@ -1106,7 +1157,10 @@ pub(crate) async fn get_remote_access(State(state): State<AppState>) -> impl Int
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .is_some();
-    let status = remote_status(&state, None);
+    let status = match remote_status_async(&state, None).await {
+        Ok(status) => status,
+        Err(code) => return json_error(code, "failed to inspect remote status").into_response(),
+    };
     if extra_open {
         Json(with_firewall(status).await).into_response()
     } else {
@@ -1141,7 +1195,10 @@ pub(crate) async fn post_remote_access(
             prev.abort_all();
         }
         restore_remote_auth(&state);
-        return Json(remote_status(&state, None)).into_response();
+        return match remote_status_async(&state, None).await {
+            Ok(status) => Json(status).into_response(),
+            Err(code) => json_error(code, "failed to inspect remote status").into_response(),
+        };
     }
 
     if let Err((status, msg)) =
@@ -1158,7 +1215,13 @@ pub(crate) async fn post_remote_access(
             && !crate::auth_token::is_loopback_bind_host(&state.bind_host);
         if !already_unauthenticated_remote {
             let target = body.host.trim();
-            let saved_host = load_webui_listen_pref().and_then(|p| p.host);
+            let pref_path = webui_listen_pref_path();
+            let saved_host = tokio::task::spawn_blocking(move || {
+                load_webui_listen_pref_at(&pref_path).and_then(|p| p.host)
+            })
+            .await
+            .ok()
+            .flatten();
             let effective_target = if !target.is_empty() {
                 target
             } else if body.apply_launch {
@@ -1195,11 +1258,12 @@ pub(crate) async fn post_remote_access(
         let restart_host = body.host.trim().to_string();
         let restart_port = body.port;
         let no_token = body.no_token;
-        return match apply_launch_settings(&state, &body) {
+        let restart_token = body.token.clone();
+        return match apply_launch_settings(&state, body).await {
             Ok(status) => {
                 if should_restart {
                     let effective_token = status.token.clone().or_else(|| {
-                        let t = body.token.trim();
+                        let t = restart_token.trim();
                         (!t.is_empty()).then(|| t.to_string())
                     });
                     tokio::spawn(async move {
@@ -1222,7 +1286,7 @@ pub(crate) async fn post_remote_access(
                 }
                 Json(status).into_response()
             }
-            Err(err) => json_error(axum::http::StatusCode::BAD_REQUEST, err).into_response(),
+            Err((code, err)) => json_error(code, err).into_response(),
         };
     }
 
@@ -1262,7 +1326,10 @@ pub(crate) async fn post_remote_access(
         host.eq_ignore_ascii_case(&state.bind_host) && body.port == state.bind_port;
     if same_as_primary {
         apply_remote_auth(&state, body.no_token);
-        return Json(with_firewall(remote_status(&state, minted)).await).into_response();
+        return match remote_status_async(&state, minted).await {
+            Ok(status) => Json(with_firewall(status).await).into_response(),
+            Err(code) => json_error(code, "failed to inspect remote status").into_response(),
+        };
     }
 
     // Same host and port: update the token only. Drop the mutex before
@@ -1286,7 +1353,10 @@ pub(crate) async fn post_remote_access(
     };
     if reused {
         apply_remote_auth(&state, body.no_token);
-        return Json(with_firewall(remote_status(&state, minted)).await).into_response();
+        return match remote_status_async(&state, minted).await {
+            Ok(status) => Json(with_firewall(status).await).into_response(),
+            Err(code) => json_error(code, "failed to inspect remote status").into_response(),
+        };
     }
 
     let Some(router) = state.http_router.get().cloned() else {
@@ -1372,7 +1442,10 @@ pub(crate) async fn post_remote_access(
         token: minted.clone(),
     });
 
-    Json(with_firewall(remote_status(&state, minted)).await).into_response()
+    match remote_status_async(&state, minted).await {
+        Ok(status) => Json(with_firewall(status).await).into_response(),
+        Err(code) => json_error(code, "failed to inspect remote status").into_response(),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1406,14 +1479,7 @@ pub struct MigrateLegacyResponse {
     pub killed_zombies_count: usize,
 }
 
-pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
+fn scan_zombie_processes_in(sys: &sysinfo::System) -> Vec<ZombieProcessInfo> {
     let my_pid = sysinfo::get_current_pid().ok().map(|p| p.as_u32());
     let mut out = Vec::new();
 
@@ -1497,8 +1563,18 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
     out
 }
 
+pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    scan_zombie_processes_in(&sys)
+}
+
 pub fn kill_zombie_processes_all() -> usize {
-    let zombies = scan_zombie_processes();
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -1506,6 +1582,7 @@ pub fn kill_zombie_processes_all() -> usize {
         true,
         ProcessRefreshKind::everything(),
     );
+    let zombies = scan_zombie_processes_in(&sys);
     let mut killed = 0;
     for z in zombies {
         if let Some(proc_) = sys.process(Pid::from_u32(z.pid)) {
@@ -1518,48 +1595,70 @@ pub fn kill_zombie_processes_all() -> usize {
 }
 
 pub(crate) async fn get_legacy_status() -> impl IntoResponse {
-    let current_exe = std::env::current_exe().ok();
-    let legacy_files: Vec<String> =
-        jeikcode_config::desktop_shared::scan_legacy_dropper_files(current_exe.as_deref())
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect();
-    let has_dirty_path = jeikcode_config::desktop_shared::has_dirty_hkcu_path();
+    match tokio::task::spawn_blocking(|| {
+        let current_exe = std::env::current_exe().ok();
+        let legacy_files: Vec<String> =
+            jeikcode_config::desktop_shared::scan_legacy_dropper_files(current_exe.as_deref())
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
+        let has_dirty_path = jeikcode_config::desktop_shared::has_dirty_hkcu_path();
 
-    let zombies = scan_zombie_processes();
-    let zombie_count = zombies.len();
-    let has_legacy_files = !legacy_files.is_empty();
-    let needs_migration = has_legacy_files || has_dirty_path || zombie_count > 0;
+        let zombies = scan_zombie_processes();
+        let zombie_count = zombies.len();
+        let has_legacy_files = !legacy_files.is_empty();
+        let needs_migration = has_legacy_files || has_dirty_path || zombie_count > 0;
 
-    Json(LegacyStatusResponse {
-        has_legacy_files,
-        legacy_files,
-        has_dirty_path,
-        zombie_count,
-        zombies,
-        needs_migration,
+        LegacyStatusResponse {
+            has_legacy_files,
+            legacy_files,
+            has_dirty_path,
+            zombie_count,
+            zombies,
+            needs_migration,
+        }
     })
+    .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(_) => json_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy status scan failed",
+        )
+        .into_response(),
+    }
 }
 
 pub(crate) async fn post_migrate_legacy(
     Json(payload): Json<MigrateLegacyRequest>,
 ) -> impl IntoResponse {
-    let current_exe = std::env::current_exe().ok();
-    let cleaned_files_count =
-        jeikcode_config::desktop_shared::cleanup_legacy_dropper_files(current_exe.as_deref());
+    match tokio::task::spawn_blocking(move || {
+        let current_exe = std::env::current_exe().ok();
+        let cleaned_files_count =
+            jeikcode_config::desktop_shared::cleanup_legacy_dropper_files(current_exe.as_deref());
 
-    jeikcode_updater::migrate_legacy_environment();
+        jeikcode_updater::migrate_legacy_environment();
 
-    let mut killed_zombies_count = 0;
-    if payload.kill_zombies {
-        killed_zombies_count = kill_zombie_processes_all();
-    }
+        let mut killed_zombies_count = 0;
+        if payload.kill_zombies {
+            killed_zombies_count = kill_zombie_processes_all();
+        }
 
-    Json(MigrateLegacyResponse {
-        success: true,
-        cleaned_files_count,
-        killed_zombies_count,
+        MigrateLegacyResponse {
+            success: true,
+            cleaned_files_count,
+            killed_zombies_count,
+        }
     })
+    .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(_) => json_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy migration failed",
+        )
+        .into_response(),
+    }
 }
 
 fn desktop_settings_file_path() -> std::path::PathBuf {
@@ -2353,5 +2452,81 @@ mod tests {
 
         let _ = runtime.handle.shutdown().await;
         let _ = reg.force_remove(&sid);
+    }
+
+    #[test]
+    fn firewall_launch_uses_encoded_command_without_temp_ps1() {
+        let launch =
+            build_firewall_elevated_launch_command(r"C:\Program Files\Jeik's\jeikcode.exe");
+        assert!(launch.contains("-EncodedCommand"));
+        assert!(!launch.contains(".ps1"));
+        assert!(!launch.contains("ExecutionPolicy"));
+
+        let b64 = launch
+            .split("'-EncodedCommand','")
+            .nth(1)
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("encoded command argument");
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64");
+        assert_eq!(raw.len() % 2, 0);
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let decoded = String::from_utf16(&units).expect("valid utf-16le");
+        assert!(decoded.contains("program='C:\\Program Files\\Jeik''s\\jeikcode.exe'"));
+        assert!(decoded.contains("netsh advfirewall firewall delete rule name=JeikCode"));
+    }
+
+    #[test]
+    fn command_drain_handles_large_stdout_and_stderr_without_pipe_deadlock() {
+        #[cfg(windows)]
+        let cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args([
+                "/C",
+                "for /L %i in (1,1,2000) do @(echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 & echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 1>&2)",
+            ]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sh");
+            c.args([
+                "-c",
+                "i=0; while [ $i -lt 2000 ]; do echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789; echo 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 >&2; i=$((i+1)); done",
+            ]);
+            c
+        };
+        let out = run_command_with_timeout_drain(cmd, std::time::Duration::from_secs(5))
+            .expect("large dual-pipe child must not deadlock");
+        assert!(out.success);
+        assert!(
+            out.stdout.len() > 100_000,
+            "stdout len={}",
+            out.stdout.len()
+        );
+        assert!(
+            out.stderr.len() > 100_000,
+            "stderr len={}",
+            out.stderr.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_status_async_matches_sync_snapshot() {
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let sync_status = remote_status(&state, Some("tok-1".into()));
+        let async_status = remote_status_async(&state, Some("tok-1".into()))
+            .await
+            .expect("remote_status_async");
+        assert_eq!(async_status.host, sync_status.host);
+        assert_eq!(async_status.port, sync_status.port);
+        assert_eq!(async_status.active, sync_status.active);
+        assert_eq!(async_status.token, sync_status.token);
     }
 }

@@ -21916,7 +21916,10 @@ async fn bind_scanning_ports(
         // 桌面端启动时，若存在之前脱离桌面壳的孤儿子进程占用持久化端口，先行清理回收，
         // 避免新启动的桌面端因旧孤儿进程霸占端口而被迫将端口 +1 顺延覆盖用户配置。
         if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
-            if api_config::kill_zombie_processes_all() > 0 {
+            let killed = tokio::task::spawn_blocking(api_config::kill_zombie_processes_all)
+                .await
+                .unwrap_or(0);
+            if killed > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
