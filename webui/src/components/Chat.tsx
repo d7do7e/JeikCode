@@ -304,6 +304,7 @@ import {
   formatCacheHitRate,
   createTokenCacheState,
   resetTokenCacheState,
+  applyContextInspectionTokens,
   estimateLocalCached,
   estimateCacheFromHistoryPrompt,
   type TokenCacheState,
@@ -1463,6 +1464,7 @@ export function Chat({
   const resetTokenTelemetry = () => {
     tokenCacheRef.current = createTokenCacheState();
     tokensAuthoritativeRef.current = false;
+    tokensRef.current = null;
     setTokens(null);
   };
 
@@ -1501,7 +1503,9 @@ export function Chat({
   ) => {
     if (cacheState) tokenCacheRef.current = { ...cacheState };
     tokensAuthoritativeRef.current = authoritative;
-    setTokens({ ...usage });
+    const next = { ...usage };
+    tokensRef.current = next;
+    setTokens(next);
   };
 
   const applyServerTokenUsage = (usage: SessionTokenUsage) => {
@@ -5244,17 +5248,20 @@ export function Chat({
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
             }
+            applySessionTokens(loadId, displayMessages, sessionResult.value.token_usage ?? undefined);
             // Persist the FULL rendered window, never just the 48-row tail we
             // happened to fetch. Saving `loaded` here truncated the L2 cache on
             // every refresh; the next cold start then had only 48 rows left.
             if (displayMessages.length > 0) {
               pruneDeliveredQueuedCards(loadId, displayMessages);
+              const tokenSnapshot = tokenUsageCacheRef.current.get(loadId);
               commitCanvasCache(projectHash, loadId, {
                 messages: displayMessages,
                 todos: sessionResult.value.todos,
                 todoRevision: sessionResult.value.todos_revision ?? 0,
                 turns: turnOutlineBySessionRef.current.get(loadId) ?? sessionResult.value.turns,
-                tokenUsage: sessionResult.value.token_usage,
+                tokenUsage: tokenSnapshot?.tokens ?? sessionResult.value.token_usage ?? null,
+                ...(tokenSnapshot ? { compacted: tokenSnapshot.compacted === true } : {}),
                 historyOffset: effectiveOffset,
                 historyTotal: totalOnDisk,
                 revision: sessionResult.value.revision,
@@ -5278,7 +5285,6 @@ export function Chat({
               // 否则 /chat/watch 随后的实时重放会被当成已消费跳过，导致面板卡在初始 0/N 状态！
               seedAppliedTodoIds(loadId, todoCallIdsFromMessages(displayMessages));
             }
-            applySessionTokens(loadId, displayMessages, sessionResult.value.token_usage ?? undefined);
             resumeClockFrom = [...displayMessages].reverse().find((m) => m.role === 'user')?.ts;
           }
           const origin = sessionResult.value.origin;
@@ -8526,8 +8532,20 @@ export function Chat({
                 window: res.ctx_window, name: res.ctx_name,
               })
             );
-            tokenCacheRef.current = resetTokenCacheState(res.used_tokens);
-            setTokens({ prompt: res.used_tokens, completion: 0, total: res.used_tokens, cached: 0, cached_estimated: false });
+            const contextSid = compactSid;
+            if (contextSid && activeIdRef.current === contextSid) {
+              const refreshed = applyContextInspectionTokens(
+                tokensRef.current,
+                tokenCacheRef.current,
+                res.used_tokens,
+              );
+              applyTokenUsage(
+                refreshed.tokens,
+                refreshed.cacheState,
+                tokensAuthoritativeRef.current,
+              );
+              saveTokenSnapshot(contextSid, tokensAuthoritativeRef.current);
+            }
             return;
           }
           if (res.kind === 'whoami') {

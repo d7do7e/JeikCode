@@ -1124,6 +1124,45 @@ export function clampCachedToPrompt(cached: number, prompt: number): number {
   return Math.min(cached, prompt);
 }
 
+export type ContextInspectionTokenSnapshot = {
+  prompt: number;
+  completion: number;
+  total: number;
+  cached: number;
+  cached_estimated: boolean;
+  reasoning: number;
+};
+
+/**
+ * Refresh footer occupancy from a read-only `/context` inspection without wiping
+ * live cache-hit telemetry or resetting `providerReportsCache`.
+ */
+export function applyContextInspectionTokens(
+  prev: Partial<ContextInspectionTokenSnapshot> | null | undefined,
+  cacheState: TokenCacheState,
+  usedTokens: number,
+): { tokens: ContextInspectionTokenSnapshot; cacheState: TokenCacheState } {
+  const prompt = Math.max(0, Math.floor(usedTokens));
+  const completion = Math.max(0, prev?.completion ?? 0);
+  const cached = clampCachedToPrompt(prev?.cached ?? 0, prompt);
+  const cached_estimated = cached > 0 ? Boolean(prev?.cached_estimated) : false;
+  const reasoning = Math.max(0, prev?.reasoning ?? 0);
+  return {
+    tokens: {
+      prompt,
+      completion,
+      total: prompt + completion,
+      cached,
+      cached_estimated,
+      reasoning,
+    },
+    cacheState: {
+      lastPrompt: prompt > 0 ? prompt : cacheState.lastPrompt,
+      providerReportsCache: cacheState.providerReportsCache,
+    },
+  };
+}
+
 /** Resolve cache telemetry for the footer pill. Provider `cached > 0` wins;
  * once a provider has reported cache hits we also trust explicit zeros;
  * otherwise fall back to prefix estimation against the prior usage prompt.

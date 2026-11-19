@@ -18,6 +18,7 @@ import {
   estimateCacheFromHistoryPrompt,
   createTokenCacheState,
   resetTokenCacheState,
+  applyContextInspectionTokens,
   clampCachedToPrompt,
   isStackedTurnBillingUsage,
   userMessageAlreadyOnCanvas,
@@ -1199,6 +1200,47 @@ test('nextTerminalReconnectDelayMs caps bounded exponential backoff at 8000ms', 
   assert.equal(nextTerminalReconnectDelayMs(3), 4000);
   assert.equal(nextTerminalReconnectDelayMs(4), 8000);
   assert.equal(nextTerminalReconnectDelayMs(10), 8000);
+});
+
+test('applyContextInspectionTokens preserves live cache metrics and normalizes zero-cache cases', () => {
+  const prev = {
+    prompt: 42_000,
+    completion: 1_200,
+    total: 43_200,
+    cached: 36_000,
+    cached_estimated: true,
+    reasoning: 400,
+  };
+  const cacheState = { lastPrompt: 42_000, providerReportsCache: true };
+
+  const refreshed = applyContextInspectionTokens(prev, cacheState, 40_000);
+  assert.deepEqual(refreshed.tokens, {
+    prompt: 40_000,
+    completion: 1_200,
+    total: 41_200,
+    cached: 36_000,
+    cached_estimated: true,
+    reasoning: 400,
+  });
+  assert.deepEqual(refreshed.cacheState, {
+    lastPrompt: 40_000,
+    providerReportsCache: true,
+  });
+
+  // Clamping cached when usedTokens shrinks below previous cached preserves invariant.
+  const shrunk = applyContextInspectionTokens(prev, cacheState, 20_000);
+  assert.equal(shrunk.tokens.cached, 20_000);
+  assert.equal(shrunk.tokens.total, 21_200);
+  assert.equal(shrunk.tokens.cached_estimated, true);
+
+  // Zero usedTokens zeroes cached and clears cached_estimated while keeping providerReportsCache.
+  const zeroed = applyContextInspectionTokens(prev, cacheState, 0);
+  assert.equal(zeroed.tokens.prompt, 0);
+  assert.equal(zeroed.tokens.total, 1_200);
+  assert.equal(zeroed.tokens.cached, 0);
+  assert.equal(zeroed.tokens.cached_estimated, false);
+  assert.equal(zeroed.cacheState.lastPrompt, 42_000);
+  assert.equal(zeroed.cacheState.providerReportsCache, true);
 });
 
 

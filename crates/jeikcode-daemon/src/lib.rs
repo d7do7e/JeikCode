@@ -3171,12 +3171,17 @@ fn turn_stat_billing_cached_tokens(stat: &jeikcode_capabilities::session::TurnSt
 fn turn_stat_occupancy_tokens(stat: &jeikcode_capabilities::session::TurnStat) -> usize {
     if stat.used_tokens > 0 {
         stat.used_tokens as usize
+    } else if stat.round_count <= 1 {
+        // Legacy single-round rows without `used_tokens`: prefer prompt-only billing
+        // tokens so large completions in `total_tokens` never skew prefix-cache estimation.
+        let prompt = turn_stat_billing_prompt_tokens(stat);
+        if prompt > 0 {
+            prompt
+        } else {
+            stat.total_tokens as usize
+        }
     } else if stat.total_tokens > 0 {
         stat.total_tokens as usize
-    } else if stat.round_count <= 1 {
-        // Legacy rows without occupancy: a single-round billing total is the
-        // last request. Multi-round sums are not occupancy — refuse them.
-        turn_stat_billing_prompt_tokens(stat)
     } else {
         0
     }
@@ -12576,6 +12581,39 @@ mod session_token_usage_tests {
         assert_eq!(compacted.completion, 0);
         assert_eq!(compacted.total, 1_234);
         assert_eq!(compacted.ctx_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn previous_single_round_stat_without_used_tokens_excludes_completion_from_cache_estimate() {
+        // Prior turn has used_tokens=0, prompt=20_000, completion=10_000 (total_tokens=30_000).
+        // Next turn has prompt=22_000 (no reported cached). Comparing 22_000 against 30_000
+        // (< 90%) previously dropped estimated cache to 0; using prompt-only billing tokens
+        // (20_000) preserves the 20_000 prefix cache estimate.
+        let mut prev_stat = usage_stat(20_000, 10_000, 0);
+        prev_stat.used_tokens = 0;
+
+        let mut curr_stat = usage_stat(22_000, 500, 0);
+        curr_stat.turn_id = 2;
+
+        let mut assistant = Message::assistant("ok", Vec::new());
+        assistant.meta = Some(MessageMeta {
+            tokens: KernelTokenUsage {
+                prompt: 22_000,
+                completion: 500,
+                cached: 0,
+            },
+            used_tokens: 22_000,
+            ctx_window: 200_000,
+            ..MessageMeta::default()
+        });
+        let snapshot = SessionSnapshot::new(vec![Message::user("go"), assistant]);
+        let mut meta = SessionMeta::new("s-est", "/p", 1);
+        meta.turn_stats = vec![prev_stat, curr_stat];
+
+        let usage = session_token_usage_from_session(&meta, &snapshot).unwrap();
+        assert_eq!(usage.prompt, 22_000);
+        assert_eq!(usage.cached, 20_000);
+        assert!(usage.cached_estimated);
     }
 }
 
