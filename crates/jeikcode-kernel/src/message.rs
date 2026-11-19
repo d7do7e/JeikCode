@@ -728,22 +728,16 @@ impl Conversation {
     /// the anchor — only the real prompt anchors the floor. (Carried from
     /// production `apply_compression`'s sacred carve-out, mapped to this flat Vec.)
     pub fn sacred_floor(&self) -> usize {
-        // All leading System messages are part of the protected prefix.
-        let lead_system = self
-            .messages
-            .iter()
-            .take_while(|m| m.role == Role::System)
-            .count();
-        // Find the FIRST REAL (non-synthetic) user message; the floor extends
-        // through it (index + 1). If none exists, the floor is just the lead
-        // system (or 0).
-        match self
-            .messages
-            .iter()
-            .position(|m| m.role == Role::User && !m.synthetic)
-        {
-            Some(idx) => (idx + 1).max(lead_system),
-            None => lead_system,
+        // Anchor on the frozen prefix end (leading System blocks plus any
+        // non-autonomous frozen synthetic User blocks such as skills, MCP,
+        // memory, and project instructions). Only a real User prompt sitting
+        // immediately after that frozen prefix extends the floor by 1; a real
+        // user prompt sent AFTER assistant or autonomous-turn history must
+        // never lock prior turns below the compaction floor.
+        let prefix_end = self.frozen_prefix_end();
+        match self.messages.get(prefix_end) {
+            Some(m) if m.role == Role::User && !m.synthetic => prefix_end + 1,
+            _ => prefix_end,
         }
     }
 
@@ -753,12 +747,61 @@ impl Conversation {
     /// Block 5: Authoritative Project Instructions & Knowledge (`=== AUTHORITATIVE PROJECT INSTRUCTIONS`)
     /// Block 6: Session Baseline (`=== SESSION BASELINE` or legacy `=== SESSION CONTEXT`)
     pub fn reconcile_system_block(&mut self, header: &str, block: Option<String>) {
+        self.reconcile_system_block_with_matcher(header, block, |m| m.text.starts_with(header));
+    }
+
+    /// Variant of [`Self::reconcile_system_block`] accepting a custom matcher over
+    /// leading `Role::System` messages (used for legacy persona block headers).
+    ///
+    /// Once assistant history exists, mutating or deleting leading `Role::System`
+    /// blocks invalidates 100% of upstream prompt caches from token 0. Instead,
+    /// leading `Role::System` blocks stay byte-identical and any genuine delta is
+    /// emitted once as a tail synthetic-user context update keyed under `sys:{header}`.
+    pub fn reconcile_system_block_with_matcher<F>(
+        &mut self,
+        header: &str,
+        block: Option<String>,
+        matcher: F,
+    ) where
+        F: Fn(&Message) -> bool,
+    {
+        if self.messages.iter().any(|m| m.role == Role::Assistant) {
+            let key = format!("sys:{header}");
+            let recorded_prev = self.delivered_context_hashes.get(&key).copied();
+            let existing_sys = self
+                .messages
+                .iter()
+                .take_while(|m| m.role == Role::System)
+                .find(|m| matcher(m));
+            // Legacy cleanup calls pass `block = None` every turn. When no matching
+            // Role::System block exists and we never delivered a sys:{header} update,
+            // return without pushing a spurious `[Context cleared]` tail message.
+            if block.is_none() && recorded_prev.is_none() && existing_sys.is_none() {
+                return;
+            }
+            let next_hash = context_block_hash(block.as_deref());
+            let prev_hash = recorded_prev
+                .unwrap_or_else(|| context_block_hash(existing_sys.map(|m| m.text.as_str())));
+            if next_hash == prev_hash {
+                return;
+            }
+            self.delivered_context_hashes.insert(key, next_hash);
+            let update_body = match block {
+                Some(text) => format!("<!-- jeikcode:context-update:{header} -->\n{text}"),
+                None => format!(
+                    "<!-- jeikcode:context-update:{header} -->\n[Context cleared: {header} is now empty]"
+                ),
+            };
+            self.push(Message::synthetic_user(update_body));
+            return;
+        }
+
         let existing = self
             .messages
             .iter()
             .enumerate()
             .take_while(|(_, m)| m.role == Role::System)
-            .find(|(_, m)| m.text.starts_with(header))
+            .find(|(_, m)| matcher(m))
             .map(|(i, _)| i);
 
         match (block, existing) {
@@ -3022,5 +3065,53 @@ mod tests {
         assert!(c.messages[4]
             .text
             .contains("[Context cleared: <memory> is now empty]"));
+    }
+
+    #[test]
+    fn sacred_floor_does_not_lock_prior_autonomous_turns_on_later_real_user() {
+        let mut c = Conversation::new();
+        c.push(Message::system("<environment>\npersona"));
+        c.push(Message::synthetic_user("<memory>\n- fact"));
+        c.push(Message::synthetic_turn("Run scheduled health check"));
+        c.push(Message::assistant("Checked logs, all healthy.", vec![]));
+        c.push(Message::user("Follow-up from human"));
+
+        // Must protect only [0..2) (System + frozen synthetic <memory>), NOT [0..5).
+        assert_eq!(c.frozen_prefix_end(), 2);
+        assert_eq!(c.sacred_floor(), 2);
+    }
+
+    #[test]
+    fn reconcile_system_block_freezes_prefix_after_assistant_history_and_dedups_tail() {
+        let mut c = Conversation::new();
+        c.push(Message::system("<environment>\nbranch=main"));
+        c.push(Message::user("hi"));
+        c.push(Message::assistant("hello", vec![]));
+
+        let orig_sys = c.messages[0].clone();
+
+        // Identical system block after assistant history -> no-op.
+        c.reconcile_system_block("<environment>", Some("<environment>\nbranch=main".into()));
+        assert_eq!(c.messages.len(), 3);
+        assert_eq!(c.messages[0], orig_sys);
+
+        // Legacy cleanup with block=None for an absent system block -> no-op (no spurious clear).
+        c.reconcile_system_block("<memory>", None);
+        assert_eq!(c.messages.len(), 3);
+
+        // Changed system block -> prefix remains byte-identical, single tail update appended.
+        let updated = "<environment>\nbranch=feat".to_string();
+        c.reconcile_system_block("<environment>", Some(updated.clone()));
+        assert_eq!(c.messages.len(), 4);
+        assert_eq!(c.messages[0], orig_sys);
+        assert!(c.messages[3].synthetic);
+        assert!(c.messages[3]
+            .text
+            .starts_with("<!-- jeikcode:context-update:<environment> -->\n"));
+        assert!(c.messages[3].text.contains("branch=feat"));
+
+        // Repeated call with identical updated text -> deduplicated via sys:<header>.
+        c.reconcile_system_block("<environment>", Some(updated));
+        assert_eq!(c.messages.len(), 4);
     }
 }

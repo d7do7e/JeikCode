@@ -523,4 +523,26 @@ mod tests {
         assert!(convo.messages[1].synthetic);
         assert_eq!(convo.messages[2].text, "hi");
     }
+
+    #[tokio::test]
+    async fn turn_start_after_assistant_does_not_reinject_cleared_system_notices() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("AGENTS.md"), "rule-1").unwrap();
+        let hook = SessionContextHook::with_home(d.path(), d.path().join("nohome"));
+        let mut convo = Conversation::new();
+        convo.push(Message::system("<environment>\npersona"));
+        hook.session_start(&mut convo, false).await;
+        convo.push(Message::user("hi"));
+        convo.push(Message::assistant("ok", vec![]));
+
+        let count_after_first_turn = convo.messages.len();
+        hook.turn_start(&mut convo).await;
+        hook.turn_start(&mut convo).await;
+
+        assert_eq!(
+            convo.messages.len(),
+            count_after_first_turn,
+            "legacy reconcile_system_block(None) cleanup must not spam [Context cleared] or break frozen-user deduplication"
+        );
+    }
 }

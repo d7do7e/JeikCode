@@ -12,7 +12,7 @@ use jeikcode_capabilities::tools::{
 };
 use jeikcode_kernel::agent::Agent;
 use jeikcode_kernel::hook::LifecycleHooks;
-use jeikcode_kernel::message::{Conversation, Message, Role};
+use jeikcode_kernel::message::{Conversation, Role};
 use jeikcode_kernel::provider::LlmProvider;
 use jeikcode_kernel::tool::{MountedTools, ToolRegistry};
 use std::path::PathBuf;
@@ -326,43 +326,13 @@ impl CodingPersonaHook {
             block_1.push_str("\n\n");
             block_1.push_str(&transition);
         }
-        let existing_b1 = convo
-            .messages
-            .iter()
-            .enumerate()
-            .take_while(|(_, m)| m.role == Role::System)
-            .find(|(_, m)| {
-                m.text.starts_with("<environment>") || m.text.starts_with("You are JeikCode")
-            })
-            .map(|(i, _)| i);
+        convo.reconcile_system_block_with_matcher("<environment>", Some(block_1), |m| {
+            crate::parts::is_persona_block_1(m)
+        });
 
-        if let Some(idx) = existing_b1 {
-            if convo.messages[idx].text != block_1 {
-                convo.messages[idx] = Message::system(block_1);
-            }
-        } else {
-            convo.reconcile_system_block("<environment>", Some(block_1));
-        }
-
-        let existing_b2 = convo
-            .messages
-            .iter()
-            .enumerate()
-            .take_while(|(_, m)| m.role == Role::System)
-            .find(|(_, m)| {
-                m.text.starts_with("<system_rules>")
-                    || m.text.starts_with("<workflow_and_execution_discipline>")
-                    || m.text.contains("CRITICAL PRECEDENCE")
-            })
-            .map(|(i, _)| i);
-
-        if let Some(idx) = existing_b2 {
-            if convo.messages[idx].text != block_2 {
-                convo.messages[idx] = Message::system(block_2);
-            }
-        } else {
-            convo.reconcile_system_block("<system_rules>", Some(block_2));
-        }
+        convo.reconcile_system_block_with_matcher("<system_rules>", Some(block_2), |m| {
+            !crate::parts::is_persona_block_1(m) && crate::parts::is_persona_block_2(m)
+        });
 
         // Block 3 (`<todo_rules>`) is temporarily disabled in `persona.rs`, so the block
         // arrives empty. Pass `None` instead of `Some("")` — the latter would insert an
@@ -372,21 +342,9 @@ impl CodingPersonaHook {
             (!block_3.trim().is_empty()).then_some(block_3),
         );
 
-        let existing_b4 = convo
-            .messages
-            .iter()
-            .enumerate()
-            .take_while(|(_, m)| m.role == Role::System)
-            .find(|(_, m)| m.text.starts_with("<explore_strategy>"))
-            .map(|(i, _)| i);
-
-        if let Some(idx) = existing_b4 {
-            if convo.messages[idx].text != block_4 {
-                convo.messages[idx] = Message::system(block_4);
-            }
-        } else {
-            convo.reconcile_system_block("<explore_strategy>", Some(block_4));
-        }
+        convo.reconcile_system_block_with_matcher("<explore_strategy>", Some(block_4), |m| {
+            crate::parts::is_persona_block_4(m)
+        });
     }
 }
 
@@ -504,5 +462,58 @@ mod tests {
             "CodingPersonaHook must preserve MODEL_CHANGE_CONTEXT_PREFIX across session_start/turn_start: {}",
             convo.messages[0].text
         );
+    }
+
+    #[tokio::test]
+    async fn coding_persona_hook_freezes_system_prefix_after_assistant_history() {
+        use super::CodingPersonaHook;
+        use jeikcode_kernel::hook::LifecycleHooks;
+        use jeikcode_kernel::message::{Conversation, Message};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook_a = CodingPersonaHook::with_git_branch(
+            "model-a",
+            None,
+            true,
+            true,
+            true,
+            dir.path(),
+            "branch-a",
+            None,
+            true,
+        );
+        let mut convo = Conversation::new();
+        hook_a.session_start(&mut convo, false).await;
+        let orig_b1 = convo.messages[0].clone();
+        convo.push(Message::user("hello"));
+        convo.push(Message::assistant("world", vec![]));
+
+        // Branch changes on next turn: leading system prefix must remain byte-identical,
+        // and the delta must appear once as a tail synthetic-user context-update.
+        let hook_b = CodingPersonaHook::with_git_branch(
+            "model-a",
+            None,
+            true,
+            true,
+            true,
+            dir.path(),
+            "branch-b",
+            None,
+            true,
+        );
+        hook_b.turn_start(&mut convo).await;
+        hook_b.turn_start(&mut convo).await;
+
+        assert_eq!(convo.messages[0], orig_b1);
+        let tail_updates: Vec<_> = convo
+            .messages
+            .iter()
+            .filter(|m| {
+                m.synthetic
+                    && m.text
+                        .starts_with("<!-- jeikcode:context-update:<environment> -->")
+            })
+            .collect();
+        assert_eq!(tail_updates.len(), 1);
     }
 }

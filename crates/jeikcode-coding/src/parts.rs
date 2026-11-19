@@ -1961,7 +1961,7 @@ fn persona_model(text: &str) -> Option<&str> {
     None
 }
 
-fn is_persona_block_1(message: &Message) -> bool {
+pub(crate) fn is_persona_block_1(message: &Message) -> bool {
     if message.role != Role::System {
         return false;
     }
@@ -1973,7 +1973,7 @@ fn is_persona_block_1(message: &Message) -> bool {
             && (message.text.contains("## PRECEDENCE:") || message.text.contains("## WORKFLOW:")))
 }
 
-fn is_persona_block_2(message: &Message) -> bool {
+pub(crate) fn is_persona_block_2(message: &Message) -> bool {
     if message.role != Role::System {
         return false;
     }
@@ -1997,7 +1997,7 @@ fn is_persona_block_3(message: &Message) -> bool {
     message.text.starts_with("<todo_rules>")
 }
 
-fn is_persona_block_4(message: &Message) -> bool {
+pub(crate) fn is_persona_block_4(message: &Message) -> bool {
     if message.role != Role::System {
         return false;
     }
@@ -2094,6 +2094,33 @@ fn reconcile_coding_persona(
             <= 1;
     if already_current {
         return;
+    }
+
+    let model_unchanged = previous_model.as_deref() == Some(cfg.model.as_str());
+    let has_assistant = snapshot
+        .messages
+        .iter()
+        .any(|message| message.role == Role::Assistant);
+    if model_unchanged && has_assistant {
+        let leading_systems: Vec<&Message> = snapshot
+            .messages
+            .iter()
+            .take_while(|message| message.role == Role::System)
+            .collect();
+        let has_leading_persona = leading_systems.iter().any(|m| is_persona_block_1(m))
+            && leading_systems.iter().any(|m| is_persona_block_2(m))
+            && leading_systems.iter().any(|m| is_persona_block_4(m))
+            && snapshot
+                .messages
+                .iter()
+                .skip(leading_systems.len())
+                .all(|message| !is_persona(message) && !is_model_change(message));
+        if has_leading_persona {
+            // Preserve leading persona system blocks byte-identically on same-model
+            // resumes with assistant history; CodingPersonaHook delivers any real
+            // git_branch / hot-reload prompt delta via a tail context-update.
+            return;
+        }
     }
 
     snapshot
@@ -2540,6 +2567,39 @@ mod tests {
         reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
         assert_eq!(snapshot.cache_epoch, initial_epoch);
         assert!(snapshot.messages[1].text.contains("## SESSION MESH:"));
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn same_model_resume_with_assistant_history_preserves_persona_prefix_without_epoch_bump() {
+        jeikcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let cfg = agent_config("deepseek-v4-flash");
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_session(
+            &cfg.model,
+            cfg.preferred_language,
+            true,
+            true,
+            true,
+            Some(&cfg.working_dir),
+            Some("feat/old-branch"),
+            true,
+        );
+        let mut msgs: Vec<Message> = [b1.clone(), b2, b3, b4]
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(Message::system)
+            .collect();
+        msgs.push(Message::user("hello"));
+        msgs.push(Message::assistant("hi", vec![]));
+        let mut snapshot = SessionSnapshot::new(msgs);
+        snapshot.model = Some(cfg.model.clone());
+        let initial_epoch = snapshot.cache_epoch;
+
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
+
+        assert_eq!(snapshot.cache_epoch, initial_epoch);
+        assert_eq!(snapshot.messages[0].text, b1);
     }
 
     #[tokio::test]
