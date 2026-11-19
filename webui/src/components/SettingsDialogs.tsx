@@ -1194,7 +1194,7 @@ function ProviderFormDialog({
                 class={'model-probe-status ' + (probeResult.ok ? 'ok' : 'bad')}
                 title={probeResult.error || ''}
               >
-                {probeResult.ok ? `OK · ${probeResult.latencyMs} ms` : 'Failed'}
+                {probeResult.ok ? t('settings.probeOk', { ms: probeResult.latencyMs }) : t('settings.probeStatusFailed')}
               </span>
             )}
           </div>

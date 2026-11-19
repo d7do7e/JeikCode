@@ -104,9 +104,17 @@ test('Chat and diagram accessibility labels use translated catalog keys', () => 
   assert.ok(!/aria-label="(?:Close|Dismiss)"/.test(sysSettings + gitPanel + modelSelector + toast + confirmDialog));
 });
 
-test('Sidebar, FileExplorer, and ConfirmDialog contain no hardcoded Chinese UI literals', () => {
+test('Sidebar, FileExplorer, ConfirmDialog, GitPanel, SystemSettingsDialog, DesktopClosePromptDialog, and SettingsDialogs contain no hardcoded Chinese UI literals', () => {
   const cjk = /[\u4e00-\u9fff]/;
-  for (const rel of ['./components/Sidebar.tsx', './components/FileExplorer.tsx', './components/ConfirmDialog.tsx']) {
+  for (const rel of [
+    './components/Sidebar.tsx',
+    './components/FileExplorer.tsx',
+    './components/ConfirmDialog.tsx',
+    './components/GitPanel.tsx',
+    './components/SystemSettingsDialog.tsx',
+    './components/DesktopClosePromptDialog.tsx',
+    './components/SettingsDialogs.tsx',
+  ]) {
     const src = readFileSync(new URL(rel, import.meta.url), 'utf8');
     const sf = ts.createSourceFile(rel, src, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TSX);
     const hits = [];

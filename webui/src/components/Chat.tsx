@@ -6844,8 +6844,10 @@ export function Chat({
       );
     } catch (err: any) {
       setDiffTabs((prev: OpenDiffTab[]) =>
-        prev.map((t: OpenDiffTab) =>
-          t.id === tabId ? { ...t, diffText: `Error: ${err?.message || 'Failed to load diff'}`, loading: false } : t
+        prev.map((tab: OpenDiffTab) =>
+          tab.id === tabId
+            ? { ...tab, diffText: t('git.loadDiffFailed', { error: err?.message || t('common.error') }), loading: false }
+            : tab
         )
       );
     }
@@ -6866,7 +6868,7 @@ export function Chat({
     const newTab: OpenDiffTab = {
       id: tabId,
       commitHash: staged ? 'STAGED' : 'WORKING',
-      commitShortHash: staged ? 'Staged' : 'Working Tree',
+      commitShortHash: staged ? t('git.stagedShort') : t('git.workingTree'),
       commitMessage: staged ? t('git.stagedChanges') : t('git.workingTree'),
       filePath: fullRelativePath,
       fileName,
@@ -6885,8 +6887,10 @@ export function Chat({
       );
     } catch (err: any) {
       setDiffTabs((prev: OpenDiffTab[]) =>
-        prev.map((t: OpenDiffTab) =>
-          t.id === tabId ? { ...t, diffText: `Error: ${err?.message || 'Failed to load diff'}`, loading: false } : t
+        prev.map((tab: OpenDiffTab) =>
+          tab.id === tabId
+            ? { ...tab, diffText: t('git.loadDiffFailed', { error: err?.message || t('common.error') }), loading: false }
+            : tab
         )
       );
     }

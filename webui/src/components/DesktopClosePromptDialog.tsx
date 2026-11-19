@@ -84,10 +84,10 @@ export function DesktopClosePromptDialog() {
             🖥️
           </div>
           <h3 style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600 }}>
-            {t('desktop.closePromptTitle') || '关闭 JeikCode'}
+            {t('desktop.closePromptTitle')}
           </h3>
           <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted, #9ca3af)', lineHeight: '1.6' }}>
-            {t('desktop.closePromptDesc') || '是否最小化到系统托盘并保持后台运行？'}
+            {t('desktop.closePromptDesc')}
           </p>
         </div>
 
@@ -98,7 +98,7 @@ export function DesktopClosePromptDialog() {
               checked={remember}
               onChange={(e) => setRemember((e.target as HTMLInputElement).checked)}
             />
-            <span>{t('desktop.rememberChoice') || '记住我的选择（可随时在系统设置中修改）'}</span>
+            <span>{t('desktop.rememberChoice')}</span>
           </label>
         </div>
 
@@ -109,7 +109,7 @@ export function DesktopClosePromptDialog() {
             onClick={() => handleAction('quit')}
             style={{ flex: 1, padding: '9px 12px' }}
           >
-            {t('desktop.actionQuit') || '退出程序'}
+            {t('desktop.actionQuit')}
           </button>
           <button
             type="button"
@@ -122,7 +122,7 @@ export function DesktopClosePromptDialog() {
               boxShadow: '0 4px 14px rgba(37, 99, 235, 0.35)',
             }}
           >
-            {t('desktop.actionTray') || '最小化到托盘'}
+            {t('desktop.actionTray')}
           </button>
         </div>
       </div>

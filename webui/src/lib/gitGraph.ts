@@ -184,6 +184,31 @@ export function formatRelativeTime(epochSecs: number): string {
   return `${Math.floor(diff / (86400 * 365))}y ago`;
 }
 
+export type GitRelativeTimeKey =
+  | 'time.justNow'
+  | 'time.minutesAgo'
+  | 'time.hoursAgo'
+  | 'git.timeDaysAgo'
+  | 'git.timeMonthsAgo'
+  | 'git.timeYearsAgo';
+
+/** Formats a relative timestamp using the active UI translation function across all locales. */
+export function formatRelativeTimeLocalized(
+  epochSecs: number,
+  t: (key: GitRelativeTimeKey, params?: Record<string, string | number>) => string,
+): string {
+  if (!epochSecs || epochSecs <= 0) return '';
+  const now = Math.floor(Date.now() / 1000);
+  const diff = Math.max(0, now - epochSecs);
+
+  if (diff < 60) return t('time.justNow');
+  if (diff < 3600) return t('time.minutesAgo', { n: Math.floor(diff / 60) });
+  if (diff < 86400) return t('time.hoursAgo', { n: Math.floor(diff / 3600) });
+  if (diff < 86400 * 30) return t('git.timeDaysAgo', { n: Math.floor(diff / 86400) });
+  if (diff < 86400 * 365) return t('git.timeMonthsAgo', { n: Math.floor(diff / (86400 * 30)) });
+  return t('git.timeYearsAgo', { n: Math.floor(diff / (86400 * 365)) });
+}
+
 /** Formats a relative timestamp with i18n support (e.g. "4 分钟前" or "4m ago"). */
 export function formatRelativeTimeI18n(epochSecs: number, isZh: boolean = false): string {
   if (!epochSecs || epochSecs <= 0) return '';
@@ -211,8 +236,8 @@ export function formatRelativeTimeI18n(epochSecs: number, isZh: boolean = false)
   return isZh ? `${y} 年前` : `${y}y ago`;
 }
 
-/** Formats absolute commit datetime (e.g. "2026年10月5日 23:19" or "2026/10/5 23:19"). */
-export function formatCommitDateTime(epochSecs: number, isZh: boolean = false): string {
+/** Formats absolute commit datetime (e.g. "2026年10月5日 23:19" or locale-formatted date). */
+export function formatCommitDateTime(epochSecs: number, isZhOrLang: boolean | string = false): string {
   if (!epochSecs || epochSecs <= 0) return '';
   const d = new Date(epochSecs * 1000);
   const year = d.getFullYear();
@@ -220,8 +245,22 @@ export function formatCommitDateTime(epochSecs: number, isZh: boolean = false): 
   const date = d.getDate();
   const hours = String(d.getHours()).padStart(2, '0');
   const minutes = String(d.getMinutes()).padStart(2, '0');
-  if (isZh) {
+  if (isZhOrLang === true || isZhOrLang === 'zh' || isZhOrLang === 'zh-TW') {
     return `${year}年${month}月${date}日 ${hours}:${minutes}`;
+  }
+  if (typeof isZhOrLang === 'string' && isZhOrLang !== 'en') {
+    try {
+      return new Intl.DateTimeFormat(isZhOrLang, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(d);
+    } catch {
+      /* fallback below */
+    }
   }
   return `${year}/${month}/${date} ${hours}:${minutes}`;
 }

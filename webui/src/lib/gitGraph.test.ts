@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { buildGitGraph, formatRelativeTime, formatRelativeTimeI18n, formatCommitDateTime } from './gitGraph.ts';
+import { buildGitGraph, formatRelativeTime, formatRelativeTimeI18n, formatRelativeTimeLocalized, formatCommitDateTime } from './gitGraph.ts';
 import type { GitCommitItem } from '../api.ts';
 
 test('buildGitGraph handles empty commit list', () => {
@@ -108,7 +108,23 @@ test('formatCommitDateTime formats timestamps', () => {
   // 2026-10-05 20:00:00 UTC = 1791230400 (or predictable epoch)
   const epoch = 1700000000;
   const strZh = formatCommitDateTime(epoch, true);
+  const strZhTw = formatCommitDateTime(epoch, 'zh-TW');
   const strEn = formatCommitDateTime(epoch, false);
+  const strJa = formatCommitDateTime(epoch, 'ja');
   assert.ok(strZh.includes('年') && strZh.includes('月') && strZh.includes('日'));
+  assert.ok(strZhTw.includes('年') && strZhTw.includes('月') && strZhTw.includes('日'));
   assert.ok(strEn.includes('/'));
+  assert.ok(strJa.length > 0);
+});
+
+test('formatRelativeTimeLocalized delegates to translation keys', () => {
+  const now = Math.floor(Date.now() / 1000);
+  const t = (key: string, params?: Record<string, string | number>) =>
+    params && 'n' in params ? `${key}:${params.n}` : key;
+  assert.equal(formatRelativeTimeLocalized(now - 10, t), 'time.justNow');
+  assert.equal(formatRelativeTimeLocalized(now - 120, t), 'time.minutesAgo:2');
+  assert.equal(formatRelativeTimeLocalized(now - 7200, t), 'time.hoursAgo:2');
+  assert.equal(formatRelativeTimeLocalized(now - 86400 * 5, t), 'git.timeDaysAgo:5');
+  assert.equal(formatRelativeTimeLocalized(now - 86400 * 60, t), 'git.timeMonthsAgo:2');
+  assert.equal(formatRelativeTimeLocalized(now - 86400 * 400, t), 'git.timeYearsAgo:1');
 });

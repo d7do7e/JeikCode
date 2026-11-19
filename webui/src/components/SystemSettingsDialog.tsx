@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getDesktopSettings, postDesktopSettings, postConfigReload, getHealth, type DesktopSettings } from '../api';
+import type { MsgKey } from '../i18n';
 import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useSettings } from '../settings';
@@ -16,8 +17,7 @@ type TabKey = 'models' | 'desktop' | 'about';
 
 interface ModuleTab {
   key: TabKey;
-  labelKey: string;
-  defaultLabel: string;
+  labelKey: MsgKey;
   icon: string;
 }
 
@@ -36,9 +36,9 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
   const backdropDismiss = useBackdropDismiss(onClose);
 
   const tabs: ModuleTab[] = [
-    { key: 'models', labelKey: 'settings.tabModels', defaultLabel: '模型与配置', icon: '⚡' },
-    { key: 'desktop', labelKey: 'settings.tabDesktop', defaultLabel: '行为与快捷键', icon: '⌨️' },
-    { key: 'about', labelKey: 'settings.tabAbout', defaultLabel: '关于与版本', icon: 'ℹ️' },
+    { key: 'models', labelKey: 'settings.tabModels', icon: '⚡' },
+    { key: 'desktop', labelKey: 'settings.tabDesktop', icon: '⌨️' },
+    { key: 'about', labelKey: 'settings.tabAbout', icon: 'ℹ️' },
   ];
 
   useEffect(() => {
@@ -102,7 +102,7 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
         <div class="modal-header system-settings-header">
           <div class="system-settings-header-title">
             <span class="system-settings-header-icon" aria-hidden="true">⚙️</span>
-            <h3>{t('settings.systemSettings') || '系统设置'}</h3>
+            <h3>{t('settings.systemSettings')}</h3>
           </div>
           <button
             type="button"
@@ -132,7 +132,7 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                   onClick={() => setActiveTab(tab.key)}
                 >
                   <span class="tab-icon" aria-hidden="true">{tab.icon}</span>
-                  <span class="tab-label">{t(tab.labelKey as any) || tab.defaultLabel}</span>
+                  <span class="tab-label">{t(tab.labelKey)}</span>
                 </button>
               );
             })}
@@ -149,15 +149,15 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
             {activeTab === 'desktop' && (
               <div class="system-settings-pane">
                 <h4 class="system-settings-pane-title">
-                  {t('settings.tabDesktop') || '行为与快捷键'}
+                  {t('settings.tabDesktop')}
                 </h4>
 
                 <div class="system-settings-card-box">
                   <div class="system-settings-box-title">
-                    {t('settings.closeActionLabel') || '关闭主窗口时'}
+                    {t('settings.closeActionLabel')}
                   </div>
                   <div class="system-settings-box-desc">
-                    {t('settings.closeActionDesc') || '配置点击窗口右上角关闭按钮 (X) 时的默认动作'}
+                    {t('settings.closeActionDesc')}
                   </div>
 
                   <div class="system-settings-radio-group">
@@ -169,7 +169,7 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                         checked={closeAction === 'tray'}
                         onChange={() => setCloseAction('tray')}
                       />
-                      <span>{t('settings.closeActionTray') || '最小化到系统托盘并在后台运行'}</span>
+                      <span>{t('settings.closeActionTray')}</span>
                     </label>
 
                     <label class="system-settings-radio-label">
@@ -180,7 +180,7 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                         checked={closeAction === 'quit'}
                         onChange={() => setCloseAction('quit')}
                       />
-                      <span>{t('settings.closeActionQuit') || '直接退出程序并停止服务'}</span>
+                      <span>{t('settings.closeActionQuit')}</span>
                     </label>
 
                     <label class="system-settings-radio-label">
@@ -191,17 +191,17 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                         checked={closeAction === 'ask'}
                         onChange={() => setCloseAction('ask')}
                       />
-                      <span>{t('settings.closeActionAsk') || '每次询问我'}</span>
+                      <span>{t('settings.closeActionAsk')}</span>
                     </label>
                   </div>
                 </div>
 
                 <div class="system-settings-card-box">
                   <div class="system-settings-box-title">
-                    {t('settings.shortcutBehaviorTitle') || '快捷键行为'}
+                    {t('settings.shortcutBehaviorTitle')}
                   </div>
                   <div class="system-settings-box-desc">
-                    {t('settings.escUndoDesc') || '开启后，ESC 可取消待发卡片、停止并回填上一条消息，或退出编辑状态。'}
+                    {t('settings.escUndoDesc')}
                   </div>
                   <label class="system-settings-radio-label">
                     <input
@@ -211,10 +211,10 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                         setEscUndoEnabled((e.target as HTMLInputElement).checked)
                       }
                     />
-                    <span>{t('settings.escUndoLabel') || 'ESC 撤销上一条消息'}</span>
+                    <span>{t('settings.escUndoLabel')}</span>
                   </label>
                   <div class="system-settings-esc-hint">
-                    {t('settings.escUndoImmediate') || '修改后立即生效'}
+                    {t('settings.escUndoImmediate')}
                   </div>
                 </div>
 
@@ -226,12 +226,12 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
                     onClick={handleSaveDesktopSettings}
                   >
                     {saving
-                      ? (t('settings.saving') || '正在保存…')
-                      : (t('settings.save') || '保存设置')}
+                      ? t('settings.saving')
+                      : t('settings.save')}
                   </button>
                   {savedSuccess && (
                     <span class="system-settings-saved-hint">
-                      ✓ {t('settings.savedSuccess') || '设置已保存'}
+                      ✓ {t('settings.savedSuccess')}
                     </span>
                   )}
                 </div>

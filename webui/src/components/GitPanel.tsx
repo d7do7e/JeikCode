@@ -27,8 +27,7 @@ import {
 } from '../api';
 import {
   buildGitGraph,
-  formatRelativeTime,
-  formatRelativeTimeI18n,
+  formatRelativeTimeLocalized,
   formatCommitDateTime,
   ROW_HEIGHT,
   LANE_WIDTH,
@@ -90,7 +89,6 @@ export function GitPanel({
   onOpenWorkingDiff,
 }: GitPanelProps) {
   const { t, lang } = useSettings();
-  const isZh = lang === 'zh';
 
   // ── 项目级全局 Git 状态 Store 订阅 (0ms 瞬间恢复首屏，跨会话共享，彻底杜绝白屏蹦图) ──
   const [storeState, setStoreState] = useState<GitProjectState>(() => gitStore.getState(cwd));
@@ -346,18 +344,19 @@ export function GitPanel({
       body: t('git.promptBranchName'),
       placeholder: 'feature/xxx',
       icon: '🌱',
-      confirmLabel: t('common.create') || '创建',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('common.create'),
+      cancelLabel: t('common.cancel'),
     });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_branch', target: commit.hash, name: name.trim(), cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Branch ${name.trim()} created`);
-      showToast(res.message || `Branch ${name.trim()} created`, 'success');
+      const msg = res.message || t('git.branchCreated', { name: name.trim() });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Failed to create branch');
+      setError(err?.message || t('git.branchCreateFailed'));
     }
   };
 
@@ -367,25 +366,26 @@ export function GitPanel({
       body: t('git.promptTagName'),
       placeholder: 'v1.0.0',
       icon: '🏷️',
-      confirmLabel: t('common.create') || '创建',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('common.create'),
+      cancelLabel: t('common.cancel'),
     });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_tag', target: commit.hash, name: name.trim(), cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Tag ${name.trim()} created`);
-      showToast(res.message || `Tag ${name.trim()} created`, 'success');
+      const msg = res.message || t('git.tagCreated', { name: name.trim() });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Failed to create tag');
+      setError(err?.message || t('git.tagCreateFailed'));
     }
   };
 
   const handleCherryPick = async (commit: GitCommitItem) => {
     const ok = await modalConfirm({
       title: t('git.ctxCherryPick'),
-      body: `Cherry pick ${commit.short_hash} "${commit.message}"?`,
+      body: t('git.cherryPickConfirm', { hash: commit.short_hash, msg: commit.message }),
       icon: '🍒',
       danger: false,
       confirmLabel: t('git.ctxCherryPick'),
@@ -395,18 +395,19 @@ export function GitPanel({
     setError(null);
     try {
       const res = await gitAction({ action: 'cherry_pick', target: commit.hash, cwd: effectiveCwd });
-      setSuccessMsg(res.message || 'Cherry-pick successful');
-      showToast(res.message || 'Cherry-pick successful', 'success');
+      const msg = res.message || t('git.cherryPickSuccess');
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Cherry-pick failed');
+      setError(err?.message || t('git.cherryPickFailed'));
     }
   };
 
   const handleRevert = async (commit: GitCommitItem) => {
     const ok = await modalConfirm({
       title: t('git.ctxRevert'),
-      body: `Revert commit ${commit.short_hash} "${commit.message}"?`,
+      body: t('git.revertConfirm', { hash: commit.short_hash, msg: commit.message }),
       icon: '↺',
       danger: true,
       confirmLabel: t('git.ctxRevert'),
@@ -416,11 +417,12 @@ export function GitPanel({
     setError(null);
     try {
       const res = await gitAction({ action: 'revert', target: commit.hash, cwd: effectiveCwd });
-      setSuccessMsg(res.message || 'Revert successful');
-      showToast(res.message || 'Revert successful', 'success');
+      const msg = res.message || t('git.revertSuccess');
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Revert failed');
+      setError(err?.message || t('git.revertFailed'));
     }
   };
 
@@ -474,18 +476,19 @@ export function GitPanel({
       body: t('git.promptRenameBranch'),
       defaultValue: branch,
       icon: '✏️',
-      confirmLabel: t('common.confirm') || '确定',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('common.confirm'),
+      cancelLabel: t('common.cancel'),
     });
     if (!newName || !newName.trim() || newName.trim() === branch) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'rename_branch', target: branch, name: newName.trim(), cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Branch renamed to ${newName.trim()}`);
-      showToast(res.message || `Branch renamed to ${newName.trim()}`, 'success');
+      const msg = res.message || t('git.branchRenamed', { name: newName.trim() });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Failed to rename branch');
+      setError(err?.message || t('git.branchRenameFailed'));
     }
   };
 
@@ -502,40 +505,42 @@ export function GitPanel({
       body: confirmPrompt,
       icon: '🗑',
       danger: true,
-      confirmLabel: t('common.delete') || '删除',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('common.delete'),
+      cancelLabel: t('common.cancel'),
     });
     if (!ok) return;
     setError(null);
     try {
       const action = isRemote ? 'delete_remote_branch' : 'delete_branch';
       const res = await gitAction({ action, target: branch, cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Branch ${branch} deleted`);
-      showToast(res.message || `Branch ${branch} deleted`, 'success');
+      const msg = res.message || t('git.branchDeleted', { name: branch });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Failed to delete branch');
+      setError(err?.message || t('git.branchDeleteFailed'));
     }
   };
 
   const handleMergeBranch = async (branch: string) => {
     const ok = await modalConfirm({
       title: t('git.ctxMergeBranch').replace('{b}', currentBranch),
-      body: `Merge "${branch}" into "${currentBranch}"?`,
+      body: t('git.mergeConfirm', { source: branch, target: currentBranch }),
       icon: '🔀',
       danger: false,
-      confirmLabel: t('common.confirm') || '合并',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('git.mergeAction'),
+      cancelLabel: t('common.cancel'),
     });
     if (!ok) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'merge_branch', target: branch, cwd: effectiveCwd });
-      setSuccessMsg(res.message || 'Merge successful');
-      showToast(res.message || 'Merge successful', 'success');
+      const msg = res.message || t('git.mergeSuccess');
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Merge failed');
+      setError(err?.message || t('git.mergeFailed'));
     }
   };
 
@@ -543,8 +548,9 @@ export function GitPanel({
     setError(null);
     try {
       const res = await gitAction({ action: 'push_branch', target: branch, cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Pushed ${branch} to remote`);
-      showToast(res.message || `Pushed ${branch} to remote`, 'success');
+      const msg = res.message || t('git.branchPushed', { name: branch });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       gitStore.setOptimisticState(cwd, (prev) => {
         if (!prev || !prev.gitStatus) return prev;
         return {
@@ -557,7 +563,7 @@ export function GitPanel({
       });
       void handleFullRefresh();
     } catch (err: any) {
-      setError(err?.message || 'Push failed');
+      setError(err?.message || t('git.pushFailed'));
     }
   };
 
@@ -567,18 +573,19 @@ export function GitPanel({
       body: t('git.promptBranchName'),
       placeholder: 'feature/xxx',
       icon: '🌱',
-      confirmLabel: t('common.create') || '创建',
-      cancelLabel: t('common.cancel') || '取消',
+      confirmLabel: t('common.create'),
+      cancelLabel: t('common.cancel'),
     });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_branch', target: branch, name: name.trim(), cwd: effectiveCwd });
-      setSuccessMsg(res.message || `Branch ${name.trim()} created from ${branch}`);
-      showToast(res.message || `Branch ${name.trim()} created from ${branch}`, 'success');
+      const msg = res.message || t('git.branchCreatedFrom', { name: name.trim(), base: branch });
+      setSuccessMsg(msg);
+      showToast(msg, 'success');
       await loadGitData(true);
     } catch (err: any) {
-      setError(err?.message || 'Failed to create branch');
+      setError(err?.message || t('git.branchCreateFailed'));
     }
   };
 
@@ -768,7 +775,7 @@ export function GitPanel({
       await gitStage({ path, all, cwd: effectiveCwd });
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
-      setError(err?.message || 'Stage failed');
+      setError(err?.message || t('git.stageFailed'));
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
@@ -841,7 +848,7 @@ export function GitPanel({
       await gitUnstage({ path, all, cwd: effectiveCwd });
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
-      setError(err?.message || 'Unstage failed');
+      setError(err?.message || t('git.unstageFailed'));
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
@@ -880,7 +887,7 @@ export function GitPanel({
       await gitDiscard({ path: file.path, isUntracked: file.status === '?', cwd: effectiveCwd });
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
-      setError(err?.message || 'Discard failed');
+      setError(err?.message || t('git.discardFailed'));
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
@@ -923,7 +930,7 @@ export function GitPanel({
       showToast(t('git.discardAll') + ` (${unstagedItems.length})`, 'info');
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
-      setError(err?.message || 'Discard all failed');
+      setError(err?.message || t('git.discardAllFailed'));
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
@@ -943,7 +950,7 @@ export function GitPanel({
 
     if (stagedCount === 0) {
       if (unstagedCount === 0) {
-        setError('No changes to commit');
+        setError(t('git.noChangesToCommit'));
         return;
       }
       const ok = await modalConfirm({
@@ -979,12 +986,12 @@ export function GitPanel({
         };
       });
 
-      setSuccessMsg(res.message || 'Commit successful');
+      setSuccessMsg(res.message || t('git.commitSuccess'));
       setCommitMessage('');
       // 提交后主动异步触发一次绿色刷新（拉取本地与远程图谱，使提交记录立即可见）
       void handleFullRefresh();
     } catch (err: any) {
-      setError(err?.message || 'Commit failed');
+      setError(err?.message || t('git.commitFailed'));
       void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsCommitting(false);
@@ -999,7 +1006,7 @@ export function GitPanel({
       if (!gitStatus?.tracking_branch) {
         // Publish branch
         const res = await gitPush({ setUpstream: true, cwd: effectiveCwd });
-        setSuccessMsg(res.message || 'Published branch successfully');
+        setSuccessMsg(res.message || t('git.branchPublished'));
       } else {
         // Pull then Push
         if (gitStatus.behind > 0) {
@@ -1007,7 +1014,7 @@ export function GitPanel({
         }
         if (gitStatus.ahead > 0 || gitStatus.behind === 0) {
           const res = await gitPush({ cwd: effectiveCwd });
-          setSuccessMsg(res.message || 'Synced successfully');
+          setSuccessMsg(res.message || t('git.syncSuccess'));
         }
       }
 
@@ -1027,7 +1034,7 @@ export function GitPanel({
       // 主动异步触发完整刷新
       void handleFullRefresh();
     } catch (err: any) {
-      setError(err?.message || 'Sync failed');
+      setError(err?.message || t('git.syncFailed'));
       void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsSyncing(false);
@@ -1047,7 +1054,7 @@ export function GitPanel({
         const res = await fetchGitCommitDetail(commit.hash, effectiveCwd);
         setCommitFiles((prev) => ({ ...prev, [commit.hash]: res.files }));
       } catch (err: any) {
-        setError(err?.message || 'Failed to load commit files');
+        setError(err?.message || t('git.loadCommitFilesFailed'));
       } finally {
         setLoadingCommitHash(null);
       }
@@ -1272,7 +1279,7 @@ export function GitPanel({
                 <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
                   <path d="M3 8.5l3.5 3.5 6.5-7" />
                 </svg>
-                <span>Working tree clean</span>
+                <span>{t('git.workingTreeClean')}</span>
               </div>
             ) : (
               <div class="git-file-list">
@@ -1591,13 +1598,13 @@ export function GitPanel({
                               handleCopyHash(c.hash);
                             }}
                           >
-                            {copiedHash === c.hash ? 'copied!' : c.short_hash}
+                            {copiedHash === c.hash ? t('git.hoverCopied') : c.short_hash}
                           </span>
                           <span class="git-commit-author">
                             {c.author_name}
                           </span>
                           <span class="git-commit-time">
-                            {formatRelativeTime(c.timestamp)}
+                            {formatRelativeTimeLocalized(c.timestamp, t)}
                           </span>
                         </div>
                       </div>
@@ -1648,7 +1655,7 @@ export function GitPanel({
                             <span class="git-meta-time-group">
                               <span class="git-hover-clock-icon">🕒</span>
                               <span class="git-expanded-time">
-                                {formatRelativeTimeI18n(c.timestamp, isZh)} ({formatCommitDateTime(c.timestamp, isZh)})
+                                {formatRelativeTimeLocalized(c.timestamp, t)} ({formatCommitDateTime(c.timestamp, lang)})
                               </span>
                             </span>
                           </div>
@@ -2028,7 +2035,7 @@ export function GitPanel({
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                   <path d="M14.5 2h-13a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5zm-12 1h11v9h-11V3zm2 2h7v1h-7V5zm0 3h7v1h-7V8z" />
                 </svg>
-                <span>{t('git.graphView') || 'Graph'}</span>
+                <span>{t('git.graphView')}</span>
                 {totalChangedCount > 0 && (
                   <span class="git-badge-counter badge-highlight">{totalChangedCount}</span>
                 )}
@@ -2071,7 +2078,7 @@ export function GitPanel({
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                   <path d="M10.5 8a2.5 2.5 0 0 1-5 0H1v-1h4.5a2.5 2.5 0 0 1 5 0H15v1h-4.5z" />
                 </svg>
-                <span>{t('git.commits') || 'Commits'}</span>
+                <span>{t('git.commits')}</span>
               </button>
               <button
                 type="button"
@@ -2162,7 +2169,7 @@ export function GitPanel({
           >
             <div class="git-commits-section-header" onClick={toggleCommitsCollapse}>
               <span class="git-section-caret">{commitsCollapsed ? "▶" : "▼"}</span>
-              <span class="git-section-title">{t("git.commits") || "Commits"}</span>
+              <span class="git-section-title">{t("git.commits")}</span>
               <span class="git-badge-counter">{graphRows.length}</span>
               <div class="git-section-actions" onClick={(e) => e.stopPropagation()}>
                 <button
