@@ -20,7 +20,8 @@ import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
 import { parseFilePathAndLines } from './lib/displayPath';
-import { dropEditorTabSnapshot, mainEditorStateKey } from './lib/editorTabState';
+import { dropEditorTabSnapshot, mainEditorStateKey, upsertEditorTab } from './lib/editorTabState';
+import type { OpenDiffTab } from './lib/openDiffTab';
 import { languageOptions } from './i18n';
 import { triggerBlobDownload } from './lib/download';
 import { partitionDroppedFiles, readDroppedFilePreview } from './lib/droppedFiles';
@@ -106,6 +107,8 @@ function rememberedSessionToMeta(
 
 export function App() {
   const t = useT();
+  const tRef = useRef(t);
+  tRef.current = t;
   const { theme, setTheme, lang, setLang, updateDead } = useSettings();
   // 刷新恢复优先级：URL 里的短 id（可分享/可直达）> 本浏览器上次选中的完整会话 id。
   // 跨设备/无痕冷启动两者都没有，才真正回到新建落地页。
@@ -149,6 +152,8 @@ export function App() {
   // 当后端列表出现同 id 的真实会话后，Sidebar 的 mergeOptimisticSessions 会自动以落盘条目为准去重。
   const [optimisticSessions, setOptimisticSessions] = useState<Record<string, SessionMetaWithProject>>({});
   const [cwd, setCwd] = useState(() => rememberedPreviewRef.current?.working_dir ?? '');
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
   // Physical session-bucket hash of the current project. The sidebar scopes its
   // list by this (see Sidebar `projectHash`), not by the `cwd` string, so a
   // session whose stored `working_dir` was restamped by the daemon's global
@@ -535,7 +540,7 @@ export function App() {
   }, [topNavMoreOpen]);
 
   // VSCode-style open diff tabs in the session header
-  const [diffTabs, setDiffTabs] = useState<any[]>([]);
+  const [diffTabs, setDiffTabs] = useState<OpenDiffTab[]>([]);
   const [activeMainTabId, setActiveMainTabId] = useState<string>(() => {
     try {
       if (!urlSessionRef.current && localStorage.getItem('jeikcode:sidebar_tab') === 'tasks') {
@@ -640,65 +645,34 @@ export function App() {
   const [mainTabDragIdx, setMainTabDragIdx] = useState<number | null>(null);
   const [mainTabOverIdx, setMainTabOverIdx] = useState<number | null>(null);
 
-  const handleOpenFile = (
-    filePath: string,
-    insertIndex?: number,
-    targetStartLine?: number,
-    targetEndLine?: number,
-  ) => {
-    const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } = parseFilePathAndLines(filePath);
-    const startLine = targetStartLine ?? parsedStart;
-    const endLine = targetEndLine ?? parsedEnd;
-    let normPath = (cleanRaw || '').trim().replace(/\\/g, '/');
-    if (!/^[a-zA-Z]:\//.test(normPath) && !normPath.startsWith('/') && cwd) {
-      const base = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
-      normPath = `${base}/${normPath.replace(/^\.?\/+/, '')}`;
-    }
-    if (/^[a-z]:\//.test(normPath)) {
-      normPath = normPath[0].toUpperCase() + normPath.slice(1);
-    }
-    const tabId = `editor_${normPath}`;
-    const existingIdx = diffTabs.findIndex((t) => t.id === tabId || (t.type === 'editor' && t.filePath === normPath));
-    if (existingIdx !== -1) {
-      const targetTabId = diffTabs[existingIdx]?.id || tabId;
-      const next = [...diffTabs];
-      if (next[existingIdx]) {
-        next[existingIdx] = {
-          ...next[existingIdx],
-          startLine,
-          endLine,
-        };
-        if (insertIndex !== undefined && insertIndex !== existingIdx) {
-          const [item] = next.splice(existingIdx, 1);
-          const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
-          next.splice(targetSlot, 0, item);
-        }
-        setDiffTabs(next);
+  const handleOpenFile = useCallback(
+    (
+      filePath: string,
+      insertIndex?: number,
+      targetStartLine?: number,
+      targetEndLine?: number,
+    ) => {
+      const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } =
+        parseFilePathAndLines(filePath);
+      const startLine = targetStartLine ?? parsedStart;
+      const endLine = targetEndLine ?? parsedEnd;
+      let normPath = (cleanRaw || '').trim().replace(/\\/g, '/');
+      const liveCwd = cwdRef.current;
+      if (!/^[a-zA-Z]:\//.test(normPath) && !normPath.startsWith('/') && liveCwd) {
+        const base = liveCwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+        normPath = `${base}/${normPath.replace(/^\.?\/+/, '')}`;
       }
-      setActiveMainTabId(targetTabId);
-      return;
-    }
-    const fileName = normPath.split(/[\\/]/).pop() || normPath;
-    const ext = fileName.split('.').pop() || 'FILE';
-    const newTab = {
-      id: tabId,
-      type: 'editor',
-      fileName,
-      filePath: normPath,
-      fileStatus: ext.slice(0, 3).toUpperCase(),
-      startLine,
-      endLine,
-    };
-    setDiffTabs((prev) => {
-      if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
-        const next = [...prev];
-        next.splice(insertIndex, 0, newTab);
-        return next;
+      if (/^[a-z]:\//.test(normPath)) {
+        normPath = normPath[0].toUpperCase() + normPath.slice(1);
       }
-      return [...prev, newTab];
-    });
-    setActiveMainTabId(tabId);
-  };
+      const tabId = `editor_${normPath}`;
+      setDiffTabs((prev) =>
+        upsertEditorTab(prev, { normPath, startLine, endLine, insertIndex }),
+      );
+      setActiveMainTabId(tabId);
+    },
+    [],
+  );
 
   // 全局文件打开事件广播监听 (例如 Markdown 相对链接点击、文件树定位等)
   useEffect(() => {
@@ -710,7 +684,7 @@ export function App() {
     };
     window.addEventListener('jeikcode:open_file', onOpenFileEvent);
     return () => window.removeEventListener('jeikcode:open_file', onOpenFileEvent);
-  }, [diffTabs, cwd]);
+  }, [handleOpenFile]);
 
   // 监听全局主视图切换广播 (例如从侧边栏快捷回到对话主舞台)
   useEffect(() => {
@@ -776,7 +750,7 @@ export function App() {
             void readDroppedFilePreview(file)
               .then((preview) => {
                 if (!preview) {
-                  showToast(t('editor.readFailedDesc'), 'error');
+                  showToast(tRef.current('editor.readFailedDesc'), 'error');
                   return;
                 }
                 window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
@@ -787,7 +761,7 @@ export function App() {
                 );
               })
               .catch(() => {
-                showToast(t('editor.readFailedDesc'), 'error');
+                showToast(tRef.current('editor.readFailedDesc'), 'error');
               });
           }
         }

@@ -8,6 +8,7 @@ import {
   readEditorTabSnapshot,
   shouldReloadFromDisk,
   toggleTextMode,
+  upsertEditorTab,
   withTabViewMode,
   withVisitedTab,
   withoutTabEntry,
@@ -129,4 +130,30 @@ test('dirty drafts only yield to an explicit refresh', () => {
   assert.equal(shouldReloadFromDisk(false, true), true);
   assert.equal(shouldReloadFromDisk(true, false), false);
   assert.equal(shouldReloadFromDisk(true, true), true);
+});
+
+test('upsertEditorTab composes consecutive opens, updates existing lines, and clamps insertIndex', () => {
+  let tabs = upsertEditorTab([], { normPath: 'C:/repo/a.ts', startLine: 10 });
+  tabs = upsertEditorTab(tabs, { normPath: 'C:/repo/b.ts' });
+  assert.deepEqual(
+    tabs.map((t) => t.id),
+    ['editor_C:/repo/a.ts', 'editor_C:/repo/b.ts'],
+  );
+  assert.equal(tabs[0]?.startLine, 10);
+
+  // Updating existing tab updates line range without duplicating and clamps negative/excess insertIndex.
+  tabs = upsertEditorTab(tabs, { normPath: 'C:/repo/b.ts', startLine: 42, endLine: 50, insertIndex: -5 });
+  assert.deepEqual(
+    tabs.map((t) => t.id),
+    ['editor_C:/repo/b.ts', 'editor_C:/repo/a.ts'],
+  );
+  assert.equal(tabs[0]?.startLine, 42);
+  assert.equal(tabs[0]?.endLine, 50);
+
+  // New tab with out-of-range insertIndex clamps to end.
+  tabs = upsertEditorTab(tabs, { normPath: 'C:/repo/c.ts', insertIndex: 999 });
+  assert.deepEqual(
+    tabs.map((t) => t.id),
+    ['editor_C:/repo/b.ts', 'editor_C:/repo/a.ts', 'editor_C:/repo/c.ts'],
+  );
 });

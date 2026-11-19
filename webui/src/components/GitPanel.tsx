@@ -162,34 +162,59 @@ export function GitPanel({
 
   const isResizingRef = useRef(false);
   const combinedViewRef = useRef<HTMLDivElement>(null);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      dragCleanupRef.current?.();
+    };
+  }, []);
 
   const handleResizerMouseDown = (e: MouseEvent) => {
     e.preventDefault();
+    dragCleanupRef.current?.();
     isResizingRef.current = true;
     document.body.style.cursor = 'row-resize';
     document.body.style.userSelect = 'none';
 
+    let latestRatio = splitRatio;
+    let moved = false;
+    let cleaned = false;
+
     const onMouseMove = (moveEvent: MouseEvent) => {
       if (!isResizingRef.current || !combinedViewRef.current) return;
       const rect = combinedViewRef.current.getBoundingClientRect();
+      if (rect.height <= 0) return;
       const offsetY = moveEvent.clientY - rect.top;
       const newRatio = Math.max(0.15, Math.min(0.85, offsetY / rect.height));
+      latestRatio = newRatio;
+      moved = true;
       setSplitRatio(newRatio);
     };
 
-    const onMouseUp = () => {
+    const cleanupDrag = (persist: boolean) => {
+      if (cleaned) return;
+      cleaned = true;
+      dragCleanupRef.current = null;
       isResizingRef.current = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-      try {
-        localStorage.setItem('jeikcode:git_panel_split_ratio', String(splitRatio));
-      } catch {}
+      window.removeEventListener('mouseup', onFinish);
+      window.removeEventListener('blur', onFinish);
+      if (persist && moved) {
+        try {
+          localStorage.setItem('jeikcode:git_panel_split_ratio', String(latestRatio));
+        } catch {}
+      }
     };
 
+    const onFinish = () => cleanupDrag(true);
+    dragCleanupRef.current = () => cleanupDrag(false);
+
     window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('mouseup', onFinish);
+    window.addEventListener('blur', onFinish);
   };
 
   // Expanded commit state for modified files

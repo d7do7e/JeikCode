@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   clearScheduleRuns,
   createSchedule,
@@ -207,22 +207,28 @@ export function TasksPanel({
     }
   }, [creatingNew, selectedTask?.id, selectedTask?.enabled]);
 
-  // Load run history for selected task
+  // Load run history for selected task (guarded by monotonic seq to discard stale replies)
+  const runsReqSeqRef = useRef(0);
   const loadRuns = useCallback(async (id: string, silent = false) => {
+    const reqSeq = ++runsReqSeqRef.current;
     if (!silent) setRunsLoading(true);
     try {
       const list = await getScheduleRuns(id);
+      if (runsReqSeqRef.current !== reqSeq) return;
       setRuns(list);
     } catch {
+      if (runsReqSeqRef.current !== reqSeq) return;
       if (!silent) setRuns([]);
     } finally {
-      if (!silent) setRunsLoading(false);
+      if (runsReqSeqRef.current === reqSeq) setRunsLoading(false);
     }
   }, []);
 
   useEffect(() => {
     if (!selectedTask || creatingNew) {
+      runsReqSeqRef.current += 1;
       setRuns([]);
+      setRunsLoading(false);
       return;
     }
     const id = selectedTask.id;
@@ -247,6 +253,7 @@ export function TasksPanel({
       }
     });
     return () => {
+      runsReqSeqRef.current += 1;
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibility);
       window.clearInterval(timer);

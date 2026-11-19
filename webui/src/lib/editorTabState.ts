@@ -11,6 +11,7 @@
  */
 
 import type { FileStamp } from './fileStamp';
+import type { OpenDiffTab } from './openDiffTab';
 
 export type TextEditorMode = 'edit' | 'preview';
 export type EditorViewMode = TextEditorMode | 'image' | 'binary';
@@ -127,4 +128,71 @@ export function bumpReloadToken(
  */
 export function shouldReloadFromDisk(isDirty: boolean, forced: boolean): boolean {
   return forced || !isDirty;
+}
+
+export interface UpsertEditorTabInput {
+  normPath: string;
+  startLine?: number;
+  endLine?: number;
+  insertIndex?: number;
+}
+
+/**
+ * Pure reducer for inserting or updating an `'editor'` tab inside `diffTabs`.
+ * Guarantees consecutive `setDiffTabs((prev) => ...)` calls in the same render tick
+ * never clobber earlier insertions and clamps `insertIndex` consistently.
+ */
+export function upsertEditorTab(
+  tabs: OpenDiffTab[],
+  input: UpsertEditorTabInput,
+): OpenDiffTab[] {
+  const { normPath, startLine, endLine, insertIndex } = input;
+  const tabId = `editor_${normPath}`;
+  const existingIdx = tabs.findIndex(
+    (t) => t.id === tabId || (t.type === 'editor' && t.filePath === normPath),
+  );
+  if (existingIdx !== -1) {
+    const next = [...tabs];
+    const existing = next[existingIdx]!;
+    next[existingIdx] = {
+      ...existing,
+      startLine,
+      endLine,
+    };
+    if (insertIndex !== undefined) {
+      const [item] = next.splice(existingIdx, 1);
+      const rawTarget = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
+      const targetSlot = Math.max(0, Math.min(rawTarget, next.length));
+      if (targetSlot !== existingIdx) {
+        next.splice(targetSlot, 0, item!);
+      } else {
+        next.splice(existingIdx, 0, item!);
+      }
+    }
+    return next;
+  }
+
+  const fileName = normPath.split(/[\\/]/).pop() || normPath;
+  const ext = fileName.split('.').pop() || 'FILE';
+  const newTab: OpenDiffTab = {
+    id: tabId,
+    type: 'editor',
+    commitHash: '',
+    commitShortHash: '',
+    commitMessage: '',
+    fileName,
+    filePath: normPath,
+    fileStatus: ext.slice(0, 3).toUpperCase(),
+    diffText: '',
+    loading: false,
+    startLine,
+    endLine,
+  };
+  if (insertIndex !== undefined) {
+    const clamped = Math.max(0, Math.min(insertIndex, tabs.length));
+    const next = [...tabs];
+    next.splice(clamped, 0, newTab);
+    return next;
+  }
+  return [...tabs, newTab];
 }
