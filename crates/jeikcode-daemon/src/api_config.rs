@@ -1605,8 +1605,67 @@ pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoRes
         }
     };
     let _ = crate::reload_mcp_and_live_runtime(&state, true, None).await;
+    let reloaded_registry =
+        invalidate_and_reload_idle_registry_handles(Some(&state.telemetry), &config).await;
     crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    let _ = reloaded_registry;
     Json(config_response(&config)).into_response()
+}
+
+/// Refresh idle `SessionRuntimeRegistry` handles (and clear cached provider
+/// fingerprints for busy handles so their next idle boundary or `/live/message`
+/// reassembles against the fresh `config.toml`).
+async fn invalidate_and_reload_idle_registry_handles(
+    telemetry: Option<&std::sync::Arc<jeikcode_telemetry::Telemetry>>,
+    config: &Config,
+) -> usize {
+    let registry = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+    let mut reloaded = 0usize;
+    for entry in registry.list_all() {
+        let sid = &entry.session_id;
+        // Clear the cached fingerprint first so even a busy session (or one
+        // whose config reload is skipped here) re-evaluates on next message.
+        registry.set_provider_fingerprint(sid, None);
+        let Some(handle) = registry.handle(sid) else {
+            continue;
+        };
+        if !matches!(
+            handle.status().phase,
+            jeikcode_coding::RuntimePhase::Ready | jeikcode_coding::RuntimePhase::AwaitingProvider
+        ) {
+            continue;
+        }
+        let resolved_provider = {
+            let mgr =
+                jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir);
+            mgr.load_native_session(sid)
+                .ok()
+                .and_then(|loaded| loaded.meta.preferred_model)
+                .filter(|name| !name.is_empty() && config.selection_exists(name))
+        };
+        let Some(next_cfg) = crate::native_live::build_reload_coding_config_from(
+            config,
+            &entry.working_dir,
+            resolved_provider.as_deref(),
+            Some(sid),
+            telemetry.cloned(),
+        ) else {
+            continue;
+        };
+        let target_provider = next_cfg.provider_name.clone();
+        let plugin_dirs = crate::gather_plugin_skill_dirs_for(&entry.working_dir);
+        if handle
+            .reload_capabilities_with_config(Some(plugin_dirs), next_cfg)
+            .await
+            .is_ok()
+        {
+            reloaded += 1;
+            if let Ok(fp) = crate::native_live::provider_fingerprint(config, &target_provider) {
+                registry.set_provider_fingerprint(sid, Some(fp));
+            }
+        }
+    }
+    reloaded
 }
 
 #[cfg(test)]
@@ -2197,5 +2256,102 @@ mod tests {
         );
         assert!(validate_desktop_no_token(false, true).is_ok());
         assert!(validate_desktop_no_token(true, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reload_config_clears_cached_registry_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+        let sid = format!("test-reload-fp-{}", uuid::Uuid::new_v4().simple());
+        let _ = reg.open_or_attach(sid.clone(), dir.path().to_path_buf());
+        reg.set_provider_fingerprint(&sid, Some("stale-fp".into()));
+        assert_eq!(reg.provider_fingerprint(&sid).as_deref(), Some("stale-fp"));
+
+        let mut cfg = Config::default();
+        cfg.default_model = Some("m".into());
+        cfg.models.insert(
+            "m".into(),
+            jeikcode_config::config::provider::ModelProfileConfig {
+                account: "acc".into(),
+                model: "m".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 1_000_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                capable_model: None,
+                pricing: None,
+                supports_vision: None,
+                reasoning_model: None,
+            },
+        );
+        cfg.provider_accounts.insert(
+            "acc".into(),
+            jeikcode_config::config::provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("k".into()),
+                base_url: Some("https://example.invalid/v1".into()),
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        cfg.coding.compact_threshold = 0.5;
+        let mut agent_cfg = crate::kernel_runtime::coding_config_from_runtime(
+            &jeikcode_coding::CodingRuntimeConfig::from_config(
+                &cfg,
+                dir.path(),
+                None,
+                None,
+                true,
+                false,
+            ),
+        );
+        agent_cfg.compact_threshold = 0.35;
+        let prepare = jeikcode_coding::PrepareOptions {
+            request_user_input: false,
+            session: jeikcode_coding::SessionMode::Disabled,
+            skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            shared_mcp_registry: None,
+            memory: false,
+            web: false,
+            review: false,
+            rate_limit_source: None,
+        };
+        let start = jeikcode_coding::CodingRuntimeStart {
+            agent: agent_cfg,
+            prepare,
+            provider_factory: crate::runtime_host::coding_provider_factory(),
+            plugin_hooks: crate::runtime_host::installed_plugin_hook_source(),
+            image_preprocessor: None,
+        };
+        let runtime = jeikcode_coding::CodingRuntime::start_with_bootstrap(
+            start,
+            jeikcode_coding::ProviderBootstrap::Required,
+        )
+        .await
+        .expect("start test runtime");
+        assert!(reg.bind_handle(&sid, runtime.handle.clone(), None));
+
+        let reloaded = super::invalidate_and_reload_idle_registry_handles(None, &cfg).await;
+        assert_eq!(reloaded, 1);
+        let expected_fp = crate::native_live::provider_fingerprint(&cfg, "m").unwrap();
+        assert_eq!(
+            reg.provider_fingerprint(&sid).as_deref(),
+            Some(expected_fp.as_str())
+        );
+
+        let _ = runtime.handle.shutdown().await;
+        let _ = reg.force_remove(&sid);
     }
 }

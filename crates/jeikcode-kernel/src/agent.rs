@@ -219,9 +219,10 @@ const REPEAT_LOOP_NUDGE: &str =
 /// reminders is enough to call it stuck without dying on the first retry.
 const ECHO_NUDGE_AT: u32 = 3;
 const ECHO_STOP_AT: u32 = 5;
-const READONLY_SOFT_STEER_ROUNDS: usize = 12;
+const READONLY_SOFT_STEER_ROUNDS: usize = 24;
 const DUP_READ_SLICE_SOFT_STEER_HITS: usize = 4;
-const READONLY_HARD_STOP_ROUNDS: usize = 22;
+const DUP_READ_SLICE_HARD_STOP_HITS: usize = 8;
+const READONLY_HARD_STOP_ROUNDS: usize = 60;
 const COMPACTIONS_WITHOUT_MUTATION_STOP: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -230,11 +231,40 @@ struct CompactionRunOutcome {
     drained: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReadOnlyQueryKey {
+    ReadSlice {
+        path: String,
+        offset: u64,
+        limit: u64,
+        keyword: Option<String>,
+        ranges: Option<String>,
+    },
+    Grep {
+        pattern: String,
+        path: String,
+        glob: String,
+        file_type: String,
+        output_mode: String,
+        case_insensitive: bool,
+        is_regex: bool,
+    },
+    Glob {
+        pattern: String,
+        path: String,
+    },
+    CodeExplore {
+        path: String,
+        query: String,
+        max_files: u64,
+    },
+}
+
 #[derive(Debug, Default)]
 struct IntraTurnReadLoopGuard {
     consecutive_readonly_rounds: usize,
     compactions_since_last_mutation: usize,
-    seen_read_slices: std::collections::HashSet<(String, u64, u64)>,
+    seen_readonly_queries: std::collections::HashSet<ReadOnlyQueryKey>,
     duplicate_read_hits: usize,
     readonly_soft_steered: bool,
     dup_slice_soft_steered: bool,
@@ -251,7 +281,7 @@ impl IntraTurnReadLoopGuard {
     fn reset_all(&mut self) {
         self.consecutive_readonly_rounds = 0;
         self.compactions_since_last_mutation = 0;
-        self.seen_read_slices.clear();
+        self.seen_readonly_queries.clear();
         self.duplicate_read_hits = 0;
         self.readonly_soft_steered = false;
         self.dup_slice_soft_steered = false;
@@ -276,19 +306,19 @@ impl IntraTurnReadLoopGuard {
         I: IntoIterator<Item = (&'a str, &'a str, bool)>,
     {
         let mut saw_any = false;
-        let mut any_mutation = false;
+        let mut any_file_or_shell_mutation = false;
         let mut all_readonly = true;
 
         for (name, args, executed) in calls {
             saw_any = true;
-            if executed && is_mutating_or_action_tool(name) {
-                any_mutation = true;
+            if executed && is_actual_mutation_tool(name) {
+                any_file_or_shell_mutation = true;
             }
             if !is_readonly_exploration_tool(name) {
                 all_readonly = false;
             }
-            if let Some(slice) = extract_read_slice_key(name, args) {
-                if !self.seen_read_slices.insert(slice) {
+            if let Some(key) = extract_readonly_query_key(name, args) {
+                if !self.seen_readonly_queries.insert(key) {
                     self.duplicate_read_hits = self.duplicate_read_hits.saturating_add(1);
                 }
             }
@@ -298,7 +328,7 @@ impl IntraTurnReadLoopGuard {
             return ReadLoopAction::Continue;
         }
 
-        if any_mutation {
+        if any_file_or_shell_mutation {
             self.reset_all();
             return ReadLoopAction::Continue;
         }
@@ -310,19 +340,11 @@ impl IntraTurnReadLoopGuard {
             self.readonly_soft_steered = false;
         }
 
-        if self.consecutive_readonly_rounds >= READONLY_HARD_STOP_ROUNDS
+        if self.duplicate_read_hits >= DUP_READ_SLICE_HARD_STOP_HITS
+            || self.consecutive_readonly_rounds >= READONLY_HARD_STOP_ROUNDS
             || self.compactions_since_last_mutation >= COMPACTIONS_WITHOUT_MUTATION_STOP
         {
             return ReadLoopAction::HardStop;
-        }
-
-        if self.consecutive_readonly_rounds >= READONLY_SOFT_STEER_ROUNDS
-            && !self.readonly_soft_steered
-        {
-            self.readonly_soft_steered = true;
-            return ReadLoopAction::SoftSteer(
-                "You have spent 12+ consecutive rounds on read-only exploration without making any edits or actions. Stop broad reading now: lock your concrete plan in `todo_write` and start `edit`/`write` changes, or delegate remaining multi-file discovery to a read-only `explore` subagent (`task`).",
-            );
         }
 
         if self.duplicate_read_hits >= DUP_READ_SLICE_SOFT_STEER_HITS
@@ -330,7 +352,16 @@ impl IntraTurnReadLoopGuard {
         {
             self.dup_slice_soft_steered = true;
             return ReadLoopAction::SoftSteer(
-                "You have re-read identical `(path, offset, limit)` file slices 4+ times in this turn. Stop re-reading already-inspected slices; rely on your prior findings, lock your plan in `todo_write`, and begin editing or delegate wide searches to an `explore` subagent (`task`).",
+                "You have repeated identical read/search queries 4+ times in this turn. Stop re-querying already-inspected targets; rely on your prior findings, synthesize your answer or plan, or delegate remaining broad sweeps to an `explore` subagent (`task`).",
+            );
+        }
+
+        if self.consecutive_readonly_rounds >= READONLY_SOFT_STEER_ROUNDS
+            && !self.readonly_soft_steered
+        {
+            self.readonly_soft_steered = true;
+            return ReadLoopAction::SoftSteer(
+                "You have spent 24+ consecutive rounds on read-only exploration without modifying files or executing shell actions. Synthesize your findings now, reply directly if you have enough evidence, or delegate remaining broad multi-file sweeps to an `explore` subagent (`task`).",
             );
         }
 
@@ -341,8 +372,14 @@ impl IntraTurnReadLoopGuard {
         if let Some(msg) = self.compaction_stop_message() {
             return msg;
         }
+        if self.duplicate_read_hits >= DUP_READ_SLICE_HARD_STOP_HITS {
+            return format!(
+                "stopped: repeated identical read/search queries {} times in a single turn without any file or shell mutation (duplicate query loop guard)",
+                self.duplicate_read_hits
+            );
+        }
         format!(
-            "stopped: {} consecutive read-only exploration rounds without any edit or action tool execution (duplicate read slices: {})",
+            "stopped: {} consecutive read-only exploration rounds without any file or shell mutation (duplicate queries: {})",
             self.consecutive_readonly_rounds, self.duplicate_read_hits
         )
     }
@@ -452,7 +489,7 @@ fn is_readonly_exploration_tool(name: &str) -> bool {
     )
 }
 
-fn is_mutating_or_action_tool(name: &str) -> bool {
+fn is_actual_mutation_tool(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
         "edit"
@@ -463,34 +500,142 @@ fn is_mutating_or_action_tool(name: &str) -> bool {
             | "apply_patch"
             | "bash"
             | "run_command"
-            | "todo_write"
-            | "task"
     )
 }
 
-fn extract_read_slice_key(name: &str, raw_args: &str) -> Option<(String, u64, u64)> {
-    if !matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "read" | "read_file"
-    ) {
-        return None;
-    }
+fn normalize_tool_path(raw: &str) -> String {
+    raw.trim().replace('\\', "/")
+}
+
+fn extract_readonly_query_key(name: &str, raw_args: &str) -> Option<ReadOnlyQueryKey> {
     let val: serde_json::Value = serde_json::from_str(raw_args).ok()?;
-    let path = val
-        .get("path")
-        .or_else(|| val.get("file_path"))
-        .and_then(|v| v.as_str())?
-        .trim()
-        .replace('\\', "/");
-    if path.is_empty() {
-        return None;
+    match name.trim().to_ascii_lowercase().as_str() {
+        "read" | "read_file" => {
+            let path = val
+                .get("path")
+                .or_else(|| val.get("file_path"))
+                .and_then(|v| v.as_str())
+                .map(normalize_tool_path)?;
+            if path.is_empty() {
+                return None;
+            }
+            let offset = val
+                .get("offset")
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64)))
+                .unwrap_or(1);
+            let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+            let keyword = val
+                .get("keyword")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            let ranges = val
+                .get("ranges")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string());
+            Some(ReadOnlyQueryKey::ReadSlice {
+                path,
+                offset,
+                limit,
+                keyword,
+                ranges,
+            })
+        }
+        "grep" => {
+            let pattern = val
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let path = if let Some(paths) = val.get("paths").and_then(|v| v.as_array()) {
+                let mut normalized: Vec<String> = paths
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(normalize_tool_path)
+                    .collect();
+                normalized.sort();
+                normalized.join("|")
+            } else {
+                val.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_tool_path)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| ".".to_string())
+            };
+            let glob = val
+                .get("glob")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let file_type = val
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let output_mode = val
+                .get("output_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("content")
+                .trim()
+                .to_string();
+            let case_insensitive = val
+                .get("case_insensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let is_regex = val
+                .get("is_regex")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(ReadOnlyQueryKey::Grep {
+                pattern,
+                path,
+                glob,
+                file_type,
+                output_mode,
+                case_insensitive,
+                is_regex,
+            })
+        }
+        "glob" => {
+            let pattern = val
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let path = val
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(normalize_tool_path)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            Some(ReadOnlyQueryKey::Glob { pattern, path })
+        }
+        "code_explore" => {
+            let path = val
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(normalize_tool_path)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            let query = val
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let max_files = val.get("max_files").and_then(|v| v.as_u64()).unwrap_or(12);
+            Some(ReadOnlyQueryKey::CodeExplore {
+                path,
+                query,
+                max_files,
+            })
+        }
+        _ => None,
     }
-    let offset = val
-        .get("offset")
-        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64)))
-        .unwrap_or(1);
-    let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
-    Some((path, offset, limit))
 }
 fn echo_loop_nudge() -> String {
     i18n::format_agent_echo_loop_nudge()
@@ -8163,7 +8308,7 @@ mod synthetic_send_tests {
     #[test]
     fn intra_turn_read_loop_guard_steers_stops_and_resets_on_mutation() {
         let mut guard = IntraTurnReadLoopGuard::default();
-        for round in 1..12 {
+        for round in 1..24 {
             let args = format!(r#"{{"path":"src/lib.rs","offset":{round},"limit":50}}"#);
             assert_eq!(
                 guard.observe_round([("read", args.as_str(), true)]),
@@ -8171,15 +8316,19 @@ mod synthetic_send_tests {
                 "round {round} should continue below soft steer threshold"
             );
         }
-        assert!(matches!(
-            guard.observe_round([(
-                "read",
-                r#"{"path":"src/lib.rs","offset":12,"limit":50}"#,
-                true
-            )]),
-            ReadLoopAction::SoftSteer(_)
-        ));
-        for round in 13..22 {
+        let steer_msg = match guard.observe_round([(
+            "read",
+            r#"{"path":"src/lib.rs","offset":24,"limit":50}"#,
+            true,
+        )]) {
+            ReadLoopAction::SoftSteer(msg) => msg,
+            other => panic!("expected SoftSteer at round 24, got {other:?}"),
+        };
+        assert!(
+            !steer_msg.contains("edit") && !steer_msg.contains("write"),
+            "novel read-only soft steer must stay mode-neutral: {steer_msg}"
+        );
+        for round in 25..60 {
             let args = format!(r#"{{"path":"src/lib.rs","offset":{round},"limit":50}}"#);
             assert_eq!(
                 guard.observe_round([("read", args.as_str(), true)]),
@@ -8189,13 +8338,13 @@ mod synthetic_send_tests {
         assert_eq!(
             guard.observe_round([(
                 "read",
-                r#"{"path":"src/lib.rs","offset":22,"limit":50}"#,
+                r#"{"path":"src/lib.rs","offset":60,"limit":50}"#,
                 true
             )]),
             ReadLoopAction::HardStop
         );
 
-        // Mutation resets counters and duplicate-slice ledger.
+        // Actual file mutation resets counters and duplicate-query ledger.
         assert_eq!(
             guard.observe_round([("edit", r#"{"path":"src/lib.rs"}"#, true)]),
             ReadLoopAction::Continue
@@ -8204,28 +8353,93 @@ mod synthetic_send_tests {
         assert_eq!(guard.compactions_since_last_mutation, 0);
         assert_eq!(guard.duplicate_read_hits, 0);
 
-        // Duplicate slice threshold (4 hits) triggers SoftSteer.
+        // Duplicate slice threshold (4 hits) triggers mode-neutral SoftSteer; 8 hits triggers HardStop.
         let same_slice = r#"{"path":"src/main.rs","offset":1,"limit":80}"#;
         assert_eq!(
             guard.observe_round([("read", same_slice, true)]),
             ReadLoopAction::Continue
         );
+        for _ in 0..3 {
+            assert_eq!(
+                guard.observe_round([("read", same_slice, true)]),
+                ReadLoopAction::Continue
+            );
+        }
+        let dup_steer = match guard.observe_round([("read", same_slice, true)]) {
+            ReadLoopAction::SoftSteer(msg) => msg,
+            other => panic!("expected SoftSteer at 4 duplicate hits, got {other:?}"),
+        };
+        assert!(
+            !dup_steer.contains("edit") && !dup_steer.contains("write"),
+            "duplicate read-only soft steer must stay mode-neutral: {dup_steer}"
+        );
+
+        // `todo_write` resets consecutive_readonly_rounds, but must NOT clear duplicate query ledger.
         assert_eq!(
-            guard.observe_round([("read", same_slice, true)]),
+            guard.observe_round([("todo_write", r#"{"plan":[]}"#, true)]),
             ReadLoopAction::Continue
         );
+        assert_eq!(guard.consecutive_readonly_rounds, 0);
+        assert_eq!(guard.duplicate_read_hits, 4);
+
+        for _ in 0..3 {
+            assert_eq!(
+                guard.observe_round([("read", same_slice, true)]),
+                ReadLoopAction::Continue
+            );
+        }
         assert_eq!(
             guard.observe_round([("read", same_slice, true)]),
+            ReadLoopAction::HardStop
+        );
+        assert!(
+            guard
+                .hard_stop_message()
+                .contains("repeated identical read/search queries 8 times"),
+            "unexpected duplicate hard stop message: {}",
+            guard.hard_stop_message()
+        );
+
+        // Non-read exploration tools (`grep`, `glob`, `code_explore`) also track duplicate queries.
+        guard.reset_all();
+        let same_grep = r#"{"pattern":"foo","path":"crates/jeikcode-kernel"}"#;
+        let same_glob = r#"{"pattern":"*.rs","path":"crates"}"#;
+        let same_explore = r#"{"path":"crates/jeikcode-coding","query":"reload"}"#;
+        assert_eq!(
+            guard.observe_round([
+                ("grep", same_grep, true),
+                ("glob", same_glob, true),
+                ("code_explore", same_explore, true),
+            ]),
             ReadLoopAction::Continue
         );
+        // 1 duplicate grep + 1 duplicate glob + 1 duplicate code_explore = 3 hits (below 4),
+        // then 1 more duplicate grep = 4 hits -> SoftSteer.
         assert_eq!(
-            guard.observe_round([("read", same_slice, true)]),
+            guard.observe_round([
+                ("grep", same_grep, true),
+                ("glob", same_glob, true),
+                ("code_explore", same_explore, true),
+            ]),
             ReadLoopAction::Continue
         );
         assert!(matches!(
-            guard.observe_round([("read", same_slice, true)]),
+            guard.observe_round([("grep", same_grep, true)]),
             ReadLoopAction::SoftSteer(_)
         ));
+        // 4 more duplicate hits reach 8 -> HardStop.
+        assert_eq!(
+            guard.observe_round([
+                ("grep", same_grep, true),
+                ("glob", same_glob, true),
+                ("code_explore", same_explore, true),
+            ]),
+            ReadLoopAction::Continue
+        );
+        assert_eq!(
+            guard.observe_round([("glob", same_glob, true)]),
+            ReadLoopAction::HardStop
+        );
 
         // 2 drain compactions without mutation trigger HardStop.
         guard.reset_all();

@@ -156,6 +156,7 @@ struct HubState {
     pending_web_steers: VecDeque<PendingWebSteer>,
     /// Present when the hub VIEW is not the execution session.
     stashed_execution: Option<StashedExecution>,
+    telemetry: Option<Arc<jeikcode_telemetry::Telemetry>>,
 }
 
 impl HubState {
@@ -1061,17 +1062,47 @@ impl LiveViewHub {
         Ok(changed)
     }
 
-    pub async fn reload_capabilities(&self) -> Result<jeikcode_coding::SessionChanged, HubError> {
+    pub async fn reload_capabilities(
+        &self,
+        telemetry: Option<std::sync::Arc<jeikcode_telemetry::Telemetry>>,
+    ) -> Result<jeikcode_coding::SessionChanged, HubError> {
         let (binding, handle) = self.bound_handle()?;
-        let changed = handle
-            .reload_capabilities_with_plugin_skills(Some(crate::gather_plugin_skill_dirs_for(
-                &binding.working_dir,
-            )))
-            .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        let reload_telemetry = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.telemetry.clone()
+        };
+        let fresh_config = crate::native_live::build_reload_coding_config(
+            &binding.working_dir,
+            Some(&binding.provider),
+            Some(&binding.session_id),
+            telemetry.or(reload_telemetry),
+        );
+        let changed = match fresh_config {
+            Some(cfg) => {
+                handle
+                    .reload_capabilities_with_config(
+                        Some(crate::gather_plugin_skill_dirs_for(&binding.working_dir)),
+                        cfg,
+                    )
+                    .await
+            }
+            None => {
+                handle
+                    .reload_capabilities_with_plugin_skills(Some(
+                        crate::gather_plugin_skill_dirs_for(&binding.working_dir),
+                    ))
+                    .await
+            }
+        }
+        .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
+    }
+
+    pub fn set_telemetry(&self, telemetry: Arc<jeikcode_telemetry::Telemetry>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.telemetry = Some(telemetry);
     }
 
     pub fn publish_command_output(&self, text: String) -> Result<(), HubError> {
@@ -1508,15 +1539,44 @@ impl LiveViewHub {
         }
         drop(state);
         if let (Some(handle), Some(working_dir)) = (reload_handle, reload_working_dir) {
+            let (reload_provider, reload_session_id, reload_telemetry) = {
+                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                (
+                    state.binding.as_ref().map(|b| b.identity.provider.clone()),
+                    state
+                        .binding
+                        .as_ref()
+                        .map(|b| b.identity.session_id.clone()),
+                    state.telemetry.clone(),
+                )
+            };
             tokio::spawn(async move {
                 // The turn just finished; the actor may still be snapshotting.
                 // Retry Busy so the agent-requested remount lands for the next user turn.
                 let plugin_dirs = crate::gather_plugin_skill_dirs_for(&working_dir);
+                let fresh_config = crate::native_live::build_reload_coding_config(
+                    &working_dir,
+                    reload_provider.as_deref(),
+                    reload_session_id.as_deref(),
+                    reload_telemetry,
+                );
                 for _ in 0..20 {
-                    match handle
-                        .reload_capabilities_with_plugin_skills(Some(plugin_dirs.clone()))
-                        .await
-                    {
+                    let result = match fresh_config.as_ref() {
+                        Some(cfg) => {
+                            handle
+                                .reload_capabilities_with_config(
+                                    Some(plugin_dirs.clone()),
+                                    cfg.clone(),
+                                )
+                                .await
+                        }
+                        None => {
+                            handle
+                                .reload_capabilities_with_plugin_skills(Some(plugin_dirs.clone()))
+                                .await
+                        }
+                    };
+                    match result {
                         Ok(_) => break,
                         Err(jeikcode_coding::RuntimeError::Busy) => {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -2958,5 +3018,110 @@ mod tests {
             LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(AgentEvent::TextDelta(text)))
                 if text == "scanning…"
         )));
+    }
+
+    #[tokio::test]
+    async fn reload_capabilities_passes_fresh_config_into_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[coding]\ncompact_threshold = 0.5\ncompact_max_tokens = 450000\n",
+        )
+        .unwrap();
+        let store = jeikcode_config::ConfigStore::new(&cfg_path);
+        let snap = store.read().unwrap();
+        let mut cfg = snap.config;
+        cfg.default_model = Some("m".into());
+        cfg.models.insert(
+            "m".into(),
+            jeikcode_config::config::provider::ModelProfileConfig {
+                account: "acc".into(),
+                model: "m".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 1_000_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                capable_model: None,
+                pricing: None,
+                supports_vision: None,
+                reasoning_model: None,
+            },
+        );
+        cfg.provider_accounts.insert(
+            "acc".into(),
+            jeikcode_config::config::provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("k".into()),
+                base_url: Some("https://example.invalid/v1".into()),
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        let built = crate::native_live::build_reload_coding_config_from(
+            &cfg,
+            dir.path(),
+            Some("m"),
+            None,
+            None,
+        )
+        .expect("fresh coding config");
+        assert!((built.compact_threshold - 0.5).abs() < 1e-6);
+        assert_eq!(built.compact_max_tokens, Some(450_000));
+
+        // Also exercise the real CodingRuntime actor reload path with `reload_capabilities_with_config`.
+        let mut agent_cfg = crate::kernel_runtime::coding_config_from_runtime(
+            &jeikcode_coding::CodingRuntimeConfig::from_config(
+                &cfg,
+                dir.path(),
+                None,
+                None,
+                true,
+                false,
+            ),
+        );
+        agent_cfg.compact_threshold = 0.35;
+        let prepare = jeikcode_coding::PrepareOptions {
+            request_user_input: false,
+            session: jeikcode_coding::SessionMode::Disabled,
+            skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            shared_mcp_registry: None,
+            memory: false,
+            web: false,
+            review: false,
+            rate_limit_source: None,
+        };
+        let start = jeikcode_coding::CodingRuntimeStart {
+            agent: agent_cfg,
+            prepare,
+            provider_factory: crate::runtime_host::coding_provider_factory(),
+            plugin_hooks: crate::runtime_host::installed_plugin_hook_source(),
+            image_preprocessor: None,
+        };
+        let runtime = jeikcode_coding::CodingRuntime::start_with_bootstrap(
+            start,
+            jeikcode_coding::ProviderBootstrap::Required,
+        )
+        .await
+        .expect("start test runtime");
+        let handle = runtime.handle.clone();
+        let changed = handle
+            .reload_capabilities_with_config(Some(Vec::new()), built)
+            .await
+            .expect("reload_capabilities_with_config succeeds");
+        assert!(changed.generation.0 >= 1);
+        let _ = handle.shutdown().await;
     }
 }

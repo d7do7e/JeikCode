@@ -20696,7 +20696,11 @@ pub(crate) async fn reload_mcp_and_live_runtime(
         *state.mcp_registry.write().await = registry;
     }
     match crate::native_live::binding() {
-        Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
+        Ok(_) => {
+            crate::native_live::reload_capabilities_with_telemetry(Some(state.telemetry.clone()))
+                .await
+                .is_ok()
+        }
         Err(_) => true,
     }
 }

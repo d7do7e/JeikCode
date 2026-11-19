@@ -730,8 +730,33 @@ fn live_current_provider() -> String {
         return binding.provider;
     }
     Config::load(&Config::default_path())
-        .map(|c| c.default_provider)
+        .ok()
+        .and_then(|c| c.effective_model_selection())
         .unwrap_or_default()
+}
+
+fn resolve_registry_session_provider(
+    config: &Config,
+    working_dir: &Path,
+    session_id: &str,
+) -> Option<String> {
+    let mgr = jeikcode_capabilities::session::SessionManager::for_project(working_dir);
+    let preferred = mgr
+        .load_native_session(session_id)
+        .ok()
+        .and_then(|loaded| loaded.meta.preferred_model)
+        .or_else(|| {
+            crate::resolve_session_by_id(session_id)
+                .ok()
+                .flatten()
+                .and_then(|resolved| resolved.meta.preferred_model)
+        })
+        .filter(|name| !name.is_empty() && config.selection_exists(name));
+    preferred.or_else(|| {
+        config
+            .effective_model_selection()
+            .filter(|name| !name.is_empty() && config.selection_exists(name))
+    })
 }
 
 /// Resolve the effective provider key: an explicit `provider_name` override wins,
@@ -3306,22 +3331,31 @@ pub(crate) async fn live_message(
             // an active turn short-circuits with `active_turn: true` so the
             // client can revert its optimistic selection and prompt the user to
             // stop the turn first.
-            if let Some(requested) = requested_provider.as_deref() {
+            let reload_config = jeikcode_config::ConfigStore::default_store()
+                .read()
+                .map(|s| s.config)
+                .unwrap_or_else(|_| Config::load(&Config::default_path()).unwrap_or_default());
+            let resolved_session_provider = requested_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    registry
+                        .provider_fingerprint(&session_id)
+                        .is_none()
+                        .then(|| {
+                            resolve_registry_session_provider(&reload_config, &wd, &session_id)
+                        })
+                        .flatten()
+                });
+            if let Some(requested) = resolved_session_provider {
                 if let Some(handle) = registry.handle(&session_id) {
-                    let reload_config = jeikcode_config::ConfigStore::default_store()
-                        .read()
-                        .map(|s| s.config)
-                        .unwrap_or_else(|_| {
-                            Config::load(&Config::default_path()).unwrap_or_default()
-                        });
-                    if !reload_config.selection_exists(requested) {
-                        return Json(serde_json::json!({
-                            "accepted": false,
-                            "error": format!("provider {requested:?} not found"),
-                        }));
-                    }
-                    let requested_fingerprint =
-                        match crate::native_live::provider_fingerprint(&reload_config, requested) {
+                    if reload_config.selection_exists(&requested) {
+                        let requested_fingerprint = match crate::native_live::provider_fingerprint(
+                            &reload_config,
+                            &requested,
+                        ) {
                             Ok(fp) => fp,
                             Err(error) => {
                                 return Json(serde_json::json!({
@@ -3330,47 +3364,64 @@ pub(crate) async fn live_message(
                                 }));
                             }
                         };
-                    let needs_reload = registry
-                        .provider_fingerprint(&session_id)
-                        .as_deref()
-                        .map(|bound| bound != requested_fingerprint.as_str())
-                        .unwrap_or(true);
-                    if needs_reload {
-                        use jeikcode_coding::runtime::RuntimePhase;
-                        match handle.status().phase {
-                            RuntimePhase::InTurn | RuntimePhase::WaitingApproval => {
-                                return Json(serde_json::json!({
-                                    "accepted": false,
-                                    "active_turn": true,
-                                    "error": "a turn is running; stop it before switching the model",
-                                }));
+                        let needs_reload = registry
+                            .provider_fingerprint(&session_id)
+                            .as_deref()
+                            .map(|bound| bound != requested_fingerprint.as_str())
+                            .unwrap_or(true);
+                        if needs_reload {
+                            use jeikcode_coding::runtime::RuntimePhase;
+                            match handle.status().phase {
+                                RuntimePhase::InTurn | RuntimePhase::WaitingApproval => {
+                                    if requested_provider.is_some() {
+                                        return Json(serde_json::json!({
+                                            "accepted": false,
+                                            "active_turn": true,
+                                            "error": "a turn is running; stop it before switching the model",
+                                        }));
+                                    }
+                                }
+                                _ => {
+                                    let mut runtime_config = live_runtime_config(
+                                        &reload_config,
+                                        &requested,
+                                        &wd,
+                                        state.telemetry.clone(),
+                                    );
+                                    apply_session_effort_override(
+                                        &mut runtime_config,
+                                        &wd,
+                                        Some(&session_id),
+                                    );
+                                    let next = crate::kernel_runtime::coding_config_from_runtime(
+                                        &runtime_config,
+                                    );
+                                    if let Err(error) = handle.reassemble_provider(next).await {
+                                        let active_turn = matches!(
+                                            error,
+                                            jeikcode_coding::runtime::RuntimeError::Busy
+                                                | jeikcode_coding::runtime::RuntimeError::Unavailable
+                                        );
+                                        return Json(serde_json::json!({
+                                            "accepted": false,
+                                            "active_turn": active_turn,
+                                            "error": format!(
+                                                "registry provider reload rejected: {error:?}"
+                                            ),
+                                        }));
+                                    }
+                                    registry.set_provider_fingerprint(
+                                        &session_id,
+                                        Some(requested_fingerprint.clone()),
+                                    );
+                                }
                             }
-                            _ => {}
                         }
-                        let runtime_config = live_runtime_config(
-                            &reload_config,
-                            requested,
-                            &wd,
-                            state.telemetry.clone(),
-                        );
-                        let next =
-                            crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-                        if let Err(error) = handle.reassemble_provider(next).await {
-                            let active_turn = matches!(
-                                error,
-                                jeikcode_coding::runtime::RuntimeError::Busy
-                                    | jeikcode_coding::runtime::RuntimeError::Unavailable
-                            );
-                            return Json(serde_json::json!({
-                                "accepted": false,
-                                "active_turn": active_turn,
-                                "error": format!("registry provider reload rejected: {error:?}"),
-                            }));
-                        }
-                        registry.set_provider_fingerprint(
-                            &session_id,
-                            Some(requested_fingerprint.clone()),
-                        );
+                    } else if requested_provider.is_some() {
+                        return Json(serde_json::json!({
+                            "accepted": false,
+                            "error": format!("provider {requested:?} not found"),
+                        }));
                     }
                 }
             }

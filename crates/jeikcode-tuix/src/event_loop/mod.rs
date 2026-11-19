@@ -10061,6 +10061,35 @@ fn active_provider_config_changed(current: &Config, desired: &Config) -> bool {
         && resolved_provider_fingerprint(current) != resolved_provider_fingerprint(desired)
 }
 
+/// Whether `[coding]`, `keep_interrupted_context`, `loop_config`, or
+/// `[tools.tool_output]` / `[tools.todo]` fields baked into `CodingAgentConfig`
+/// changed between `current` and `desired`. Unlike provider selection, these
+/// edits must propagate into the live runtime on `/reload` and external polls.
+fn runtime_agent_config_changed(current: &Config, desired: &Config) -> bool {
+    let a = &current.coding;
+    let b = &desired.coding;
+    a.max_rounds != b.max_rounds
+        || a.connect_timeout_secs != b.connect_timeout_secs
+        || a.open_timeout_secs != b.open_timeout_secs
+        || a.ttft_secs != b.ttft_secs
+        || a.transition_secs != b.transition_secs
+        || a.streaming_sliding_secs != b.streaming_sliding_secs
+        || a.first_token_timeout_retries != b.first_token_timeout_retries
+        || a.compact_threshold.to_bits() != b.compact_threshold.to_bits()
+        || a.compact_max_tokens != b.compact_max_tokens
+        || a.goal_max_rounds != b.goal_max_rounds
+        || a.goal_rollback_on_stall != b.goal_rollback_on_stall
+        || a.goal_fresh_epoch != b.goal_fresh_epoch
+        || current.keep_interrupted_context != desired.keep_interrupted_context
+        || current.loop_config.max_rounds != desired.loop_config.max_rounds
+        || current.tools.tool_output.max_bytes != desired.tools.tool_output.max_bytes
+        || current.tools.tool_output.terminal_max_bytes
+            != desired.tools.tool_output.terminal_max_bytes
+        || current.tools.tool_output.no_fold_tools != desired.tools.tool_output.no_fold_tools
+        || current.tools.todo.enabled != desired.tools.todo.enabled
+        || current.tools.todo.eager != desired.tools.todo.eager
+}
+
 fn config_for_persistence(
     desired: &Config,
     persisted: &Config,
@@ -11025,6 +11054,40 @@ mod external_config_tests {
             Some(&persisted.snapshot.revision),
         ));
     }
+
+    #[test]
+    fn runtime_agent_config_changed_detects_coding_and_tool_output_edits() {
+        let base = config("m", false);
+        assert!(!runtime_agent_config_changed(&base, &base));
+
+        let mut changed = base.clone();
+        changed.coding.compact_threshold = 0.5;
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.coding.compact_max_tokens = Some(400_000);
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.coding.max_rounds = 120;
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.coding.ttft_secs = 90;
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.tools.tool_output.max_bytes = Some(32_768);
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.keep_interrupted_context = !base.keep_interrupted_context;
+        assert!(runtime_agent_config_changed(&base, &changed));
+
+        let mut changed = base.clone();
+        changed.coding.goal_max_rounds = Some(150);
+        assert!(runtime_agent_config_changed(&base, &changed));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11213,7 +11276,8 @@ fn reconcile_persisted_config(
         ctx.runtime.ui_availability(),
         auth_available,
     ) || (manual_reload_announce
-        && active_provider_config_changed(&ctx.config, &desired));
+        && active_provider_config_changed(&ctx.config, &desired))
+        || runtime_agent_config_changed(&ctx.config, &desired);
 
     if !wants_reload {
         let (provider, model) = resolved_provider_and_model(&desired);
@@ -11236,17 +11300,13 @@ fn reconcile_persisted_config(
         return Ok(PersistedConfigReload::Applied { provider, model });
     }
 
-    if manual_reload_announce && ctx.runtime.is_turn_busy() {
+    if ctx.runtime.is_turn_busy() {
         return Ok(PersistedConfigReload::Busy);
     }
 
     let origin_generation = ctx.runtime.current_generation();
     jeikcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-    let enqueue_res = if manual_reload_announce {
-        reload_runtime_provider_when_idle_from(ctx, &desired)
-    } else {
-        reload_runtime_provider_from(ctx, &desired)
-    };
+    let enqueue_res = reload_runtime_provider_when_idle_from(ctx, &desired);
     if let Err(error) = enqueue_res {
         jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
         return Err(anyhow::anyhow!(
@@ -11570,6 +11630,7 @@ fn poll_shared_state(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
     if config_changed {
         crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
     }
+    poll_agent_requested_config_reload(ctx, renderer);
     let auth_changed = poll_external_auth(ctx);
     config_changed || auth_changed
 }
@@ -14513,6 +14574,17 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
     }
     let plugin_skill_dirs =
         jeikcode_capabilities::plugin::loader::installed_plugin_skill_dirs(&ctx.working_dir);
+    let refreshed_snapshot = match ctx.config_store.read() {
+        Ok(snapshot) => {
+            let desired = desired_config_from_snapshot(ctx, snapshot.config, true);
+            let agent_cfg = build_agent_config_for_reload(ctx, &desired);
+            Some((snapshot.revision, desired, agent_cfg))
+        }
+        Err(error) => {
+            crate::tuix_trace!("CONFIG", "capability reload config read failed: {error:#}");
+            None
+        }
+    };
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             jeikcode_capabilities::mcp::ProjectMcpPool::global()
@@ -14521,8 +14593,9 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
         })
     });
     ctx.runtime
-        .reload_capabilities(
+        .reload_capabilities_with_config(
             plugin_skill_dirs.clone(),
+            refreshed_snapshot.as_ref().map(|(_, _, cfg)| cfg.clone()),
             ctx.foreground_runtime_id,
             ctx.runtime_event_tx.clone(),
         )
@@ -14532,6 +14605,23 @@ pub(crate) fn request_capability_reload(ctx: &mut LoopCtx) -> Result<(), String>
             })
             .into_owned()
         })?;
+    if let Some((revision, desired, _)) = refreshed_snapshot {
+        if ctx.config.language != desired.language {
+            crate::i18n::set_locale(jeikcode_config::i18n::resolve_initial_locale(
+                None,
+                desired.language,
+            ));
+        }
+        ctx.config = desired;
+        sync_reasoning_effort_from_provider(ctx);
+        jeikcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        ctx.observed_config_revision = Some(revision);
+    }
+    if ctx.pending_provider_reload.is_some() {
+        // An automatic reload is already queued or in flight; once capabilities
+        // reload completes, let external config polling re-verify the revision.
+        ctx.observed_config_revision = None;
+    }
     ctx.bg_manager.reload_capabilities_for_working_dir(
         &ctx.working_dir,
         plugin_skill_dirs,
@@ -14815,7 +14905,7 @@ fn stage_committed_config_reload(
     let rollback_runtime_config = Some(previous_runtime_config);
     let origin_generation = ctx.runtime.current_generation();
     jeikcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
-    if let Err(error) = reload_runtime_provider_from(ctx, &desired) {
+    if let Err(error) = reload_runtime_provider_when_idle_from(ctx, &desired) {
         let rollback = rollback_pending_provider_reload(
             ctx,
             PendingProviderReload {

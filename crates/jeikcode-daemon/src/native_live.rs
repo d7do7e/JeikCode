@@ -1032,8 +1032,67 @@ pub async fn change_directory(
     hub().change_directory(working_dir).await
 }
 
+pub(crate) fn build_reload_coding_config_from(
+    config: &jeikcode_config::config::Config,
+    working_dir: &Path,
+    provider_hint: Option<&str>,
+    session_id: Option<&str>,
+    telemetry: Option<std::sync::Arc<jeikcode_telemetry::Telemetry>>,
+) -> Option<jeikcode_coding::CodingAgentConfig> {
+    let provider_name = provider_hint
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && config.selection_exists(name))
+        .map(str::to_string)
+        .or_else(|| config.effective_model_selection())
+        .filter(|name| !name.is_empty() && config.selection_exists(name))?;
+    let telemetry = telemetry.unwrap_or_else(|| {
+        jeikcode_telemetry::Telemetry::init(
+            jeikcode_telemetry::ResolvedConfig {
+                state: jeikcode_telemetry::TelemetryState::Disabled("reload"),
+                endpoint: String::new(),
+                jeikcode_dir: jeikcode_config::config::Config::config_dir(),
+            },
+            env!("CARGO_PKG_VERSION").into(),
+        )
+    });
+    let mut runtime_config =
+        crate::live_api::live_runtime_config(config, &provider_name, working_dir, telemetry);
+    crate::live_api::apply_session_effort_override(&mut runtime_config, working_dir, session_id);
+    Some(crate::kernel_runtime::coding_config_from_runtime(
+        &runtime_config,
+    ))
+}
+
+pub(crate) fn build_reload_coding_config(
+    working_dir: &Path,
+    provider_hint: Option<&str>,
+    session_id: Option<&str>,
+    telemetry: Option<std::sync::Arc<jeikcode_telemetry::Telemetry>>,
+) -> Option<jeikcode_coding::CodingAgentConfig> {
+    let config = jeikcode_config::ConfigStore::default_store()
+        .read()
+        .ok()
+        .map(|snap| snap.config)
+        .or_else(|| {
+            let path = jeikcode_config::config::Config::default_path();
+            path.is_file()
+                .then(|| jeikcode_config::config::Config::load(&path).ok())
+                .flatten()
+        })?;
+    build_reload_coding_config_from(&config, working_dir, provider_hint, session_id, telemetry)
+}
+
 pub async fn reload_capabilities() -> Result<jeikcode_coding::SessionChanged, HubError> {
-    hub().reload_capabilities().await
+    reload_capabilities_with_telemetry(None).await
+}
+
+pub async fn reload_capabilities_with_telemetry(
+    telemetry: Option<std::sync::Arc<jeikcode_telemetry::Telemetry>>,
+) -> Result<jeikcode_coding::SessionChanged, HubError> {
+    if let Some(tel) = telemetry.as_ref() {
+        hub().set_telemetry(tel.clone());
+    }
+    hub().reload_capabilities(telemetry).await
 }
 
 pub fn publish_command_output(text: String) -> Result<(), HubError> {
