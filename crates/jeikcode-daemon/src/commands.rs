@@ -483,8 +483,8 @@ pub(crate) fn snapshot_used_tokens(messages: &[jeikcode_kernel::message::Message
     messages
         .iter()
         .rev()
-        .find(|m| m.role == Role::Assistant)
-        .and_then(|m| m.meta.as_ref())
+        .filter(|m| m.role == Role::Assistant && !m.is_display_only())
+        .find_map(|m| m.meta.as_ref())
         .map(|meta| meta.used_tokens)
         .unwrap_or(0)
 }

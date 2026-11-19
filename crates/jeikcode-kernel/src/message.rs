@@ -1109,8 +1109,8 @@ impl Conversation {
         self.messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::Assistant)
-            .and_then(|m| m.meta.as_ref())
+            .filter(|m| m.role == Role::Assistant && !m.is_display_only())
+            .find_map(|m| m.meta.as_ref())
             .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
             .unwrap_or((0, 0, 0.0))
     }
@@ -1128,7 +1128,7 @@ impl Conversation {
         self.messages
             .iter()
             .rev()
-            .filter(|m| m.role == Role::Assistant)
+            .filter(|m| m.role == Role::Assistant && !m.is_display_only())
             .find_map(|m| m.meta.as_ref())
             .map(|meta| meta.tokens.prompt.saturating_add(meta.tokens.completion))
             .unwrap_or(0)
@@ -3128,5 +3128,35 @@ mod tests {
         assert_eq!(c.frozen_prefix_end(), 3);
         assert!(c.messages[2].text.starts_with("<project_instructions>"));
         assert!(c.messages[3].text.starts_with("<!-- jeikcode:anchor"));
+    }
+
+    #[test]
+    fn last_pressure_and_last_context_tokens_skip_diagnostic_and_metaless_assistant_rows() {
+        let mut c = Conversation::new();
+        c.push(Message::user("hi"));
+        let mut real = Message::assistant("answer", vec![]);
+        real.meta = Some(MessageMeta {
+            tokens: crate::stream::TokenUsage {
+                prompt: 12_000,
+                completion: 3_000,
+                cached: 9_000,
+            },
+            used_tokens: 12_000,
+            ctx_window: 100_000,
+            utilization: 0.12,
+            ..Default::default()
+        });
+        c.push(real);
+
+        // Diagnostic assistant row (meta: None, internal_origin: Some(TURN_DIAGNOSTIC_ORIGIN))
+        let mut diag = Message::assistant("rate limited", vec![]);
+        diag.internal_origin = Some(TURN_DIAGNOSTIC_ORIGIN.into());
+        c.push(diag);
+
+        // Trailing empty assistant placeholder with meta: None
+        c.push(Message::assistant("", vec![]));
+
+        assert_eq!(c.last_pressure(), (100_000, 12_000, 0.12));
+        assert_eq!(c.last_context_tokens(), 15_000);
     }
 }

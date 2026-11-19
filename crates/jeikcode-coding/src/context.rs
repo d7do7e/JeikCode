@@ -99,8 +99,8 @@ fn snapshot_last_used_tokens(messages: &[Message]) -> u32 {
     messages
         .iter()
         .rev()
-        .find(|m| m.role == Role::Assistant)
-        .and_then(|m| m.meta.as_ref())
+        .filter(|m| m.role == Role::Assistant && !m.is_display_only())
+        .find_map(|m| m.meta.as_ref())
         .map(|meta| meta.used_tokens)
         .unwrap_or(0)
 }

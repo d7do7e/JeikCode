@@ -3234,9 +3234,8 @@ fn last_assistant_request_usage(
     let meta = messages
         .iter()
         .rev()
-        .find(|message| message.role == Role::Assistant)?
-        .meta
-        .as_ref()?;
+        .filter(|message| message.role == Role::Assistant && !message.is_display_only())
+        .find_map(|message| message.meta.as_ref())?;
     let prompt = if meta.tokens.prompt > 0 {
         meta.tokens.prompt as usize
     } else {
@@ -3300,8 +3299,17 @@ pub(crate) fn session_token_usage_from_session(
         last_assistant_request_usage(&snapshot.messages)
     {
         let mut cached_estimated = false;
+        let provider_reported_cache_before = snapshot.messages.iter().any(|m| {
+            m.role == jeikcode_kernel::message::Role::Assistant
+                && !m.is_display_only()
+                && m.meta.as_ref().is_some_and(|mm| mm.tokens.cached > 0)
+        });
         let cached = if cached > 0 && cached <= prompt {
             cached
+        } else if provider_reported_cache_before {
+            // Prior assistant turns in this session already reported real cache hits;
+            // an explicit cached == 0 on the latest turn signals a genuine cache miss/collapse.
+            0
         } else if let Some(estimated) = estimate_cache_from_previous_turn(meta, prompt) {
             cached_estimated = true;
             estimated
@@ -12821,6 +12829,55 @@ mod session_token_usage_tests {
         assert_eq!(usage.prompt, 22_000);
         assert_eq!(usage.cached, 20_000);
         assert!(usage.cached_estimated);
+    }
+
+    #[test]
+    fn session_token_usage_skips_diagnostic_rows_and_preserves_cache_collapse() {
+        let mut prior = Message::assistant("first", Vec::new());
+        prior.meta = Some(MessageMeta {
+            tokens: KernelTokenUsage {
+                prompt: 30_000,
+                completion: 500,
+                cached: 25_000,
+            },
+            used_tokens: 30_000,
+            ctx_window: 200_000,
+            ..MessageMeta::default()
+        });
+
+        let mut latest = Message::assistant("second", Vec::new());
+        latest.meta = Some(MessageMeta {
+            tokens: KernelTokenUsage {
+                prompt: 32_000,
+                completion: 400,
+                cached: 0,
+            },
+            used_tokens: 32_000,
+            ctx_window: 200_000,
+            ..MessageMeta::default()
+        });
+
+        let mut diag = Message::assistant("provider timeout", Vec::new());
+        diag.internal_origin = Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN.into());
+
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("u1"),
+            prior,
+            Message::user("u2"),
+            latest,
+            diag,
+        ]);
+        let mut meta = SessionMeta::new("s-diag-collapse", "/p", 2);
+        meta.turn_stats = vec![usage_stat(30_000, 500, 25_000), usage_stat(32_000, 400, 0)];
+
+        let usage = session_token_usage_from_session(&meta, &snapshot).unwrap();
+        assert_eq!(usage.prompt, 32_000);
+        assert_eq!(usage.completion, 400);
+        assert_eq!(
+            usage.cached, 0,
+            "explicit 0 cache after prior cache hits must stay 0 instead of faking ~95% estimate"
+        );
+        assert!(!usage.cached_estimated);
     }
 
     #[test]

@@ -3515,9 +3515,13 @@ impl RunningAgent {
                         last_counted_drain_round = Some(round);
                         read_loop_guard.note_drain_compaction();
                     }
+                    let ran_attempt = attempts;
                     attempts += 1;
                     if est(&convo.messages) >= before {
-                        break; // nothing drained (sacred floor / single huge input) — warn below
+                        if ran_attempt < 2 {
+                            continue;
+                        }
+                        break; // Tier 2 drain produced no reduction (sacred floor / single huge input)
                     }
                     messages = convo.model_history();
                     self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -9129,5 +9133,141 @@ mod synthetic_send_tests {
         let (window, used) = RunningAgent::resolve_pressure_facts(&convo).unwrap();
         assert_eq!(window, 100_000);
         assert_eq!(used, 70_000);
+    }
+
+    #[tokio::test]
+    async fn pre_send_emergency_compaction_escalates_past_noop_tiers_to_tier2_drain() {
+        use crate::message::{CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView};
+        use crate::stream::TokenUsage;
+        use crate::testkit::RecordingProvider;
+        use crate::tool::ToolCall;
+        use async_trait::async_trait;
+        use std::sync::{Arc, Mutex};
+
+        struct Tier2EscalationStrategy {
+            attempts: Arc<Mutex<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl CompactionStrategy for Tier2EscalationStrategy {
+            async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+                let CompactTrigger::Overflow { attempt } = view.trigger else {
+                    return CompactionPlan::noop();
+                };
+                self.attempts.lock().unwrap().push(attempt);
+                if attempt < 2 {
+                    return CompactionPlan::noop();
+                }
+                // Tier 2 drains older rounds past sacred_floor while keeping the latest round.
+                let drain_to = view.messages.len().saturating_sub(2);
+                if drain_to <= view.sacred_floor {
+                    return CompactionPlan::noop();
+                }
+                CompactionPlan {
+                    drain_from: view.sacred_floor,
+                    drain_to,
+                    summary: Some("drained summary".into()),
+                    rewrites: Vec::new(),
+                    resume_note: None,
+                }
+            }
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        // Context window 12_000 -> input_watermark_budget = 10_800.
+        // Round 1 returns 3 tool calls with 20_000 chars each (~15_000 tokens total),
+        // pushing round 2 past 10_800 so pre-send emergency compaction must fire.
+        let mut r1 = Vec::new();
+        for i in 0..3 {
+            r1.push(StreamEvent::ToolCall(ToolCall {
+                id: format!("c{i}"),
+                name: "read".into(),
+                arguments: format!(r#"{{"path":"big_{i}.rs"}}"#),
+            }));
+        }
+        r1.push(StreamEvent::Usage(TokenUsage {
+            prompt: 500,
+            completion: 100,
+            cached: 0,
+        }));
+        r1.push(StreamEvent::Done { truncated: false });
+
+        let r2 = vec![
+            StreamEvent::TextDelta("done after tier 2".into()),
+            StreamEvent::Done { truncated: false },
+        ];
+
+        struct BigReadTool;
+        #[async_trait]
+        impl crate::tool::Tool for BigReadTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn description(&self) -> &str {
+                "read"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn read_only_hint(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _args: &str,
+                _ctx: &crate::tool::ToolContext,
+            ) -> crate::tool::ToolResult {
+                crate::tool::ToolResult {
+                    call_id: String::new(),
+                    content: "x".repeat(20_000),
+                    is_error: false,
+                    images: Vec::new(),
+                }
+            }
+        }
+
+        let provider = Arc::new(RecordingProvider::new(vec![r1, r2]).with_ctx_window(12_000));
+        let calls = provider.calls();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(BigReadTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["read"]))
+            .compaction(Arc::new(Tier2EscalationStrategy {
+                attempts: Arc::clone(&attempts),
+            }))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut compacted_events = 0usize;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Compacted { committed, .. } => {
+                    if committed {
+                        compacted_events += 1;
+                    }
+                }
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![0, 1, 2],
+            "pre-send emergency compaction must advance through noop tiers 0 and 1 to tier 2"
+        );
+        assert_eq!(compacted_events, 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 }
