@@ -1968,10 +1968,10 @@ impl RunningAgent {
             })
             .and_then(|m| m.meta.as_ref())
             .map(|meta| {
-                let used = if meta.used_tokens > 0 {
-                    meta.used_tokens
-                } else if meta.tokens.prompt > 0 {
+                let used = if meta.tokens.prompt > 0 {
                     meta.tokens.prompt.saturating_add(meta.tokens.completion)
+                } else if meta.used_tokens > 0 {
+                    meta.used_tokens
                 } else {
                     convo
                         .messages
@@ -2080,14 +2080,7 @@ impl RunningAgent {
         let prefix_len = convo
             .messages
             .iter()
-            .take_while(|m| {
-                m.role == crate::message::Role::System
-                    || (m.role == crate::message::Role::User
-                        && m.synthetic
-                        && !m.autonomous_turn
-                        && !m.is_compaction_turn_start()
-                        && !m.text.trim_start().starts_with("<!-- jeikcode:anchor"))
-            })
+            .take_while(|m| m.role == crate::message::Role::System || m.is_frozen_prefix_user())
             .count();
         convo.messages.truncate(prefix_len);
         convo.delivered_context_hashes.clear();
@@ -2147,10 +2140,10 @@ impl RunningAgent {
             })
             .and_then(|m| m.meta.as_ref())
             .map(|meta| {
-                let used = if meta.used_tokens > 0 {
-                    meta.used_tokens
-                } else {
+                let used = if meta.tokens.prompt > 0 {
                     meta.tokens.prompt.saturating_add(meta.tokens.completion)
+                } else {
+                    meta.used_tokens
                 };
                 (meta.ctx_window, used)
             })
@@ -9112,5 +9105,29 @@ mod synthetic_send_tests {
 
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
+    }
+
+    #[test]
+    fn resolve_pressure_facts_includes_completion_when_used_tokens_is_nonzero() {
+        let mut convo = Conversation::new();
+        convo.push(Message::system("sys"));
+        convo.push(Message::user("hi"));
+        let mut reply = Message::assistant("done", vec![]);
+        reply.meta = Some(crate::message::MessageMeta {
+            tokens: crate::stream::TokenUsage {
+                prompt: 50_000,
+                completion: 20_000,
+                cached: 40_000,
+            },
+            ctx_window: 100_000,
+            used_tokens: 50_000,
+            utilization: 0.5,
+            ..Default::default()
+        });
+        convo.push(reply);
+
+        let (window, used) = RunningAgent::resolve_pressure_facts(&convo).unwrap();
+        assert_eq!(window, 100_000);
+        assert_eq!(used, 70_000);
     }
 }

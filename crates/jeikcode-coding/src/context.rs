@@ -186,11 +186,7 @@ where
             let mut end = lead_system;
             // Include the v2 frozen synthetic user prefix (skills, MCP, memory,
             // preferences, project instructions) before the first real prompt or anchor.
-            while end < wire.len()
-                && wire[end].role == Role::User
-                && wire[end].synthetic
-                && !is_compaction_anchor_text(&wire[end].text)
-            {
+            while end < wire.len() && wire[end].is_frozen_prefix_user() {
                 end += 1;
             }
             let prompt = join_non_empty_blocks(wire[..end].iter().map(|m| m.text.as_str()));

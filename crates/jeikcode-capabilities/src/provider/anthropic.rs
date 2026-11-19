@@ -686,11 +686,7 @@ fn count_leading_synthetic_user_blocks(messages: &[Message]) -> usize {
         if m.role == Role::System {
             continue;
         }
-        if m.role == Role::User
-            && m.synthetic
-            && !m.autonomous_turn
-            && !crate::compaction::is_compaction_anchor_text(&m.text)
-        {
+        if m.is_frozen_prefix_user() {
             let formatted = format_user_message(m);
             let content = formatted.get("content").cloned().unwrap_or(Value::Null);
             blocks += content_to_blocks(content).len();

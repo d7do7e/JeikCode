@@ -405,6 +405,19 @@ impl Message {
         }
     }
 
+    /// Whether this message is a static frozen prefix block (skills, MCP, memory,
+    /// user preferences, project instructions) rather than an autonomous turn,
+    /// compaction boundary, or post-history context update.
+    pub fn is_frozen_prefix_user(&self) -> bool {
+        let trimmed = self.text.trim_start();
+        self.role == Role::User
+            && self.synthetic
+            && !self.autonomous_turn
+            && !self.is_compaction_turn_start()
+            && !trimmed.starts_with("<!-- jeikcode:anchor")
+            && !trimmed.starts_with("<!-- jeikcode:context-update:")
+    }
+
     /// Approximate token count for this message — a byte heuristic (~4 bytes/token;
     /// images ≈ 1600 tokens each). Used ONLY as a FALLBACK for context-pressure when
     /// the provider omits a usage report (e.g. a gateway that returns an empty 200, or
@@ -940,24 +953,15 @@ impl Conversation {
         while i < self.messages.len() && self.messages[i].role == Role::System {
             i += 1;
         }
-        while i < self.messages.len()
-            && self.messages[i].role == Role::User
-            && self.messages[i].synthetic
-            && !self.messages[i].autonomous_turn
-        {
+        while i < self.messages.len() && self.messages[i].is_frozen_prefix_user() {
             i += 1;
         }
         i
     }
 
-    /// Locate a prefix block by header among messages that precede the first
-    /// real user (leading systems + frozen synthetic users).
+    /// Locate a prefix block by header within the frozen leading prefix.
     fn find_before_first_real_user(&self, header: &str) -> Option<usize> {
-        let end = self
-            .messages
-            .iter()
-            .position(|m| m.role == Role::User && !m.synthetic)
-            .unwrap_or(self.messages.len());
+        let end = self.frozen_prefix_end();
         self.messages[..end]
             .iter()
             .position(|m| m.text.starts_with(header))
@@ -985,12 +989,8 @@ impl Conversation {
                 .get(header)
                 .copied()
                 .unwrap_or_else(|| {
-                    let first_real_user = self
-                        .messages
-                        .iter()
-                        .position(|m| m.role == Role::User && !m.synthetic)
-                        .unwrap_or(self.messages.len());
-                    let existing = self.messages[..first_real_user].iter().find(|m| {
+                    let prefix_end = self.frozen_prefix_end();
+                    let existing = self.messages[..prefix_end].iter().find(|m| {
                         ((m.role == Role::User && m.synthetic) || m.role == Role::System)
                             && m.text.starts_with(header)
                     });
@@ -1023,11 +1023,7 @@ impl Conversation {
                     .iter()
                     .take_while(|m| m.role == Role::System)
                     .count();
-                let first_real_user = self
-                    .messages
-                    .iter()
-                    .position(|m| m.role == Role::User && !m.synthetic)
-                    .unwrap_or(self.messages.len());
+                let prefix_end = self.frozen_prefix_end();
 
                 let needs_reorder = if !is_synthetic_user {
                     true
@@ -1036,7 +1032,7 @@ impl Conversation {
                         let o = frozen_user_block_order(&m.text);
                         o > 0 && o > target_order
                     });
-                    let after_violation = self.messages[i + 1..first_real_user].iter().any(|m| {
+                    let after_violation = self.messages[i + 1..prefix_end].iter().any(|m| {
                         let o = frozen_user_block_order(&m.text);
                         o > 0 && o < target_order
                     });
@@ -1054,23 +1050,19 @@ impl Conversation {
                         .iter()
                         .take_while(|m| m.role == Role::System)
                         .count();
-                    let first_real_user = self
-                        .messages
-                        .iter()
-                        .position(|m| m.role == Role::User && !m.synthetic)
-                        .unwrap_or(self.messages.len());
+                    let prefix_end = self.frozen_prefix_end();
 
                     let insert_at = if target_order > 0 {
-                        self.messages[lead_system..first_real_user]
+                        self.messages[lead_system..prefix_end]
                             .iter()
                             .position(|m| {
                                 let o = frozen_user_block_order(&m.text);
                                 o > 0 && o > target_order
                             })
                             .map(|pos| lead_system + pos)
-                            .unwrap_or(first_real_user)
+                            .unwrap_or(prefix_end)
                     } else {
-                        first_real_user
+                        prefix_end
                     };
                     self.messages
                         .insert(insert_at, Message::synthetic_user(text));
@@ -1084,23 +1076,19 @@ impl Conversation {
                     .iter()
                     .take_while(|m| m.role == Role::System)
                     .count();
-                let first_real_user = self
-                    .messages
-                    .iter()
-                    .position(|m| m.role == Role::User && !m.synthetic)
-                    .unwrap_or(self.messages.len());
+                let prefix_end = self.frozen_prefix_end();
 
                 let insert_at = if target_order > 0 {
-                    self.messages[lead_system..first_real_user]
+                    self.messages[lead_system..prefix_end]
                         .iter()
                         .position(|m| {
                             let o = frozen_user_block_order(&m.text);
                             o > 0 && o > target_order
                         })
                         .map(|pos| lead_system + pos)
-                        .unwrap_or(first_real_user)
+                        .unwrap_or(prefix_end)
                 } else {
-                    first_real_user
+                    prefix_end
                 };
                 self.messages
                     .insert(insert_at, Message::synthetic_user(text));
@@ -3113,5 +3101,32 @@ mod tests {
         // Repeated call with identical updated text -> deduplicated via sys:<header>.
         c.reconcile_system_block("<environment>", Some(updated));
         assert_eq!(c.messages.len(), 4);
+    }
+
+    #[test]
+    fn frozen_prefix_end_and_sacred_floor_stop_before_compaction_anchors_and_context_updates() {
+        let mut c = Conversation::new();
+        c.push(Message::system("sys"));
+        c.push(Message::synthetic_user("<memory>\nfact"));
+        c.push(Message::synthetic_user(
+            "<!-- jeikcode:anchor v1 -->\nsummary of earlier turns",
+        ));
+        c.push(Message::synthetic_user(
+            "<!-- jeikcode:context-update:<memory> -->\nupdated fact",
+        ));
+        c.push(Message::user("Real user after anchor"));
+
+        assert_eq!(c.frozen_prefix_end(), 2);
+        assert_eq!(c.sacred_floor(), 2);
+
+        // Even after assistant history was drained, reconciling a frozen block
+        // must land inside [0..2), strictly before the anchor and context update.
+        c.reconcile_frozen_user_block(
+            "<project_instructions>",
+            Some("<project_instructions>\nrules".into()),
+        );
+        assert_eq!(c.frozen_prefix_end(), 3);
+        assert!(c.messages[2].text.starts_with("<project_instructions>"));
+        assert!(c.messages[3].text.starts_with("<!-- jeikcode:anchor"));
     }
 }

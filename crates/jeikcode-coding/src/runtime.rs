@@ -1034,10 +1034,10 @@ pub async fn compact_snapshot_with_epoch(
         })
         .and_then(|m| m.meta.as_ref())
         .map(|meta| {
-            let used = if meta.used_tokens > 0 {
-                meta.used_tokens
-            } else {
+            let used = if meta.tokens.prompt > 0 {
                 meta.tokens.prompt.saturating_add(meta.tokens.completion)
+            } else {
+                meta.used_tokens
             };
             (meta.ctx_window, used)
         })
