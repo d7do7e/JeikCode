@@ -1598,6 +1598,30 @@ export function Chat({
     resetTokenTelemetry();
   };
 
+  const restoreIdbTokenUsage = (
+    sid: string,
+    idb: { messages: Message[]; tokenUsage?: any; compacted?: boolean | null },
+  ) => {
+    if (!idb.tokenUsage) return;
+    const existing = tokenUsageCacheRef.current.get(sid);
+    if (existing?.authoritative || sessionTokensRunning(sid)) return;
+    if (idb.compacted) {
+      const compactedCacheState: TokenCacheState = {
+        lastPrompt: idb.tokenUsage.prompt ?? 0,
+        providerReportsCache: false,
+      };
+      tokenUsageCacheRef.current.set(sid, {
+        tokens: idb.tokenUsage,
+        cacheState: compactedCacheState,
+        authoritative: false,
+        compacted: true,
+      });
+      applyTokenUsage(idb.tokenUsage, compactedCacheState, false);
+      return;
+    }
+    applySessionTokens(sid, idb.messages, idb.tokenUsage);
+  };
+
   useEffect(() => {
     if (!showTokenDetails) return;
     const handleClickOutside = (e: MouseEvent) => {
@@ -3277,13 +3301,25 @@ export function Chat({
       meta.turns ?? [],
       localTurnsBeforeCatchUp,
     );
+    if (activeIdRef.current === sid && meta.token_usage) {
+      applySessionTokens(sid, clean, meta.token_usage);
+    }
+    const tokSnapForCache = tokenUsageCacheRef.current.get(sid);
+    const keepCompactedTokens = Boolean(
+      tokSnapForCache?.compacted &&
+        meta.token_usage &&
+        meta.token_usage.total > (tokSnapForCache.tokens.total ?? 0),
+    );
     // 权威反写缓存：必须带上历史偏移与总数，杜绝 IndexedDB 缓存保留旧的 0 偏移！
     commitCanvasCache(hash, sid, {
       messages: clean,
       todos: meta.todos,
       todoRevision: meta.todos_revision ?? 0,
       turns: mergedTurnsForCatchUp,
-      tokenUsage: meta.token_usage,
+      tokenUsage: keepCompactedTokens
+        ? tokSnapForCache!.tokens
+        : (meta.token_usage ?? tokSnapForCache?.tokens),
+      ...(tokSnapForCache ? { compacted: tokSnapForCache.compacted === true } : {}),
       revision: meta.revision,
       historyOffset: hasCausalGap ? diskOffset : undefined,
       historyTotal: meta.message_count,
@@ -3303,9 +3339,6 @@ export function Chat({
         // rows from the server win, while provisional/newer local rows survive.
         turnOutlineBySessionRef.current.set(sid, mergedTurnsForCatchUp);
         setTurnOutline(mergedTurnsForCatchUp);
-      }
-      if (meta.token_usage) {
-        applySessionTokens(sid, clean, meta.token_usage);
       }
       // 服务端 board 是清单唯一真值（工具每次执行同步提交），不是滞后的磁盘快照：
       // 运行中同样整表覆盖，空表 = 权威清空（全部完成已关闭 / 已回溯）。
@@ -4896,12 +4929,31 @@ export function Chat({
             if (!messageCacheRef.current.has(earlySid)) {
               const clean = idb.messages;
               messageCacheRef.current.set(earlySid, clean);
+              restoreIdbTokenUsage(earlySid, idb);
               messagesRef.current = clean;
               setMessages({ type: 'replace', rows: clean });
               setLoading(false);
               noteCacheRevision(earlySid, idb.revision);
               if (idb.projectHash) {
                 projectHashBySessionRef.current.set(earlySid, idb.projectHash);
+              }
+              if (idb.historyOffset !== undefined) {
+                const diskOffset = idb.historyOffset;
+                const diskTotal = idb.historyTotal ?? (idb.messages.length + diskOffset);
+                const firstTurnIdx = idb.turns?.[0]?.index ?? 0;
+                const olderExists = hasOlderVisibleMessages({ offset: diskOffset, firstTurnIndex: firstTurnIdx });
+                historyOffsetRef.current = diskOffset;
+                historyTotalRef.current = diskTotal;
+                setHasOlder(olderExists);
+                historyOffsetBySessionRef.current.set(earlySid, diskOffset);
+                historyTotalBySessionRef.current.set(earlySid, diskTotal);
+                hasOlderBySessionRef.current.set(earlySid, olderExists);
+              }
+              if (idb.approvalMode) {
+                modeCacheRef.current.set(earlySid, idb.approvalMode as ApprovalMode);
+              }
+              if (idb.preferredModel) {
+                providerCacheRef.current.set(earlySid, idb.preferredModel);
               }
               if (idb.turns && idb.turns.length > 0) {
                 const nextOutline = fullerOutline(
@@ -5008,22 +5060,7 @@ export function Chat({
               (idb.thinkingBudget as number | null) ?? null,
             );
           }
-          if (idb.tokenUsage) {
-            if (idb.compacted) {
-              // 压缩后的占用比磁盘里最后一条 assistant 的 usage 更新：先恢复快照，
-              // applySessionTokens 的 compacted 守卫才会拒绝被压缩前的旧值覆盖。
-              tokenUsageCacheRef.current.set(loadId, {
-                tokens: idb.tokenUsage,
-                cacheState: {
-                  lastPrompt: idb.tokenUsage.prompt ?? 0,
-                  providerReportsCache: false,
-                },
-                authoritative: false,
-                compacted: true,
-              });
-            }
-            applySessionTokens(loadId, idb.messages, idb.tokenUsage);
-          }
+          restoreIdbTokenUsage(loadId, idb);
         }
       });
       if (!messageCacheRef.current.has(loadId)) {
@@ -5536,27 +5573,64 @@ export function Chat({
         const projectSessions = await listProjectSessions(curHash);
         const candidates = (projectSessions || []).slice(0, 5);
         for (const cand of candidates) {
-          if (cancelled || busy) break;
-          if (cand.id === sessionId) continue;
+          if (cancelled || busyRef.current) break;
+          if (cand.id === sessionId || activeIdRef.current === cand.id) continue;
           if (messageCacheRef.current.has(cand.id)) continue;
+          if (
+            backgroundRunningSessionsRef.current.has(cand.id) ||
+            localTurnSessionsRef.current.has(cand.id)
+          ) {
+            continue;
+          }
           const existing = await getSessionCache(curHash, cand.id);
           if (existing) continue;
 
           // 随机 5~10 秒延迟加载一个，防网络与 I/O 拥塞
           const delay = 5000 + Math.random() * 5000;
           await new Promise((r) => setTimeout(r, delay));
-          if (cancelled || busy) break;
+          if (cancelled || busyRef.current) break;
+          if (
+            activeIdRef.current === cand.id ||
+            messageCacheRef.current.has(cand.id) ||
+            backgroundRunningSessionsRef.current.has(cand.id) ||
+            localTurnSessionsRef.current.has(cand.id)
+          ) {
+            continue;
+          }
 
           const res = await pullSession({ projectHash: curHash, sessionId: cand.id, mode: 'snapshot', limit: HISTORY_PAGE });
+          if (
+            cancelled ||
+            busyRef.current ||
+            activeIdRef.current === cand.id ||
+            messageCacheRef.current.has(cand.id) ||
+            backgroundRunningSessionsRef.current.has(cand.id) ||
+            localTurnSessionsRef.current.has(cand.id)
+          ) {
+            continue;
+          }
+          const knownRev = cacheRevisionBySessionRef.current.get(cand.id) ?? 0;
+          if (typeof res?.revision === 'number' && knownRev > 0 && res.revision < knownRev) {
+            continue;
+          }
           if (res && Array.isArray(res.messages)) {
             const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0, res.pinned_user_index);
-            messageCacheRef.current.set(cand.id, loaded);
             commitCanvasCache(curHash, cand.id, {
               messages: loaded,
               todos: res.todos,
+              todoRevision: res.todos_revision ?? 0,
               turns: res.turns,
               tokenUsage: res.token_usage,
+              historyOffset: res.offset ?? 0,
+              historyTotal: res.message_count ?? (res.messages.length + (res.offset ?? 0)),
+              approvalMode: res.approval_mode ?? undefined,
+              preferredModel: res.preferred_model ?? undefined,
+              reasoningEffort: res.reasoning_effort ?? undefined,
+              thinkingBudget: res.thinking_budget ?? undefined,
               revision: res.revision,
+              phase: 'terminal',
+              operationId: null,
+              lastSeq: null,
             });
           }
         }
