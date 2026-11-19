@@ -29,9 +29,9 @@ fn live_terminals() -> &'static Mutex<std::collections::HashMap<String, Arc<Live
     PROCESSES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn spawn_gate() -> &'static Mutex<()> {
-    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(()))
+fn spawn_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -565,27 +565,38 @@ pub(crate) async fn get_or_spawn_terminal_process(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<Arc<LiveTerminalProcess>> {
-    let _gate = lock(spawn_gate());
-    if let Some(existing) = lock(live_terminals()).get(term_id).cloned() {
+    let _gate = spawn_gate().lock().await;
+    let dead_existing = if let Some(existing) = lock(live_terminals()).get(term_id).cloned() {
         if child_still_running(&existing) {
             resize_terminal(&existing, cols, rows);
             return Ok(existing);
         }
-        shutdown_pty(&existing);
         lock(live_terminals()).remove(term_id);
-    }
+        Some(existing)
+    } else {
+        None
+    };
 
-    let target_cwd = normalize_cwd(cwd);
-    let launch = shell_launch(shell_name, &target_cwd);
-    let spawned = spawn_pty_command(
-        &launch.program,
-        &launch.args,
-        &launch.env,
-        &target_cwd,
-        cols,
-        rows,
-    )?;
-    let actual_shell = launch.actual_shell.clone();
+    let cwd_owned = cwd.to_string();
+    let shell_owned = shell_name.to_string();
+    let (target_cwd, actual_shell, spawned) = tokio::task::spawn_blocking(move || {
+        if let Some(dead) = dead_existing {
+            shutdown_pty(&dead);
+        }
+        let target_cwd = normalize_cwd(&cwd_owned);
+        let launch = shell_launch(&shell_owned, &target_cwd);
+        let spawned = spawn_pty_command(
+            &launch.program,
+            &launch.args,
+            &launch.env,
+            &target_cwd,
+            cols,
+            rows,
+        )?;
+        Ok::<_, anyhow::Error>((target_cwd, launch.actual_shell, spawned))
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("spawn terminal task failed: {err}"))??;
     let pid = spawned.child.process_id();
     let killer = spawned.child.clone_killer();
     let (broadcast, _) = tokio::sync::broadcast::channel::<String>(512);

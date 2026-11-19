@@ -950,7 +950,15 @@ fn main() {
             let handle = app.handle().clone();
             let boot_url_for_start = Arc::clone(&boot_url_slot);
             tauri::async_runtime::spawn(async move {
-                match start_webui(&handle) {
+                let handle_for_start = handle.clone();
+                let start_res =
+                    tauri::async_runtime::spawn_blocking(move || start_webui(&handle_for_start))
+                        .await;
+                let start_res = match start_res {
+                    Ok(inner) => inner,
+                    Err(err) => Err(format!("启动任务异常：{err}")),
+                };
+                match start_res {
                     Ok((url, managed_child, exit_rx, launch)) => {
                         let initial_pid = managed_child.pid;
                         if !store_child_unless_shutting_down(&handle, managed_child) {
@@ -1923,8 +1931,18 @@ fn http_loopback_request(
 fn local_binary_sha256(bin: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
 
-    let bytes = std::fs::read(bin).ok()?;
-    Some(format!("{:x}", Sha256::digest(bytes)))
+    let mut file = std::fs::File::open(bin).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn daemon_health_is_stale(
@@ -2672,5 +2690,40 @@ mod tests {
             super::resolve_close_request_decision("quit", true, true),
             super::CloseRequestDecision::AllowExit
         );
+    }
+
+    #[test]
+    fn local_binary_sha256_streams_empty_multi_chunk_and_missing_files() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!(
+            "jeikcode-desktop-sha256-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            super::local_binary_sha256(&empty).as_deref(),
+            Some(format!("{:x}", Sha256::digest(b"")).as_str())
+        );
+
+        let large_bytes: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        let large = dir.join("large.bin");
+        std::fs::write(&large, &large_bytes).unwrap();
+        assert_eq!(
+            super::local_binary_sha256(&large).as_deref(),
+            Some(format!("{:x}", Sha256::digest(&large_bytes)).as_str())
+        );
+
+        let missing = dir.join("missing.bin");
+        assert!(super::local_binary_sha256(&missing).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
