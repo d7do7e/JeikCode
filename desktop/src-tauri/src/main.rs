@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jeikcode_config::desktop_shared::{
-    desktop_settings_path, is_loopback_host, load_close_action, load_webui_listen,
-    save_close_action_at, save_webui_listen_pref, DESKTOP_CLI_BIN_ENV, DESKTOP_ENV,
-    DESKTOP_MANAGED_ENV, DESKTOP_PID_ENV, RESTART_EXACT_PORT_ENV, RESTART_LISTEN_PORT_ENV,
-    RESTART_REQUESTED_EXIT_CODE, SERVER_TOKEN_ENV,
+    cleanup_legacy_dropper_files, desktop_settings_path, is_loopback_host, load_close_action,
+    load_webui_listen, migrate_hkcu_path, save_close_action_at, save_webui_listen_pref,
+    DESKTOP_CLI_BIN_ENV, DESKTOP_ENV, DESKTOP_MANAGED_ENV, DESKTOP_PID_ENV, RESTART_EXACT_PORT_ENV,
+    RESTART_LISTEN_PORT_ENV, RESTART_REQUESTED_EXIT_CODE, SERVER_TOKEN_ENV,
 };
 use jeikcode_config::i18n::resolve_locale_from_disk;
 use jeikcode_config::locale::Locale;
@@ -1427,128 +1427,12 @@ fn resolve_desktop_cli(bundled: Option<&Path>) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[cfg(windows)]
 fn cleanup_legacy_dropper_install() {
-    let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let local_bin = home.join(".local").join("bin");
-    if let Ok(entries) = std::fs::read_dir(&local_bin) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if name.starts_with("jeikcode") || name.starts_with("atomcode") {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-    let _ = std::fs::remove_dir(&local_bin);
-
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-    else {
-        return;
-    };
-    let current: String = env.get_value("Path").unwrap_or_default();
-    let install_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-
-    let mut parts: Vec<String> = current
-        .split(';')
-        .filter(|p| {
-            let trimmed = p.trim();
-            if trimmed.is_empty() {
-                return false;
-            }
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.contains(".local\\bin")
-                || lower.contains(".local/bin")
-                || lower.contains("atomcode")
-            {
-                return false;
-            }
-            true
-        })
-        .map(|s| s.to_string())
-        .collect();
-
-    if let Some(dir) = install_dir {
-        let dir_str = dir.display().to_string();
-        let res_dir = dir.join("resources");
-        if res_dir.is_dir() {
-            let res_str = res_dir.display().to_string();
-            if !parts
-                .iter()
-                .any(|p| p.trim().eq_ignore_ascii_case(&res_str))
-            {
-                parts.insert(0, res_str);
-            }
-        }
-        if !parts
-            .iter()
-            .any(|p| p.trim().eq_ignore_ascii_case(&dir_str))
-        {
-            parts.insert(0, dir_str);
-        }
-    }
-
-    let new_path = parts.join(";");
-    if new_path != current {
-        let _ = env.set_value("Path", &new_path);
-        broadcast_env_change();
-    }
-}
-
-#[cfg(windows)]
-fn broadcast_env_change() {
-    #[link(name = "user32")]
-    extern "system" {
-        fn SendMessageTimeoutW(
-            hwnd: *mut std::ffi::c_void,
-            msg: u32,
-            wparam: usize,
-            lparam: *const u16,
-            flags: u32,
-            timeout: u32,
-            result: *mut usize,
-        ) -> isize;
-    }
-    use std::os::windows::ffi::OsStrExt;
-    let env_wide: Vec<u16> = std::ffi::OsStr::new("Environment")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let hwnd_broadcast = 0xffff as *mut std::ffi::c_void;
-    const WM_SETTINGCHANGE: u32 = 0x001A;
-    const SMTO_ABORTIFHUNG: u32 = 0x0002;
-    let mut res = 0;
-    unsafe {
-        SendMessageTimeoutW(
-            hwnd_broadcast,
-            WM_SETTINGCHANGE,
-            0,
-            env_wide.as_ptr(),
-            SMTO_ABORTIFHUNG,
-            5000,
-            &mut res,
-        );
-    }
-}
-
-#[cfg(not(windows))]
-fn cleanup_legacy_dropper_install() {
-    let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let legacy_bin = home.join(".local").join("bin").join("jeikcode");
-    if legacy_bin.is_file() {
-        // 如果是孤儿残留且非当前运行程序，移除避免旧版本优先命中
-        let _ = std::fs::remove_file(&legacy_bin);
+    let current_exe = std::env::current_exe().ok();
+    let _ = cleanup_legacy_dropper_files(current_exe.as_deref());
+    #[cfg(windows)]
+    if let Some(dir) = current_exe.as_ref().and_then(|p| p.parent()) {
+        let _ = migrate_hkcu_path(&[dir.to_path_buf(), dir.join("resources")]);
     }
 }
 

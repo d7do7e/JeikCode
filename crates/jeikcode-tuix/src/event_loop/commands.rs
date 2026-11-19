@@ -226,35 +226,34 @@ fn attach_observer_runtime(
         session.working_dir.clone()
     };
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
-    let _ = reg.open_or_attach(key.clone(), working_dir);
-    let _ = reg.bind_handle(&key, handle.clone(), Some(runtime_id.as_u64()));
-    tokio::spawn(async move {
-        let Ok((_, mut rx)) = reg.subscribe(&key, None) else {
-            return;
-        };
-        loop {
-            match rx.recv().await {
-                Ok(sequenced) => {
-                    let Some(runtime) = sequenced.runtime else {
-                        continue;
-                    };
-                    let envelope = jeikcode_coding::SequencedRuntimeEvent {
-                        generation: sequenced.generation,
-                        sequence: sequenced.sequence,
-                        event: runtime,
-                    };
-                    if event_tx
-                        .send(bg_runtime::RuntimeEventPayload::SequencedNative(envelope))
-                        .is_err()
-                    {
-                        break;
+    if let Ok((_replay, mut rx)) =
+        reg.attach_and_subscribe_runtime(key, working_dir, handle, Some(runtime_id.as_u64()))
+    {
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(sequenced) => {
+                        let Some(runtime) = sequenced.runtime else {
+                            continue;
+                        };
+                        let envelope = jeikcode_coding::SequencedRuntimeEvent {
+                            generation: sequenced.generation,
+                            sequence: sequenced.sequence,
+                            event: runtime,
+                        };
+                        if event_tx
+                            .send(bg_runtime::RuntimeEventPayload::SequencedNative(envelope))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        });
+    }
     bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
     Some((
         runtime_id,

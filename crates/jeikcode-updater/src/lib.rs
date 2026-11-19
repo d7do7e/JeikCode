@@ -85,7 +85,7 @@ const JEIKCODE_USER_AGENT: &str = concat!("jeikcode/", env!("CARGO_PKG_VERSION")
 /// otherwise leave reqwest's env-based proxy detection intact. Same behavior as the
 /// retiring `jeikcode_core::proxy::apply_async_proxy_policy`, using the config crate's
 /// proxy env items so this crate needs no `jeikcode-core` dependency.
-fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+pub fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     jeikcode_config::proxy::ensure_runtime_initialized();
     if std::env::var(jeikcode_config::proxy::MODE_ENV)
         .ok()
@@ -373,27 +373,7 @@ pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
 
 /// Clean up orphaned legacy copies in `~/.local/bin` left by older dropper versions.
 pub fn cleanup_legacy_dropper_file(running: &Path) {
-    if let Some(home) = jeikcode_config::util::real_home_dir() {
-        let local_bin = home.join(".local").join("bin");
-        if let Ok(entries) = std::fs::read_dir(&local_bin) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
-                        && !same_exe(&path, running)
-                    {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(&local_bin);
-    }
+    let _ = jeikcode_config::desktop_shared::cleanup_legacy_dropper_files(Some(running));
 }
 
 /// Migrate legacy installations on Windows/Unix for direct binary update users:
@@ -401,104 +381,13 @@ pub fn cleanup_legacy_dropper_file(running: &Path) {
 /// 2. On Windows, clean legacy `.local\bin` from `HKCU\Environment\Path` and
 ///    ensure the running binary's directory is registered in `Path`.
 pub fn migrate_legacy_environment() {
+    let Ok(running) = current_exe_path() else {
+        return;
+    };
+    cleanup_legacy_dropper_file(&running);
     #[cfg(windows)]
-    {
-        let Ok(running) = current_exe_path() else {
-            return;
-        };
-        cleanup_legacy_dropper_file(&running);
-
-        use winreg::enums::*;
-        use winreg::RegKey;
-        let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-        else {
-            return;
-        };
-        let current: String = env.get_value("Path").unwrap_or_default();
-        let home = jeikcode_config::util::real_home_dir();
-        let legacy_dir = home
-            .as_ref()
-            .map(|h| h.join(".local").join("bin").display().to_string());
-        let install_dir = running.parent().map(|d| d.display().to_string());
-
-        let mut parts: Vec<String> = current
-            .split(';')
-            .filter(|p| {
-                let trimmed = p.trim();
-                if trimmed.is_empty() {
-                    return false;
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if lower.contains(".local\\bin")
-                    || lower.contains(".local/bin")
-                    || lower.contains("atomcode")
-                {
-                    return false;
-                }
-                true
-            })
-            .map(|s| s.to_string())
-            .collect();
-
-        // 仅在当前运行目录包含有效可执行文件且非临时目录时加入 PATH
-        if let Some(ref dir_str) = install_dir {
-            let lower = dir_str.to_ascii_lowercase();
-            if !lower.contains("temp") && !lower.contains("staged") && !lower.contains("target\\") {
-                if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(dir_str)) {
-                    parts.insert(0, dir_str.clone());
-                }
-            }
-        }
-
-        let new_path = parts.join(";");
-        if new_path != current {
-            let _ = env.set_value("Path", &new_path);
-            broadcast_setting_change();
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Ok(running) = current_exe_path() {
-            cleanup_legacy_dropper_file(&running);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn broadcast_setting_change() {
-    #[link(name = "user32")]
-    extern "system" {
-        fn SendMessageTimeoutW(
-            hwnd: *mut std::ffi::c_void,
-            msg: u32,
-            wparam: usize,
-            lparam: *const u16,
-            flags: u32,
-            timeout: u32,
-            result: *mut usize,
-        ) -> isize;
-    }
-    use std::os::windows::ffi::OsStrExt;
-    let env_wide: Vec<u16> = std::ffi::OsStr::new("Environment")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let hwnd_broadcast = 0xffff as *mut std::ffi::c_void;
-    const WM_SETTINGCHANGE: u32 = 0x001A;
-    const SMTO_ABORTIFHUNG: u32 = 0x0002;
-    let mut res = 0;
-    unsafe {
-        SendMessageTimeoutW(
-            hwnd_broadcast,
-            WM_SETTINGCHANGE,
-            0,
-            env_wide.as_ptr(),
-            SMTO_ABORTIFHUNG,
-            5000,
-            &mut res,
-        );
+    if let Some(dir) = running.parent() {
+        let _ = jeikcode_config::desktop_shared::migrate_hkcu_path(&[dir.to_path_buf()]);
     }
 }
 
@@ -1260,7 +1149,7 @@ pub fn capture_launch_markers() {
 pub fn is_desktop_managed() -> bool {
     *DESKTOP_MANAGED_FLAG.get_or_init(|| {
         let managed = std::env::var_os(DESKTOP_MANAGED_ENV).is_some()
-            || std::env::var_os("JEIKCODE_DESKTOP").is_some()
+            || std::env::var_os(DESKTOP_ENV).is_some()
             || std::env::var(DESKTOP_PID_ENV)
                 .ok()
                 .and_then(|p| p.trim().parse::<u32>().ok())
@@ -2199,7 +2088,7 @@ pub fn restart_process_with_config(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         let mut flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
-        if !is_desktop_managed() && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+        if !is_desktop_managed() && std::env::var_os(DESKTOP_ENV).is_none() {
             flags |= CREATE_BREAKAWAY_FROM_JOB;
         }
         cmd.creation_flags(flags);

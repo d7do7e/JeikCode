@@ -449,12 +449,9 @@ fn observe_existing_chat_turn(
     handle: jeikcode_coding::CodingRuntimeHandle,
     coding_cfg: jeikcode_coding::CodingAgentConfig,
 ) -> Result<PreparedChatTurn, String> {
-    let key = session_id.to_string();
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
-    let _ = reg.open_or_attach(key.clone(), working_dir.clone());
-    let _ = reg.bind_handle(&key, handle.clone(), None);
     let (_replay, rx) = reg
-        .subscribe_or_empty(&key, working_dir, None)
+        .attach_and_subscribe_runtime(session_id.to_string(), working_dir, handle.clone(), None)
         .map_err(|error| error.to_string())?;
     Ok(PreparedChatTurn {
         handle,

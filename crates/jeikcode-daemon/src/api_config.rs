@@ -1445,12 +1445,10 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
             .exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let exe_path_lower = exe_path_str.to_ascii_lowercase();
 
         // 1. 判定是否为老旧 Dropper 目录残存
-        let is_legacy_path = exe_path_lower.contains(".local\\bin")
-            || exe_path_lower.contains(".local/bin")
-            || exe_path_lower.contains("atomcode");
+        let is_legacy_path =
+            jeikcode_config::desktop_shared::is_dirty_legacy_path_entry(&exe_path_str);
 
         // 2. 检查环境变量是否包含 JEIKCODE_DESKTOP=1
         let is_desktop_env = proc_.environ().iter().any(|env_str| {
@@ -1520,48 +1518,13 @@ pub fn kill_zombie_processes_all() -> usize {
 }
 
 pub(crate) async fn get_legacy_status() -> impl IntoResponse {
-    let mut legacy_files = Vec::new();
     let current_exe = std::env::current_exe().ok();
-    if let Some(home) = jeikcode_config::util::real_home_dir() {
-        let local_bin = home.join(".local").join("bin");
-        if let Ok(entries) = std::fs::read_dir(&local_bin) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    let is_current = current_exe.as_ref().map_or(false, |c| c == &path);
-                    if (name.starts_with("jeikcode") || name.starts_with("atomcode")) && !is_current
-                    {
-                        legacy_files.push(path.display().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let mut has_dirty_path = false;
-    #[cfg(windows)]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        if let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            let path_val: String = env.get_value("Path").unwrap_or_default();
-            for item in path_val.split(';') {
-                let lower = item.trim().to_ascii_lowercase();
-                if lower.contains(".local\\bin")
-                    || lower.contains(".local/bin")
-                    || lower.contains("atomcode")
-                {
-                    has_dirty_path = true;
-                    break;
-                }
-            }
-        }
-    }
+    let legacy_files: Vec<String> =
+        jeikcode_config::desktop_shared::scan_legacy_dropper_files(current_exe.as_deref())
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect();
+    let has_dirty_path = jeikcode_config::desktop_shared::has_dirty_hkcu_path();
 
     let zombies = scan_zombie_processes();
     let zombie_count = zombies.len();
@@ -1581,33 +1544,9 @@ pub(crate) async fn get_legacy_status() -> impl IntoResponse {
 pub(crate) async fn post_migrate_legacy(
     Json(payload): Json<MigrateLegacyRequest>,
 ) -> impl IntoResponse {
-    let mut cleaned_files_count = 0;
     let current_exe = std::env::current_exe().ok();
-    if let Some(ref running) = current_exe {
-        if let Some(home) = jeikcode_config::util::real_home_dir() {
-            let local_bin = home.join(".local").join("bin");
-            if let Ok(entries) = std::fs::read_dir(&local_bin) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
-                            && running != &path
-                        {
-                            if std::fs::remove_file(&path).is_ok() {
-                                cleaned_files_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = std::fs::remove_dir(&local_bin);
-        }
-    }
+    let cleaned_files_count =
+        jeikcode_config::desktop_shared::cleanup_legacy_dropper_files(current_exe.as_deref());
 
     jeikcode_updater::migrate_legacy_environment();
 

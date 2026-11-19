@@ -1027,6 +1027,26 @@ impl SessionRuntimeRegistry {
         Ok((replay, rx))
     }
 
+    /// Open/attach a session entry, bind `handle` (+ optional TUI `runtime_id`),
+    /// and subscribe to the event broadcast channel in one shared step.
+    pub fn attach_and_subscribe_runtime(
+        &self,
+        key: SessionKey,
+        working_dir: PathBuf,
+        handle: CodingRuntimeHandle,
+        runtime_id: Option<u64>,
+    ) -> Result<
+        (
+            Vec<SequencedSessionEvent>,
+            broadcast::Receiver<SequencedSessionEvent>,
+        ),
+        RegistryError,
+    > {
+        self.open_or_attach(key.clone(), working_dir)?;
+        let _ = self.bind_handle(&key, handle, runtime_id);
+        self.subscribe(&key, None)
+    }
+
     /// Subscribe even when the session is not yet registered — returns empty
     /// replay and a channel that will receive events after `open_or_attach`.
     /// Prefer [`subscribe`] when the session is known live.
@@ -1634,5 +1654,41 @@ mod tests {
         // bind-vs-request mismatch (e.g. when the runner is torn down).
         reg.set_provider_fingerprint(&"s".into(), None);
         assert!(reg.provider_fingerprint(&"s".into()).is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_and_subscribe_runtime_binds_handle_and_forwards_events() {
+        use jeikcode_kernel::event::AgentEvent;
+        let reg = SessionRuntimeRegistry::new();
+        let (handle, _rx) = crate::runtime::coding_runtime_control_channel();
+        let expected_id = handle.instance_id().to_string();
+
+        let (replay, mut events) = reg
+            .attach_and_subscribe_runtime(
+                "obs-s".into(),
+                PathBuf::from("/obs"),
+                handle.clone(),
+                Some(42),
+            )
+            .expect("attach_and_subscribe_runtime");
+        assert!(replay
+            .iter()
+            .all(|e| e.runtime.is_none() && e.view.is_none()));
+        assert_eq!(reg.session_id_for_runtime_id(42).as_deref(), Some("obs-s"));
+        assert_eq!(
+            reg.handle(&"obs-s".into())
+                .map(|h| h.instance_id().to_string()),
+            Some(expected_id)
+        );
+        assert!(reg.push_runtime_event(
+            &"obs-s".into(),
+            1,
+            crate::runtime::CodingRuntimeEvent::Agent(AgentEvent::TextDelta("attached".into())),
+        ));
+        let got = events.recv().await.expect("event after attach");
+        assert!(matches!(
+            got.runtime,
+            Some(crate::runtime::CodingRuntimeEvent::Agent(AgentEvent::TextDelta(t))) if t == "attached"
+        ));
     }
 }

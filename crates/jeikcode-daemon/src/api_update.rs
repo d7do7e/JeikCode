@@ -123,58 +123,9 @@ fn set_update_status(status: UpdateStatus) {
     *CURRENT_UPDATE_STATUS.lock().unwrap() = Some(status);
 }
 
-/// 语义化版本号比较器（支持预发布标签，如 v7.1.50-beta.2 vs v7.1.50-beta.1，以及正式版与预发布版比较）
+/// 语义化版本号比较器（共享 `jeikcode_updater::version_is_newer` 实现）
 pub fn compare_versions(latest: &str, current: &str) -> bool {
-    let parse_semver = |v: &str| -> (Vec<u64>, Option<(String, u64)>) {
-        let clean = v.trim().trim_start_matches('v').trim_start_matches('V');
-        if let Some((main_part, pre_part)) = clean.split_once('-') {
-            let nums: Vec<u64> = main_part
-                .split('.')
-                .filter_map(|s| s.parse::<u64>().ok())
-                .collect();
-            let pre_info = if let Some((tag, num_str)) = pre_part.split_once('.') {
-                Some((tag.to_lowercase(), num_str.parse::<u64>().unwrap_or(0)))
-            } else {
-                Some((pre_part.to_lowercase(), 0))
-            };
-            (nums, pre_info)
-        } else {
-            let nums: Vec<u64> = clean
-                .split('.')
-                .filter_map(|s| s.parse::<u64>().ok())
-                .collect();
-            (nums, None)
-        }
-    };
-
-    let (latest_nums, latest_pre) = parse_semver(latest);
-    let (current_nums, current_pre) = parse_semver(current);
-
-    // 1. 比较主版本号 [major, minor, patch, ...]
-    let max_len = latest_nums.len().max(current_nums.len());
-    for i in 0..max_len {
-        let l = latest_nums.get(i).copied().unwrap_or(0);
-        let c = current_nums.get(i).copied().unwrap_or(0);
-        if l > c {
-            return true;
-        } else if l < c {
-            return false;
-        }
-    }
-
-    // 2. 主版本号相同时比较预发布段 (标准 SemVer 规则：无 pre-release 正式版 > 有 pre-release 预发布版)
-    match (latest_pre, current_pre) {
-        (None, Some(_)) => true, // 正式版 > 预发布版 (如 latest 7.1.50 正式版 > current 7.1.50-beta.2)
-        (Some(_), None) => false, // 预发布版 < 正式版 (如 latest 7.1.50-beta.2 < current 7.1.50 正式版)
-        (Some((l_tag, l_num)), Some((c_tag, c_num))) => {
-            if l_tag != c_tag {
-                l_tag > c_tag
-            } else {
-                l_num > c_num // 如 beta.2 > beta.1
-            }
-        }
-        (None, None) => false, // 完全一致
-    }
+    jeikcode_updater::version_is_newer(latest, current)
 }
 
 /// 兼容老接口
@@ -184,10 +135,12 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
 
 /// 探测当前是否在桌面端环境
 pub fn is_desktop_environment() -> bool {
-    std::env::var("JEIKCODE_DESKTOP").is_ok()
+    jeikcode_updater::is_desktop_managed()
+        || std::env::var_os(jeikcode_config::desktop_shared::DESKTOP_ENV).is_some()
 }
 
 const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
+const DEFAULT_RELEASE_DOWNLOAD_BASE: &str = "https://github.com/jeikl/JeikCode/releases/download";
 
 #[derive(Debug, Deserialize, Clone)]
 struct GitHubRelease {
@@ -210,7 +163,7 @@ struct GitHubReleaseAsset {
 }
 
 fn create_update_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    jeikcode_updater::apply_proxy_policy(reqwest::Client::builder())
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
@@ -223,6 +176,56 @@ fn create_update_client() -> Option<reqwest::Client> {
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .ok()
+}
+
+fn normalized_tag(version: &str) -> String {
+    let trimmed = version.trim();
+    if trimmed.starts_with('v') || trimmed.starts_with('V') {
+        format!(
+            "v{}",
+            trimmed.trim_start_matches('v').trim_start_matches('V')
+        )
+    } else {
+        format!("v{trimmed}")
+    }
+}
+
+fn effective_download_base() -> String {
+    jeikcode_updater::download_base()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn resolve_release_asset_url(base: &str, tag: &str, asset_name: &str, default_url: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(DEFAULT_RELEASE_DOWNLOAD_BASE) {
+        let norm_tag = normalized_tag(tag);
+        format!("{trimmed}/{norm_tag}/{asset_name}")
+    } else {
+        default_url.to_string()
+    }
+}
+
+fn desktop_installer_filename(version: &str) -> Option<String> {
+    let tag = normalized_tag(version);
+    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+    #[cfg(target_os = "windows")]
+    {
+        Some(format!("JeikCode.Desktop_{clean_ver}_x64-setup.exe"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(format!("JeikCode.Desktop_{clean_ver}_aarch64.dmg"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(format!("JeikCode.Desktop_{clean_ver}_amd64.AppImage"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = clean_ver;
+        None
+    }
 }
 
 /// 根据指定的更新通道，在 Release 列表中寻找语义化版本号最大的目标 Release，支持跨版本直升最高版
@@ -255,7 +258,11 @@ fn find_highest_release(
     highest.cloned()
 }
 
-fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option<String> {
+fn find_desktop_installer_url_in_assets(
+    assets: &[GitHubReleaseAsset],
+    tag: &str,
+    download_base: &str,
+) -> Option<String> {
     #[cfg(target_os = "windows")]
     let predicate = |name: &str| -> bool {
         let lower = name.to_lowercase();
@@ -274,10 +281,14 @@ fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option
     assets
         .iter()
         .find(|a| predicate(&a.name))
-        .map(|a| a.browser_download_url.clone())
+        .map(|a| resolve_release_asset_url(download_base, tag, &a.name, &a.browser_download_url))
 }
 
-fn find_cli_asset_url(assets: &[GitHubReleaseAsset], tag: &str) -> Option<String> {
+fn find_cli_asset_url(
+    assets: &[GitHubReleaseAsset],
+    tag: &str,
+    download_base: &str,
+) -> Option<String> {
     if let Some(target) = jeikcode_updater::detect_target() {
         let expected_name = format!("jeikcode-{tag}-{target}");
         let expected_exe = format!("{expected_name}.exe");
@@ -285,122 +296,71 @@ fn find_cli_asset_url(assets: &[GitHubReleaseAsset], tag: &str) -> Option<String
             .iter()
             .find(|a| a.name == expected_name || a.name == expected_exe)
         {
-            return Some(a.browser_download_url.clone());
+            return Some(resolve_release_asset_url(
+                download_base,
+                tag,
+                &a.name,
+                &a.browser_download_url,
+            ));
         }
     }
     None
 }
 
-fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
-    let tag = if version.starts_with('v') || version.starts_with('V') {
-        version.to_string()
+fn resolve_desktop_installer_url_fallback_with_base(
+    version: &str,
+    download_base: &str,
+) -> Option<String> {
+    let tag = normalized_tag(version);
+    let filename = desktop_installer_filename(&tag)?;
+    let base = download_base.trim_end_matches('/');
+    let effective = if base.is_empty() {
+        DEFAULT_RELEASE_DOWNLOAD_BASE
     } else {
-        format!("v{version}")
+        base
     };
-    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
-
-    #[cfg(target_os = "windows")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    Some(format!("{effective}/{tag}/{filename}"))
 }
 
-/// 解析桌面安装包候选下载地址
+fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
+    resolve_desktop_installer_url_fallback_with_base(version, &effective_download_base())
+}
+
+/// 解析桌面安装包候选下载地址（优先走用户配置的更新镜像，再退回 GitHub Release API）
 async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
-    let tag = if version.starts_with('v') || version.starts_with('V') {
-        version.to_string()
-    } else {
-        format!("v{version}")
-    };
-    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+    let tag = normalized_tag(version);
+    let base = effective_download_base();
+    let client = create_update_client();
 
-    // 优先尝试通过 GitHub API 查找 release assets 列表中的安装包
-    let api_url = format!("https://api.github.com/repos/jeikl/JeikCode/releases/tags/{tag}");
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
+    if !base.is_empty() && !base.eq_ignore_ascii_case(DEFAULT_RELEASE_DOWNLOAD_BASE) {
+        if let (Some(ref c), Some(mirror_url)) = (
+            &client,
+            resolve_desktop_installer_url_fallback_with_base(&tag, &base),
+        ) {
+            if let Ok(resp) = c.head(&mirror_url).send().await {
+                if resp.status().is_success() {
+                    return Some(mirror_url);
+                }
+            }
+        }
+    }
 
-    if let Ok(resp) = client.get(&api_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-                    #[cfg(target_os = "windows")]
-                    let predicate = |name: &str| -> bool {
-                        let lower = name.to_lowercase();
-                        lower.ends_with(".exe")
-                            && (lower.contains("setup") || lower.contains("desktop"))
-                    };
-                    #[cfg(target_os = "macos")]
-                    let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
-                    #[cfg(target_os = "linux")]
-                    let predicate = |name: &str| -> bool {
-                        let lower = name.to_lowercase();
-                        lower.ends_with(".appimage") || lower.ends_with(".deb")
-                    };
-                    #[cfg(not(any(
-                        target_os = "windows",
-                        target_os = "macos",
-                        target_os = "linux"
-                    )))]
-                    let predicate = |_: &str| false;
-
-                    for asset in assets {
-                        if let (Some(name), Some(url)) = (
-                            asset.get("name").and_then(|n| n.as_str()),
-                            asset.get("browser_download_url").and_then(|u| u.as_str()),
-                        ) {
-                            if predicate(name) {
-                                return Some(url.to_string());
-                            }
-                        }
+    if let Some(ref c) = client {
+        let api_url = format!("https://api.github.com/repos/jeikl/JeikCode/releases/tags/{tag}");
+        if let Ok(resp) = c.get(&api_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(rel) = resp.json::<GitHubRelease>().await {
+                    if let Some(url) =
+                        find_desktop_installer_url_in_assets(&rel.assets, &tag, &base)
+                    {
+                        return Some(url);
                     }
                 }
             }
         }
     }
 
-    // 后备方案：使用标准发布产物命名约定
-    #[cfg(target_os = "windows")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    resolve_desktop_installer_url_fallback_with_base(&tag, &base)
 }
 
 /// GET /api/update/check
@@ -466,14 +426,17 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                     browser_download_url: a.browser_download_url.clone(),
                 })
                 .collect();
+            let dl_base = effective_download_base();
             if is_desktop {
-                download_url = find_desktop_installer_url_in_assets(&assets)
-                    .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
+                download_url =
+                    find_desktop_installer_url_in_assets(&assets, &latest_version, &dl_base)
+                        .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
             } else {
-                download_url = find_cli_asset_url(&assets, &latest_version).or_else(|| {
-                    jeikcode_updater::detect_target()
-                        .map(|target| jeikcode_updater::binary_url(&latest_version, target))
-                });
+                download_url =
+                    find_cli_asset_url(&assets, &latest_version, &dl_base).or_else(|| {
+                        jeikcode_updater::detect_target()
+                            .map(|target| jeikcode_updater::binary_url(&latest_version, target))
+                    });
             }
         }
     }
@@ -495,18 +458,23 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                         latest_version = rel.tag_name.clone();
                         release_notes = rel.body;
                         released_at = rel.published_at;
+                        let dl_base = effective_download_base();
                         if is_desktop {
-                            download_url = find_desktop_installer_url_in_assets(&rel.assets)
-                                .or_else(|| {
-                                    resolve_desktop_installer_url_fallback(&latest_version)
-                                });
+                            download_url = find_desktop_installer_url_in_assets(
+                                &rel.assets,
+                                &latest_version,
+                                &dl_base,
+                            )
+                            .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
                         } else {
-                            download_url = find_cli_asset_url(&rel.assets, &latest_version)
-                                .or_else(|| {
-                                    jeikcode_updater::detect_target().map(|target| {
-                                        jeikcode_updater::binary_url(&latest_version, target)
-                                    })
-                                });
+                            download_url =
+                                find_cli_asset_url(&rel.assets, &latest_version, &dl_base).or_else(
+                                    || {
+                                        jeikcode_updater::detect_target().map(|target| {
+                                            jeikcode_updater::binary_url(&latest_version, target)
+                                        })
+                                    },
+                                );
                         }
                     }
                 }
@@ -1057,6 +1025,34 @@ mod tests {
         .await
         .0;
         assert!(!resp_first.should_prompt);
+    }
+
+    #[test]
+    fn mirror_download_base_rewrites_release_asset_and_fallback_urls() {
+        let custom = "https://mirror.example.com/jeikcode/releases/download/";
+        assert_eq!(
+            resolve_release_asset_url(
+                custom,
+                "v7.5.1",
+                "JeikCode.Desktop_7.5.1_x64-setup.exe",
+                "https://github.com/jeikl/JeikCode/releases/download/v7.5.1/JeikCode.Desktop_7.5.1_x64-setup.exe",
+            ),
+            "https://mirror.example.com/jeikcode/releases/download/v7.5.1/JeikCode.Desktop_7.5.1_x64-setup.exe"
+        );
+        assert_eq!(
+            resolve_release_asset_url(
+                DEFAULT_RELEASE_DOWNLOAD_BASE,
+                "v7.5.1",
+                "JeikCode.Desktop_7.5.1_x64-setup.exe",
+                "https://github.com/jeikl/JeikCode/releases/download/v7.5.1/JeikCode.Desktop_7.5.1_x64-setup.exe",
+            ),
+            "https://github.com/jeikl/JeikCode/releases/download/v7.5.1/JeikCode.Desktop_7.5.1_x64-setup.exe"
+        );
+        if let Some(url) = resolve_desktop_installer_url_fallback_with_base("7.5.1", custom) {
+            assert!(
+                url.starts_with("https://mirror.example.com/jeikcode/releases/download/v7.5.1/JeikCode.Desktop_7.5.1_")
+            );
+        }
     }
 
     #[test]
