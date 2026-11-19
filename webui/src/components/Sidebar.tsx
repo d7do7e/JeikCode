@@ -4,6 +4,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
+import { triggerBlobDownload } from '../lib/download';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo, SidebarProjects } from '../api';
 import { mergeSessionRow, onGlobalEvent, removeSessionRows } from '../lib/globalEvents';
@@ -1605,16 +1606,8 @@ export function Sidebar({
       const title = detail.name || detail.id.slice(0, 8);
       const lines = sessionMessagesToMarkdownLines(detail.messages, title);
       const mdContent = lines.join('\n');
-      // Trigger browser download
       const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${title.replace(/[\\/:*?"<>|]/g, '_')}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      triggerBlobDownload(blob, `${title.replace(/[\\/:*?"<>|]/g, '_')}.md`);
     } catch {
       showToast(t('sidebar.exportFailed'), 'error');
     }

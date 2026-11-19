@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,9 +22,9 @@ use jeikcode_config::desktop_shared::{
 use jeikcode_config::i18n::resolve_locale_from_disk;
 use jeikcode_config::locale::Locale;
 use jeikcode_config::util::real_home_dir;
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Listener, Manager};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
@@ -275,6 +276,19 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     if let Some(slot) = app.try_state::<ChildSlot>() {
         let taken = slot.0.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut child) = taken {
+            #[cfg(unix)]
+            {
+                let pid = child.id() as i32;
+                if pid > 0 {
+                    extern "C" {
+                        fn kill(pid: i32, sig: i32) -> i32;
+                    }
+                    const SIGTERM: i32 = 15;
+                    unsafe {
+                        let _ = kill(-pid, SIGTERM);
+                    }
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -287,6 +301,45 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     // 兜底 2：在 Windows 上，强力清理属于本桌面壳 PID 的后台子进程，彻底消除改参数重启后脱离的孤儿子进程
     #[cfg(target_os = "windows")]
     cleanup_desktop_owned_children_windows();
+}
+
+fn store_child_unless_shutting_down(
+    app: &tauri::AppHandle,
+    mut child: std::process::Child,
+) -> bool {
+    if let Some(slot) = app.try_state::<ChildSlot>() {
+        let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+            drop(guard);
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        *guard = Some(child);
+        return true;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+fn tray_locale_from_query(raw: &str) -> Option<Locale> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Locale::from_str(trimmed).ok()
+}
+
+fn update_tray_texts_for_app(app: &tauri::AppHandle, locale: Locale) {
+    let texts = tray_texts_for_locale(locale);
+    if let Some(state) = app.try_state::<TrayUiState>() {
+        if let Some(handles) = state.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = handles.tray.set_tooltip(Some(texts.tooltip));
+            let _ = handles.show_item.set_text(texts.show_window);
+            let _ = handles.quit_item.set_text(texts.quit);
+        }
+    }
 }
 
 fn is_authorized_shell_action_url(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> bool {
@@ -324,6 +377,15 @@ fn handle_desktop_shell_action(
             {
                 let _ = save_close_action_at(&desktop_settings_path(), &action);
             }
+            true
+        }
+        "/__desktop_action/set_language" => {
+            let locale = url
+                .query_pairs()
+                .find(|(k, _)| k == "lang")
+                .and_then(|(_, v)| tray_locale_from_query(&v))
+                .unwrap_or_else(|| resolve_locale_from_disk(None));
+            update_tray_texts_for_app(app, locale);
             true
         }
         _ => false,
@@ -555,6 +617,7 @@ fn main() {
     let child = Mutex::new(None);
     tauri::Builder::default()
         .manage(ChildSlot(child))
+        .manage(TrayUiState(Mutex::new(None)))
         .setup(|app| {
             let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
@@ -569,6 +632,13 @@ fn main() {
             .title("JeikCode Desktop")
             .inner_size(1280.0, 800.0)
             .resizable(true)
+            .on_page_load(|window, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                    if let Some(away) = read_host_away(&window) {
+                        publish_host_away(&window, away);
+                    }
+                }
+            })
             .on_navigation(move |url| {
                 let current_origin = nav_origin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if handle_desktop_shell_action(url, &nav_app_handle, current_origin.as_ref()) {
@@ -616,18 +686,7 @@ fn main() {
             watch_host_presence(window.clone());
             let drop_window = window.clone();
             let close_window = window.clone();
-            let hide_window = window.clone();
-            let app_handle_for_event = app.handle().clone();
             let app_handle_for_close = app.handle().clone();
-
-            let _ = window.listen("jeikcode:desktop:hide_to_tray", move |_| {
-                hide_window_to_tray(&hide_window);
-            });
-
-            let _ = window.listen("jeikcode:desktop:quit_app", move |_| {
-                terminate_managed_child(&app_handle_for_event);
-                app_handle_for_event.exit(0);
-            });
 
             let last_close_time = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
             let last_close_for_event = Arc::clone(&last_close_time);
@@ -684,8 +743,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
                     Ok((url, child, eof_rx, launch)) => {
-                        if let Some(slot) = handle.try_state::<ChildSlot>() {
-                            *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+                        if !store_child_unless_shutting_down(&handle, child) {
+                            return;
                         }
                         // 必须先记下地址再导航，否则这次 WebUI 会被当成外链弹出浏览器。
                         remember_webui_origin(&webui_origin, &url);
@@ -791,6 +850,14 @@ fn resolve_tray_texts() -> TrayTexts {
     tray_texts_for_locale(resolve_locale_from_disk(None))
 }
 
+struct TrayUiHandles {
+    tray: TrayIcon,
+    show_item: MenuItem<tauri::Wry>,
+    quit_item: MenuItem<tauri::Wry>,
+}
+
+struct TrayUiState(Mutex<Option<TrayUiHandles>>);
+
 fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let texts = resolve_tray_texts();
     let show_item = MenuItemBuilder::with_id("show", texts.show_window).build(app)?;
@@ -806,7 +873,7 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
         .cloned()
         .expect("未在 tauri.conf.json 中找到应用默认图标");
 
-    let _tray = TrayIconBuilder::with_id("main-tray")
+    let tray = TrayIconBuilder::with_id("main-tray")
         .tooltip(texts.tooltip)
         .icon(icon)
         .menu(&menu)
@@ -844,6 +911,14 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
             }
         })
         .build(app)?;
+
+    if let Some(state) = app.try_state::<TrayUiState>() {
+        *state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(TrayUiHandles {
+            tray,
+            show_item,
+            quit_item,
+        });
+    }
 
     Ok(())
 }
@@ -1022,6 +1097,11 @@ fn spawn_desktop_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     suppress_console(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -1062,6 +1142,11 @@ fn spawn_desktop_server(
         .unwrap_or(launch.port);
     let ready_deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < ready_deadline && !health_ready(probe_port) {
+        if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("desktop shutting down".to_string());
+        }
         std::thread::sleep(Duration::from_millis(40));
     }
     Ok((url, child, eof_rx))
@@ -1122,20 +1207,29 @@ fn supervise_webui(
                 // 原地重启交接：锁定原端口并支持退避重试，绝不随意误判漂移端口导致异地失联
                 let mut res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
                 for _ in 0..3 {
-                    if res.is_ok() {
+                    if res.is_ok() || DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(400));
+                    if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
                     res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
                 }
                 res
             } else {
+                if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    return;
+                }
                 spawn_desktop_server(&launch, true, Duration::from_secs(30))
                     .or_else(|_| spawn_desktop_server(&launch, false, Duration::from_secs(30)))
             };
 
             match spawned {
                 Ok((next_url, child, next_eof_rx)) => {
+                    if !store_child_unless_shutting_down(&app, child) {
+                        return;
+                    }
                     let probe_port = next_url
                         .parse::<tauri::Url>()
                         .ok()
@@ -1148,9 +1242,6 @@ fn supervise_webui(
                             probe_port,
                             Some(&launch.token),
                         );
-                    }
-                    if let Some(slot) = app.try_state::<ChildSlot>() {
-                        *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                     }
                     eof_rx = next_eof_rx;
                     open_webui_in_shell(&window, &origin, &next_url);
@@ -1474,8 +1565,8 @@ mod tests {
     use super::{
         external_browser_url, extract_webui_url, generate_csprng_token, host_window_away,
         is_authorized_shell_action_url, navigation_action, new_window_action,
-        remember_webui_origin, resolve_desktop_cli, tray_texts_for_locale, window_url, LinkAction,
-        Locale, WebuiOrigin,
+        remember_webui_origin, resolve_desktop_cli, tray_locale_from_query, tray_texts_for_locale,
+        window_url, LinkAction, Locale, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -1720,6 +1811,16 @@ mod tests {
             assert!(!texts.show_window.is_empty());
             assert!(!texts.quit.is_empty());
         }
+    }
+
+    #[test]
+    fn tray_locale_query_parses_supported_locales_and_rejects_empty() {
+        assert_eq!(tray_locale_from_query("zh"), Some(Locale::ZhCn));
+        assert_eq!(tray_locale_from_query("zh-TW"), Some(Locale::ZhTw));
+        assert_eq!(tray_locale_from_query("vi"), Some(Locale::Vi));
+        assert_eq!(tray_locale_from_query("ja"), Some(Locale::Ja));
+        assert_eq!(tray_locale_from_query(""), None);
+        assert_eq!(tray_locale_from_query("   "), None);
     }
 
     trait ReadToStringTest {

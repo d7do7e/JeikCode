@@ -7,6 +7,7 @@ import { useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { messages, Lang, MsgKey } from './i18n';
 import { getConfig, postLanguage, postAutoGitSync } from './api';
 import { Theme, EffectiveTheme, resolveEffectiveTheme } from './lib/theme';
+import { isDesktopShell, triggerDesktopAction } from './lib/desktop';
 
 export type { Theme, EffectiveTheme };
 export { resolveEffectiveTheme };
@@ -186,7 +187,13 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
     selectionVersion.current += 1;
     setLangState(next);
     // Serialize writes so a slower earlier request cannot replace a newer choice.
-    const save = pendingSave.current.then(() => postLanguage(next));
+    const save = pendingSave.current
+      .then(() => postLanguage(next))
+      .then(() => {
+        if (isDesktopShell()) {
+          triggerDesktopAction('set_language', { lang: next });
+        }
+      });
     // Keep the promise chain alive on error while propagating rejection to caller.
     pendingSave.current = save.catch(() => {});
     return save;

@@ -21,6 +21,7 @@ import { ConfirmModalHost } from './components/ConfirmDialog';
 import { parseFilePathAndLines } from './lib/displayPath';
 import { dropEditorTabSnapshot, mainEditorStateKey } from './lib/editorTabState';
 import { languageOptions } from './i18n';
+import { triggerBlobDownload } from './lib/download';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销。
 // 注意：**每次启动都会渲染**的弹窗绝不能放进这里——懒加载它们没有收益，
@@ -1251,14 +1252,7 @@ export function App() {
       const lines = sessionMessagesToMarkdownLines(detail.messages, title);
       const mdContent = lines.join('\n');
       const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${title.replace(/[\\/:*?"<>|]/g, '_')}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      triggerBlobDownload(blob, `${title.replace(/[\\/:*?"<>|]/g, '_')}.md`);
     } catch {
       showToast(t('sidebar.exportFailed'), 'error');
     } finally {

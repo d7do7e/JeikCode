@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { buildRestartRedirectUrl, getRemoteAccess, getToken, postRemoteAccess, type RemoteAccessStatus } from '../api';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
+import { isDesktopShell } from '../lib/desktop';
 import { useT } from '../settings';
 
 export function RemoteAccessControl() {
@@ -223,6 +224,7 @@ export function RemoteAccessControl() {
       }
     }
 
+    const isDesktop = isDesktopShell();
     // 4. 等新实例上线（最多 45 秒，覆盖 systemd RestartSec / procd respawn 的延迟）
     const upDeadline = Date.now() + 45000;
     while (Date.now() < upDeadline) {
@@ -233,20 +235,17 @@ export function RemoteAccessControl() {
           // 避免旧标签页里 per-tab 的过期 sessionStorage 覆盖轮换后的新 token。
           currentToken = getToken();
         }
-        let isDesktop = window.location.search.includes('desktop=');
-        if (!isDesktop) {
-          try {
-            isDesktop = sessionStorage.getItem('jeikcode_desktop') === '1';
-          } catch {
-            /* ignore */
-          }
-        }
-        window.location.href = buildRestartRedirectUrl(window.location.href, {
+        const targetHref = buildRestartRedirectUrl(window.location.href, {
           samePort,
           targetPortNum,
           currentToken,
           isDesktop,
         });
+        if (isDesktop) {
+          // Give Tauri supervise_webui's open_webui_in_shell a head start so we don't race window.navigate.
+          await sleep(1500);
+        }
+        window.location.href = targetHref;
         return;
       }
       await sleep(600);

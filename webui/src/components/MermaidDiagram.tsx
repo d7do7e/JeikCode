@@ -1,5 +1,6 @@
 import DOMPurify from 'dompurify';
 import { useT, type TParams } from '../settings';
+import { triggerBlobDownload } from '../lib/download';
 import type { MsgKey } from '../i18n';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
@@ -213,14 +214,7 @@ export function MermaidDiagram({ code, isDark = false, t: propT }: MermaidDiagra
   const handleDownloadSvg = useCallback(() => {
     if (!svgContent) return;
     const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mermaid-diagram-${Date.now()}.svg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    triggerBlobDownload(blob, `mermaid-diagram-${Date.now()}.svg`);
   }, [svgContent]);
 
   // 监听全屏模式下的 Escape 键退出

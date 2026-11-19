@@ -4,6 +4,7 @@ import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, Updat
 import { upgradeErrorText } from '../i18n';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
+import { isDesktopShell } from '../lib/desktop';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { Markdown } from './Markdown';
 import { useT } from '../settings';
@@ -213,6 +214,9 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                 currentInstanceId,
               })
             ) {
+              if (isDesktopShell()) {
+                await new Promise((resolve) => window.setTimeout(resolve, 1500));
+              }
               window.location.reload();
               return;
             }
