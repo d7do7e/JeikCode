@@ -19,6 +19,7 @@ import {
   updateSchedule,
 } from '../api';
 import { onGlobalEvent } from '../lib/globalEvents';
+import { keyboardActivateProps } from '../lib/modalA11y';
 import { deleteSessionCache } from '../lib/sessionCache';
 import { useT } from '../settings';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -446,6 +447,10 @@ export function TasksPanel({
                   <div
                     key={task.id}
                     class={'tasks-overview-card' + (!task.enabled ? ' is-disabled' : '')}
+                    {...keyboardActivateProps(() => {
+                      onCreatingChange(false);
+                      onSelectTaskId(task.id);
+                    })}
                     onClick={() => {
                       onCreatingChange(false);
                       onSelectTaskId(task.id);

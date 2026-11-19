@@ -7,6 +7,7 @@ import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
 import { createLatestRequestGuard } from '../lib/updateCheckGuard';
 import { isDesktopShell } from '../lib/desktop';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
+import { useModalA11y } from '../lib/modalA11y';
 import { Markdown } from './Markdown';
 import { useT } from '../settings';
 
@@ -65,6 +66,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const currentVersionRef = useRef('');
   const initialInstanceIdRef = useRef('');
   const reloadAfterRestartRef = useRef<() => void>(() => {});
+  const mainDialogRef = useRef<HTMLDivElement>(null);
+  const notesDialogRef = useRef<HTMLDivElement>(null);
+
+  useModalA11y(mainDialogRef, { open: true, disabled: updating, onClose });
+  useModalA11y(notesDialogRef, { open: notesOpen, onClose: () => setNotesOpen(false) });
 
   // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
   const mainBackdropDismiss = useBackdropDismiss(() => {
@@ -297,18 +303,6 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   };
 
   useEffect(() => {
-    if (!notesOpen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.stopPropagation();
-        setNotesOpen(false);
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [notesOpen]);
-
-  useEffect(() => {
     setNotesCopied('idle');
   }, [targetVersion, notesOpen]);
 
@@ -342,7 +336,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
       class="modal-overlay"
       {...mainBackdropDismiss}
     >
-      <div class="modal-card update-modal-card" role="dialog" aria-labelledby="update-dialog-title">
+      <div ref={mainDialogRef} class="modal-card update-modal-card" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
         <div class="modal-header">
           <span style="font-size: 16px;">🚀</span>
           <h3 id="update-dialog-title">{t('update.modalTitle')}</h3>
@@ -585,6 +579,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         {...notesBackdropDismiss}
       >
         <div
+          ref={notesDialogRef}
           class="release-notes-card"
           role="dialog"
           aria-modal="true"

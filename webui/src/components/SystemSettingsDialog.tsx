@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getDesktopSettings, postDesktopSettings, postConfigReload, getHealth, type DesktopSettings } from '../api';
 import type { MsgKey } from '../i18n';
 import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
+import { useModalA11y } from '../lib/modalA11y';
 import { useSettings } from '../settings';
 import { ModelConfigView } from './SettingsDialogs';
 
@@ -31,6 +32,9 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
   const [reloadingDisk, setReloadingDisk] = useState(false);
   const [reloadedDisk, setReloadedDisk] = useState(false);
   const [appVersion, setAppVersion] = useState(bakedAppVersion());
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useModalA11y(dialogRef, { open: true, onClose });
 
   // 遮罩空白处点击关闭：避免弹窗内拖拽划词时被误判为外部点击而秒关。
   const backdropDismiss = useBackdropDismiss(onClose);
@@ -91,18 +95,20 @@ export function SystemSettingsDialog({ onClose, initialTab, onOpenConfigSync }: 
     <div
       class="modal-overlay system-settings-modal-overlay"
       {...backdropDismiss}
-      role="dialog"
-      aria-modal="true"
     >
       <div
+        ref={dialogRef}
         class="modal-card modal-card-lg system-settings-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="system-settings-dialog-title"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div class="modal-header system-settings-header">
           <div class="system-settings-header-title">
             <span class="system-settings-header-icon" aria-hidden="true">⚙️</span>
-            <h3>{t('settings.systemSettings')}</h3>
+            <h3 id="system-settings-dialog-title">{t('settings.systemSettings')}</h3>
           </div>
           <button
             type="button"

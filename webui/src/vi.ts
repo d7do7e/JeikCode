@@ -856,6 +856,8 @@ export const vi: Record<keyof typeof en, string> = {
   'userInput.submit': 'Gửi',
   'userInput.skip': 'Bỏ qua',
   'userInput.close': 'Đóng và bỏ qua',
+  'userInput.prevStep': 'Bước trước',
+  'userInput.nextStep': 'Bước tiếp theo',
   'userInput.other': 'Khác',
   'userInput.error': 'Gửi thất bại, vui lòng thử lại',
   'notify.done.title': 'JeikCode đã hoàn tất',

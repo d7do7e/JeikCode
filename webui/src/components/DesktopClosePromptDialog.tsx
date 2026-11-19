@@ -1,14 +1,18 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { postDesktopSettings } from '../api';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { triggerDesktopAction } from '../lib/desktop';
+import { useModalA11y } from '../lib/modalA11y';
 import { useT } from '../settings';
 
 export function DesktopClosePromptDialog() {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [remember, setRemember] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useModalA11y(dialogRef, { open, onClose: () => setOpen(false) });
 
   // 遮罩空白处点击关闭：避免弹窗内拖拽划词时被误判为外部点击而秒关。
   const backdropDismiss = useBackdropDismiss(() => setOpen(false));
@@ -42,8 +46,6 @@ export function DesktopClosePromptDialog() {
     <div
       class="modal-overlay desktop-close-prompt-overlay"
       {...backdropDismiss}
-      role="dialog"
-      aria-modal="true"
       style={{
         zIndex: 100001,
         background: 'var(--app-modal-background, rgba(0, 0, 0, 0.65))',
@@ -56,7 +58,11 @@ export function DesktopClosePromptDialog() {
       }}
     >
       <div
+        ref={dialogRef}
         class="modal-card modal-card-sm desktop-close-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="desktop-close-prompt-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 'min(440px, 94vw)',
@@ -83,7 +89,7 @@ export function DesktopClosePromptDialog() {
           >
             🖥️
           </div>
-          <h3 style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600 }}>
+          <h3 id="desktop-close-prompt-title" style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600 }}>
             {t('desktop.closePromptTitle')}
           </h3>
           <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted, #9ca3af)', lineHeight: '1.6' }}>

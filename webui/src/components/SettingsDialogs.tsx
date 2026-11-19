@@ -23,6 +23,7 @@ import { languageOptions, Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
+import { keyboardActivateProps, useModalA11y } from '../lib/modalA11y';
 
 // 上下文窗口预设（计算机标准二进制 1024 进制：256K / 512K / 1M / 2M）。
 const CONTEXT_WINDOW_PRESETS = [262144, 524288, 1048576, 2097152];
@@ -114,6 +115,10 @@ function SettingsModal({
 }) {
   const { t } = useSettings();
   const mountTimeRef = useRef(Date.now());
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleIdRef = useRef(`settings-modal-title-${Math.random().toString(36).slice(2, 9)}`);
+
+  useModalA11y(dialogRef, { open: true, onClose });
 
   // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
   // 挂载前 150ms 忽略外部点击，防双层弹窗点击穿透。
@@ -134,10 +139,17 @@ function SettingsModal({
       {...backdropDismiss}
       style={{ zIndex: 99999 }}
     >
-      <div class={'modal-card' + sizeClass} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        class={'modal-card' + sizeClass}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleIdRef.current}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div class="modal-header">
-          <span>⚙</span>
-          <h3>{title}</h3>
+          <span aria-hidden="true">⚙</span>
+          <h3 id={titleIdRef.current}>{title}</h3>
           <button class="ghost-btn modal-close" onClick={onClose} aria-label={t('settings.close')}>
             ×
           </button>
@@ -605,6 +617,8 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
                   <div key={account.id} class="provider-group">
                     <div
                       class="provider-group-header"
+                      aria-expanded={!isCollapsed}
+                      {...keyboardActivateProps(() => toggleCollapse(account.id))}
                       onClick={() => toggleCollapse(account.id)}
                     >
                       <div class="provider-group-info">
@@ -1167,6 +1181,8 @@ function ProviderFormDialog({
                   e.preventDefault();
                   pickModel(filtered[highlight]!);
                 } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  e.stopPropagation();
                   setModelMenuOpen(false);
                 }
               }}

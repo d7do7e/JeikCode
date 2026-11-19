@@ -925,6 +925,8 @@ const zh = {
   'userInput.submit': '提交',
   'userInput.skip': '跳过',
   'userInput.close': '关闭并跳过',
+  'userInput.prevStep': '上一步',
+  'userInput.nextStep': '下一步',
   'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
 
@@ -2291,6 +2293,8 @@ export const en: Record<MsgKey, string> = {
   'userInput.submit': 'Submit',
   'userInput.skip': 'Skip',
   'userInput.close': 'Close and skip',
+  'userInput.prevStep': 'Previous step',
+  'userInput.nextStep': 'Next step',
   'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
 

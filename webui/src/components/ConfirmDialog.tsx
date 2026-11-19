@@ -5,6 +5,7 @@ import { createPortal } from 'preact/compat';
 import { useEffect, useState, useRef } from 'preact/hooks';
 import { useT } from '../settings';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
+import { useModalA11y } from '../lib/modalA11y';
 
 export interface ConfirmDialogProps {
   title?: string;
@@ -51,10 +52,18 @@ export function ConfirmDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState(input?.defaultValue ?? '');
+  const dialogRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
   const confirmBtnRef = useRef<HTMLButtonElement>(null);
   const [selectedOption, setSelectedOption] = useState<'cancel' | 'confirm'>('confirm');
+
+  useModalA11y(dialogRef, {
+    open: true,
+    disabled: busy,
+    onClose,
+    initialFocusRef: input ? inputRef : confirmBtnRef,
+  });
 
   // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
   const backdropDismiss = useBackdropDismiss(() => {
@@ -64,11 +73,6 @@ export function ConfirmDialog({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (busy) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-        return;
-      }
       // 如果焦点在输入框中，左右键由文本框自行移动光标
       if (input && document.activeElement === inputRef.current) {
         return;
@@ -136,10 +140,10 @@ export function ConfirmDialog({
       class="modal-overlay confirm-modal-overlay"
       {...backdropDismiss}
     >
-      <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
+      <div ref={dialogRef} class="modal-card modal-card-sm" role="dialog" aria-modal="true" aria-labelledby="confirm-dialog-title">
         <div class="modal-header">
-          <span style="font-size: 16px;">{displayIcon}</span>
-          <h3>{effectiveTitle}</h3>
+          <span style="font-size: 16px;" aria-hidden="true">{displayIcon}</span>
+          <h3 id="confirm-dialog-title">{effectiveTitle}</h3>
           <button
             type="button"
             class="ghost-btn modal-close"

@@ -441,15 +441,27 @@ function BatchCard({ req, onDone, submitAnswer, dock, center }: UserInputCardPro
       onClose={() => void skipAll()}
       footer={
         <>
-          <button class="btn" disabled={loading} onClick={skipAll}>
+          <button type="button" class="btn" disabled={loading} onClick={skipAll}>
             {t('userInput.skip')}
           </button>
           {step > 0 && (
-            <button class="btn" disabled={loading} onClick={back}>
+            <button
+              type="button"
+              class="btn"
+              disabled={loading}
+              onClick={back}
+              aria-label={t('userInput.prevStep')}
+            >
               ←
             </button>
           )}
-          <button class="btn btn-primary" disabled={nextDisabled} onClick={next}>
+          <button
+            type="button"
+            class="btn btn-primary"
+            disabled={nextDisabled}
+            onClick={next}
+            aria-label={isLast ? undefined : t('userInput.nextStep')}
+          >
             {isLast ? t('userInput.submit') : '→'}
           </button>
         </>

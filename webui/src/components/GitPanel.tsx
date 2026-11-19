@@ -3,6 +3,7 @@ import { createPortal } from 'preact/compat';
 import { useSettings } from '../settings';
 import { modalConfirm, modalPrompt } from './ConfirmDialog';
 import { showToast } from './Toast';
+import { keyboardActivateProps } from '../lib/modalA11y';
 import { getPageZoom } from '../lib/pageZoom';
 import {
   fetchGitBranches,
@@ -1218,6 +1219,7 @@ export function GitPanel({
                     <div
                       key={file.path}
                       class="git-status-file-row"
+                      {...keyboardActivateProps(() => onOpenWorkingDiff?.(file, true, effectiveCwd))}
                       onClick={() => onOpenWorkingDiff?.(file, true, effectiveCwd)}
                       title={`${file.path} (${t('git.stagedChanges')})`}
                     >
@@ -1290,6 +1292,7 @@ export function GitPanel({
                     <div
                       key={file.path}
                       class="git-status-file-row"
+                      {...keyboardActivateProps(() => onOpenWorkingDiff?.(file, false, effectiveCwd))}
                       onClick={() => onOpenWorkingDiff?.(file, false, effectiveCwd)}
                       title={`${file.path} (${t('git.changes')})`}
                     >
@@ -1355,6 +1358,7 @@ export function GitPanel({
                     (isCurrent ? ' current' : '') +
                     (isSelected ? ' selected' : '')
                   }
+                  {...keyboardActivateProps(() => setSelectedBranch(b))}
                   onClick={() => setSelectedBranch(b)}
                   onDblClick={() => !isCurrent && handleCheckout(b)}
                   onContextMenu={(e) => handleBranchContextMenu(e, b, false)}
@@ -1435,6 +1439,7 @@ export function GitPanel({
                     <div
                       key={rb}
                       class={'git-branch-item remote' + (isSelected ? ' selected' : '')}
+                      {...keyboardActivateProps(() => setSelectedBranch(rb))}
                       onClick={() => setSelectedBranch(rb)}
                       onDblClick={() => handleCheckout(rb)}
                       onContextMenu={(e) => handleBranchContextMenu(e, rb, true)}
@@ -1516,6 +1521,8 @@ export function GitPanel({
                         (isHead ? ' head-row' : '') +
                         (isExpanded ? ' selected' : '')
                       }
+                      aria-expanded={isExpanded}
+                      {...keyboardActivateProps(() => toggleCommitExpanded(c))}
                       onClick={() => {
                         toggleCommitExpanded(c);
                       }}
@@ -1957,6 +1964,7 @@ export function GitPanel({
                               <div
                                 key={file.path}
                                 class="git-file-row"
+                                {...keyboardActivateProps(() => onOpenFileDiff?.(c, file, effectiveCwd))}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   onOpenFileDiff?.(c, file, effectiveCwd);
@@ -2167,7 +2175,12 @@ export function GitPanel({
               height: commitsCollapsed ? "32px" : `${100 - Math.round(splitRatio * 100)}%`,
             }}
           >
-            <div class="git-commits-section-header" onClick={toggleCommitsCollapse}>
+            <div
+              class="git-commits-section-header"
+              aria-expanded={!commitsCollapsed}
+              {...keyboardActivateProps(toggleCommitsCollapse)}
+              onClick={toggleCommitsCollapse}
+            >
               <span class="git-section-caret">{commitsCollapsed ? "▶" : "▼"}</span>
               <span class="git-section-title">{t("git.commits")}</span>
               <span class="git-badge-counter">{graphRows.length}</span>
