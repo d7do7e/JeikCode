@@ -884,9 +884,12 @@ export function shouldClearCanvasOnSwitch(input: {
   if (input.canvasLen <= 0) return false;
   // 新建会话（草稿态）必须是**空白 landing 页**：landing 判定是 messages.length === 0，
   // 保留旧画布会让新会话直接显示上一会话的记录。
+  // 切换到其他会话（targetSessionId !== sourceSessionId）时同样必须清掉旧会话画布，
+  // 否则未缓存/新建目标会话的防抖缓存保存或后续对账会把上一会话的消息写进目标会话缓存。
   // 旧会话的在途记录不靠“留着画布”保存，而是在切走前已经写入它自己的缓存
   // （`messageCacheRef.set(prevId, cached)`），回来时原样恢复。
   if (!input.targetSessionId) return true;
+  if (input.targetSessionId !== input.sourceSessionId) return true;
   return !input.sourceActive;
 }
 

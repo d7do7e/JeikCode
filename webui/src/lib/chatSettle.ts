@@ -18,6 +18,37 @@ export interface LocalStreamEntryLike {
   abortController: { signal: { aborted: boolean } };
 }
 
+/** 切回会话时仅恢复真正由本端发起且未中止的 POST 流（观察流 watchOnly 不得接管 abortRef）。 */
+export function shouldRestoreActiveStreamOnSwitch(
+  entry: LocalStreamEntryLike | null | undefined,
+): boolean {
+  return ownsRunningLocalSend(entry);
+}
+
+/** 停止 detached poll 时仅当目标是当前活跃前台会话（或全局停止）才清理前台轮询与待机 watch。 */
+export function shouldClearForegroundPollOnStop(
+  targetSid: string | null | undefined,
+  activeSid: string | null | undefined,
+): boolean {
+  return !targetSid || activeSid === targetSid;
+}
+
+/** 防抖写回画布缓存前校验会话 id、代际与画布就绪归属是否仍一致，杜绝跨会话缓存污染。 */
+export function shouldCommitCanvasCacheSave(input: {
+  scheduledSid: string | null | undefined;
+  scheduledGen: number;
+  activeSid: string | null | undefined;
+  currentGen: number;
+  readySid: string | null | undefined;
+}): boolean {
+  return Boolean(
+    input.scheduledSid &&
+      input.activeSid === input.scheduledSid &&
+      input.currentGen === input.scheduledGen &&
+      input.readySid === input.scheduledSid,
+  );
+}
+
 /** 本端是否仍持有一条真正在跑的**发送**流（观察流不算）。 */
 export function ownsRunningLocalSend(
   entry: LocalStreamEntryLike | null | undefined,

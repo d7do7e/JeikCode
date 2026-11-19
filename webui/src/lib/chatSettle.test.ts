@@ -4,6 +4,9 @@ import {
   lastAssistantTextLen,
   ownsRunningLocalSend,
   shouldAdoptAuthoritativeTail,
+  shouldClearForegroundPollOnStop,
+  shouldCommitCanvasCacheSave,
+  shouldRestoreActiveStreamOnSwitch,
   tailAssistantHasUnresolvedTools,
 } from './chatSettle.ts';
 import {
@@ -201,4 +204,54 @@ test('lastAssistantTextLen 只看最后一条助手正文/思考', () => {  cons
   ];
   assert.equal(lastAssistantTextLen(rows), 5);
   assert.equal(lastAssistantTextLen([]), 0);
+});
+
+test('shouldRestoreActiveStreamOnSwitch 拒绝对 watchOnly 观察流恢复 abortRef', () => {
+  const open = { signal: { aborted: false } };
+  assert.equal(shouldRestoreActiveStreamOnSwitch({ watchOnly: true, abortController: open }), false);
+  assert.equal(shouldRestoreActiveStreamOnSwitch({ abortController: open }), true);
+  assert.equal(
+    shouldRestoreActiveStreamOnSwitch({ abortController: { signal: { aborted: true } } }),
+    false,
+  );
+  assert.equal(shouldRestoreActiveStreamOnSwitch(undefined), false);
+});
+
+test('shouldClearForegroundPollOnStop 防止后台会话停止误杀前台轮询', () => {
+  assert.equal(shouldClearForegroundPollOnStop(undefined, 's-fg'), true);
+  assert.equal(shouldClearForegroundPollOnStop('s-fg', 's-fg'), true);
+  assert.equal(shouldClearForegroundPollOnStop('s-bg', 's-fg'), false);
+});
+
+test('shouldCommitCanvasCacheSave 在会话切换或画布未就绪时拒绝写入', () => {
+  assert.equal(
+    shouldCommitCanvasCacheSave({
+      scheduledSid: 's1',
+      scheduledGen: 2,
+      activeSid: 's1',
+      currentGen: 2,
+      readySid: 's1',
+    }),
+    true,
+  );
+  assert.equal(
+    shouldCommitCanvasCacheSave({
+      scheduledSid: 's1',
+      scheduledGen: 2,
+      activeSid: 's2',
+      currentGen: 3,
+      readySid: 's2',
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCommitCanvasCacheSave({
+      scheduledSid: 's1',
+      scheduledGen: 2,
+      activeSid: 's1',
+      currentGen: 2,
+      readySid: null,
+    }),
+    false,
+  );
 });

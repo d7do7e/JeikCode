@@ -1147,6 +1147,11 @@ test('发完消息瞬间新建会话：新会话必须是空白 landing，旧会
   );
   assert.equal(
     shouldClearCanvasOnSwitch({ targetSessionId: 's-new', sourceSessionId: 's-old', canvasLen: 12, sourceActive: true }),
+    true,
+  );
+  // 同一活跃会话内部刷新不清空画布
+  assert.equal(
+    shouldClearCanvasOnSwitch({ targetSessionId: 's-same', sourceSessionId: 's-same', canvasLen: 12, sourceActive: true }),
     false,
   );
 });

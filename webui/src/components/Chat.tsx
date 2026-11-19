@@ -388,6 +388,9 @@ import {
   lastAssistantTextLen,
   ownsRunningLocalSend,
   shouldAdoptAuthoritativeTail,
+  shouldClearForegroundPollOnStop,
+  shouldCommitCanvasCacheSave,
+  shouldRestoreActiveStreamOnSwitch,
   tailAssistantHasUnresolvedTools,
 } from '../lib/chatSettle';
 
@@ -927,10 +930,14 @@ export function Chat({
     if (!targetSid || activeIdRef.current === targetSid) return;
     backgroundRunningSessionsRef.current.delete(targetSid);
     localTurnSessionsRef.current.delete(targetSid);
+    localPostedTurnSessionsRef.current.delete(targetSid);
     onTurnRunningChange?.(targetSid, false);
     sessionWatchersRef.current.get(targetSid)?.abort();
     sessionWatchersRef.current.delete(targetSid);
-    localActiveStreamsBySessionRef.current.delete(targetSid);
+    const existingStream = localActiveStreamsBySessionRef.current.get(targetSid);
+    if (existingStream?.watchOnly === true) {
+      localActiveStreamsBySessionRef.current.delete(targetSid);
+    }
     const ph =
       projectHashBySessionRef.current.get(targetSid) ||
       viewedProjectHashRef.current ||
@@ -943,6 +950,7 @@ export function Chat({
   function settleBusyFromAuthority(sid: string) {
     if (!sid) return;
     localTurnSessionsRef.current.delete(sid);
+    localPostedTurnSessionsRef.current.delete(sid);
     backgroundRunningSessionsRef.current.delete(sid);
     const ph =
       projectHashBySessionRef.current.get(sid) ||
@@ -2174,6 +2182,8 @@ export function Chat({
   const requestIdRef = useRef<string | null>(null);
   /** 专用于跟踪当前正在活跃接收 streamChat 的本地请求 ID（UUID），防止被后台查询异步改写的 requestIdRef 干扰 */
   const activeStreamRequestIdRef = useRef<string | null>(null);
+  /** 按会话隔离本端通过 POST /chat 发起并尚未终结的回合归属，避免把远端/TUI 回合误判为 ownStream */
+  const localPostedTurnSessionsRef = useRef<Set<string>>(new Set());
   /** 按会话隔离本端发起的活跃本地流，切会话时保留控制器并在切回时无缝接管，杜绝双流并行与重放重叠 */
   const localActiveStreamsBySessionRef = useRef<Map<string, {
     abortController: AbortController;
@@ -2347,14 +2357,18 @@ export function Chat({
     );
   }
   function stopDetachedHistoryPoll(targetSid?: string) {
-    if (detachedPollTimerRef.current != null) {
+    const clearForeground = shouldClearForegroundPollOnStop(targetSid, activeIdRef.current);
+    if (clearForeground && detachedPollTimerRef.current != null) {
       window.clearInterval(detachedPollTimerRef.current);
       detachedPollTimerRef.current = null;
     }
     if (targetSid) {
       sessionWatchersRef.current.get(targetSid)?.abort();
       sessionWatchersRef.current.delete(targetSid);
-      localActiveStreamsBySessionRef.current.delete(targetSid);
+      const entry = localActiveStreamsBySessionRef.current.get(targetSid);
+      if (entry && !ownsRunningLocalSend(entry)) {
+        localActiveStreamsBySessionRef.current.delete(targetSid);
+      }
     } else {
       for (const ctrl of sessionWatchersRef.current.values()) {
         ctrl.abort();
@@ -2367,7 +2381,9 @@ export function Chat({
     }
     // 一并清待机 watch：升级时它的 abort 已交给 detachedWatchAbortRef（上方
     // 已 abort），纯空闲态时仅存在于 idleWatchAbortRef，这里兜底。
-    stopIdleWatch();
+    if (clearForeground) {
+      stopIdleWatch();
+    }
   }
   function stopBackgroundFinishWatch() {
     if (backgroundFinishTimerRef.current != null) {
@@ -2401,6 +2417,7 @@ export function Chat({
         if (activeIdRef.current === id) continue;
         backgroundRunningSessionsRef.current.delete(id);
         localTurnSessionsRef.current.delete(id);
+        localPostedTurnSessionsRef.current.delete(id);
         onTurnRunningChange?.(id, false);
         const hash = projectHashBySessionRef.current.get(id) || viewedProjectHashRef.current || activeSession?.project_hash;
         if (!hash) continue;
@@ -2828,6 +2845,7 @@ export function Chat({
             localActiveStreamsBySessionRef.current.delete(params.loadId);
             backgroundRunningSessionsRef.current.delete(params.loadId);
             localTurnSessionsRef.current.delete(params.loadId);
+            localPostedTurnSessionsRef.current.delete(params.loadId);
             onTurnRunningChange?.(params.loadId, false);
             archiveBackgroundTodos(params.loadId);
           }
@@ -2934,14 +2952,18 @@ export function Chat({
 
     // Live reattach via event bus fan-out.
     const watchAbort = new AbortController();
-    detachedWatchAbortRef.current = watchAbort;
+    if (!opts?.background && activeIdRef.current === loadId) {
+      detachedWatchAbortRef.current = watchAbort;
+    }
     sessionWatchersRef.current.set(loadId, watchAbort);
-    localActiveStreamsBySessionRef.current.set(loadId, {
-      abortController: watchAbort,
-      requestId: loadId,
-      // 观察流不是本端回合：它断网后永远不会更新，不能用来否决服务端的权威空闲结论。
-      watchOnly: true,
-    });
+    if (!ownsRunningLocalSend(localActiveStreamsBySessionRef.current.get(loadId))) {
+      localActiveStreamsBySessionRef.current.set(loadId, {
+        abortController: watchAbort,
+        requestId: loadId,
+        // 观察流不是本端回合：它断网后永远不会更新，不能用来否决服务端的权威空闲结论。
+        watchOnly: true,
+      });
+    }
 
     const effectiveProjectHash =
       projectHash ||
@@ -3038,6 +3060,7 @@ export function Chat({
                 localActiveStreamsBySessionRef.current.delete(loadId);
                 backgroundRunningSessionsRef.current.delete(loadId);
                 localTurnSessionsRef.current.delete(loadId);
+                localPostedTurnSessionsRef.current.delete(loadId);
                 onTurnRunningChange?.(loadId, false);
                 archiveBackgroundTodos(loadId);
                 if (activeIdRef.current === loadId) {
@@ -3121,9 +3144,13 @@ export function Chat({
             }
             terminalSeen = true;
             watchAbort.abort();
-            settleSessionRunningState(loadId);
-            settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
-            void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
+            if (activeIdRef.current === loadId) {
+              settleSessionRunningState(loadId);
+              settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+            } else {
+              settleBackgroundSessionFromAuthority(loadId);
+              archiveBackgroundTodos(loadId);
+            }
           }
         })
         .catch(() => {});
@@ -3322,6 +3349,7 @@ export function Chat({
    */
   function settleSessionRunningState(sid: string) {
     localTurnSessionsRef.current.delete(sid);
+    localPostedTurnSessionsRef.current.delete(sid);
     backgroundRunningSessionsRef.current.delete(sid);
     const stream = localActiveStreamsBySessionRef.current.get(sid);
     if (!stream || stream.watchOnly) {
@@ -3644,6 +3672,7 @@ export function Chat({
     transitionChatRecovery({ type: 'authoritative_terminal' });
     backgroundRunningSessionsRef.current.delete(loadId);
     localTurnSessionsRef.current.delete(loadId);
+    localPostedTurnSessionsRef.current.delete(loadId);
     onTurnRunningChange?.(loadId, false);
     setHistoryHint(null);
     setBusyAndClock(false);
@@ -3906,6 +3935,7 @@ export function Chat({
   const textRafRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
+      cancelCanvasCacheSave();
       stopDetachedHistoryPoll();
       stopBackgroundFinishWatch();
       clearTrailingHandoverIdleVerify();
@@ -3945,6 +3975,7 @@ export function Chat({
           sessionWatchersRef.current.delete(sid);
           localActiveStreamsBySessionRef.current.delete(sid);
           localTurnSessionsRef.current.delete(sid);
+          localPostedTurnSessionsRef.current.delete(sid);
           backgroundRunningSessionsRef.current.delete(sid);
           messageCacheRef.current.delete(sid);
           cacheRevisionBySessionRef.current.delete(sid);
@@ -4326,6 +4357,7 @@ export function Chat({
     // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
+      cancelCanvasCacheSave();
       blockQueueDrainRef.current = true;
       const prevId = activeIdRef.current;
       if (!isFirstMountRef.current) {
@@ -4515,13 +4547,15 @@ export function Chat({
       stopIdleWatch();
       optimisticFiredRef.current = false;
       const restoredActiveStream = sessionId ? localActiveStreamsBySessionRef.current.get(sessionId) : undefined;
-      if (restoredActiveStream && !restoredActiveStream.abortController.signal.aborted) {
-        abortRef.current = restoredActiveStream.abortController;
-        activeStreamRequestIdRef.current = restoredActiveStream.requestId;
+      if (shouldRestoreActiveStreamOnSwitch(restoredActiveStream)) {
+        abortRef.current = restoredActiveStream!.abortController;
+        activeStreamRequestIdRef.current = restoredActiveStream!.requestId;
       } else {
         abortRef.current = null;
         activeStreamRequestIdRef.current = null;
-        if (sessionId) localActiveStreamsBySessionRef.current.delete(sessionId);
+        if (sessionId && restoredActiveStream?.abortController.signal.aborted) {
+          localActiveStreamsBySessionRef.current.delete(sessionId);
+        }
       }
       pendingSelfEchoRef.current = sessionId
         ? (pendingSelfEchoBySessionRef.current.get(sessionId) ?? [])
@@ -5053,6 +5087,7 @@ export function Chat({
             : runtimeIsRunning ? true : null;
         if (serverActive === false) {
           localTurnSessionsRef.current.delete(loadId);
+          localPostedTurnSessionsRef.current.delete(loadId);
           backgroundRunningSessionsRef.current.delete(loadId);
           onTurnRunningChange?.(loadId, false);
         }
@@ -5390,6 +5425,7 @@ export function Chat({
               busyRef.current = true;
             } else {
               localTurnSessionsRef.current.delete(loadId);
+              localPostedTurnSessionsRef.current.delete(loadId);
               backgroundRunningSessionsRef.current.delete(loadId);
               onTurnRunningChange?.(loadId, false);
               liveLifecycleRef.current = createLiveLifecycleState();
@@ -9023,6 +9059,7 @@ export function Chat({
         }
         backgroundRunningSessionsRef.current.delete(targetSid);
         localTurnSessionsRef.current.delete(targetSid);
+        localPostedTurnSessionsRef.current.delete(targetSid);
         onTurnRunningChange?.(targetSid, false);
         const liveDoc = liveTodoDoc(targetSid);
         const settled = settleLiveTodo(liveDoc);
@@ -9059,6 +9096,12 @@ export function Chat({
    * 所以每处理完一帧就排队一次缓存写入（L1 同步、L2 异步），回合收尾另有强制写入。
    */
   const canvasCacheTimerRef = useRef<number | null>(null);
+  function cancelCanvasCacheSave() {
+    if (canvasCacheTimerRef.current != null) {
+      window.clearTimeout(canvasCacheTimerRef.current);
+      canvasCacheTimerRef.current = null;
+    }
+  }
   /**
    * Persist the UNION of the full L1 canvas and the visible window.
    *
@@ -9097,13 +9140,36 @@ export function Chat({
 
   function scheduleCanvasCacheSave() {
     if (canvasCacheTimerRef.current != null) return;
+    const scheduledSid = activeIdRef.current ?? sessionId;
+    const scheduledGen = sessionGenerationRef.current;
+    if (
+      !shouldCommitCanvasCacheSave({
+        scheduledSid,
+        scheduledGen,
+        activeSid: activeIdRef.current,
+        currentGen: sessionGenerationRef.current,
+        readySid: canvasReadySessionIdRef.current,
+      })
+    ) {
+      return;
+    }
     canvasCacheTimerRef.current = window.setTimeout(() => {
       canvasCacheTimerRef.current = null;
-      const target = activeIdRef.current ?? sessionId;
-      if (!target) return;
+      if (
+        !shouldCommitCanvasCacheSave({
+          scheduledSid,
+          scheduledGen,
+          activeSid: activeIdRef.current,
+          currentGen: sessionGenerationRef.current,
+          readySid: canvasReadySessionIdRef.current,
+        })
+      ) {
+        return;
+      }
+      const target = scheduledSid!;
       const hash =
         projectHashBySessionRef.current.get(target) ??
-        activeSession?.project_hash ??
+        (activeSession?.id === target ? activeSession.project_hash : undefined) ??
         viewedProjectHashRef.current ??
         '';
       if (!hash) return;
@@ -9857,6 +9923,7 @@ export function Chat({
           }
           transitionChatRecovery({ type: 'authoritative_terminal' });
           localTurnSessionsRef.current.delete(event.session_id);
+          localPostedTurnSessionsRef.current.delete(event.session_id);
           backgroundRunningSessionsRef.current.delete(event.session_id);
           onTurnRunningChange?.(event.session_id, false);
           turnStartedAtBySessionRef.current.delete(event.session_id);
@@ -9896,6 +9963,7 @@ export function Chat({
           const finishTerminal = () => {
             if (settleSid) {
               localTurnSessionsRef.current.delete(settleSid);
+              localPostedTurnSessionsRef.current.delete(settleSid);
               backgroundRunningSessionsRef.current.delete(settleSid);
               onTurnRunningChange?.(settleSid, false);
               turnStartedAtBySessionRef.current.delete(settleSid);
@@ -10117,6 +10185,7 @@ export function Chat({
           if (activeIdRef.current) {
             backgroundRunningSessionsRef.current.delete(activeIdRef.current);
             localTurnSessionsRef.current.delete(activeIdRef.current);
+            localPostedTurnSessionsRef.current.delete(activeIdRef.current);
             onTurnRunningChange?.(activeIdRef.current, false);
             turnStartedAtBySessionRef.current.delete(activeIdRef.current);
           }
@@ -10166,6 +10235,7 @@ export function Chat({
         if (activeIdRef.current) {
           backgroundRunningSessionsRef.current.delete(activeIdRef.current);
           localTurnSessionsRef.current.delete(activeIdRef.current);
+          localPostedTurnSessionsRef.current.delete(activeIdRef.current);
           onTurnRunningChange?.(activeIdRef.current, false);
           turnStartedAtBySessionRef.current.delete(activeIdRef.current);
         }
@@ -10872,6 +10942,7 @@ export function Chat({
       if (effectiveSid) {
         boundSessionId = effectiveSid;
         localTurnSessionsRef.current.add(effectiveSid);
+        localPostedTurnSessionsRef.current.add(effectiveSid);
         if (stillViewingTurn) {
           activeIdRef.current = effectiveSid;
           loadedForRef.current = effectiveSid;
@@ -11013,6 +11084,7 @@ export function Chat({
           // stale; `settleToIdleWatch` guards on this set and would otherwise
           // ignore the watcher's terminal, freezing the restored card.
           localTurnSessionsRef.current.delete(errorSid);
+          localPostedTurnSessionsRef.current.delete(errorSid);
           localActiveStreamsBySessionRef.current.delete(errorSid);
           pendingSelfEchoBySessionRef.current.delete(errorSid);
         }
@@ -11042,6 +11114,7 @@ export function Chat({
           setBusyAndClock(false);
           if (turnOwnerSid) {
             localTurnSessionsRef.current.delete(turnOwnerSid);
+            localPostedTurnSessionsRef.current.delete(turnOwnerSid);
             onTurnRunningChange?.(turnOwnerSid, false);
           }
         }
@@ -12777,7 +12850,8 @@ export function Chat({
       : undefined;
     const ownStream =
       abortRef.current !== null ||
-      (!!localStreamEntry && localStreamEntry.watchOnly !== true);
+      (!!localStreamEntry && localStreamEntry.watchOnly !== true) ||
+      Boolean(currentSid && localPostedTurnSessionsRef.current.has(currentSid));
     /**
      * await 期间用户可能已经发出了新回合。它的运行态（busy / localTurnSessions /
      * 观察流）是新一轮的唯一真相，绝不能被本次停止的收尾阶段抹掉。
@@ -12806,6 +12880,7 @@ export function Chat({
       sessionWatchersRef.current.delete(currentSid);
       localActiveStreamsBySessionRef.current.delete(currentSid);
       localTurnSessionsRef.current.delete(currentSid);
+      localPostedTurnSessionsRef.current.delete(currentSid);
       backgroundRunningSessionsRef.current.delete(currentSid);
       onTurnRunningChange?.(currentSid, false);
     }
@@ -12818,6 +12893,7 @@ export function Chat({
       markSessionManuallyStopped(requestAlias);
       localActiveStreamsBySessionRef.current.delete(requestAlias);
       localTurnSessionsRef.current.delete(requestAlias);
+      localPostedTurnSessionsRef.current.delete(requestAlias);
       backgroundRunningSessionsRef.current.delete(requestAlias);
       onTurnRunningChange?.(requestAlias, false);
     }
