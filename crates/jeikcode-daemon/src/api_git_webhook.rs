@@ -229,6 +229,16 @@ pub async fn get_git_webhook_info_api() -> impl IntoResponse {
         .into_response()
 }
 
+/// Compare-and-swap claim over `(repo, pr_number, claimed_sha)` so failed,
+/// unadmitted, or preempted reviews roll back cleanly without clobbering newer SHAs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrShaClaim {
+    pub repo: String,
+    pub pr_number: u64,
+    pub claimed_sha: String,
+    pub previous_sha: Option<String>,
+}
+
 /// Authorize a webhook against a bound Git adapter configuration before touching
 /// event parsing. Missing bindings, disabled bindings, non-App modes, empty secrets,
 /// and invalid HMAC signatures all return the exact same `401 Unauthorized` response
@@ -318,6 +328,7 @@ pub async fn handle_git_webhook_api(
     }
 
     // 8. 过滤 Pull Request 事件（检查开关、有效动作与 SHA 去重）
+    let mut claimed_sha: Option<PrShaClaim> = None;
     if event.is_pull_request && event.event_kind != GitEventKind::IssueCommentCreated {
         if !binding_config.events.pull_request {
             return (
@@ -346,20 +357,26 @@ pub async fn handle_git_webhook_api(
         if let (Some(pr_number), Some(ref head_sha)) =
             (event.issue_or_pr_number, event.head_sha.as_deref())
         {
-            if !crate::git_adapter::polling::check_and_update_pr_sha(
+            match crate::git_adapter::polling::try_claim_pr_sha(
                 &event.repo_full_name,
                 pr_number,
                 head_sha,
             ) {
-                tracing::info!(
-                    "[git_webhook] PR #{pr_number} in `{}` already reviewed at SHA {head_sha}. Skipping duplicate review.",
-                    event.repo_full_name
-                );
-                return (
-                    StatusCode::OK,
-                    "PR commit SHA already reviewed (deduplicated)",
-                )
-                    .into_response();
+                crate::git_adapter::polling::TryClaimPrSha::Claimed(claim) => {
+                    claimed_sha = Some(claim);
+                }
+                crate::git_adapter::polling::TryClaimPrSha::AlreadyReviewed => {
+                    tracing::info!(
+                        "[git_webhook] PR #{pr_number} in `{}` already reviewed at SHA {head_sha}. Skipping duplicate review.",
+                        event.repo_full_name
+                    );
+                    return (
+                        StatusCode::OK,
+                        "PR commit SHA already reviewed (deduplicated)",
+                    )
+                        .into_response();
+                }
+                crate::git_adapter::polling::TryClaimPrSha::InvalidSha => {}
             }
         }
     }
@@ -368,8 +385,14 @@ pub async fn handle_git_webhook_api(
     let state_clone = state.clone();
     let adapter_clone = adapter.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            execute_git_workflow(state_clone, adapter_clone, binding_config, event).await
+        if let Err(e) = execute_git_workflow(
+            state_clone,
+            adapter_clone,
+            binding_config,
+            event,
+            claimed_sha,
+        )
+        .await
         {
             tracing::error!("[git_webhook] Workflow execution failed: {e}");
         }
@@ -384,6 +407,7 @@ pub(crate) async fn execute_git_workflow(
     adapter: Arc<dyn GitPlatformAdapter>,
     config: GitAdapterConfig,
     event: NormalizedGitEvent,
+    claimed_sha: Option<PrShaClaim>,
 ) -> Result<(), String> {
     let pr_or_issue_number = match event.issue_or_pr_number {
         Some(num) => num,
@@ -480,43 +504,10 @@ pub(crate) async fn execute_git_workflow(
         )
     };
 
-    // 2. 检查会话当前是否处于第一轮或进行中状态 (Inflight)
-    let is_active = state.is_session_active(&session_id).await;
-    if is_active {
-        // 如果当前审查正在进行中：直接将该消息加入代发卡片队列（Queued Draft），并通过总线广播前后端！
-        tracing::info!(
-            "[git_webhook] Session `{session_id}` is actively running. Enqueueing comment into draft cards queue."
-        );
-        state
-            .push_to_session_queue(&session_id, &formatted_comment_instruction)
-            .await;
-        return Ok(());
-    }
-
-    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（全语种统一英文占位，简洁紧凑）
-    //    注意：正文必须保留 "JeikCode" 关键字，供 git_adapter 的 find_bot_primary_comment 定位并原地更新。
-    if !token.is_empty() {
-        let ack_message = format!(
-            "### 🌟 JeikCode Code Review\n\n\
-            ⏳ Reviewing, please hold on…\n\
-            📄 The full report will be published right here once ready\n\n\
-            > Target: [{kind_label} #{pr_or_issue_number}]({pr_url})"
-        );
-        let _ = adapter
-            .post_comment(
-                &token,
-                custom_api_base,
-                repo,
-                pr_or_issue_number,
-                &ack_message,
-            )
-            .await;
-    }
-
-    // 4. 根据开关动态组装完整的提示词 (双语规范 + 0.即时评论策略置顶注入)
+    // 2. 根据开关动态组装完整的提示词 (双语规范 + 0.即时评论策略置顶注入)
     let dynamic_system_prompt = assemble_dynamic_prompt(&config);
 
-    // 5. 确定目标工作目录与审查模型
+    // 3. 确定目标工作目录与审查模型
     let working_dir = crate::find_working_dir_for_project_hash(&config.project_hash)
         .unwrap_or_else(|| state.bind_working_dir.clone());
     let target_review_model = config.review_model.as_deref().unwrap_or("default");
@@ -547,26 +538,43 @@ pub(crate) async fn execute_git_workflow(
         )),
     };
 
-    // 6. Shared admission: same identity, input-log and display rows as /chat.
+    // 4. Shared admission (Preempt): headless Git review sessions never drain WebUI
+    //    draft queues, so latest-wins preemption replaces superseded runs cleanly while
+    //    compare-and-swap SHA rollback protects retryability on any failure/rejection.
     let admitted = match crate::admit_chat_turn(
         &state,
         chat_req,
-        crate::ChatAdmissionMode::RejectIfBusy,
+        crate::ChatAdmissionMode::Preempt {
+            timeout: std::time::Duration::from_secs(20),
+        },
         None,
     )
     .await
     {
         Ok(admitted) => admitted,
         Err(e) => {
-            tracing::warn!(
-                "[git_webhook] Could not admit chat turn for session `{session_id}`: {e:?}"
-            );
-            state
-                .push_to_session_queue(&session_id, &formatted_comment_instruction)
-                .await;
-            return Ok(());
+            if let Some(ref claim) = claimed_sha {
+                crate::git_adapter::polling::rollback_pr_sha(claim);
+            }
+            return Err(format!(
+                "could not admit chat turn for session `{session_id}`: {e:?}"
+            ));
         }
     };
+
+    // 5. Only post/update the "Reviewing..." placeholder AFTER turn admission succeeds
+    //    and ONLY when `update_existing_comment` is enabled so we never orphan placeholders.
+    let ack_comment_id = post_or_update_ack_comment(
+        adapter.as_ref(),
+        &config,
+        &token,
+        custom_api_base,
+        repo,
+        pr_or_issue_number,
+        kind_label,
+        &pr_url,
+    )
+    .await;
     let crate::AdmittedChatTurn {
         request: chat_req,
         operation_id,
@@ -638,69 +646,189 @@ pub(crate) async fn execute_git_workflow(
         .await;
     });
 
-    // 7. 收集审查输出结果
+    // 7. 收集审查输出结果（显式跟踪终态，取消或报错时绝不发表残缺正文，并回滚 PR SHA claim）
     let mut collected_review = String::new();
+    let mut had_error = false;
+    let mut was_cancelled = false;
+    let mut saw_done = false;
+    let mut terminal_error: Option<String> = None;
     while let Some(evt) = rx.recv().await {
         match evt {
             ChatEvent::TextDelta { content, .. } => {
                 collected_review.push_str(&content);
             }
-            ChatEvent::Done { message, .. } => {
-                if collected_review.trim().is_empty() {
-                    if let Some(msg) = message {
-                        collected_review = msg;
+            ChatEvent::Done {
+                message,
+                stop_reason,
+                ..
+            } => {
+                saw_done = true;
+                match stop_reason.as_deref() {
+                    Some("cancelled" | "manual_stop" | "interrupted_by_user") => {
+                        was_cancelled = true;
+                    }
+                    Some(reason) if reason != "stopped" => {
+                        had_error = true;
+                        terminal_error = Some(message.unwrap_or_else(|| reason.to_string()));
+                    }
+                    _ => {
+                        if collected_review.trim().is_empty() {
+                            if let Some(msg) = message {
+                                collected_review = msg;
+                            }
+                        }
                     }
                 }
                 break;
             }
             ChatEvent::Error { message, .. } => {
                 tracing::warn!("[git_webhook] Review turn returned error: {message}");
-                if collected_review.trim().is_empty() {
-                    collected_review = format!("Review encountered an error: {message}");
-                }
+                had_error = true;
+                terminal_error = Some(message);
                 break;
             }
             ChatEvent::Stopped => {
+                was_cancelled = true;
                 break;
             }
             _ => {}
         }
     }
 
+    if was_cancelled || had_error || !saw_done {
+        if let Some(ref claim) = claimed_sha {
+            crate::git_adapter::polling::rollback_pr_sha(claim);
+        }
+        if was_cancelled {
+            tracing::info!(
+                "[git_webhook] Review turn for `{session_id}` was cancelled/preempted; skipped publishing partial output."
+            );
+            return Ok(());
+        }
+        return Err(terminal_error.unwrap_or_else(|| {
+            format!("review turn for `{session_id}` ended without normal completion")
+        }));
+    }
+
     // 8. 远端发表或更新审查评论
     if !token.is_empty() && !collected_review.trim().is_empty() {
         let final_review_output = append_jeikcode_footer(&collected_review);
-        if config.update_existing_comment {
-            if let Ok(Some(existing_id)) = adapter
-                .find_bot_primary_comment(&token, custom_api_base, repo, pr_or_issue_number)
-                .await
-            {
-                let _ = adapter
-                    .update_comment(
-                        &token,
-                        custom_api_base,
-                        repo,
-                        existing_id,
-                        Some(pr_or_issue_number),
-                        &final_review_output,
-                    )
-                    .await;
-                return Ok(());
-            }
-        }
-
-        let _ = adapter
-            .post_comment(
-                &token,
-                custom_api_base,
-                repo,
-                pr_or_issue_number,
-                &final_review_output,
-            )
-            .await;
+        publish_review_comment(
+            adapter.as_ref(),
+            &config,
+            &token,
+            custom_api_base,
+            repo,
+            pr_or_issue_number,
+            ack_comment_id,
+            &final_review_output,
+        )
+        .await;
     }
 
     Ok(())
+}
+
+async fn post_or_update_ack_comment(
+    adapter: &dyn GitPlatformAdapter,
+    config: &GitAdapterConfig,
+    token: &str,
+    custom_api_base: Option<&str>,
+    repo: &str,
+    pr_or_issue_number: u64,
+    kind_label: &str,
+    pr_url: &str,
+) -> Option<u64> {
+    if token.is_empty() || !config.update_existing_comment {
+        return None;
+    }
+    let ack_message = format!(
+        "### 🌟 JeikCode Code Review\n\n\
+        ⏳ Reviewing, please hold on…\n\
+        📄 The full report will be published right here once ready\n\n\
+        > Target: [{kind_label} #{pr_or_issue_number}]({pr_url})"
+    );
+    if let Ok(Some(existing_id)) = adapter
+        .find_bot_primary_comment(token, custom_api_base, repo, pr_or_issue_number)
+        .await
+    {
+        if adapter
+            .update_comment(
+                token,
+                custom_api_base,
+                repo,
+                existing_id,
+                Some(pr_or_issue_number),
+                &ack_message,
+            )
+            .await
+            .is_ok()
+        {
+            return Some(existing_id);
+        }
+    }
+    adapter
+        .post_comment(
+            token,
+            custom_api_base,
+            repo,
+            pr_or_issue_number,
+            &ack_message,
+        )
+        .await
+        .ok()
+}
+
+async fn publish_review_comment(
+    adapter: &dyn GitPlatformAdapter,
+    config: &GitAdapterConfig,
+    token: &str,
+    custom_api_base: Option<&str>,
+    repo: &str,
+    pr_or_issue_number: u64,
+    ack_comment_id: Option<u64>,
+    final_review_output: &str,
+) {
+    if config.update_existing_comment {
+        let target_id = match ack_comment_id {
+            Some(id) => Some(id),
+            None => adapter
+                .find_bot_primary_comment(token, custom_api_base, repo, pr_or_issue_number)
+                .await
+                .ok()
+                .flatten(),
+        };
+        if let Some(existing_id) = target_id {
+            match adapter
+                .update_comment(
+                    token,
+                    custom_api_base,
+                    repo,
+                    existing_id,
+                    Some(pr_or_issue_number),
+                    final_review_output,
+                )
+                .await
+            {
+                Ok(()) => return,
+                Err(err) => {
+                    tracing::warn!(
+                        "[git_webhook] Failed to update comment #{existing_id} on `{repo}` #{pr_or_issue_number}, falling back to post_comment: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = adapter
+        .post_comment(
+            token,
+            custom_api_base,
+            repo,
+            pr_or_issue_number,
+            final_review_output,
+        )
+        .await;
 }
 
 /// 动态拼接 System Prompt：
@@ -842,5 +970,176 @@ mod tests {
             body
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_git_workflow_updates_existing_ack_and_falls_back_to_post_on_update_error() {
+        use std::sync::{Arc, Mutex};
+
+        struct MockAdapter {
+            calls: Arc<Mutex<Vec<String>>>,
+            existing_comment: Option<u64>,
+            fail_update: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::git_adapter::GitPlatformAdapter for MockAdapter {
+            fn platform_id(&self) -> &'static str {
+                "github"
+            }
+            fn verify_signature(
+                &self,
+                _secret: &str,
+                _headers: &HeaderMap,
+                _body_bytes: &[u8],
+            ) -> bool {
+                true
+            }
+            fn parse_event(
+                &self,
+                _headers: &HeaderMap,
+                _payload: serde_json::Value,
+            ) -> Result<Option<crate::git_adapter::NormalizedGitEvent>, String> {
+                Ok(None)
+            }
+            async fn post_comment(
+                &self,
+                _token: &str,
+                _api_base: Option<&str>,
+                _repo: &str,
+                _number: u64,
+                body: &str,
+            ) -> Result<u64, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("post:{}", body.lines().next().unwrap_or("")));
+                Ok(99)
+            }
+            async fn update_comment(
+                &self,
+                _token: &str,
+                _api_base: Option<&str>,
+                _repo: &str,
+                comment_id: u64,
+                _target_number: Option<u64>,
+                body: &str,
+            ) -> Result<(), String> {
+                self.calls.lock().unwrap().push(format!(
+                    "update:{comment_id}:{}",
+                    body.lines().next().unwrap_or("")
+                ));
+                if self.fail_update {
+                    Err("forbidden".into())
+                } else {
+                    Ok(())
+                }
+            }
+            async fn find_bot_primary_comment(
+                &self,
+                _token: &str,
+                _api_base: Option<&str>,
+                _repo: &str,
+                _number: u64,
+            ) -> Result<Option<u64>, String> {
+                Ok(self.existing_comment)
+            }
+            async fn test_connection(
+                &self,
+                _token: &str,
+                _api_base: Option<&str>,
+                _repo: &str,
+            ) -> Result<String, String> {
+                Ok("ok".into())
+            }
+            async fn fetch_active_pull_requests_with_etag(
+                &self,
+                _token: &str,
+                _api_base: Option<&str>,
+                _repo: &str,
+                _etag: Option<&str>,
+            ) -> Result<crate::git_adapter::PollPullRequestsOutput, String> {
+                unreachable!()
+            }
+        }
+
+        // 1. When update_existing_comment == false, post_or_update_ack_comment must NOT
+        // post an orphaned "Reviewing..." comment, and publish_review_comment posts directly.
+        let calls_no_update = Arc::new(Mutex::new(Vec::new()));
+        let adapter_no_update = MockAdapter {
+            calls: Arc::clone(&calls_no_update),
+            existing_comment: Some(42),
+            fail_update: false,
+        };
+        let mut cfg_no_update = base_cfg(true, "sec", true);
+        cfg_no_update.update_existing_comment = false;
+        let ack_none = super::post_or_update_ack_comment(
+            &adapter_no_update,
+            &cfg_no_update,
+            "t",
+            None,
+            "o/r",
+            1,
+            "PR",
+            "https://example/1",
+        )
+        .await;
+        assert_eq!(ack_none, None);
+        assert!(calls_no_update.lock().unwrap().is_empty());
+        super::publish_review_comment(
+            &adapter_no_update,
+            &cfg_no_update,
+            "t",
+            None,
+            "o/r",
+            1,
+            ack_none,
+            "final review",
+        )
+        .await;
+        assert_eq!(*calls_no_update.lock().unwrap(), vec!["post:final review"]);
+
+        // 2. When update_existing_comment == true and update_comment fails,
+        // publish_review_comment falls back to post_comment rather than dropping the review.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let adapter = MockAdapter {
+            calls: Arc::clone(&calls),
+            existing_comment: Some(42),
+            fail_update: true,
+        };
+        let mut cfg_update = base_cfg(true, "sec", true);
+        cfg_update.update_existing_comment = true;
+        let ack_id = super::post_or_update_ack_comment(
+            &adapter,
+            &cfg_update,
+            "t",
+            None,
+            "o/r",
+            1,
+            "PR",
+            "https://example/1",
+        )
+        .await;
+        assert_eq!(ack_id, Some(99));
+        super::publish_review_comment(
+            &adapter,
+            &cfg_update,
+            "t",
+            None,
+            "o/r",
+            1,
+            ack_id,
+            "final review",
+        )
+        .await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "update:42:### 🌟 JeikCode Code Review",
+                "post:### 🌟 JeikCode Code Review",
+                "update:99:final review",
+                "post:final review"
+            ]
+        );
     }
 }

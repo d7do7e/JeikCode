@@ -14,7 +14,7 @@ use super::{
     ensure_fresh_github_app_token, get_all_bindings, get_platform_adapter, GitSyncMode,
     NormalizedGitEvent,
 };
-use crate::api_git_webhook::execute_git_workflow;
+use crate::api_git_webhook::{execute_git_workflow, PrShaClaim};
 use crate::AppState;
 
 /// 最大并发自动审查任务数，防止海啸审查耗尽守护进程与模型资源
@@ -180,6 +180,21 @@ pub fn seed_repo_baseline_with_etag(
     save_poll_state_to_disk(&lock);
 }
 
+/// Result of trying to atomically claim `(repo, pr_number, head_sha)` for review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryClaimPrSha {
+    Claimed(PrShaClaim),
+    AlreadyReviewed,
+    InvalidSha,
+}
+
+/// Polling candidate paired with its compare-and-swap PR SHA claim.
+#[derive(Debug, Clone)]
+pub struct PollReviewItem {
+    pub event: NormalizedGitEvent,
+    pub claim: Option<PrShaClaim>,
+}
+
 /// 原子更新仓库中活跃 PR 的 Head SHA 及 ETag（单次加锁 + 单次写盘），返回需要触发审查的事件列表。
 /// 若接收到无 ETag 的 200 响应，显式清除先前的 ETag 缓存，防止跨端点绑定残留。
 pub fn record_poll_results_atomic(
@@ -188,6 +203,18 @@ pub fn record_poll_results_atomic(
     new_etag: Option<String>,
     auto_review_new_pr: bool,
 ) -> Vec<NormalizedGitEvent> {
+    record_poll_results_atomic_with_claims(repo, events, new_etag, auto_review_new_pr)
+        .into_iter()
+        .map(|item| item.event)
+        .collect()
+}
+
+pub fn record_poll_results_atomic_with_claims(
+    repo: &str,
+    events: &[NormalizedGitEvent],
+    new_etag: Option<String>,
+    auto_review_new_pr: bool,
+) -> Vec<PollReviewItem> {
     let normalized_repo = repo.trim().to_lowercase();
     let normalized_etag = new_etag
         .map(|s| s.trim().to_string())
@@ -197,7 +224,7 @@ pub fn record_poll_results_atomic(
 
     let repo_state = lock
         .repos
-        .entry(normalized_repo)
+        .entry(normalized_repo.clone())
         .or_insert_with(RepoPollState::default);
 
     let mut state_changed = false;
@@ -221,10 +248,8 @@ pub fn record_poll_results_atomic(
             continue;
         }
 
-        let is_new_or_updated = match repo_state.pr_head_shas.get(&pr_number) {
-            Some(existing) => existing != head_sha,
-            None => true,
-        };
+        let previous_sha = repo_state.pr_head_shas.get(&pr_number).cloned();
+        let is_new_or_updated = previous_sha.as_deref() != Some(head_sha);
 
         if is_new_or_updated {
             repo_state
@@ -233,7 +258,15 @@ pub fn record_poll_results_atomic(
             state_changed = true;
 
             if auto_review_new_pr {
-                events_to_review.push(event.clone());
+                events_to_review.push(PollReviewItem {
+                    event: event.clone(),
+                    claim: Some(PrShaClaim {
+                        repo: normalized_repo.clone(),
+                        pr_number,
+                        claimed_sha: head_sha.to_string(),
+                        previous_sha,
+                    }),
+                });
             }
         }
     }
@@ -251,35 +284,77 @@ pub fn record_poll_results_atomic(
     events_to_review
 }
 
-/// 判定并记录 PR 是否有新提交变更（若检测到新 PR 或 SHA 变更则返回 true，并原子更新缓存）
-pub fn check_and_update_pr_sha(repo: &str, pr_number: u64, head_sha: &str) -> bool {
+/// Atomically check and claim `(repo, pr_number, head_sha)`, returning the prior SHA
+/// so failed/cancelled/unadmitted reviews can roll back via [`rollback_pr_sha`].
+pub fn try_claim_pr_sha(repo: &str, pr_number: u64, head_sha: &str) -> TryClaimPrSha {
     let normalized_repo = repo.trim().to_lowercase();
     let head_sha = head_sha.trim();
     if head_sha.is_empty() {
-        return false;
+        return TryClaimPrSha::InvalidSha;
     }
 
     let mut lock = get_state_cache().lock().unwrap_or_else(|p| p.into_inner());
 
     let repo_state = lock
         .repos
-        .entry(normalized_repo)
+        .entry(normalized_repo.clone())
         .or_insert_with(RepoPollState::default);
 
-    if let Some(existing_sha) = repo_state.pr_head_shas.get(&pr_number) {
-        if existing_sha == head_sha {
-            // SHA 未发生任何改变，去重跳过
-            return false;
-        }
+    let previous_sha = repo_state.pr_head_shas.get(&pr_number).cloned();
+    if previous_sha.as_deref() == Some(head_sha) {
+        return TryClaimPrSha::AlreadyReviewed;
     }
 
-    // 发现全新 PR 或新提交 Push 到该 PR
     repo_state
         .pr_head_shas
         .insert(pr_number, head_sha.to_string());
     repo_state.initialized = true;
     save_poll_state_to_disk(&lock);
+    TryClaimPrSha::Claimed(PrShaClaim {
+        repo: normalized_repo,
+        pr_number,
+        claimed_sha: head_sha.to_string(),
+        previous_sha,
+    })
+}
+
+/// Compare-and-swap rollback: restores `previous_sha` (or removes `pr_number` if `None`)
+/// only if `pr_head_shas[pr_number]` still matches `claim.claimed_sha`. Preserves `initialized`.
+pub fn rollback_pr_sha(claim: &PrShaClaim) -> bool {
+    let normalized_repo = claim.repo.trim().to_lowercase();
+    let claimed_sha = claim.claimed_sha.trim();
+    let mut lock = get_state_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(repo_state) = lock.repos.get_mut(&normalized_repo) else {
+        return false;
+    };
+    if repo_state
+        .pr_head_shas
+        .get(&claim.pr_number)
+        .map(String::as_str)
+        != Some(claimed_sha)
+    {
+        return false;
+    }
+    match &claim.previous_sha {
+        Some(prev) => {
+            repo_state
+                .pr_head_shas
+                .insert(claim.pr_number, prev.clone());
+        }
+        None => {
+            repo_state.pr_head_shas.remove(&claim.pr_number);
+        }
+    }
+    save_poll_state_to_disk(&lock);
     true
+}
+
+/// 判定并记录 PR 是否有新提交变更（若检测到新 PR 或 SHA 变更则返回 true，并原子更新缓存）
+pub fn check_and_update_pr_sha(repo: &str, pr_number: u64, head_sha: &str) -> bool {
+    matches!(
+        try_claim_pr_sha(repo, pr_number, head_sha),
+        TryClaimPrSha::Claimed(_)
+    )
 }
 
 /// 标记仓库轮询时间（保存在内存中，避免高频写盘）
@@ -570,14 +645,16 @@ pub async fn poll_cycle_tick(state: &AppState) {
                 }
 
                 // 仓库已初始化：原子更新 PR Head SHAs 与 ETag，单次加锁并持久化落盘
-                let events_to_review = record_poll_results_atomic(
+                let items_to_review = record_poll_results_atomic_with_claims(
                     repo,
                     &events,
                     output.etag,
                     config.auto_review_new_pr,
                 );
 
-                for event in events_to_review {
+                for item in items_to_review {
+                    let event = item.event;
+                    let claim = item.claim;
                     let Some(pr_number) = event.issue_or_pr_number else {
                         continue;
                     };
@@ -594,9 +671,14 @@ pub async fn poll_cycle_tick(state: &AppState) {
                     let sem = get_review_semaphore().clone();
                     tokio::spawn(async move {
                         let _permit = sem.acquire_owned().await.expect("semaphore open");
-                        if let Err(e) =
-                            execute_git_workflow(state_clone, adapter_clone, config_clone, event)
-                                .await
+                        if let Err(e) = execute_git_workflow(
+                            state_clone,
+                            adapter_clone,
+                            config_clone,
+                            event,
+                            claim,
+                        )
+                        .await
                         {
                             tracing::error!("[git_polling] Automated review execution failed: {e}");
                         }
@@ -1062,5 +1144,57 @@ mod tests {
         // Normal network error mentioning repo name repo-500 should use standard network backoff (base 15s) rather than 5xx backoff (base 30s)
         let delay = calculate_backoff_delay_secs(1, "connection reset for repo-500", repo, now);
         assert!((15..=20).contains(&delay), "delay was {delay}");
+    }
+
+    #[test]
+    fn try_claim_pr_sha_and_rollback_cas_preserves_newer_shas() {
+        let _home = crate::tests::ScopedChatHome::new();
+        let repo = "test-owner/cas-rollback-repo";
+
+        assert_eq!(try_claim_pr_sha(repo, 7, "   "), TryClaimPrSha::InvalidSha);
+
+        // Initial claim has previous_sha: None.
+        let claim1 = match try_claim_pr_sha(repo, 7, "sha-1") {
+            TryClaimPrSha::Claimed(c) => c,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(claim1.previous_sha, None);
+        assert_eq!(
+            try_claim_pr_sha(repo, 7, "sha-1"),
+            TryClaimPrSha::AlreadyReviewed
+        );
+
+        // Rolling back claim1 removes PR 7 so sha-1 can be retried.
+        assert!(rollback_pr_sha(&claim1));
+        assert!(is_repo_initialized(repo));
+        let claim1_retry = match try_claim_pr_sha(repo, 7, "sha-1") {
+            TryClaimPrSha::Claimed(c) => c,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // Newer commit sha-2 supersedes sha-1.
+        let claim2 = match try_claim_pr_sha(repo, 7, "sha-2") {
+            TryClaimPrSha::Claimed(c) => c,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(claim2.previous_sha.as_deref(), Some("sha-1"));
+
+        // Delayed rollback of claim1_retry must NOT clobber sha-2.
+        assert!(!rollback_pr_sha(&claim1_retry));
+        assert_eq!(
+            try_claim_pr_sha(repo, 7, "sha-2"),
+            TryClaimPrSha::AlreadyReviewed
+        );
+
+        // Rolling back claim2 restores previous_sha = "sha-1".
+        assert!(rollback_pr_sha(&claim2));
+        assert_eq!(
+            try_claim_pr_sha(repo, 7, "sha-1"),
+            TryClaimPrSha::AlreadyReviewed
+        );
+        assert!(matches!(
+            try_claim_pr_sha(repo, 7, "sha-2"),
+            TryClaimPrSha::Claimed(_)
+        ));
     }
 }
