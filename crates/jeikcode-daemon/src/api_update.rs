@@ -603,7 +603,7 @@ async fn run_cli_update(
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
     let channel = match channel_opt.as_deref() {
         Some("beta") => jeikcode_updater::UpdateChannel::Beta,
         _ => jeikcode_updater::UpdateChannel::Stable,
@@ -641,6 +641,83 @@ async fn run_cli_update(
         ))
     };
 
+    drive_upgrade_events(
+        rx,
+        driver,
+        &IS_UPDATING,
+        listen_host,
+        listen_port,
+        restart_token,
+        no_token,
+        shutdown_tx,
+        |exe, listen_host, listen_port, restart_token, no_token, shutdown_tx| {
+            let restart_token = restart_token;
+            let restart_host = listen_host;
+            if listen_port > 0 {
+                let _ = crate::api_config::save_webui_listen_pref(
+                    restart_host.clone(),
+                    listen_port,
+                    restart_token.clone(),
+                );
+            }
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                // 在调用 restart 前，主动触发优雅停机释放当前的监听套接字（Listen Socket）
+                if let Some(tx) = shutdown_tx {
+                    let _ = tx.send(true);
+                }
+                crate::stop_server();
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                let Err(err) = jeikcode_updater::restart_process_with_config(
+                    &exe,
+                    listen_port,
+                    restart_host.as_deref(),
+                    listen_port,
+                    restart_token.as_deref(),
+                    Some(no_token),
+                );
+                tracing::error!("in-place upgrade restart failed: {err}");
+                set_update_status(UpdateStatus {
+                    status: "error".to_string(),
+                    progress: 0,
+                    bytes: 0,
+                    total: 0,
+                    error: Some(format!("重启失败: {err}")),
+                    error_code: Some(
+                        jeikcode_updater::UpgradeFailureKind::Restart
+                            .as_str()
+                            .to_string(),
+                    ),
+                });
+                IS_UPDATING.store(false, Ordering::SeqCst);
+            });
+        },
+    )
+    .await
+}
+
+async fn drive_upgrade_events<F, T>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<jeikcode_updater::UpgradeEvent>,
+    driver: tokio::task::JoinHandle<std::result::Result<T, jeikcode_updater::UpgradeFailure>>,
+    updating_flag: &AtomicBool,
+    listen_host: Option<String>,
+    listen_port: u16,
+    restart_token: Option<String>,
+    no_token: bool,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    mut schedule_restart: F,
+) -> Result<()>
+where
+    F: FnMut(
+        std::path::PathBuf,
+        Option<String>,
+        u16,
+        Option<String>,
+        bool,
+        Option<tokio::sync::watch::Sender<bool>>,
+    ),
+{
+    let mut restart_scheduled = false;
     while let Some(ev) = rx.recv().await {
         match ev {
             jeikcode_updater::UpgradeEvent::Downloading { bytes, total } => {
@@ -678,49 +755,18 @@ async fn run_cli_update(
                     error: None,
                     error_code: None,
                 });
-                // File is already swapped in place. Restart so remote WebUI /
-                // serve picks up the new image (Unix exec; Windows delayed spawn).
-                let restart_token = restart_token.clone();
-                let restart_host = listen_host.clone();
-                if listen_port > 0 {
-                    let _ = crate::api_config::save_webui_listen_pref(
-                        restart_host.clone(),
-                        listen_port,
-                        restart_token.clone(),
-                    );
-                }
-                let shutdown_tx = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                    // 在调用 restart 前，主动触发优雅停机释放当前的监听套接字（Listen Socket）
-                    if let Some(tx) = shutdown_tx {
-                        let _ = tx.send(true);
-                    }
-                    crate::stop_server();
-                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                    let Err(err) = jeikcode_updater::restart_process_with_config(
-                        &exe,
-                        listen_port,
-                        restart_host.as_deref(),
-                        listen_port,
-                        restart_token.as_deref(),
-                        Some(no_token),
-                    );
-                    tracing::error!("in-place upgrade restart failed: {err}");
-                    set_update_status(UpdateStatus {
-                        status: "error".to_string(),
-                        progress: 0,
-                        bytes: 0,
-                        total: 0,
-                        error: Some(format!("重启失败: {err}")),
-                        error_code: Some(
-                            jeikcode_updater::UpgradeFailureKind::Restart
-                                .as_str()
-                                .to_string(),
-                        ),
-                    });
-                    IS_UPDATING.store(false, Ordering::SeqCst);
-                });
+                // File is already swapped in place. Keep `updating_flag` armed until the
+                // delayed restart task executes (or fails) so concurrent POST /update/execute
+                // requests cannot race the 680ms shutdown/restart window.
+                restart_scheduled = true;
+                schedule_restart(
+                    exe,
+                    listen_host.clone(),
+                    listen_port,
+                    restart_token.clone(),
+                    no_token,
+                    shutdown_tx.clone(),
+                );
             }
             jeikcode_updater::UpgradeEvent::Failed(err) => {
                 set_update_status(UpdateStatus {
@@ -746,8 +792,13 @@ async fn run_cli_update(
             anyhow::anyhow!("update task terminated before reporting a result: {join_err}"),
         )),
     };
-    IS_UPDATING.store(false, Ordering::SeqCst);
+    if !restart_scheduled {
+        updating_flag.store(false, Ordering::SeqCst);
+    }
     if let Err(failure) = outcome {
+        if restart_scheduled {
+            updating_flag.store(false, Ordering::SeqCst);
+        }
         set_update_status(UpdateStatus {
             status: "error".to_string(),
             progress: 0,
@@ -1082,5 +1133,76 @@ mod tests {
         let parsed_mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join("mcp.json")).unwrap()).unwrap();
         assert!(parsed_mcp["mcpServers"].get("context7").is_some());
+    }
+
+    #[tokio::test]
+    async fn drive_upgrade_events_keeps_updating_flag_armed_when_done_schedules_restart() {
+        let flag = AtomicBool::new(true);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(jeikcode_updater::UpgradeEvent::Done {
+            exe: std::path::PathBuf::from("jeikcode.exe"),
+            backup: std::path::PathBuf::from("jeikcode.exe.bak"),
+            version: "7.5.2".into(),
+        })
+        .unwrap();
+        drop(tx);
+        let driver: tokio::task::JoinHandle<
+            std::result::Result<(), jeikcode_updater::UpgradeFailure>,
+        > = tokio::spawn(async { Ok(()) });
+        let mut scheduled = false;
+
+        drive_upgrade_events(
+            rx,
+            driver,
+            &flag,
+            None,
+            0,
+            None,
+            false,
+            None,
+            |_, _, _, _, _, _| {
+                scheduled = true;
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(scheduled);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "Done with scheduled restart must keep updating_flag armed"
+        );
+
+        let flag_err = AtomicBool::new(true);
+        let (tx_err, rx_err) = tokio::sync::mpsc::unbounded_channel();
+        tx_err
+            .send(jeikcode_updater::UpgradeEvent::Failed("network".into()))
+            .unwrap();
+        drop(tx_err);
+        let driver_err: tokio::task::JoinHandle<
+            std::result::Result<(), jeikcode_updater::UpgradeFailure>,
+        > = tokio::spawn(async {
+            Err(jeikcode_updater::UpgradeFailure::new(
+                jeikcode_updater::UpgradeFailureKind::Download,
+                anyhow::anyhow!("boom"),
+            ))
+        });
+        drive_upgrade_events(
+            rx_err,
+            driver_err,
+            &flag_err,
+            None,
+            0,
+            None,
+            false,
+            None,
+            |_, _, _, _, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            !flag_err.load(Ordering::SeqCst),
+            "Failed upgrade without Done must clear updating_flag"
+        );
     }
 }

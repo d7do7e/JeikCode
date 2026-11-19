@@ -516,18 +516,22 @@ fn chrono_like_now() -> String {
 
 // ─── Sessions ───────────────────────────────────────────────────────────────
 
-fn list_project_sessions(working_dir: &std::path::Path) -> Vec<(String, SessionSummary)> {
-    let root = jeikcode_capabilities::session::SessionManager::sessions_root();
+fn list_project_sessions_in_root(
+    root: &std::path::Path,
+    working_dir: &std::path::Path,
+) -> Vec<(String, SessionSummary)> {
     let project_hash = jeikcode_capabilities::session::SessionManager::project_hash(working_dir);
-    let scan = jeikcode_capabilities::session::SessionManager::scan_catalog(&root);
+    let scan = jeikcode_capabilities::session::SessionManager::scan_catalog(root);
     let mut out = Vec::new();
     for entry in scan.entries {
         if entry.project_bucket != project_hash {
             continue;
         }
-        let meta = jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir)
-            .read_meta(&entry.id)
-            .ok();
+        let meta = jeikcode_capabilities::session::SessionManager::with_root(
+            root.join(&entry.project_bucket),
+        )
+        .read_meta(&entry.id)
+        .ok();
         let summary = SessionSummary {
             id: entry.id.clone(),
             name: entry.name.clone(),
@@ -570,25 +574,30 @@ fn normalize_session_key(raw: Option<&str>) -> Option<String> {
 /// The protocol key is the durable identity. `name` remains the fallback for
 /// sessions created before `protocol_key` existed; the fallback backfills the
 /// key so a later WebUI rename cannot break API resume.
-fn find_session_id_by_key(working_dir: &std::path::Path, key: &str) -> Option<String> {
+fn find_session_id_by_key_in_root(
+    root: &std::path::Path,
+    working_dir: &std::path::Path,
+    key: &str,
+) -> Option<String> {
     let key = key.trim();
     if key.is_empty() {
         return None;
     }
-    let sessions = list_project_sessions(working_dir);
-    if let Some(id) = sessions
+    let sessions = list_project_sessions_in_root(root, working_dir);
+    if let Some((bucket, id)) = sessions
         .iter()
         .find(|(_, s)| s.protocol_key.as_deref() == Some(key))
-        .map(|(_, s)| s.id.clone())
+        .map(|(b, s)| (b.clone(), s.id.clone()))
     {
+        let _ = bucket;
         return Some(id);
     }
-    let found = sessions
+    let (bucket, found) = sessions
         .into_iter()
         .find(|(_, s)| s.name == key)
-        .map(|(_, s)| s.id)?;
+        .map(|(b, s)| (b, s.id))?;
     // Legacy protocol session: pin the key now so renames stop affecting lookup.
-    let manager = jeikcode_capabilities::session::SessionManager::for_project(working_dir);
+    let manager = jeikcode_capabilities::session::SessionManager::with_root(root.join(bucket));
     let _ = manager.update_meta(&found, |meta| {
         if meta.protocol_key.is_none() {
             meta.protocol_key = Some(key.to_string());
@@ -601,15 +610,35 @@ fn find_session_id_by_key(working_dir: &std::path::Path, key: &str) -> Option<St
 /// - key present + existing name match → resume that session id
 /// - key present + no match → create new session named exactly as the key
 /// - key absent → ephemeral (no id / no name)
-fn resolve_session_for_key(
+fn resolve_session_for_key_in_root(
+    root: &std::path::Path,
     working_dir: &std::path::Path,
     session_key: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     let Some(key) = normalize_session_key(session_key) else {
         return (None, None);
     };
-    let existing = find_session_id_by_key(working_dir, &key);
+    let existing = find_session_id_by_key_in_root(root, working_dir, &key);
     (existing, Some(key))
+}
+
+/// Acquire a per-key async mutex backed by `Weak` references so concurrent compat
+/// requests for the same `user` serialize across `preempt_occupancy` -> catalog
+/// lookup -> `admit_chat_turn`, while expired keys are pruned automatically.
+fn compat_key_mutex(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex as StdMutex, OnceLock, Weak};
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let map = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = guard.get(key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let fresh = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(key.to_string(), Arc::downgrade(&fresh));
+    fresh
 }
 
 /// GET /v1/sessions?user=<session_key>
@@ -620,7 +649,16 @@ pub(crate) async fn list_sessions(
     let working_dir = state.bind_working_dir.clone();
     let limit = q.limit.unwrap_or(100).min(500);
     let filter = normalize_session_key(q.user.as_deref());
-    let data: Vec<CompatSession> = list_project_sessions(&working_dir)
+    let root = jeikcode_capabilities::session::SessionManager::sessions_root();
+    let sessions = match tokio::task::spawn_blocking(move || {
+        list_project_sessions_in_root(&root, &working_dir)
+    })
+    .await
+    {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+    let data: Vec<CompatSession> = sessions
         .into_iter()
         .filter(|(_, s)| {
             filter
@@ -650,14 +688,21 @@ pub(crate) async fn list_sessions(
 pub(crate) async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let working_dir = state.bind_working_dir.clone();
     let key = normalize_session_key(Some(id.as_str())).unwrap_or(id.clone());
-    match list_project_sessions(&working_dir)
-        .into_iter()
-        .find(|(_, s)| {
-            s.id == key
-                || s.id.starts_with(&key)
-                || s.name == key
-                || s.protocol_key.as_deref() == Some(key.as_str())
-        }) {
+    let root = jeikcode_capabilities::session::SessionManager::sessions_root();
+    let sessions = match tokio::task::spawn_blocking(move || {
+        list_project_sessions_in_root(&root, &working_dir)
+    })
+    .await
+    {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+    match sessions.into_iter().find(|(_, s)| {
+        s.id == key
+            || s.id.starts_with(&key)
+            || s.name == key
+            || s.protocol_key.as_deref() == Some(key.as_str())
+    }) {
         Some((project_hash, s)) => Json(CompatSession {
             id: s.id,
             object: "session",
@@ -965,7 +1010,37 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("api-{}", uuid::Uuid::new_v4()));
-    let (session_id, _) = resolve_session_for_key(&working_dir, Some(session_key_raw.as_str()));
+    let occupancy = format!("compat-user:{session_key_raw}");
+    let key_mutex = compat_key_mutex(&occupancy);
+    let _key_guard = key_mutex.lock().await;
+
+    let preempted_sid = match state
+        .active_chats
+        .preempt_occupancy(&occupancy, Duration::from_secs(60))
+        .await
+    {
+        Ok(sid) => sid,
+        Err(ActiveChatAdmissionError::SessionBusy) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "previous turn did not stop in time",
+                "session_busy",
+            );
+        }
+        Err(ActiveChatAdmissionError::RequestBusy) => {
+            return api_error(StatusCode::CONFLICT, "request is busy", "request_busy");
+        }
+    };
+
+    let sessions_root = jeikcode_capabilities::session::SessionManager::sessions_root();
+    let wd_for_resolve = working_dir.clone();
+    let key_for_resolve = session_key_raw.clone();
+    let (resolved_sid, _) = tokio::task::spawn_blocking(move || {
+        resolve_session_for_key_in_root(&sessions_root, &wd_for_resolve, Some(&key_for_resolve))
+    })
+    .await
+    .unwrap_or((None, None));
+    let session_id = resolved_sid.or(preempted_sid);
 
     // Always Auto for OpenAI/Anthropic API; serve --yolo additionally disables
     // interactive user-input modals process-wide via AppState.yolo.
@@ -984,7 +1059,6 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
         session_title: Some(session_key_raw.clone()),
     };
 
-    let occupancy = format!("compat-user:{session_key_raw}");
     let admitted = match crate::admit_chat_turn(
         &state,
         chat_req,
@@ -1007,6 +1081,7 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
             return api_error(StatusCode::CONFLICT, "request is busy", "request_busy");
         }
     };
+    drop(_key_guard);
     let crate::AdmittedChatTurn {
         request: chat_req,
         operation_id,
@@ -1753,13 +1828,14 @@ mod tests {
         );
         // resolve with no catalog → always "create" path (None id + Some key)
         let dir = std::path::Path::new(".");
-        let (id1, k1) = resolve_session_for_key(dir, Some("user_1"));
-        let (id2, k2) = resolve_session_for_key(dir, Some("user-2"));
+        let empty_root = tempfile::tempdir().unwrap();
+        let (id1, k1) = resolve_session_for_key_in_root(empty_root.path(), dir, Some("user_1"));
+        let (id2, k2) = resolve_session_for_key_in_root(empty_root.path(), dir, Some("user-2"));
         assert!(id1.is_none() && id2.is_none());
         assert_eq!(k1.as_deref(), Some("user_1"));
         assert_eq!(k2.as_deref(), Some("user-2"));
         // omit user → ephemeral
-        let (id0, k0) = resolve_session_for_key(dir, None);
+        let (id0, k0) = resolve_session_for_key_in_root(empty_root.path(), dir, None);
         assert!(id0.is_none() && k0.is_none());
     }
 
@@ -1970,5 +2046,49 @@ mod tests {
         tokio::time::sleep(HTTP_DISCONNECT_CANCEL_GRACE + Duration::from_millis(50)).await;
         assert!(!token.is_cancelled());
         assert!(!armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn compat_key_mutex_and_resolve_session_in_root_isolate_and_backfill_keys() {
+        let m1 = compat_key_mutex("compat-user:alice");
+        let m2 = compat_key_mutex("compat-user:alice");
+        assert!(Arc::ptr_eq(&m1, &m2));
+        drop(m1);
+        drop(m2);
+        // Weak reference pruned once all strong holders drop.
+        let m3 = compat_key_mutex("compat-user:alice");
+        assert_eq!(Arc::strong_count(&m3), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mgr = jeikcode_capabilities::session::SessionManager::with_root(
+            root.join(jeikcode_capabilities::session::SessionManager::project_hash(&work)),
+        );
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut meta = jeikcode_capabilities::session::SessionMeta::new(
+            &sid,
+            work.to_string_lossy().as_ref(),
+            1,
+        );
+        meta.name = "alice_proj".into();
+        meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        let lease = mgr.acquire_lease(&sid).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&jeikcode_kernel::message::SessionSnapshot::new(vec![])),
+            Some(&jeikcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        drop(lease);
+
+        let (resolved, normalized) =
+            resolve_session_for_key_in_root(&root, &work, Some("  alice_proj  "));
+        assert_eq!(resolved.as_deref(), Some(sid.as_str()));
+        assert_eq!(normalized.as_deref(), Some("alice_proj"));
+        let updated = mgr.read_meta(&sid).unwrap();
+        assert_eq!(updated.protocol_key.as_deref(), Some("alice_proj"));
     }
 }

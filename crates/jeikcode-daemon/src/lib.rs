@@ -4164,6 +4164,29 @@ impl ActiveChatRegistry {
         }
     }
 
+    /// Preempt any active turn holding `alias` (e.g. compat `compat-user:<key>`),
+    /// returning the occupant's `session_id` captured before stopping so a second
+    /// turn racing ahead of `SessionMeta` persistence still resumes the same session.
+    pub(crate) async fn preempt_occupancy(
+        &self,
+        alias: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>, ActiveChatAdmissionError> {
+        let occupant_sid = {
+            let index = self.inner.read().await;
+            index
+                .aliases
+                .get(alias)
+                .and_then(|op_id| index.operations.get(op_id))
+                .and_then(|op| op.session_id.clone())
+        };
+        let has_occupant = self.inner.read().await.aliases.contains_key(alias);
+        if has_occupant && !self.stop_and_wait(alias.to_string(), Some(timeout)).await {
+            return Err(ActiveChatAdmissionError::SessionBusy);
+        }
+        Ok(occupant_sid)
+    }
+
     async fn stop_and_wait_any(&self, aliases: Vec<String>, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut saw_alias = false;
@@ -4781,14 +4804,14 @@ pub(crate) fn session_row_wire(
     })
 }
 
-/// Same row, addressed by project bucket instead of a working dir (catalog
-/// mutation helpers already hold the bucket).
-pub(crate) fn session_row_wire_in_bucket(
+/// Same row, addressed by project bucket and explicit sessions root (thread-safe
+/// for `IsolatedHome` / `spawn_blocking` workers).
+pub(crate) fn session_row_wire_in_root(
+    sessions_root: &std::path::Path,
     project_bucket: &str,
     session_id: &str,
 ) -> Option<SessionRowWire> {
-    let manager =
-        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
+    let manager = NativeSessionManager::with_root(sessions_root.join(project_bucket));
     let meta = manager.read_meta(session_id).ok()?;
     let origin = match meta.origin {
         jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
@@ -4812,6 +4835,19 @@ pub(crate) fn session_row_wire_in_bucket(
         reasoning_effort: meta.reasoning_effort.clone(),
         thinking_budget: meta.thinking_budget,
     })
+}
+
+/// Same row, addressed by project bucket instead of a working dir (catalog
+/// mutation helpers already hold the bucket).
+pub(crate) fn session_row_wire_in_bucket(
+    project_bucket: &str,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    session_row_wire_in_root(
+        &NativeSessionManager::sessions_root(),
+        project_bucket,
+        session_id,
+    )
 }
 
 /// 推送一条会话行的增量快照（读 meta 失败即静默跳过：下次事件/冷启动收敛）。
@@ -11572,6 +11608,121 @@ async fn truncate_session(
     .await
 }
 
+enum ForkOutcome {
+    NotFound,
+    Forked {
+        response: ForkSessionResponse,
+        session_row: Option<SessionRowWire>,
+    },
+}
+
+fn fork_session_in_root(
+    sessions_root: &std::path::Path,
+    hash: &str,
+    id: &str,
+    req: ForkSessionRequest,
+) -> std::io::Result<ForkOutcome> {
+    let (project_hash, manager, source_id, source) = if valid_project_bucket(hash) {
+        let mgr = NativeSessionManager::with_root(sessions_root.join(hash));
+        if let Ok(loaded) = mgr.load_native_session(id) {
+            (hash.to_string(), mgr, id.to_string(), loaded)
+        } else if let Ok(Some(resolved)) = resolve_session_in_root(sessions_root, id) {
+            let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+            if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+                (resolved.project_hash, mgr, resolved.meta.id, loaded)
+            } else {
+                return Ok(ForkOutcome::NotFound);
+            }
+        } else {
+            return Ok(ForkOutcome::NotFound);
+        }
+    } else if let Ok(Some(resolved)) = resolve_session_in_root(sessions_root, id) {
+        let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+        if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+            (resolved.project_hash, mgr, resolved.meta.id, loaded)
+        } else {
+            return Ok(ForkOutcome::NotFound);
+        }
+    } else {
+        return Ok(ForkOutcome::NotFound);
+    };
+
+    let target_message_count = req.target_index.map(|target_index| {
+        if let Some(real_index) = resolve_target_message_index(
+            &source.snapshot.messages,
+            target_index,
+            req.expected_text.as_deref(),
+            req.expected_role.as_deref(),
+            req.target_message_id.as_deref(),
+        ) {
+            if req.inclusive.unwrap_or(true) {
+                (real_index + 1).min(source.snapshot.messages.len())
+            } else {
+                real_index.min(source.snapshot.messages.len())
+            }
+        } else {
+            target_index.min(source.snapshot.messages.len())
+        }
+    });
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now = jeikcode_capabilities::session::now_ms();
+    let (mut forked, _lease) = manager
+        .fork_native_session_at(&source_id, &new_id, target_message_count, now)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    forked.meta.updated_at = now.saturating_add(1);
+    // A fork is a new manual conversation. It must never steal the source
+    // session's protocol key (or its protocol origin), otherwise a later
+    // `/v1/*` request could resume the fork instead of the original.
+    forked.meta.protocol_key = None;
+    forked.meta.origin = jeikcode_capabilities::session::SessionOrigin::Manual;
+    if let Some(title) = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        forked.meta.name = title.to_string();
+        forked.meta.user_renamed = true;
+    }
+    if let Err(err) = manager.write_meta(&forked.meta) {
+        drop(_lease);
+        let _ = crate::legacy_convert::delete_catalog_session_in_root(
+            sessions_root,
+            &project_hash,
+            &new_id,
+        );
+        return Err(std::io::Error::other(err.to_string()));
+    }
+
+    let session_row = session_row_wire_in_root(sessions_root, &project_hash, &new_id);
+    let root_id = forked
+        .meta
+        .fork_info
+        .as_ref()
+        .map(|f| f.root_id.clone())
+        .unwrap_or_else(|| source_id.clone());
+
+    let response = ForkSessionResponse {
+        success: true,
+        id: new_id,
+        name: forked.meta.name,
+        parent_id: source_id,
+        root_id,
+        working_dir: PathBuf::from(&forked.meta.working_dir),
+        project_hash,
+        message_count: forked.meta.message_count,
+        turn_count: forked.meta.turn_count,
+        created_at: u64::try_from(forked.meta.created_at.max(0)).unwrap_or(0) / 1_000,
+    };
+
+    Ok(ForkOutcome::Forked {
+        response,
+        session_row,
+    })
+}
+
 /// POST /projects/:hash/sessions/:id/fork - Fork (branch) a session
 async fn fork_session(
     State(state): State<AppState>,
@@ -11584,98 +11735,36 @@ async fn fork_session(
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let sessions_root = NativeSessionManager::sessions_root();
-        let (project_hash, manager, source_id, source) = if valid_project_bucket(&hash) {
-            let mgr = NativeSessionManager::with_root(sessions_root.join(&hash));
-            if let Ok(loaded) = mgr.load_native_session(&id) {
-                (hash.clone(), mgr, id.clone(), loaded)
-            } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-                let mgr =
-                    NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
-                if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
-                    (resolved.project_hash, mgr, resolved.meta.id, loaded)
-                } else {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                    )
-                        .into_response();
-                }
-            } else {
+        let outcome = match run_session_catalog_io(move || {
+            fork_session_in_root(&sessions_root, &hash, &id, req)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
                 return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": e.to_string() })),
                 )
                     .into_response();
             }
-        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-            let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
-            if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
-                (resolved.project_hash, mgr, resolved.meta.id, loaded)
-            } else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                )
-                    .into_response();
-            }
-        } else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "success": false, "error": "session not found" })),
-            )
-                .into_response();
         };
 
-        let target_message_count = req.target_index.map(|target_index| {
-            if let Some(real_index) = resolve_target_message_index(
-                &source.snapshot.messages,
-                target_index,
-                req.expected_text.as_deref(),
-                req.expected_role.as_deref(),
-                req.target_message_id.as_deref(),
-            ) {
-                if req.inclusive.unwrap_or(true) {
-                    (real_index + 1).min(source.snapshot.messages.len())
-                } else {
-                    real_index.min(source.snapshot.messages.len())
-                }
-            } else {
-                target_index.min(source.snapshot.messages.len())
+        let (response, session_row) = match outcome {
+            ForkOutcome::NotFound => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                )
+                    .into_response();
             }
-        });
+            ForkOutcome::Forked {
+                response,
+                session_row,
+            } => (response, session_row),
+        };
 
-        let new_id = uuid::Uuid::new_v4().to_string();
-        let now = jeikcode_capabilities::session::now_ms();
-        let (mut forked, _lease) =
-            match manager.fork_native_session_at(&source_id, &new_id, target_message_count, now) {
-                Ok(res) => res,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-
-        forked.meta.updated_at = now.saturating_add(1);
-        // A fork is a new manual conversation. It must never steal the source
-        // session's protocol key (or its protocol origin), otherwise a later
-        // `/v1/*` request could resume the fork instead of the original.
-        forked.meta.protocol_key = None;
-        forked.meta.origin = jeikcode_capabilities::session::SessionOrigin::Manual;
-        if let Some(title) = req
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            forked.meta.name = title.to_string();
-            forked.meta.user_renamed = true;
-        }
-        let _ = manager.write_meta(&forked.meta);
-
-        if let Some(session) = session_row_wire_in_bucket(&project_hash, &new_id) {
+        if let Some(session) = session_row {
             publish_global(GlobalWireEvent::SessionUpsert { session });
         }
 
@@ -11685,26 +11774,6 @@ async fn fork_session(
             error_kind: None,
             error_data: None,
         });
-
-        let root_id = forked
-            .meta
-            .fork_info
-            .as_ref()
-            .map(|f| f.root_id.clone())
-            .unwrap_or_else(|| source_id.clone());
-
-        let response = ForkSessionResponse {
-            success: true,
-            id: new_id,
-            name: forked.meta.name,
-            parent_id: source_id,
-            root_id,
-            working_dir: PathBuf::from(&forked.meta.working_dir),
-            project_hash,
-            message_count: forked.meta.message_count,
-            turn_count: forked.meta.turn_count,
-            created_at: u64::try_from(forked.meta.created_at.max(0)).unwrap_or(0) / 1_000,
-        };
 
         (StatusCode::OK, Json(response)).into_response()
     })
@@ -26487,6 +26556,89 @@ mod tests {
 
         // Unknown id → None.
         assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn preempt_occupancy_returns_active_session_id_and_drains_slot() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry
+            .admit_occupied(
+                Some("sess-first".into()),
+                Some("req-1".into()),
+                Some("compat-user:alice".into()),
+            )
+            .await
+            .unwrap();
+
+        let reg_clone = registry.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            reg_clone.complete(&admission.operation_id).await;
+        });
+
+        let preempted_sid = registry
+            .preempt_occupancy("compat-user:alice", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(preempted_sid.as_deref(), Some("sess-first"));
+        stopper.await.unwrap();
+    }
+
+    #[test]
+    fn fork_session_in_root_resets_protocol_key_and_origin_and_handles_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let work = temp.path().join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let bucket = NativeSessionManager::project_hash(&work);
+        let mgr = NativeSessionManager::with_root(root.join(&bucket));
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let mut meta = jeikcode_capabilities::session::SessionMeta::new(
+            &source_id,
+            work.to_string_lossy().as_ref(),
+            1,
+        );
+        meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        meta.protocol_key = Some("alice-key".into());
+        meta.origin = jeikcode_capabilities::session::SessionOrigin::Protocol;
+        let lease = mgr.acquire_lease(&source_id).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&jeikcode_kernel::message::SessionSnapshot::new(vec![
+                jeikcode_kernel::message::Message::user("hi"),
+                jeikcode_kernel::message::Message::assistant("hello", vec![]),
+            ])),
+            Some(&jeikcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        drop(lease);
+
+        let missing =
+            fork_session_in_root(root, &bucket, "nonexistent", ForkSessionRequest::default())
+                .unwrap();
+        assert!(matches!(missing, ForkOutcome::NotFound));
+
+        let forked = fork_session_in_root(
+            root,
+            &bucket,
+            &source_id,
+            ForkSessionRequest {
+                title: Some("branched".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ForkOutcome::Forked { response, .. } = forked else {
+            panic!("expected ForkOutcome::Forked");
+        };
+        let forked_meta = mgr.read_meta(&response.id).unwrap();
+        assert_eq!(forked_meta.protocol_key, None);
+        assert_eq!(
+            forked_meta.origin,
+            jeikcode_capabilities::session::SessionOrigin::Manual
+        );
+        assert_eq!(forked_meta.name, "branched");
     }
 
     // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
