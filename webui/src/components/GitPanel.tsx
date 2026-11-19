@@ -2120,13 +2120,13 @@ export function GitPanel({
               </div>
             )}
           </div>
-          <button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button>
+          <button type="button" onClick={() => setError(null)} aria-label={t('common.dismiss')}>×</button>
         </div>
       )}
       {successMsg && (
         <div class="git-alert-banner git-alert-success" role="status">
           <span>{successMsg}</span>
-          <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Dismiss">×</button>
+          <button type="button" onClick={() => setSuccessMsg(null)} aria-label={t('common.dismiss')}>×</button>
         </div>
       )}
 

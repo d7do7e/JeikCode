@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { useT } from '../settings';
 
 export type ToastType = 'info' | 'success' | 'warning' | 'error';
 
@@ -24,6 +25,7 @@ export function showToast(message: string, type: ToastType = 'info') {
 }
 
 export function ToastHost() {
+  const translate = useT();
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   useEffect(() => {
@@ -55,7 +57,7 @@ export function ToastHost() {
             type="button"
             class="webui-toast-close"
             onClick={() => setToasts((prev) => prev.filter((item) => item.id !== t.id))}
-            aria-label="Close"
+            aria-label={translate('common.dismiss')}
           >
             ×
           </button>

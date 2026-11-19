@@ -75,6 +75,19 @@ test('Chat and diagram accessibility labels use translated catalog keys', () => 
   }
   assert.equal(messages.vi['common.dismiss'], 'Đóng');
   assert.equal(messages.vi['chat.inspectorTabs'], 'Các thẻ kiểm tra');
+
+  // Ensure modal/dialog close & banner dismiss buttons across touched components use localized keys.
+  const sysSettings = readFileSync(new URL('./components/SystemSettingsDialog.tsx', import.meta.url), 'utf8');
+  const gitPanel = readFileSync(new URL('./components/GitPanel.tsx', import.meta.url), 'utf8');
+  const modelSelector = readFileSync(new URL('./components/ModelSelector.tsx', import.meta.url), 'utf8');
+  const toast = readFileSync(new URL('./components/Toast.tsx', import.meta.url), 'utf8');
+  const confirmDialog = readFileSync(new URL('./components/ConfirmDialog.tsx', import.meta.url), 'utf8');
+  assert.ok(sysSettings.includes(`aria-label={t('settings.close')}`), 'SystemSettingsDialog close aria-label');
+  assert.ok(modelSelector.includes(`aria-label={t('settings.close')}`), 'ModelSelector close aria-label');
+  assert.ok(gitPanel.includes(`aria-label={t('common.dismiss')}`), 'GitPanel dismiss aria-label');
+  assert.ok(toast.includes(`aria-label={translate('common.dismiss')}`) || toast.includes(`aria-label={t('common.dismiss')}`), 'Toast dismiss aria-label');
+  assert.ok(confirmDialog.includes('aria-label={effectiveCancel}'), 'ConfirmDialog close aria-label');
+  assert.ok(!/aria-label="(?:Close|Dismiss)"/.test(sysSettings + gitPanel + modelSelector + toast + confirmDialog));
 });
 
 test('language selectors share native self-names in English-first order', () => {

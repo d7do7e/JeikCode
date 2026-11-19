@@ -139,7 +139,13 @@ export function ConfirmDialog({
         <div class="modal-header">
           <span style="font-size: 16px;">{displayIcon}</span>
           <h3>{title}</h3>
-          <button class="ghost-btn modal-close" onClick={onClose} aria-label={cancelLabel}>
+          <button
+            type="button"
+            class="ghost-btn modal-close"
+            onClick={() => { if (!busy) onClose(); }}
+            disabled={busy}
+            aria-label={effectiveCancel}
+          >
             ×
           </button>
         </div>
@@ -169,9 +175,10 @@ export function ConfirmDialog({
         <div class="modal-footer">
           {!alertOnly && (
             <button
+              type="button"
               ref={cancelBtnRef}
               class={`btn btn-secondary ${selectedOption === 'cancel' ? 'modal-btn-selected' : ''}`}
-              onClick={onClose}
+              onClick={() => { if (!busy) onClose(); }}
               onFocus={() => setSelectedOption('cancel')}
               disabled={busy}
               style={selectedOption === 'cancel' ? { outline: '2px solid var(--app-primary, #3b82f6)', outlineOffset: '2px' } : undefined}
@@ -180,6 +187,7 @@ export function ConfirmDialog({
             </button>
           )}
           <button
+            type="button"
             ref={confirmBtnRef}
             class={`btn ${danger ? 'btn-danger' : 'btn-primary'} ${selectedOption === 'confirm' ? 'modal-btn-selected' : ''}`}
             onClick={handleConfirm}

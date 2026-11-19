@@ -15,26 +15,43 @@ interface RenameDialogProps {
 
 export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
   const t = useT();
-  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
-  const backdropDismiss = useBackdropDismiss(onClose);
   const [name, setName] = useState(session.name || '');
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(() => {
+    if (!busy) onClose();
+  });
 
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
   }, []);
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (busy || e.isComposing) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
   async function submit() {
     const n = name.trim();
     if (!n || busy) return;
     setBusy(true);
+    setError(null);
     try {
       await renameSession(session.project_hash, session.id, n);
       onDone(n);
       onClose();
-    } catch {
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
     }
   }
@@ -44,11 +61,17 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
       class="modal-overlay"
       {...backdropDismiss}
     >
-      <div class="modal-card modal-card-sm">
+      <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
         <div class="modal-header">
           <span>✎</span>
           <h3>{t('rename.title')}</h3>
-          <button class="ghost-btn modal-close" onClick={onClose} aria-label={t('common.cancel')}>
+          <button
+            type="button"
+            class="ghost-btn modal-close"
+            onClick={() => { if (!busy) onClose(); }}
+            disabled={busy}
+            aria-label={t('common.cancel')}
+          >
             ×
           </button>
         </div>
@@ -59,6 +82,7 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
             type="text"
             value={name}
             placeholder={t('rename.placeholder')}
+            disabled={busy}
             onInput={(e) => setName((e.target as HTMLInputElement).value)}
             onKeyDown={(e) => {
               // 忽略输入法组字阶段的回车（选词确认），避免误触发保存。
@@ -66,12 +90,13 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
               if (e.key === 'Enter') submit();
             }}
           />
+          {error && <div class="modal-error" role="alert">{error}</div>}
         </div>
         <div class="modal-footer">
-          <button class="btn" onClick={onClose}>
+          <button type="button" class="btn" onClick={() => { if (!busy) onClose(); }} disabled={busy}>
             {t('common.cancel')}
           </button>
-          <button class="btn btn-primary" onClick={submit} disabled={busy || !name.trim()}>
+          <button type="button" class="btn btn-primary" onClick={submit} disabled={busy || !name.trim()}>
             {t('rename.confirm')}
           </button>
         </div>
@@ -131,6 +156,18 @@ export function DeleteDialog({
     ? t('delete.bodyMany', { n: remaining.length })
     : t('delete.body', { name });
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (busy || e.isComposing) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
   async function confirm() {
     if (busy || remaining.length === 0) return;
     const batch = remaining.slice();
@@ -175,11 +212,17 @@ export function DeleteDialog({
       class="modal-overlay"
       {...backdropDismiss}
     >
-      <div class="modal-card modal-card-sm">
+      <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
         <div class="modal-header">
           <span>🗑</span>
           <h3>{t('delete.title')}</h3>
-          <button class="ghost-btn modal-close" onClick={onClose} aria-label={t('common.cancel')}>
+          <button
+            type="button"
+            class="ghost-btn modal-close"
+            onClick={() => { if (!busy) onClose(); }}
+            disabled={busy}
+            aria-label={t('common.cancel')}
+          >
             ×
           </button>
         </div>
@@ -188,10 +231,10 @@ export function DeleteDialog({
           {error && <div class="modal-error" role="alert">{error}</div>}
         </div>
         <div class="modal-footer">
-          <button class="btn" onClick={onClose}>
+          <button type="button" class="btn" onClick={() => { if (!busy) onClose(); }} disabled={busy}>
             {t('common.cancel')}
           </button>
-          <button class="btn btn-danger" onClick={confirm} disabled={busy || remaining.length === 0}>
+          <button type="button" class="btn btn-danger" onClick={confirm} disabled={busy || remaining.length === 0}>
             {t('delete.confirm')}
           </button>
         </div>
