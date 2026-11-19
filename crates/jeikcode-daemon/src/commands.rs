@@ -403,10 +403,11 @@ async fn exec_native_compact(
     // 阶段登记与广播由 `exec_compact` 在受理那一刻统一负责；这里只做压缩与提交。
     let sid_for_notice = session.lease.id().to_string();
 
-    let compact_fut = jeikcode_coding::runtime::compact_snapshot(
+    let compact_fut = jeikcode_coding::runtime::compact_snapshot_with_epoch(
         session.loaded.snapshot.messages.clone(),
         provider,
         (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
+        session.loaded.snapshot.cache_epoch,
     );
     let compacted = tokio::select! {
         _ = cancellation.cancelled() => {

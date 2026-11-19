@@ -1005,19 +1005,57 @@ pub async fn compact_snapshot(
     provider: Arc<dyn LlmProvider>,
     focus: Option<String>,
 ) -> SnapshotCompaction {
+    compact_snapshot_with_epoch(messages, provider, focus, 0).await
+}
+
+/// Apply the same v2 manual-compaction policy and kernel invariants to a
+/// persisted message list while preserving the caller's `cache_epoch`.
+pub async fn compact_snapshot_with_epoch(
+    messages: Vec<Message>,
+    provider: Arc<dyn LlmProvider>,
+    focus: Option<String>,
+    cache_epoch: u64,
+) -> SnapshotCompaction {
     let mut conversation = Conversation {
         messages,
-        cache_epoch: 0,
+        cache_epoch,
         ..Default::default()
     };
     let floor = conversation.sacred_floor();
-    let (recorded_window, used_tokens, _) = conversation.last_pressure();
+    let (recorded_window, mut used_tokens) = conversation
+        .messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == jeikcode_kernel::message::Role::Assistant
+                && m.internal_origin.as_deref()
+                    != Some(jeikcode_kernel::message::TURN_DIAGNOSTIC_ORIGIN)
+                && m.meta.is_some()
+        })
+        .and_then(|m| m.meta.as_ref())
+        .map(|meta| {
+            let used = if meta.used_tokens > 0 {
+                meta.used_tokens
+            } else {
+                meta.tokens.prompt.saturating_add(meta.tokens.completion)
+            };
+            (meta.ctx_window, used)
+        })
+        .unwrap_or((0, 0));
+    let estimated_tokens: u32 = conversation
+        .messages
+        .iter()
+        .map(|m| m.estimate_tokens() as u64)
+        .sum::<u64>()
+        .min(u32::MAX as u64) as u32;
+    used_tokens = used_tokens.max(estimated_tokens);
     let live_window = provider.context_window();
-    let ctx_window = if live_window > 0 {
+    let window = if live_window > 0 {
         live_window
     } else {
         recorded_window
     };
+    let ctx_window = jeikcode_kernel::agent::input_watermark_budget(window);
     let utilization = if ctx_window > 0 {
         used_tokens as f32 / ctx_window as f32
     } else {
@@ -15211,9 +15249,10 @@ mod tests {
             .with_ctx_window(128_000),
         );
 
-        let result = compact_snapshot(messages, provider, None).await;
+        let result = compact_snapshot_with_epoch(messages, provider, None, 4).await;
 
         assert!(result.outcome.committed);
+        assert_eq!(result.outcome.epoch, 5);
         assert!(matches!(
             result.mutation,
             SnapshotCompactionMutation::Replace { .. }

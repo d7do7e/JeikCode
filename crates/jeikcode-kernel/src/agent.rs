@@ -1956,18 +1956,8 @@ impl RunningAgent {
         self.should_compact_at(convo, self.compact_threshold)
     }
 
-    fn should_compact_at(
-        &self,
-        convo: &Conversation,
-        threshold: Option<f32>,
-    ) -> Option<CompactTrigger> {
-        let thresh = threshold?;
-        // Measure the context the NEXT request will carry: the provider's prompt
-        // PLUS that response's completion (the assistant output is now part of the
-        // history). `meta.used_tokens` alone is the prompt side, so a 20K response
-        // used to arrive "20K under" the real pressure. Fall back to the
-        // conservative estimator when the provider reported no usage.
-        let (recorded_window, used) = convo
+    fn resolve_pressure_facts(convo: &Conversation) -> Option<(u32, u32)> {
+        convo
             .messages
             .iter()
             .rev()
@@ -1983,10 +1973,29 @@ impl RunningAgent {
                 } else if meta.tokens.prompt > 0 {
                     meta.tokens.prompt.saturating_add(meta.tokens.completion)
                 } else {
-                    convo.messages.iter().map(|m| m.estimate_tokens()).sum()
+                    convo
+                        .messages
+                        .iter()
+                        .map(|m| m.estimate_tokens() as u64)
+                        .sum::<u64>()
+                        .min(u32::MAX as u64) as u32
                 };
                 (meta.ctx_window, used)
-            })?;
+            })
+    }
+
+    fn should_compact_at(
+        &self,
+        convo: &Conversation,
+        threshold: Option<f32>,
+    ) -> Option<CompactTrigger> {
+        let thresh = threshold?;
+        // Measure the context the NEXT request will carry: the provider's prompt
+        // PLUS that response's completion (the assistant output is now part of the
+        // history). `meta.used_tokens` alone is the prompt side, so a 20K response
+        // used to arrive "20K under" the real pressure. Fall back to the
+        // conservative estimator when the provider reported no usage.
+        let (recorded_window, used) = Self::resolve_pressure_facts(convo)?;
         // Prefer the live window; fall back to the recorded one only when the live
         // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
         // stored-ratio behavior for the unknown-window case (no regression there).
@@ -2013,18 +2022,15 @@ impl RunningAgent {
             return;
         };
         let floor = convo.sacred_floor();
-        let (recorded_window, used_tokens) = convo
+        let (recorded_window, mut used_tokens) =
+            Self::resolve_pressure_facts(convo).unwrap_or((0, 0));
+        let estimated_tokens: u32 = convo
             .messages
             .iter()
-            .rev()
-            .find(|message| {
-                message.role == crate::message::Role::Assistant
-                    && message.internal_origin.as_deref() != Some(TURN_DIAGNOSTIC_ORIGIN)
-                    && message.meta.is_some()
-            })
-            .and_then(|message| message.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens))
-            .unwrap_or((0, 0));
+            .map(|m| m.estimate_tokens() as u64)
+            .sum::<u64>()
+            .min(u32::MAX as u64) as u32;
+        used_tokens = used_tokens.max(estimated_tokens);
         let live_window = self.provider.context_window();
         let window = if live_window > 0 {
             live_window
@@ -2078,6 +2084,7 @@ impl RunningAgent {
                 m.role == crate::message::Role::System
                     || (m.role == crate::message::Role::User
                         && m.synthetic
+                        && !m.autonomous_turn
                         && !m.is_compaction_turn_start()
                         && !m.text.trim_start().starts_with("<!-- jeikcode:anchor"))
             })
@@ -2087,7 +2094,9 @@ impl RunningAgent {
         self.hooks.session_start(convo, true).await;
         let handoff = handoff_summary.trim();
         if !handoff.is_empty() {
-            convo.push(Message::synthetic_user(handoff.to_string()));
+            // Mark handoff as an autonomous turn boundary so frozen_prefix_end(),
+            // sacred_floor(), and subsequent fresh-epoch resets never lock it in.
+            convo.push(Message::synthetic_turn(handoff.to_string()));
         }
         convo.cache_epoch = convo.cache_epoch.saturating_add(1);
         let bytes_after = crate::message::snapshot_byte_size(&convo.messages);
@@ -7964,6 +7973,98 @@ mod provider_message_pairing_tests {
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
     }
+
+    #[tokio::test]
+    async fn compact_before_internal_continuation_uses_pressure_fallback_for_will_summarize() {
+        use crate::message::{CompactionPlan, CompactionStrategy, CompactionView};
+        use crate::testkit::RecordingProvider;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct ContinuationCheckStrategy {
+            observed_will_summarize_used: AtomicU32,
+            observed_plan_used: AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionStrategy for ContinuationCheckStrategy {
+            async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+                self.observed_plan_used
+                    .store(view.used_tokens, Ordering::Relaxed);
+                CompactionPlan::noop()
+            }
+
+            fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+                self.observed_will_summarize_used
+                    .store(view.used_tokens, Ordering::Relaxed);
+                view.used_tokens > 0
+            }
+        }
+
+        let strat = Arc::new(ContinuationCheckStrategy {
+            observed_will_summarize_used: AtomicU32::new(0),
+            observed_plan_used: AtomicU32::new(0),
+        });
+        let mut convo = Conversation::new();
+        convo.push(Message::system("sys"));
+        convo.push(Message::user("task"));
+        let mut a = Message::assistant("answer", vec![]);
+        a.meta = Some(crate::message::MessageMeta {
+            ctx_window: 100_000,
+            used_tokens: 0,
+            tokens: crate::stream::TokenUsage {
+                prompt: 70_000,
+                completion: 20_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        convo.push(a);
+
+        let provider = Arc::new(RecordingProvider::new(vec![]).with_ctx_window(100_000));
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let running = RunningAgent {
+            provider,
+            tools: ToolRegistry::new().mount(&[]),
+            persona: Vec::new(),
+            middlewares: Vec::new(),
+            hooks: Arc::new(crate::hook::NoopHooks),
+            rt: RequestCtx::new(ev_tx, None),
+            max_rounds: None,
+            tool_loop_policy: None,
+            max_continuations: None,
+            resume: None,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_parallel_tools: None,
+            compaction: strat.clone(),
+            compact_threshold: Some(0.8),
+            auto_drain_threshold: None,
+            compact_on_turn_end: false,
+            compaction_checkpoint: None,
+            timeouts: Default::default(),
+            first_token_retries: MAX_FIRST_TOKEN_RETRIES,
+            chat_options: ChatOptions::default(),
+            cwd: None,
+            cancel_token: None,
+            session_id: None,
+            turn_counter: AtomicU64::new(0),
+            request_counter: AtomicU64::new(0),
+            clock: Arc::new(crate::clock::SystemClock::default()),
+            keep_interrupted_context: false,
+            round_cap_checkpoint: false,
+            graceful_final_synthesis: false,
+        };
+        let mut attempted_stages = [false, false];
+        running
+            .compact_before_internal_continuation(&mut convo, &mut attempted_stages)
+            .await;
+
+        assert_eq!(
+            strat.observed_will_summarize_used.load(Ordering::Relaxed),
+            90_000
+        );
+        assert_eq!(strat.observed_plan_used.load(Ordering::Relaxed), 90_000);
+        assert!(attempted_stages[1], "stage 1 (summarize) must be selected");
+    }
 }
 
 #[cfg(test)]
@@ -8373,6 +8474,39 @@ mod synthetic_send_tests {
         convo.push(goal_turn);
         // frozen_prefix_end stops before autonomous_turn even before the first real user.
         assert_eq!(convo.frozen_prefix_end(), 2);
+    }
+
+    #[test]
+    fn resolve_pressure_facts_falls_back_to_prompt_plus_completion_and_estimates() {
+        let mut convo = Conversation::new();
+        convo.push(Message::system("sys"));
+        convo.push(Message::user("hello"));
+        let mut a = Message::assistant("answer", vec![]);
+        a.meta = Some(crate::message::MessageMeta {
+            ctx_window: 100_000,
+            used_tokens: 0,
+            tokens: crate::stream::TokenUsage {
+                prompt: 40_000,
+                completion: 15_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        convo.push(a);
+        // Diagnostic assistant message must be skipped when resolving pressure facts.
+        let mut diag = Message::assistant("diagnostic", vec![]);
+        diag.internal_origin = Some(TURN_DIAGNOSTIC_ORIGIN.to_string());
+        diag.meta = Some(crate::message::MessageMeta {
+            ctx_window: 10,
+            used_tokens: 9,
+            ..Default::default()
+        });
+        convo.push(diag);
+
+        assert_eq!(
+            RunningAgent::resolve_pressure_facts(&convo),
+            Some((100_000, 55_000))
+        );
     }
 
     #[test]
@@ -8888,5 +9022,95 @@ mod synthetic_send_tests {
         );
         assert_eq!(errors.len(), 1);
         assert_eq!(stop_reason, Some(StopReason::ProviderError));
+    }
+
+    #[tokio::test]
+    async fn reset_to_fresh_epoch_excludes_handoff_from_sacred_floor_and_drops_prior_handoffs() {
+        use crate::testkit::RecordingProvider;
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("first answer".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("second answer".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let mut convo = Conversation::new();
+        convo.push(Message::system("persona"));
+        convo.push(Message::synthetic_user("<memory>keep</memory>"));
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .resume(SessionSnapshot::new(convo.messages))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "user turn 1".into(),
+                images: vec![],
+            })
+            .unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        handle
+            .commands
+            .send(AgentCommand::ResetToFreshEpoch {
+                handoff_summary: "handoff epoch 1".into(),
+            })
+            .unwrap();
+        let snap1 = loop {
+            if let Some(AgentEvent::Compacted {
+                snapshot: Some(snap),
+                ..
+            }) = handle.events.recv().await
+            {
+                break snap;
+            }
+        };
+        assert_eq!(snap1.messages.len(), 3);
+        assert_eq!(snap1.messages[2].text, "handoff epoch 1");
+        assert!(snap1.messages[2].autonomous_turn);
+        assert_eq!(
+            Conversation {
+                messages: snap1.messages.clone(),
+                ..Default::default()
+            }
+            .sacred_floor(),
+            2,
+            "handoff must stay outside frozen_prefix_end / sacred_floor"
+        );
+
+        // Second ResetToFreshEpoch must drop the first handoff instead of accumulating it.
+        handle
+            .commands
+            .send(AgentCommand::ResetToFreshEpoch {
+                handoff_summary: "handoff epoch 2".into(),
+            })
+            .unwrap();
+        let snap2 = loop {
+            if let Some(AgentEvent::Compacted {
+                snapshot: Some(snap),
+                ..
+            }) = handle.events.recv().await
+            {
+                break snap;
+            }
+        };
+        assert_eq!(snap2.messages.len(), 3);
+        assert_eq!(snap2.messages[2].text, "handoff epoch 2");
+        assert!(snap2.messages.iter().all(|m| m.text != "handoff epoch 1"));
+
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }

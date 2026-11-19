@@ -671,22 +671,34 @@ fn build_request_body(
     Value::Object(body)
 }
 
-/// Count leading frozen synthetic `Role::User` messages (e.g. `<available_skills>`,
+/// Count leading frozen synthetic `Role::User` wire blocks (e.g. `<available_skills>`,
 /// `<mcp_server_instructions>`, `<memory>`, `<user_preferences>`, `<project_instructions>`)
-/// immediately after the leading `Role::System` prefix so `messages[0]` can anchor
-/// a dedicated cache breakpoint at the end of the static repo/session prefix.
+/// immediately after the leading prefix so `messages[0]` can anchor a dedicated cache
+/// breakpoint at the end of the static repo/session prefix.
+///
+/// Mirrors `format_messages`: `Role::System` entries are lifted to top-level `system[]`,
+/// `autonomous_turn` and compaction-anchor entries terminate the frozen prefix, and each
+/// frozen message contributes the exact count of blocks produced by `format_user_message`
+/// + `content_to_blocks` (post-`unwrap_strong_reminders`).
 fn count_leading_synthetic_user_blocks(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .skip_while(|m| m.role == Role::System)
-        .take_while(|m| {
-            m.role == Role::User
-                && m.synthetic
-                && m.images.is_empty()
-                && !m.text.trim().is_empty()
-                && !crate::compaction::is_compaction_anchor_text(&m.text)
-        })
-        .count()
+    let mut blocks = 0usize;
+    for m in messages {
+        if m.role == Role::System {
+            continue;
+        }
+        if m.role == Role::User
+            && m.synthetic
+            && !m.autonomous_turn
+            && !crate::compaction::is_compaction_anchor_text(&m.text)
+        {
+            let formatted = format_user_message(m);
+            let content = formatted.get("content").cloned().unwrap_or(Value::Null);
+            blocks += content_to_blocks(content).len();
+            continue;
+        }
+        break;
+    }
+    blocks
 }
 
 /// Mark the last frozen synthetic-user content block in `messages[0]` as a cache
@@ -702,13 +714,24 @@ fn apply_synthetic_user_cache_breakpoint(
     let Some(first) = messages.first_mut() else {
         return;
     };
-    if let Some(Value::Array(blocks)) = first.get_mut("content") {
-        let target_idx = leading_synthetic_user_blocks - 1;
-        if let Some(block) = blocks.get_mut(target_idx) {
-            if block.is_object() {
-                block["cache_control"] = json!({ "type": "ephemeral" });
+    match first.get_mut("content") {
+        Some(Value::String(text)) if leading_synthetic_user_blocks == 1 && !text.is_empty() => {
+            let text = text.clone();
+            first["content"] = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+        Some(Value::Array(blocks)) => {
+            let target_idx = leading_synthetic_user_blocks - 1;
+            if let Some(block) = blocks.get_mut(target_idx) {
+                if block.is_object() {
+                    block["cache_control"] = json!({ "type": "ephemeral" });
+                }
             }
         }
+        _ => {}
     }
 }
 
@@ -3055,6 +3078,66 @@ mod tests {
         assert_eq!(
             off_content[1],
             json!({"type":"redacted_thinking","data":"enc-claude-1"})
+        );
+    }
+
+    #[test]
+    fn synthetic_user_cache_breakpoint_aligns_with_unwrapped_frozen_prefix_and_skips_autonomous() {
+        let empty_after_unwrap =
+            Message::synthetic_user("<strong-reminder>\n</strong-reminder>".to_string());
+        let frozen_a = Message::synthetic_user("<available_skills>a</available_skills>");
+        let frozen_b = Message::synthetic_user("<memory>b</memory>");
+        let autonomous = Message::synthetic_turn("[autonomous turn prompt]");
+
+        // Case 1: empty unwrapped block + 2 frozen blocks + autonomous turn -> breakpoint lands
+        // strictly on `frozen_b` (index 1 in merged blocks), not on `autonomous` (index 2).
+        let msgs = vec![
+            Message::system("persona"),
+            empty_after_unwrap,
+            frozen_a,
+            Message::system("late system"),
+            frozen_b,
+            autonomous.clone(),
+            Message::assistant("reply", vec![]),
+        ];
+        let body = build_request_body(
+            "claude-opus-4-8",
+            &msgs,
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let first_blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(first_blocks.len(), 3);
+        assert!(first_blocks[0].get("cache_control").is_none());
+        assert_eq!(first_blocks[1]["text"], "<memory>b</memory>");
+        assert_eq!(
+            first_blocks[1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(first_blocks[2].get("cache_control").is_none());
+
+        // Case 2: single frozen synthetic block before assistant + later autonomous turn ->
+        // Value::String promotes to 1 cached text block so prefix caching still anchors.
+        let single_prefix = vec![
+            Message::system("persona"),
+            Message::synthetic_user("<memory>only</memory>"),
+            Message::assistant("a1", vec![]),
+            autonomous,
+        ];
+        let body2 = build_request_body(
+            "claude-opus-4-8",
+            &single_prefix,
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let single_blocks = body2["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(single_blocks.len(), 1);
+        assert_eq!(single_blocks[0]["text"], "<memory>only</memory>");
+        assert_eq!(
+            single_blocks[0]["cache_control"],
+            json!({ "type": "ephemeral" })
         );
     }
 }

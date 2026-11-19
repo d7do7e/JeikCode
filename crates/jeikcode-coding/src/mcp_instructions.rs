@@ -93,6 +93,12 @@ fn truncate_combined_instructions(value: String) -> String {
 #[async_trait]
 impl LifecycleHooks for McpInstructionsHook {
     async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
+        // Reset memo on session_start (including reset_to_fresh_epoch) so updated MCP
+        // instructions reconcile into the fresh prefix even when `last_block` matched.
+        *self
+            .last_block
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         self.refresh_in_place(convo);
     }
 
@@ -144,5 +150,32 @@ mod tests {
         let truncated = truncate_combined_instructions(oversized);
         assert_eq!(truncated.chars().count(), MAX_TOTAL_INSTRUCTIONS_CHARS);
         assert!(truncated.ends_with("[additional MCP server instructions truncated or omitted]"));
+    }
+
+    #[tokio::test]
+    async fn session_start_after_fresh_epoch_truncation_reconciles_even_when_last_block_cached() {
+        let registry = Arc::new(McpRegistry::new());
+        let mounted = Arc::new(RwLock::new(vec![]));
+        let hook = McpInstructionsHook::new(vec![registry], mounted);
+
+        // Prime `last_block` with `Some(None)` (matching current `render_instructions() == None`),
+        // then simulate a truncated fresh-epoch prefix still carrying a stale MCP block.
+        *hook.last_block.lock().unwrap() = Some(None);
+        let mut convo = Conversation::default();
+        convo.push(Message::system("PERSONA"));
+        convo.push(Message::synthetic_user(format!(
+            "{MCP_INSTRUCTIONS_HEADER}\nstale v1\n</mcp_server_instructions>"
+        )));
+        convo.delivered_context_hashes.clear();
+
+        hook.session_start(&mut convo, true).await;
+        assert!(
+            convo
+                .messages
+                .iter()
+                .all(|m| !m.text.starts_with(MCP_INSTRUCTIONS_HEADER)),
+            "session_start must reset last_block memo and reconcile stale prefix: {:?}",
+            convo.messages
+        );
     }
 }

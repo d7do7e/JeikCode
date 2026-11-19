@@ -614,7 +614,7 @@ fn post_tool_matches(matcher: &Option<String>, tool_name: Option<&str>) -> bool 
 
 #[async_trait]
 impl LifecycleHooks for CCExternalHooks {
-    async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
+    async fn session_start(&self, convo: &mut Conversation, resumed: bool) {
         let payload = serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": HookEvent::SessionStart.cc_name(),
@@ -637,12 +637,14 @@ impl LifecycleHooks for CCExternalHooks {
                 .and_then(|d| d.additional_context().map(str::to_owned))
                 .unwrap_or_else(|| stdout.trim().to_string());
             if !ctx.is_empty() {
+                let reminder = crate::reminder::system_reminder(&ctx);
+                if resumed && convo.messages.iter().any(|m| m.text == reminder) {
+                    continue;
+                }
                 // Synthetic: this is injected ambient context, not a real user turn.
                 // A plain `Message::user` would look user-authored and can steal the
                 // first-real-user slot (titles, sacred_floor).
-                convo.push(Message::synthetic_user(crate::reminder::system_reminder(
-                    &ctx,
-                )));
+                convo.push(Message::synthetic_user(reminder));
             }
         }
     }
@@ -1366,6 +1368,9 @@ sys.exit(2)
             "{}",
             convo.messages[0].text
         );
+        // Re-running on resume / reset_to_fresh_epoch must not duplicate identical reminders.
+        cc.session_start(&mut convo, true).await;
+        assert_eq!(convo.messages.len(), 1);
     }
 
     #[test]

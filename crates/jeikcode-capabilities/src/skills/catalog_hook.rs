@@ -80,6 +80,12 @@ impl SkillCatalogHook {
 #[async_trait]
 impl LifecycleHooks for SkillCatalogHook {
     async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
+        // Reset memo on session_start (including reset_to_fresh_epoch) so updated
+        // skills reconcile into the prefix even if a prior turn already cached `last_block`.
+        *self
+            .last_block
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         self.refresh_in_place(convo);
     }
 
@@ -217,5 +223,33 @@ mod tests {
         hook.turn_start(&mut c).await;
         let after: Vec<String> = c.messages.iter().map(|m| m.text.clone()).collect();
         assert_eq!(snapshot, after, "unchanged catalog leaves bytes identical");
+    }
+
+    #[tokio::test]
+    async fn session_start_after_fresh_epoch_truncation_reconciles_updated_catalog() {
+        let hook = SkillCatalogHook::new(Some(format!(
+            "{CATALOG_HEADER}\n- a: 1\n</available_skills>"
+        )));
+        let mut c = convo_with_persona();
+        hook.session_start(&mut c, false).await;
+        c.push(Message::assistant("reply", vec![]));
+
+        // Mid-session update appends a context-update message while preserving the frozen prefix
+        // and updates `last_block` to `- b: 2`.
+        hook.set_catalog(Some(format!(
+            "{CATALOG_HEADER}\n- b: 2\n</available_skills>"
+        )));
+        hook.turn_start(&mut c).await;
+        assert!(c.messages.last().unwrap().text.contains("- b: 2"));
+
+        // Simulate reset_to_fresh_epoch: truncate back to the old leading prefix and clear hashes.
+        c.messages.truncate(2);
+        c.delivered_context_hashes.clear();
+        hook.session_start(&mut c, true).await;
+        assert!(
+            c.messages[1].text.contains("- b: 2") && !c.messages[1].text.contains("- a: 1"),
+            "session_start must reconcile updated catalog into fresh-epoch prefix: {:?}",
+            c.messages
+        );
     }
 }
