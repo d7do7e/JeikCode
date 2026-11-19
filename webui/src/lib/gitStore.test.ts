@@ -120,3 +120,66 @@ test('gitStore triggerAutoFetch shares in-flight Promise for concurrent calls', 
   assert.equal(p1, p2, 'Concurrent calls to triggerAutoFetch must return the exact same in-flight Promise');
   await Promise.allSettled([p1, p2]);
 });
+
+test('gitStore setActiveRepoRoot bumps epoch and preserves followup forceAll/filterBranch', async () => {
+  const cwd = '/test/repo/epoch-followup';
+  const origFetch = globalThis.fetch;
+  let releaseFirstFetch!: () => void;
+  let firstGate = new Promise<void>((resolve) => {
+    releaseFirstFetch = resolve;
+  });
+  let callCount = 0;
+  const graphCalls: Array<{ cwd: string; branch?: string }> = [];
+
+  (globalThis as any).fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    callCount += 1;
+    if (callCount <= 2) {
+      await firstGate;
+    }
+    if (url.includes('/git/branches')) {
+      return new Response(JSON.stringify({ is_repo: true, current: 'main', local: ['main'], remote: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/git/status')) {
+      return new Response(JSON.stringify({ is_repo: true, current_branch: 'main', ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/git/graph')) {
+      const parsed = new URL(url, 'http://localhost');
+      const repoCwd = parsed.searchParams.get('cwd') || '';
+      const branch = parsed.searchParams.get('branch') || undefined;
+      graphCalls.push({ cwd: repoCwd, branch });
+      return new Response(JSON.stringify({ commits: [{ hash: `${repoCwd}:${branch ?? 'all'}`, short_hash: 'abc', parents: [], message: 'msg', author: 'a', date: '2026-01-01', refs: [] }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const first = gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+    // Queue a branch filter while the first request is in-flight, and switch repo root.
+    void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true, filterBranch: 'feat/test' });
+    gitStore.setActiveRepoRoot(cwd, '/test/repo/epoch-followup/subrepo');
+    releaseFirstFetch();
+    await first;
+    // Let followup microtasks/fetches settle
+    await new Promise((r) => setTimeout(r, 40));
+
+    const finalState = gitStore.getState(cwd);
+    assert.equal(finalState.activeRepoRoot, '/test/repo/epoch-followup/subrepo');
+    assert.equal(finalState.filterBranch, 'feat/test');
+    assert.ok(
+      graphCalls.some((c) => c.cwd === '/test/repo/epoch-followup/subrepo' && c.branch === 'feat/test'),
+      `followup must carry forceAll + filterBranch to the new subrepo: ${JSON.stringify(graphCalls)}`
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

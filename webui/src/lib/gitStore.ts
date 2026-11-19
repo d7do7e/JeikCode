@@ -103,6 +103,8 @@ const STORAGE_PREFIX = 'jeikcode:git_store:';
 interface InflightControl {
   running: boolean;
   needsFollowup: boolean;
+  followupForceAll?: boolean;
+  followupFilterBranch?: string;
   debounceTimer: number | null;
 }
 
@@ -110,12 +112,23 @@ class ProjectGitManager {
   private states = new Map<string, GitProjectState>();
   private listeners = new Map<string, Set<(state: GitProjectState) => void>>();
   private inflights = new Map<string, InflightControl>();
+  private repoEpochs = new Map<string, number>();
   private pendingVersions = new Map<string, number>();
   private lastFetchTimes = new Map<string, number>();
   private fetchInflight = new Map<string, Promise<boolean>>();
 
   private normalizeKey(cwd?: string): string {
     return cwd ? cwd.trim() : '';
+  }
+
+  private getRepoEpoch(key: string): number {
+    return this.repoEpochs.get(key) ?? 0;
+  }
+
+  private bumpRepoEpoch(key: string): number {
+    const next = this.getRepoEpoch(key) + 1;
+    this.repoEpochs.set(key, next);
+    return next;
   }
 
   /**
@@ -306,10 +319,13 @@ class ProjectGitManager {
 
       if (ctrl.running) {
         ctrl.needsFollowup = true;
+        if (options.forceAll) ctrl.followupForceAll = true;
+        if (options.filterBranch !== undefined) ctrl.followupFilterBranch = options.filterBranch;
         return;
       }
 
       ctrl.running = true;
+      const startEpoch = this.getRepoEpoch(key);
       const prevState = this.getState(key);
       const isInitialSilent = prevState.branches !== null && prevState.gitStatus !== null;
 
@@ -377,6 +393,14 @@ class ProjectGitManager {
           })),
         });
 
+        // If activeRepoRoot changed while requests were in flight, discard the stale
+        // payload and schedule an immediate full followup refresh for the new repo.
+        if (this.getRepoEpoch(key) !== startEpoch) {
+          ctrl.needsFollowup = true;
+          ctrl.followupForceAll = true;
+          return;
+        }
+
         const curState = this.getState(key);
         const nextState: GitProjectState = {
           branches: branchRes,
@@ -399,6 +423,11 @@ class ProjectGitManager {
         this.saveToStorage(key, nextState);
         this.notify(key);
       } catch (err: unknown) {
+        if (this.getRepoEpoch(key) !== startEpoch) {
+          ctrl.needsFollowup = true;
+          ctrl.followupForceAll = true;
+          return;
+        }
         const message = err instanceof Error ? err.message : String(err);
         const cur = this.getState(key);
         this.states.set(key, { ...cur, loading: false, error: message });
@@ -408,9 +437,18 @@ class ProjectGitManager {
         if (ctrlAfter) {
           ctrlAfter.running = false;
           if (ctrlAfter.needsFollowup) {
+            const followupForceAll = Boolean(ctrlAfter.followupForceAll);
+            const followupFilterBranch = ctrlAfter.followupFilterBranch;
             ctrlAfter.needsFollowup = false;
-            // 排队追踪执行，立即发起
-            this.scheduleRefresh(key, { immediate: true, reason: 'followup' });
+            ctrlAfter.followupForceAll = false;
+            ctrlAfter.followupFilterBranch = undefined;
+            // 排队追踪执行，立即发起，保留被合并请求中的 forceAll 与 filterBranch
+            void this.scheduleRefresh(key, {
+              immediate: true,
+              reason: 'followup',
+              forceAll: followupForceAll,
+              filterBranch: followupFilterBranch,
+            });
           }
         }
       }
@@ -545,6 +583,7 @@ class ProjectGitManager {
   ): void {
     const key = this.normalizeKey(cwd);
     const cur = this.getState(key);
+    this.bumpRepoEpoch(key);
     const updated: GitProjectState = {
       ...cur,
       activeRepoRoot: repoRoot,
@@ -555,7 +594,7 @@ class ProjectGitManager {
     this.states.set(key, updated);
     this.saveToStorage(key, updated);
     this.notify(key);
-    this.scheduleRefresh(key, { immediate: true, forceAll: true });
+    void this.scheduleRefresh(key, { immediate: true, forceAll: true });
   }
 
   /**

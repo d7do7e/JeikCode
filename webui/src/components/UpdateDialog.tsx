@@ -57,7 +57,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
 
-  const isDesktop = false;
+  const isDesktop = isDesktopShell();
   const isMounted = useRef(true);
   const checkGuardRef = useRef(createLatestRequestGuard());
   const reloadStarted = useRef(false);

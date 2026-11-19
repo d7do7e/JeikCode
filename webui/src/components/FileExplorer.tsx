@@ -161,14 +161,8 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
   const [locateLoading, setLocateLoading] = useState(false);
   const [selectedLocateIdx, setSelectedLocateIdx] = useState(0);
 
-  // VSCode 经典搜索与替换控件状态
+  // 全局内容搜索状态
   const [searchQuery, setSearchQuery] = useState('');
-  const [replaceQuery, setReplaceQuery] = useState('');
-  const [replaceOpen, setReplaceOpen] = useState(false);
-  const [matchCase, setMatchCase] = useState(false);
-  const [matchWholeWord, setMatchWholeWord] = useState(false);
-  const [useRegex, setUseRegex] = useState(false);
-  const [preserveCase, setPreserveCase] = useState(false);
 
   // 搜索结果
   const [searchLoading, setSearchLoading] = useState(false);
@@ -176,8 +170,10 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
 
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const replaceInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const activeRootRef = useRef(rootPath);
+  activeRootRef.current = rootPath;
+  const selectionHydratedRootRef = useRef(rootPath);
 
   // 右键上下文菜单与多选状态 (支持持久化记忆选中项与展开项)
   const [contextMenu, setContextMenu] = useState<{
@@ -208,10 +204,27 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     currentName: string;
   }>({ open: false, node: null, currentName: '' });
 
-  // 选区变化时同步持久化
+  // 切换工作区根目录时先重水合并跳过当轮持久化，待重水合后的下一帧再写回 localStorage，
+  // 绝不在同一次 effect flush 中把旧项目的 selectedPaths 写进新项目存储键
   useEffect(() => {
+    if (selectionHydratedRootRef.current !== rootPath) {
+      selectionHydratedRootRef.current = rootPath;
+      setExpandedPaths(getSavedExpandedPaths(rootPath));
+      const nextSaved = getSavedSelectedPaths(rootPath);
+      if (nextSaved?.paths && nextSaved.paths.length > 0) {
+        setSelectedPaths(new Set(nextSaved.paths));
+        setLastSelectedPath(nextSaved.lastPath || null);
+      } else if (activeFilePath) {
+        setSelectedPaths(new Set([activeFilePath]));
+        setLastSelectedPath(activeFilePath);
+      } else {
+        setSelectedPaths(new Set());
+        setLastSelectedPath(null);
+      }
+      return;
+    }
     saveSelectedPaths(rootPath, Array.from(selectedPaths), lastSelectedPath);
-  }, [selectedPaths, lastSelectedPath, rootPath]);
+  }, [selectedPaths, lastSelectedPath, rootPath, activeFilePath]);
 
   // 高性能文件/目录全量索引与相对路径搜索过滤 (支持绝对/相对路径定位与文件名搜索双模)
   useEffect(() => {
@@ -349,14 +362,16 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
 
   // 加载根目录
   const loadRoot = useCallback(async (force = false) => {
+    const reqRoot = rootPath;
     if (!force) {
-      const cached = getCachedTree(rootPath);
+      const cached = getCachedTree(reqRoot);
       if (cached && cached.length > 0) {
         setTree(cached);
+        setLoading(false);
         return;
       }
-      void getCachedDirectoryTree<TreeNode[]>(rootPath).then((idbTree) => {
-        if (idbTree && idbTree.length > 0) {
+      void getCachedDirectoryTree<TreeNode[]>(reqRoot).then((idbTree) => {
+        if (activeRootRef.current === reqRoot && idbTree && idbTree.length > 0) {
           setTree(idbTree);
           setLoading(false);
         }
@@ -364,7 +379,8 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     }
     setLoading(true);
     try {
-      const res = await fetchFsTree(rootPath);
+      const res = await fetchFsTree(reqRoot);
+      if (activeRootRef.current !== reqRoot) return;
       const populateNodes = async (entries: FsEntry[], parentIgnored = false): Promise<TreeNode[]> => {
         const list: TreeNode[] = [];
         for (const e of entries) {
@@ -401,13 +417,18 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       };
 
       const nodes = await populateNodes(res.entries);
+      if (activeRootRef.current !== reqRoot) return;
       setTree(nodes);
-      setCachedTree(rootPath, nodes);
-      void saveCachedDirectoryTree(rootPath, nodes);
+      setCachedTree(reqRoot, nodes);
+      void saveCachedDirectoryTree(reqRoot, nodes);
     } catch (err: any) {
-      showToast(err?.message || tRef.current('explorer.loadTreeFailed'), 'error');
+      if (activeRootRef.current === reqRoot) {
+        showToast(err?.message || tRef.current('explorer.loadTreeFailed'), 'error');
+      }
     } finally {
-      setLoading(false);
+      if (activeRootRef.current === reqRoot) {
+        setLoading(false);
+      }
     }
   }, [rootPath]);
 
@@ -525,7 +546,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     [onOpenFile, revealAndExpandToPath],
   );
 
-  // 快捷键监听：仅当焦点在资源管理器范围内时，按 Ctrl+F 调出搜索，Ctrl+H 调出替换
+  // 快捷键监听：仅当焦点在资源管理器范围内时，按 Ctrl+F 调出全局内容搜索
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const root = containerRef.current;
@@ -542,12 +563,6 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
         e.stopPropagation();
         setSearchMode('search');
         setTimeout(() => searchInputRef.current?.focus(), 50);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'h') {
-        e.preventDefault();
-        e.stopPropagation();
-        setSearchMode('search');
-        setReplaceOpen(true);
-        setTimeout(() => replaceInputRef.current?.focus(), 50);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -741,11 +756,23 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     }
   };
 
-  // 快捷键监听：按 Delete 或 Ctrl+D 触发删除，按 F2 触发重命名
+  // 快捷键监听：仅当焦点落在资源管理器文件树内且无模态弹窗时，按 Delete / Ctrl+D 删除、按 F2 重命名
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (searchMode !== 'tree') return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      const root = containerRef.current;
+      if (!root) return;
+      const target = e.target as HTMLElement | null;
+      const isInside = Boolean(
+        (target && root.contains(target)) ||
+        (document.activeElement && root.contains(document.activeElement))
+      );
+      if (!isInside) return;
       const activeTag = (document.activeElement?.tagName || '').toLowerCase();
-      if (activeTag === 'input' || activeTag === 'textarea') return;
+      if (activeTag === 'input' || activeTag === 'textarea' || (document.activeElement as HTMLElement | null)?.isContentEditable) {
+        return;
+      }
 
       if (e.key === 'F2') {
         const targetPath = lastSelectedPath || (selectedPaths.size === 1 ? Array.from(selectedPaths)[0] : null);
@@ -773,7 +800,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedPaths, lastSelectedPath, tree, collectVisibleNodes]);
+  }, [selectedPaths, lastSelectedPath, tree, collectVisibleNodes, searchMode]);
 
   // 关闭右键菜单
   useEffect(() => {
@@ -954,86 +981,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                     ×
                   </button>
                 )}
-                <button
-                  type="button"
-                  class={'search-toggle-btn' + (matchCase ? ' active' : '')}
-                  onClick={() => setMatchCase((v) => !v)}
-                  title={t('explorer.matchCaseTitle')}
-                >
-                  Aa
-                </button>
-                <button
-                  type="button"
-                  class={'search-toggle-btn' + (matchWholeWord ? ' active' : '')}
-                  onClick={() => setMatchWholeWord((v) => !v)}
-                  title={t('explorer.matchWholeWordTitle')}
-                >
-                  ab
-                </button>
-                <button
-                  type="button"
-                  class={'search-toggle-btn' + (useRegex ? ' active' : '')}
-                  onClick={() => setUseRegex((v) => !v)}
-                  title={t('explorer.useRegexTitle')}
-                >
-                  .*
-                </button>
               </div>
-            </div>
-
-            {/* 替换行折叠控制 */}
-            <div class="replace-toggle-row">
-              <button
-                type="button"
-                class="replace-arrow-btn"
-                onClick={() => setReplaceOpen((v) => !v)}
-                title={t('explorer.toggleReplace')}
-              >
-                {replaceOpen ? '▼' : '▶'}
-              </button>
-              {replaceOpen && (
-                <div class="search-input-wrapper" style={{ flex: 1 }}>
-                  <input
-                    ref={replaceInputRef}
-                    type="text"
-                    class="vscode-search-field"
-                    placeholder={t('editor.replace')}
-                    value={replaceQuery}
-                    onInput={(e) => setReplaceQuery((e.target as HTMLInputElement).value)}
-                  />
-                  <div class="search-field-actions">
-                    {replaceQuery && (
-                      <button
-                        type="button"
-                        class="search-clear-btn"
-                        onClick={() => {
-                          setReplaceQuery('');
-                          replaceInputRef.current?.focus();
-                        }}
-                        title={t('explorer.clearInput')}
-                      >
-                        ×
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      class={'search-toggle-btn' + (preserveCase ? ' active' : '')}
-                      onClick={() => setPreserveCase((v) => !v)}
-                      title={t('explorer.preserveCaseTitle')}
-                    >
-                      AB
-                    </button>
-                    <button
-                      type="button"
-                      class="search-toggle-btn"
-                      onClick={() => showToast(t('editor.replaceAllSuccess', { n: 0 }), 'success')}
-                      title={t('editor.replaceAllTitle')}
-                    >
-                      🔁
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
         )}
