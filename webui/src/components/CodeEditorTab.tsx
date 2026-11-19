@@ -770,6 +770,7 @@ export function CodeEditorTab({
   // 读取文件内容 (非文本类文件直接跳过文本读取，进入图片/二进制视图)
   useEffect(() => {
     let cancelled = false;
+    let diskSettled = false;
     if (isMemoryPreview) {
       if (inMemoryContent !== undefined) {
         setContent(inMemoryContent);
@@ -816,8 +817,8 @@ export function CodeEditorTab({
 
     // 优先从 L1/L2 IndexedDB 异步直出已缓存内容（1~2ms），杜绝白屏等待与加载中闪烁
     void getCachedFileContent(filePath).then((cached) => {
-      // 用户已开始编辑时，缓存直出不得覆盖本地草稿。
-      if (!cancelled && !isDirtyRef.current && cached !== null) {
+      // 用户已开始编辑或磁盘读已先落地时，缓存直出不得覆盖。
+      if (!cancelled && !diskSettled && !isDirtyRef.current && cached !== null) {
         setContent(cached);
         historyRef.current = [{ text: cached, cursor: 0 }];
         historyIndexRef.current = 0;
@@ -829,6 +830,7 @@ export function CodeEditorTab({
     if (!restoredSnapshot) setLoading(true);
     fetchFsRead(filePath, cwd)
       .then((res) => {
+        diskSettled = true;
         // 请求期间用户可能已经键入：磁盘旧内容不得覆盖未保存草稿。
         // 例外：冲突面板的“重新加载”或顶栏刷新（用户已确认）是显式放弃草稿的授权。
         if (!cancelled && (!isDirtyRef.current || manualForce || forcedReload)) {
@@ -878,6 +880,7 @@ export function CodeEditorTab({
         }
       })
       .catch((err) => {
+        diskSettled = true;
         if (!cancelled) {
           const errMsg = err?.message || String(err);
           setLoadError(errMsg);

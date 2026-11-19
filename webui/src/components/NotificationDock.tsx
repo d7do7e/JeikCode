@@ -904,18 +904,18 @@ export function NotificationDock({
             }
           }}
           submitAnswer={async (body: UserInputAnswer) => {
-            dismissCardLocally(
-              currentCard.card.key,
-              currentCard.card.sessionId,
-              currentCard.card.req.request_id,
-            );
-            if (!currentCard.card.req.session_id) {
-              return postLiveUserInput(body, currentCard.card.sessionId);
-            }
+            decisionInFlight.current = true;
             try {
-              return await postChatUserInput(currentCard.card.req.session_id, body);
-            } catch {
-              return postLiveUserInput(body, currentCard.card.sessionId);
+              if (!currentCard.card.req.session_id) {
+                return await postLiveUserInput(body, currentCard.card.sessionId);
+              }
+              try {
+                return await postChatUserInput(currentCard.card.req.session_id, body);
+              } catch {
+                return await postLiveUserInput(body, currentCard.card.sessionId);
+              }
+            } finally {
+              decisionInFlight.current = false;
             }
           }}
         />

@@ -1426,9 +1426,16 @@ export function Chat({
   /** Blocks token snapshots from bleeding across a session switch render. */
   const tokenSaveGenerationRef = useRef(0);
   const tokensAuthoritativeRef = useRef(false);
+  const roundReasoningRef = useRef(0);
   const lastUserTokensRef = useRef(0);
   const [showTokenDetails, setShowTokenDetails] = useState(false);
   const tokenPopoverRef = useRef<HTMLDivElement>(null);
+
+  const setTokensTracked = (updater: (prev: TokenUsage | null) => TokenUsage | null) => {
+    const next = updater(tokensRef.current);
+    tokensRef.current = next;
+    setTokens(next);
+  };
 
   const applyAuthoritativeTokenUsage = (usage: {
     prompt: number;
@@ -1441,16 +1448,18 @@ export function Chat({
       { prompt: usage.prompt, cached: usage.cached },
       tokenCacheRef.current,
     );
-    tokenCacheRef.current = resolved.nextState;
-    tokensAuthoritativeRef.current = true;
-    setTokens({
-      prompt: usage.prompt,
-      completion: usage.completion,
-      total: usage.total,
-      cached: resolved.cached,
-      cached_estimated: resolved.cached_estimated,
-      reasoning: usage.reasoning ?? 0,
-    });
+    applyTokenUsage(
+      {
+        prompt: usage.prompt,
+        completion: usage.completion,
+        total: usage.total,
+        cached: resolved.cached,
+        cached_estimated: resolved.cached_estimated,
+        reasoning: usage.reasoning ?? 0,
+      },
+      resolved.nextState,
+      true,
+    );
   };
 
   const mergeLocalTokens = (
@@ -1472,6 +1481,7 @@ export function Chat({
   const resetTokenTelemetry = () => {
     tokenCacheRef.current = createTokenCacheState();
     tokensAuthoritativeRef.current = false;
+    roundReasoningRef.current = 0;
     tokensRef.current = null;
     setTokens(null);
   };
@@ -8537,8 +8547,12 @@ export function Chat({
                   { forceTail: true },
                 );
               }
-              tokenCacheRef.current = resetTokenCacheState(res.after_tokens);
-              setTokens({ prompt: res.after_tokens, completion: 0, total: res.after_tokens, cached: 0, cached_estimated: false });
+              roundReasoningRef.current = 0;
+              applyTokenUsage(
+                { prompt: res.after_tokens, completion: 0, total: res.after_tokens, cached: 0, cached_estimated: false, reasoning: 0 },
+                resetTokenCacheState(res.after_tokens),
+                false,
+              );
               // 压缩后的占用必须成为本会话的当前事实：内存快照 + 缓存都要落，
               // 否则刷新/切走再回来会被压缩前的旧 usage 覆盖。
               if (compactSid) {
@@ -9399,15 +9413,18 @@ export function Chat({
         if (outlineHit && outlineHit.index < historyOffsetRef.current) {
           break;
         }
+        roundReasoningRef.current = 0;
         const userDelta = estimateTextTokens(userText);
         lastUserTokensRef.current = userDelta;
         if (userDelta > 0) {
-          setTokens((prev) => mergeLocalTokens(prev, {
+          setTokensTracked((prev) => mergeLocalTokens(prev, {
             prompt: (prev?.prompt ?? 0) + userDelta,
             completion: prev?.completion ?? 0,
             total: (prev?.total ?? 0) + userDelta,
             reasoning: 0,
           }));
+        } else if (tokensRef.current && (tokensRef.current.reasoning ?? 0) > 0) {
+          setTokensTracked((prev) => (prev ? { ...prev, reasoning: 0 } : prev));
         }
         const turnIndex = nextTurnNavIndex();
         rememberTurnOutline(
@@ -9533,7 +9550,7 @@ export function Chat({
         );
         const textDelta = estimateTextTokens(event.content);
         if (textDelta > 0) {
-          setTokens((prev) => mergeLocalTokens(prev, {
+          setTokensTracked((prev) => mergeLocalTokens(prev, {
             prompt: prev?.prompt ?? 0,
             completion: (prev?.completion ?? 0) + textDelta,
             total: (prev?.total ?? 0) + textDelta,
@@ -9556,7 +9573,8 @@ export function Chat({
         });
         const rDelta = estimateTextTokens(event.content);
         if (rDelta > 0) {
-          setTokens((prev) => mergeLocalTokens(prev, {
+          roundReasoningRef.current += rDelta;
+          setTokensTracked((prev) => mergeLocalTokens(prev, {
             prompt: prev?.prompt ?? 0,
             completion: (prev?.completion ?? 0) + rDelta,
             total: (prev?.total ?? 0) + rDelta,
@@ -9757,20 +9775,15 @@ export function Chat({
       }
 
       case 'tokens': {
-        const resolved = resolveTokenCache(
-          { prompt: event.prompt, cached: event.cached },
-          tokenCacheRef.current,
-        );
-        tokenCacheRef.current = resolved.nextState;
-        tokensAuthoritativeRef.current = true;
-        setTokens((prev) => ({
+        const roundReasoning = Math.min(roundReasoningRef.current, event.completion);
+        roundReasoningRef.current = 0;
+        applyAuthoritativeTokenUsage({
           prompt: event.prompt,
           completion: event.completion,
           total: event.total,
-          cached: resolved.cached,
-          cached_estimated: resolved.cached_estimated,
-          reasoning: prev?.reasoning ?? 0,
-        }));
+          cached: event.cached,
+          reasoning: event.reasoning ?? roundReasoning,
+        });
         break;
       }
 
@@ -9855,7 +9868,7 @@ export function Chat({
         }
         if (event.tokens) {
           if (typeof event.tokens === 'number' && event.tokens > 0) {
-            setTokens((prev) => ({
+            setTokensTracked((prev) => ({
               prompt: prev?.prompt ?? 0,
               completion: prev?.completion ?? (event.tokens as number),
               total: Math.max(prev?.total ?? 0, event.tokens as number),
@@ -9876,6 +9889,7 @@ export function Chat({
             }
           }
         }
+        roundReasoningRef.current = 0;
         const terminal = classifyChatDone({
           stopReason: event.stop_reason,
           message: event.message,
@@ -11249,7 +11263,7 @@ export function Chat({
     const userDelta = estimateTextTokens(messageText);
     lastUserTokensRef.current = userDelta;
     if (userDelta > 0) {
-      setTokens((prev) => mergeLocalTokens(prev, {
+      setTokensTracked((prev) => mergeLocalTokens(prev, {
         prompt: (prev?.prompt ?? 0) + userDelta,
         completion: prev?.completion ?? 0,
         total: (prev?.total ?? 0) + userDelta,

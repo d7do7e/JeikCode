@@ -393,6 +393,7 @@ export function RightInspector({
             class={'terminal-panel-slot' + (tab === 'terminal' ? '' : ' is-hidden')}
           >
             <TerminalPanel
+              key={(workingDir || 'default').replace(/\\/g, '/').trim().toLowerCase()}
               cwd={workingDir}
               active={tab === 'terminal' && !collapsed}
               onTabsCountChange={onTerminalCountChange}

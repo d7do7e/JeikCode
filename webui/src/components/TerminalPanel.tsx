@@ -227,6 +227,26 @@ const getProjectTerminalStorageKey = (projectCwd?: string) => {
   return `jeikcode:terminal:sessions:${norm}`;
 };
 
+const getProjectScratchpadStorageKey = (projectCwd?: string) => {
+  const norm = (projectCwd || 'default').replace(/\\/g, '/').trim().toLowerCase();
+  return `jeikcode:terminal:scratchpad:${norm}`;
+};
+
+function buildDefaultTerminalTabs(projectCwd?: string): TerminalTab[] {
+  const norm = (projectCwd || 'default').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+  const id = `term_main_${norm}`;
+  const shell = getDefaultShellForPlatform(resolveHostPlatform(projectCwd));
+  return [
+    {
+      id,
+      name: `${shell} 1`,
+      cwd: projectCwd || '.',
+      shell,
+      timestamp: 0,
+    },
+  ];
+}
+
 function getSavedSessions(projectCwd?: string): TerminalTab[] | null {
   try {
     if (typeof window !== 'undefined' && window.sessionStorage) {
@@ -293,7 +313,14 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   const { theme, effectiveTheme } = useSettings();
   const isDark = effectiveTheme ? effectiveTheme === 'dark' : (theme === 'dark');
 
-  const sessionScopeKey = cwd || 'default';
+  const sessionScopeKey = (cwd || 'default').replace(/\\/g, '/').trim().toLowerCase();
+  const activeCwdRef = useRef(cwd);
+  activeCwdRef.current = cwd;
+  const activeScopeRef = useRef(sessionScopeKey);
+  activeScopeRef.current = sessionScopeKey;
+  const tabsScopeRef = useRef(sessionScopeKey);
+  const scratchpadScopeRef = useRef(sessionScopeKey);
+  const syncGenerationRef = useRef(0);
 
   const stableDefaultId = useMemo(() => {
     const norm = (cwd || 'default').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
@@ -303,21 +330,10 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   const [tabs, setTabs] = useState<TerminalTab[]>(() => {
     const saved = getSavedSessions(cwd);
     if (saved && saved.length > 0) return saved;
-    const norm = (cwd || 'default').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
-    const id = `term_main_${norm}`;
     // 首个标签必须跟随宿主机真实平台（Windows→PowerShell，macOS→Zsh，Linux→Bash）。
     // 此前硬编码 DEFAULT_SHELL('powershell')：非 Windows 宿主上标签名写着 powershell，
     // 后端却按 bash 启动实际进程，导致“标签名与真实终端不一致”。
-    const shell = getDefaultShellForPlatform(resolveHostPlatform(cwd));
-    return [
-      {
-        id,
-        name: `${shell} 1`,
-        cwd: cwd || '.',
-        shell,
-        timestamp: 0,
-      },
-    ];
+    return buildDefaultTerminalTabs(cwd);
   });
 
   const [activeTabId, setActiveTabIdState] = useState<string>(() => {
@@ -410,7 +426,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   };
   const [scratchpadText, setScratchpadText] = useState(() => {
     try {
-      return window.sessionStorage?.getItem(`jeikcode:terminal:scratchpad:${sessionScopeKey}`) || '';
+      return window.sessionStorage?.getItem(getProjectScratchpadStorageKey(cwd)) || '';
     } catch {
       return '';
     }
@@ -1011,8 +1027,16 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
   // 同步并拉取后端项目常驻终端会话（跨页面刷新、多标签、异地访问保持强一致广播同步，彻底消除死尸缓存污染）
   const syncWithBackend = useCallback(async () => {
+    const targetCwd = cwd;
+    const targetScope = sessionScopeKey;
+    const gen = syncGenerationRef.current;
+    const stale = () =>
+      syncGenerationRef.current !== gen ||
+      activeCwdRef.current !== targetCwd ||
+      activeScopeRef.current !== targetScope;
     try {
-      const res = await fetchTerminalList(cwd);
+      const res = await fetchTerminalList(targetCwd);
+      if (stale()) return;
       if (res.success) {
         if (res.platform && res.platform !== hostPlatform) {
           setHostPlatform(res.platform);
@@ -1048,10 +1072,11 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           }
 
           // 以后端真实运行的列表为唯一真值，绝不将本地残留的死尸 merge 回去！
+          tabsScopeRef.current = targetScope;
           setTabs(enriched);
-          saveSessions(enriched, cwd);
+          saveSessions(enriched, targetCwd);
           setActiveTabId((cur) => {
-            const saved = getSavedActiveTab(cwd);
+            const saved = getSavedActiveTab(targetCwd);
             if (saved && enriched.some((t: any) => t.id === saved)) return saved;
             const has = enriched.some((t: any) => t.id === cur);
             return has ? cur : enriched[0]!.id;
@@ -1066,17 +1091,44 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           const newTab: TerminalTab = {
             id: newId,
             name: `${preferredShell} 1`,
-            cwd: cwd || '.',
+            cwd: targetCwd || '.',
             shell: preferredShell,
             timestamp: Date.now(),
           };
+          tabsScopeRef.current = targetScope;
           setTabs([newTab]);
-          saveSessions([newTab], cwd);
+          saveSessions([newTab], targetCwd);
           setActiveTabId(newId);
         }
       }
     } catch {}
-  }, [cwd, preferredShell]);
+  }, [cwd, sessionScopeKey, preferredShell, hostPlatform, stableDefaultId, disposeTerminalRecord]);
+
+  // Defense-in-depth if TerminalPanel stays mounted across a cwd switch.
+  useEffect(() => {
+    if (tabsScopeRef.current === sessionScopeKey && scratchpadScopeRef.current === sessionScopeKey) {
+      return;
+    }
+    syncGenerationRef.current += 1;
+    for (const record of termMap.current.values()) {
+      disposeTerminalRecord(record);
+    }
+    termMap.current.clear();
+    const saved = getSavedSessions(cwd);
+    const nextTabs = saved && saved.length > 0 ? saved : buildDefaultTerminalTabs(cwd);
+    tabsScopeRef.current = sessionScopeKey;
+    setTabs(nextTabs);
+    const savedActive = getSavedActiveTab(cwd);
+    setActiveTabIdState(
+      savedActive && nextTabs.some((t) => t.id === savedActive) ? savedActive : (nextTabs[0]?.id || ''),
+    );
+    scratchpadScopeRef.current = sessionScopeKey;
+    try {
+      setScratchpadText(window.sessionStorage?.getItem(getProjectScratchpadStorageKey(cwd)) || '');
+    } catch {
+      setScratchpadText('');
+    }
+  }, [cwd, sessionScopeKey, disposeTerminalRecord]);
 
   useEffect(() => {
     void syncWithBackend();
@@ -1118,23 +1170,35 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
   // 每次 tabs 状态变动时持久化同步，保障 background 级别的常驻生命周期
   useEffect(() => {
+    if (tabsScopeRef.current !== sessionScopeKey) return;
     saveSessions(tabs, cwd);
-  }, [tabs, cwd]);
+  }, [tabs, cwd, sessionScopeKey]);
 
   // 同步代输命令框内容
   useEffect(() => {
+    if (scratchpadScopeRef.current !== sessionScopeKey) return;
     try {
-      window.sessionStorage?.setItem(`jeikcode:terminal:scratchpad:${sessionScopeKey}`, scratchpadText);
+      window.sessionStorage?.setItem(getProjectScratchpadStorageKey(cwd), scratchpadText);
     } catch {}
-  }, [scratchpadText, sessionScopeKey]);
+  }, [scratchpadText, cwd, sessionScopeKey]);
 
   // 创建新终端标签
   const createNewTab = useCallback(
     async (shellName = preferredShell, initialCommand?: string) => {
       // 用户主动新建终端：允许下一次布局把焦点交给新终端。
       focusOnNextLayoutRef.current = true;
+      const targetCwd = cwd;
+      const targetScope = sessionScopeKey;
+      const gen = syncGenerationRef.current;
       try {
-        const res = await createTerminalSession({ shell: shellName, cwd });
+        const res = await createTerminalSession({ shell: shellName, cwd: targetCwd });
+        if (
+          syncGenerationRef.current !== gen ||
+          activeCwdRef.current !== targetCwd ||
+          activeScopeRef.current !== targetScope
+        ) {
+          return;
+        }
         const newTab: TerminalTab = {
           id: res.terminal_id,
           name: `${res.name}`,
@@ -1148,11 +1212,18 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         setTabs((prev) => [...prev, newTab]);
         setActiveTabId(newTab.id);
       } catch {
+        if (
+          syncGenerationRef.current !== gen ||
+          activeCwdRef.current !== targetCwd ||
+          activeScopeRef.current !== targetScope
+        ) {
+          return;
+        }
         const mockId = `term_${Date.now().toString(36)}`;
         const fallbackTab: TerminalTab = {
           id: mockId,
           name: `${shellName} ${tabs.length + 1}`,
-          cwd: cwd || '.',
+          cwd: targetCwd || '.',
           shell: shellName,
           timestamp: Date.now(),
         };
@@ -1163,7 +1234,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         setActiveTabId(mockId);
       }
     },
-    [cwd, tabs.length, preferredShell]
+    [cwd, sessionScopeKey, tabs.length, preferredShell]
   );
 
   // 监听全局终端执行命令事件（如 /init 构建代码图谱自动拉起主流终端并执行）
