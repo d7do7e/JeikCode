@@ -10679,20 +10679,135 @@ pub struct RenameRequest {
     pub name: String,
 }
 
-/// Rename a session
-fn rename_session_file(
+/// Rename a session inside an explicit sessions root and publish `SessionUpsert`.
+fn rename_session_file_in_root(
+    sessions_root: &std::path::Path,
     project_hash: &str,
     session_id: &str,
     new_name: &str,
-) -> std::io::Result<()> {
-    crate::legacy_convert::rename_catalog_session_in_project(project_hash, session_id, new_name)
-        .map(|_| ())
-        .map_err(std::io::Error::other)?;
+) -> anyhow::Result<()> {
+    crate::legacy_convert::rename_catalog_session_in_root(
+        sessions_root,
+        project_hash,
+        session_id,
+        new_name,
+    )?;
     // 跨实例增量：就地 upsert 该行（改名 + updated_at），不重拉列表。
-    if let Some(session) = session_row_wire_in_bucket(project_hash, session_id) {
+    if let Some(session) = session_row_wire_in_root(sessions_root, project_hash, session_id) {
         publish_global(GlobalWireEvent::SessionUpsert { session });
     }
     Ok(())
+}
+
+fn classify_rename_session_error(error: &anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    match error.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::SessionInUse { .. }) => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Wait for the current operation to finish, then try again.",
+        ),
+        Some(SessionStoreError::NotFound { .. }) => delete_session_api_error(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            "The session was not found.",
+        ),
+        Some(SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. }) => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The session identifier is invalid.",
+            )
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RENAME_FAILED",
+            "Failed to rename the session. Check the JeikCode logs for details.",
+        ),
+    }
+}
+
+async fn rename_session_in_root(
+    state: &AppState,
+    client_mode: SessionMode,
+    sessions_root: std::path::PathBuf,
+    hash: String,
+    id: String,
+    new_name: String,
+) -> axum::response::Response {
+    let trimmed_name = new_name.trim().to_string();
+    if !valid_project_bucket(&hash) {
+        return delete_session_api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SESSION",
+            "The project or session identifier is invalid.",
+        )
+        .into_response();
+    }
+    if trimmed_name.is_empty() {
+        return delete_session_api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_NAME",
+            "Session name cannot be empty.",
+        )
+        .into_response();
+    }
+
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(state, session_uuid, client_mode, || async move {
+        let hash_owned = hash.clone();
+        let id_owned = id.clone();
+        let name_owned = trimmed_name.clone();
+        let io_res = run_session_catalog_io(move || {
+            Ok(rename_session_file_in_root(
+                &sessions_root,
+                &hash_owned,
+                &id_owned,
+                &name_owned,
+            ))
+        })
+        .await;
+
+        match io_res {
+            Ok(Ok(())) => {
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "rename".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
+                let msg = format!("Session {} renamed to '{}'", id, trimmed_name);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Ok(Err(e)) => {
+                let err = classify_rename_session_error(&e);
+                if err.0 == StatusCode::INTERNAL_SERVER_ERROR {
+                    tracing::error!(
+                        project_bucket = %hash,
+                        session_id = %id,
+                        error = ?e,
+                        "failed to rename session"
+                    );
+                }
+                err.into_response()
+            }
+            Err(error) => {
+                tracing::error!(
+                    project_bucket = %hash,
+                    session_id = %id,
+                    error = %error,
+                    "session rename task failed"
+                );
+                delete_session_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RENAME_FAILED",
+                    "Failed to rename the session. Check the JeikCode logs for details.",
+                )
+                .into_response()
+            }
+        }
+    })
+    .await
 }
 
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
@@ -10702,26 +10817,14 @@ async fn rename_session(
     Path((hash, id)): Path<(String, String)>,
     Json(req): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    let session_uuid = uuid::Uuid::parse_str(&id).ok();
-    let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, client_mode, || async move {
-        match rename_session_file(&hash, &id, &req.name) {
-            Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand {
-                    type_: "rename".into(),
-                    success: Some(true),
-                    error_kind: None,
-                    error_data: None,
-                });
-                let msg = format!("Session {} renamed to '{}'", id, req.name);
-                (StatusCode::OK, Json(msg)).into_response()
-            }
-            Err(e) => {
-                let msg = format!("Failed to rename session: {}", e);
-                (StatusCode::NOT_FOUND, Json(msg)).into_response()
-            }
-        }
-    })
+    rename_session_in_root(
+        &state,
+        client_mode,
+        NativeSessionManager::sessions_root(),
+        hash,
+        id,
+        req.name,
+    )
     .await
 }
 
@@ -26639,6 +26742,97 @@ mod tests {
             jeikcode_capabilities::session::SessionOrigin::Manual
         );
         assert_eq!(forked_meta.name, "branched");
+    }
+
+    #[tokio::test]
+    async fn rename_session_in_root_validates_classifies_errors_and_emits_upsert() {
+        let _home = ScopedChatHome::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let work = temp.path().join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let bucket = NativeSessionManager::project_hash(&work);
+        let mgr = NativeSessionManager::with_root(root.join(&bucket));
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut meta = jeikcode_capabilities::session::SessionMeta::new(
+            &sid,
+            work.to_string_lossy().as_ref(),
+            1,
+        );
+        meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        let lease = mgr.acquire_lease(&sid).unwrap();
+        mgr.commit_native_import(
+            &lease,
+            Some(&jeikcode_kernel::message::SessionSnapshot::new(vec![
+                jeikcode_kernel::message::Message::user("hi"),
+            ])),
+            Some(&jeikcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        drop(lease);
+
+        let state = chat_test_state(&_home);
+
+        // Invalid bucket -> 400.
+        let bad_bucket = rename_session_in_root(
+            &state,
+            SessionMode::Webui,
+            root.to_path_buf(),
+            "../bad".into(),
+            sid.clone(),
+            "New Title".into(),
+        )
+        .await;
+        assert_eq!(bad_bucket.status(), StatusCode::BAD_REQUEST);
+
+        // Blank trimmed name -> 400.
+        let blank_name = rename_session_in_root(
+            &state,
+            SessionMode::Webui,
+            root.to_path_buf(),
+            bucket.clone(),
+            sid.clone(),
+            "   \t ".into(),
+        )
+        .await;
+        assert_eq!(blank_name.status(), StatusCode::BAD_REQUEST);
+
+        // Missing session -> 404 (not 500).
+        let missing = rename_session_in_root(
+            &state,
+            SessionMode::Webui,
+            root.to_path_buf(),
+            bucket.clone(),
+            uuid::Uuid::new_v4().to_string(),
+            "Valid Name".into(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // Success -> 200, trimmed name persisted, and SessionUpsert broadcast.
+        let mut rx = global_events().subscribe();
+        let ok = rename_session_in_root(
+            &state,
+            SessionMode::Webui,
+            root.to_path_buf(),
+            bucket.clone(),
+            sid.clone(),
+            "  Trimmed Title  ".into(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let updated = mgr.read_meta(&sid).unwrap();
+        assert_eq!(updated.name, "Trimmed Title");
+        let mut saw_upsert = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let GlobalWireEvent::SessionUpsert { session } = ev {
+                if session.id == sid && session.name == "Trimmed Title" {
+                    saw_upsert = true;
+                }
+            }
+        }
+        assert!(saw_upsert, "expected SessionUpsert with trimmed title");
     }
 
     // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。

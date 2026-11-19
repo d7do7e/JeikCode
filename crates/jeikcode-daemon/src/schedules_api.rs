@@ -52,6 +52,32 @@ fn clear_running(id: &str) {
         .remove(id);
 }
 
+struct RunningGuard {
+    id: String,
+    active: bool,
+}
+
+impl RunningGuard {
+    fn acquire(id: &str) -> Option<Self> {
+        if try_mark_running(id) {
+            Some(Self {
+                id: id.to_string(),
+                active: true,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if self.active {
+            clear_running(&self.id);
+        }
+    }
+}
+
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -451,17 +477,56 @@ pub(crate) async fn toggle_schedule(
     }
 }
 
-/// DELETE /schedules/:id — Unregister from OS scheduler and delete task definition.
-pub(crate) async fn delete_schedule(Path(id): Path<String>) -> impl IntoResponse {
+async fn delete_schedule_in_root(
+    schedules_root: std::path::PathBuf,
+    id: String,
+    uninstall_os: bool,
+) -> axum::response::Response {
     if !valid_id(&id) {
         return err_response(StatusCode::BAD_REQUEST, format!("invalid task id {id:?}"));
     }
 
-    let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        if let Ok(os) = schedule_os::current() {
-            let _ = os.uninstall(&id);
+    let Some(_guard) = RunningGuard::acquire(&id) else {
+        return err_response(
+            StatusCode::CONFLICT,
+            format!("task {id:?} is currently running; stop it before deleting"),
+        );
+    };
+
+    let id_for_task = id.clone();
+    let res = tokio::task::spawn_blocking(move || -> Result<(), (StatusCode, String)> {
+        if schedule::is_run_locked_in(&schedules_root, &id_for_task) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("task {id_for_task:?} is currently running; stop it before deleting"),
+            ));
         }
-        schedule::remove(&id).map_err(|e| format!("failed to remove task {id:?}: {e}"))?;
+        match schedule::load_in(&schedules_root, &id_for_task) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("task {id_for_task:?} not found"),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to inspect task {id_for_task:?}: {e}"),
+                ));
+            }
+        }
+        if uninstall_os {
+            if let Ok(os) = schedule_os::current() {
+                let _ = os.uninstall(&id_for_task);
+            }
+        }
+        schedule::remove_in(&schedules_root, &id_for_task).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to remove task {id_for_task:?}: {e}"),
+            )
+        })?;
         Ok(())
     })
     .await;
@@ -471,12 +536,17 @@ pub(crate) async fn delete_schedule(Path(id): Path<String>) -> impl IntoResponse
             publish_global(GlobalWireEvent::SchedulesUpdated);
             (StatusCode::OK, Json(serde_json::json!({ "success": true }))).into_response()
         }
-        Ok(Err(msg)) => err_response(StatusCode::INTERNAL_SERVER_ERROR, msg),
+        Ok(Err((status, msg))) => err_response(status, msg),
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Schedule delete failed: {e}"),
         ),
     }
+}
+
+/// DELETE /schedules/:id — Unregister from OS scheduler and delete task definition.
+pub(crate) async fn delete_schedule(Path(id): Path<String>) -> impl IntoResponse {
+    delete_schedule_in_root(schedule::schedules_root(), id, true).await
 }
 
 /// POST /schedules/sync — Reconcile all stored tasks with the OS scheduler.
@@ -530,6 +600,13 @@ pub(crate) async fn run_schedule_now(Path(id): Path<String>) -> impl IntoRespons
         return err_response(StatusCode::BAD_REQUEST, format!("invalid task id {id:?}"));
     }
 
+    let Some(guard) = RunningGuard::acquire(&id) else {
+        return err_response(
+            StatusCode::CONFLICT,
+            format!("task {id:?} is already running"),
+        );
+    };
+
     let id_for_load = id.clone();
     let loaded = tokio::task::spawn_blocking(move || schedule::load(&id_for_load)).await;
     let task = match loaded {
@@ -563,7 +640,7 @@ pub(crate) async fn run_schedule_now(Path(id): Path<String>) -> impl IntoRespons
         tokio::task::spawn_blocking(move || schedule::is_run_locked(&id_for_lock_check))
             .await
             .unwrap_or(false);
-    if already_locked || !try_mark_running(&id) {
+    if already_locked {
         return err_response(
             StatusCode::CONFLICT,
             format!("task {id:?} is already running"),
@@ -573,7 +650,6 @@ pub(crate) async fn run_schedule_now(Path(id): Path<String>) -> impl IntoRespons
     let exe = match schedule_os::resolve_schedule_runner_exe() {
         Ok(p) => p,
         Err(e) => {
-            clear_running(&id);
             return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
     };
@@ -592,7 +668,6 @@ pub(crate) async fn run_schedule_now(Path(id): Path<String>) -> impl IntoRespons
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            clear_running(&id);
             return err_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to spawn scheduled task runner: {e}"),
@@ -602,10 +677,9 @@ pub(crate) async fn run_schedule_now(Path(id): Path<String>) -> impl IntoRespons
 
     publish_global(GlobalWireEvent::SchedulesUpdated);
 
-    let id_done = id.clone();
     tokio::spawn(async move {
+        let _guard = guard;
         let _ = child.wait().await;
-        clear_running(&id_done);
         publish_global(GlobalWireEvent::SchedulesUpdated);
     });
 
@@ -1071,5 +1145,53 @@ mod tests {
         assert!(deleted_ids.contains(&"run-done-1".to_string()));
         assert!(deleted_ids.contains(&"run-empty-2".to_string()));
         assert!(saw_schedules_updated);
+    }
+
+    #[tokio::test]
+    async fn delete_schedule_guards_running_and_missing_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Missing task returns 404.
+        let missing = delete_schedule_in_root(root.clone(), "missing-task".into(), false).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let task = ScheduleTask {
+            id: "sched-guard-1".into(),
+            title: "Guard test".into(),
+            prompt: "ping".into(),
+            cwd: "/tmp".into(),
+            schedule: Schedule::Hourly,
+            permission_mode: "plan".into(),
+            notify: "important".into(),
+            enabled: true,
+            created_at: 1,
+            last_run_at: None,
+            last_status: None,
+        };
+        schedule::save_in(&root, &task).unwrap();
+
+        // In-flight memory guard returns 409 and preserves task file.
+        {
+            let _guard = RunningGuard::acquire(&task.id).expect("in-flight lock");
+            let conflict_mem = delete_schedule_in_root(root.clone(), task.id.clone(), false).await;
+            assert_eq!(conflict_mem.status(), StatusCode::CONFLICT);
+            assert!(schedule::load_in(&root, &task.id).is_ok());
+        }
+
+        // Disk run lock returns 409 and preserves task file.
+        {
+            let _disk_lock = schedule::try_acquire_run_lock_in(&root, &task.id)
+                .unwrap()
+                .expect("disk run lock");
+            let conflict_disk = delete_schedule_in_root(root.clone(), task.id.clone(), false).await;
+            assert_eq!(conflict_disk.status(), StatusCode::CONFLICT);
+            assert!(schedule::load_in(&root, &task.id).is_ok());
+        }
+
+        // Once locks release, delete succeeds with 200 and removes the task.
+        let ok = delete_schedule_in_root(root.clone(), task.id.clone(), false).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(schedule::load_in(&root, &task.id).is_err());
     }
 }

@@ -1036,18 +1036,21 @@ impl LiveViewHub {
         if self.turn_in_progress() {
             return Err(HubError::ActiveTurn);
         }
-        let handle = {
+        let (handle, prev_execution_id) = {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let binding = state.binding.as_ref().ok_or(HubError::Unbound)?;
-            binding
+            let handle = binding
                 .control
                 .handle()
-                .ok_or(HubError::RuntimeUnavailable)?
+                .ok_or(HubError::RuntimeUnavailable)?;
+            let prev_exec = state.execution_session_id().map(str::to_string);
+            (handle, prev_exec)
         };
         let changed = handle
             .fresh_session()
             .await
             .map_err(map_session_transition_error)?;
+        let snapshot_result = handle.snapshot().await;
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(session_id) = changed.session_id.clone() {
             state.execution_session_id = Some(session_id.clone());
@@ -1061,6 +1064,36 @@ impl LiveViewHub {
                 stashed.pending_web_steers.clear();
                 stashed.turn_active = false;
                 stashed.last_runtime_sequence = None;
+            } else if state.binding.as_ref().is_some_and(|b| {
+                prev_execution_id
+                    .as_deref()
+                    .is_none_or(|eid| eid == b.identity.session_id)
+            }) {
+                if let Some(binding) = state.binding.as_mut() {
+                    binding.identity.generation = binding.control.status().generation;
+                    binding.identity.session_id = session_id;
+                    binding.identity.working_dir = changed.working_dir.clone();
+                }
+                match snapshot_result {
+                    Ok(snap) => {
+                        state.snapshot = Some(snap);
+                        state.snapshot_error = None;
+                    }
+                    Err(err) => {
+                        state.snapshot = None;
+                        state.snapshot_error = Some(err.to_string());
+                    }
+                }
+                state.replay.clear();
+                state.pending_requests.clear();
+                state.pending_web_steers.clear();
+                state.turn_active = false;
+                state.last_runtime_sequence = None;
+                self.publish_view_locked(
+                    &mut state,
+                    LiveViewEvent::Runtime(CodingRuntimeEvent::SessionChanged(changed)),
+                    false,
+                );
             }
         }
         Ok(())
@@ -3399,6 +3432,131 @@ mod tests {
             matches!(err, HubError::RuntimeRejected(_)),
             "expected RuntimeRejected after passing stashed Hub lookup, got {err:?}"
         );
+
+        let _ = handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fresh_execution_session_resets_unstashed_view_and_preserves_joinable_snapshot() {
+        let _home = crate::tests::ScopedChatHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = jeikcode_config::Config::default();
+        cfg.default_model = Some("m".into());
+        cfg.models.insert(
+            "m".into(),
+            jeikcode_config::config::provider::ModelProfileConfig {
+                account: "acc".into(),
+                model: "m".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 1_000_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                capable_model: None,
+                pricing: None,
+                supports_vision: None,
+                reasoning_model: None,
+            },
+        );
+        cfg.provider_accounts.insert(
+            "acc".into(),
+            jeikcode_config::config::provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("k".into()),
+                base_url: Some("https://example.invalid/v1".into()),
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        let agent_cfg = crate::kernel_runtime::coding_config_from_runtime(
+            &jeikcode_coding::CodingRuntimeConfig::from_config(
+                &cfg,
+                dir.path(),
+                None,
+                None,
+                true,
+                false,
+            ),
+        );
+        let prepare = jeikcode_coding::PrepareOptions {
+            request_user_input: false,
+            session: jeikcode_coding::SessionMode::Disabled,
+            skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            shared_mcp_registry: None,
+            memory: false,
+            web: false,
+            review: false,
+            rate_limit_source: None,
+        };
+        let start = jeikcode_coding::CodingRuntimeStart {
+            agent: agent_cfg,
+            prepare,
+            provider_factory: crate::runtime_host::coding_provider_factory(),
+            plugin_hooks: crate::runtime_host::installed_plugin_hook_source(),
+            image_preprocessor: None,
+        };
+        let runtime = jeikcode_coding::CodingRuntime::start_with_bootstrap(
+            start,
+            jeikcode_coding::ProviderBootstrap::Required,
+        )
+        .await
+        .expect("start test runtime");
+        let handle = runtime.handle.clone();
+        let hub = LiveViewHub::new();
+        let control: Arc<dyn LiveRuntimeControl> = Arc::new(handle.clone());
+        let initial_binding = hub
+            .bind(
+                "seed-session",
+                dir.path().to_path_buf(),
+                snapshot("old"),
+                control,
+            )
+            .unwrap();
+        let mut rx = hub.events.subscribe();
+
+        // Populate replay on the unstashed live view before calling fresh_execution_session.
+        hub.accept_local_input(UserInput {
+            text: "stale".into(),
+            images: Vec::new(),
+            id: None,
+        })
+        .unwrap();
+        {
+            let mut st = hub.state.lock().unwrap();
+            st.turn_active = false;
+        }
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+
+        hub.fresh_execution_session().await.unwrap();
+
+        let new_exec = hub
+            .execution_session_id()
+            .expect("execution session id populated");
+        assert_ne!(new_exec, "seed-session");
+        let joined = hub.join().expect("join must succeed with fresh snapshot");
+        assert_eq!(joined.binding.session_id, new_exec);
+        assert!(joined.replay.is_empty());
+
+        let mut saw_session_changed = false;
+        while let Ok(obs) = rx.try_recv() {
+            if let LiveViewEvent::Runtime(CodingRuntimeEvent::SessionChanged(ev)) = obs.event {
+                if ev.session_id.as_deref() == Some(new_exec.as_str()) {
+                    saw_session_changed = true;
+                }
+            }
+        }
+        assert!(saw_session_changed, "must publish SessionChanged to VIEW");
 
         let _ = handle.shutdown().await;
     }

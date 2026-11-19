@@ -263,7 +263,7 @@ fn save_atomic_in(root: &std::path::Path, task: &ScheduleTask) -> std::io::Resul
     Ok(())
 }
 
-fn save_in(root: &std::path::Path, task: &ScheduleTask) -> std::io::Result<()> {
+pub fn save_in(root: &std::path::Path, task: &ScheduleTask) -> std::io::Result<()> {
     with_meta_lock_in(root, &task.id, || save_atomic_in(root, task))
 }
 
@@ -372,7 +372,7 @@ pub fn update_run_status(
     update_run_status_in(&schedules_root(), id, last_run_at, last_status)
 }
 
-fn load_in(root: &std::path::Path, id: &str) -> std::io::Result<ScheduleTask> {
+pub fn load_in(root: &std::path::Path, id: &str) -> std::io::Result<ScheduleTask> {
     let bytes = std::fs::read(task_path_in(root, id)?)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -398,7 +398,7 @@ fn list_in(root: &std::path::Path) -> Vec<ScheduleTask> {
     out
 }
 
-fn remove_in(root: &std::path::Path, id: &str) -> std::io::Result<()> {
+pub fn remove_in(root: &std::path::Path, id: &str) -> std::io::Result<()> {
     match std::fs::remove_file(task_path_in(root, id)?) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

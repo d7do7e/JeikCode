@@ -1336,16 +1336,24 @@ pub fn rename_catalog_session_in_project(
     id: &str,
     new_name: &str,
 ) -> anyhow::Result<String> {
-    rename_catalog_session_in_project_root(
+    rename_catalog_session_in_root(
         &SessionManager::sessions_root(),
         project_bucket,
         id,
         new_name,
-        false,
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!("session {project_bucket}/{id} rejected a user rename unexpectedly")
-    })
+    )
+}
+
+pub(crate) fn rename_catalog_session_in_root(
+    sessions_root: &std::path::Path,
+    project_bucket: &str,
+    id: &str,
+    new_name: &str,
+) -> anyhow::Result<String> {
+    rename_catalog_session_in_project_root(sessions_root, project_bucket, id, new_name, false)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("session {project_bucket}/{id} rejected a user rename unexpectedly")
+        })
 }
 
 pub fn apply_ai_catalog_name_in_project(
@@ -1386,7 +1394,12 @@ fn rename_catalog_session_in_project_root(
                 .collect();
             reject_matching_catalog_diagnostic(&project_diagnostics, id)
                 .err()
-                .unwrap_or_else(|| anyhow::anyhow!("session {project_bucket}/{id} not found"))
+                .unwrap_or_else(|| {
+                    let meta_path = SessionManager::with_root(sessions_root.join(project_bucket))
+                        .meta_path(id)
+                        .unwrap_or_else(|_| sessions_root.join(project_bucket).join(id));
+                    SessionStoreError::NotFound { path: meta_path }.into()
+                })
         })?;
     rename_catalog_entry_in_root(sessions_root, entry, new_name, ai)
 }
@@ -1606,8 +1619,11 @@ fn rename_catalog_entry_in_root(
         || native_meta.as_ref().map(|meta| &meta.owner) == Some(&StorageOwner::Native);
     let mut cutover_lease = None;
     let meta = if use_native {
-        native_meta
-            .ok_or_else(|| anyhow::anyhow!("native session {:?} has no metadata", entry.id))?
+        native_meta.ok_or_else(|| SessionStoreError::NotFound {
+            path: manager
+                .meta_path(&entry.id)
+                .unwrap_or_else(|_| sessions_root.join(&entry.project_bucket).join(&entry.id)),
+        })?
     } else {
         let lease = manager.acquire_lease(&entry.id)?;
         let outcome = converge_session(&manager, &lease)?;
