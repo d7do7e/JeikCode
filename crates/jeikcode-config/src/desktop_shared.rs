@@ -237,9 +237,122 @@ pub fn is_legacy_dropper_filename(name: &str) -> bool {
     lower.starts_with("jeikcode") || lower.starts_with("atomcode")
 }
 
+fn normalized_path_segments(entry: &str) -> Vec<String> {
+    entry
+        .trim()
+        .trim_matches('"')
+        .split(['\\', '/'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_local_bin_suffix(entry: &str) -> bool {
+    let parts = normalized_path_segments(entry);
+    matches!(
+        parts.as_slice(),
+        [.., parent, leaf] if parent == ".local" && leaf == "bin"
+    )
+}
+
+fn contains_local_bin_segment(entry: &str) -> bool {
+    let parts = normalized_path_segments(entry);
+    parts.windows(2).any(|w| w[0] == ".local" && w[1] == "bin")
+}
+
 pub fn is_dirty_legacy_path_entry(entry: &str) -> bool {
     let lower = entry.trim().to_ascii_lowercase();
-    lower.contains(".local\\bin") || lower.contains(".local/bin") || lower.contains("atomcode")
+    lower.contains("atomcode") || contains_local_bin_segment(entry)
+}
+
+fn expand_windows_or_tilde_dir(entry: &str) -> Option<PathBuf> {
+    let trimmed = entry.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+    {
+        return real_home_dir().map(|h| h.join(rest));
+    }
+    if trimmed.eq_ignore_ascii_case("%USERPROFILE%") {
+        return real_home_dir();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("%userprofile%") {
+        let suffix = &trimmed["%userprofile%".len()..];
+        let clean_suffix = suffix.trim_start_matches(['\\', '/']);
+        if rest.contains('%') {
+            return None;
+        }
+        return real_home_dir().map(|h| {
+            if clean_suffix.is_empty() {
+                h
+            } else {
+                h.join(clean_suffix)
+            }
+        });
+    }
+    if trimmed.contains('%') {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn local_bin_should_be_pruned(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let path = entry.path();
+                // Keep .local\bin if it holds any directory/symlink or any non-dropper file.
+                let is_regular_file = entry.file_type().is_ok_and(|ft| ft.is_file());
+                let is_dropper = is_regular_file
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_legacy_dropper_filename);
+                if !is_dropper {
+                    return false;
+                }
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+/// Prune `atomcode` entries unconditionally, and prune `.local\bin` ONLY when it
+/// does not exist or contains no third-party tools (preserving `uv`/`pipx`/`claude`/etc.).
+pub fn should_prune_legacy_path_entry(entry: &str) -> bool {
+    let trimmed = entry.trim().trim_matches('"');
+    if trimmed.to_ascii_lowercase().contains("atomcode") {
+        return true;
+    }
+    if !is_local_bin_suffix(trimmed) {
+        return false;
+    }
+    let Some(expanded) = expand_windows_or_tilde_dir(trimmed) else {
+        return false;
+    };
+    local_bin_should_be_pruned(&expanded)
+}
+
+pub(crate) fn is_ephemeral_or_build_dir(path: &Path) -> bool {
+    path.components().any(|comp| {
+        let std::path::Component::Normal(os) = comp else {
+            return false;
+        };
+        let lower = os.to_string_lossy().to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "temp" | "tmp" | "staged" | "target" | "jeikcode-desktop-update"
+        )
+    })
 }
 
 pub fn legacy_local_bin_dir() -> Option<PathBuf> {
@@ -300,7 +413,7 @@ pub fn has_dirty_hkcu_path() -> bool {
         return false;
     };
     let path_val: String = env.get_value("Path").unwrap_or_default();
-    path_val.split(';').any(is_dirty_legacy_path_entry)
+    path_val.split(';').any(should_prune_legacy_path_entry)
 }
 
 #[cfg(not(windows))]
@@ -334,29 +447,33 @@ pub(crate) fn encode_reg_path_bytes(value: &str) -> Vec<u8> {
 }
 
 pub(crate) fn merge_hkcu_path_entries(current: &str, extra_dirs: &[PathBuf]) -> String {
+    merge_hkcu_path_entries_with(current, extra_dirs, true, |p| p.is_dir())
+}
+
+pub(crate) fn merge_hkcu_path_entries_with(
+    current: &str,
+    extra_dirs: &[PathBuf],
+    skip_ephemeral: bool,
+    dir_exists: impl Fn(&Path) -> bool,
+) -> String {
     let mut parts: Vec<String> = current
         .split(';')
         .filter(|p| {
             let trimmed = p.trim();
-            !trimmed.is_empty() && !is_dirty_legacy_path_entry(trimmed)
+            !trimmed.is_empty() && !should_prune_legacy_path_entry(trimmed)
         })
         .map(str::to_string)
         .collect();
 
     for dir in extra_dirs.iter().rev() {
         let cleaned = strip_windows_verbatim_path(dir);
-        if !cleaned.is_dir() {
+        if !dir_exists(&cleaned) {
+            continue;
+        }
+        if skip_ephemeral && is_ephemeral_or_build_dir(&cleaned) {
             continue;
         }
         let dir_str = cleaned.display().to_string();
-        let lower = dir_str.to_ascii_lowercase();
-        if lower.contains("temp")
-            || lower.contains("staged")
-            || lower.contains("target\\")
-            || lower.contains("target/")
-        {
-            continue;
-        }
         if !parts
             .iter()
             .any(|p| p.trim().eq_ignore_ascii_case(&dir_str))
@@ -441,7 +558,7 @@ fn broadcast_env_setting_change() {
             0,
             env_wide.as_ptr(),
             SMTO_ABORTIFHUNG,
-            5000,
+            500,
             &mut res,
         );
     }
@@ -515,9 +632,17 @@ mod tests {
         assert!(!is_legacy_dropper_filename("other-tool.exe"));
 
         assert!(is_dirty_legacy_path_entry("C:\\Users\\a\\.local\\bin"));
+        assert!(is_dirty_legacy_path_entry(
+            "C:\\Users\\a\\.local\\bin\\jeikcode.exe"
+        ));
         assert!(is_dirty_legacy_path_entry("/home/a/.local/bin"));
+        assert!(is_dirty_legacy_path_entry("/home/a/.local/bin/jeikcode"));
+        assert!(!is_dirty_legacy_path_entry("C:\\Users\\a\\.local\\binary"));
         assert!(is_dirty_legacy_path_entry("C:\\Apps\\AtomCode"));
         assert!(!is_dirty_legacy_path_entry("C:\\Program Files\\JeikCode"));
+        assert!(should_prune_legacy_path_entry(
+            r#""C:\Users\nonexistent-test-user\.local\bin""#
+        ));
 
         let dir = tempfile::tempdir().unwrap();
         let local_bin = dir.path().join(".local").join("bin");
@@ -558,29 +683,55 @@ mod tests {
     #[test]
     fn merge_hkcu_path_entries_strips_verbatim_prefixes_and_preserves_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let install_dir = dir.path().join("JeikCodeDesktop");
-        let resources_dir = install_dir.join("resources");
-        std::fs::create_dir_all(&resources_dir).unwrap();
+        let empty_local_bin = dir.path().join("empty_home").join(".local").join("bin");
+        let tools_local_bin = dir.path().join("tools_home").join(".local").join("bin");
+        std::fs::create_dir_all(&tools_local_bin).unwrap();
+        std::fs::write(tools_local_bin.join("uv.exe"), b"uv").unwrap();
 
+        let install_dir = PathBuf::from(r"C:\Apps\JeikCodeDesktop");
+        let resources_dir = install_dir.join("resources");
         let verbatim_install = PathBuf::from(format!(r"\\?\{}", install_dir.display()));
         let verbatim_resources = PathBuf::from(format!(r"\\?\{}", resources_dir.display()));
         let existing = format!(
-            r"C:\Windows\System32;C:\Users\depc\.local\bin;{}",
+            r"C:\Windows\System32;{};{};{}",
+            empty_local_bin.display(),
+            tools_local_bin.display(),
             resources_dir.display()
         );
-        let merged = merge_hkcu_path_entries(&existing, &[verbatim_install, verbatim_resources]);
-        assert!(merged.contains(&install_dir.display().to_string()));
+        let merged = merge_hkcu_path_entries_with(
+            &existing,
+            &[verbatim_install, verbatim_resources],
+            true,
+            |_| true,
+        );
+        let segs: Vec<&str> = merged.split(';').collect();
+        assert!(segs.contains(&install_dir.display().to_string().as_str()));
         assert!(!merged.contains(r"\\?\"));
-        assert!(!merged.contains(r"\.local\bin"));
-        assert!(merged.contains(r"C:\Windows\System32"));
-        // resources_dir already existed (case-insensitively), so it is not duplicated
+        assert!(!segs.contains(&empty_local_bin.display().to_string().as_str()));
+        assert!(
+            segs.contains(&tools_local_bin.display().to_string().as_str()),
+            ".local/bin with third-party uv.exe must be preserved: {merged}"
+        );
+        assert!(segs.contains(&r"C:\Windows\System32"));
         assert_eq!(
-            merged
-                .split(';')
+            segs.iter()
                 .filter(|p| p.eq_ignore_ascii_case(&resources_dir.display().to_string()))
                 .count(),
             1
         );
+
+        // Component-based ephemeral check must reject Temp/tmp/target/staged without
+        // false-positively rejecting directories like "Tempest" or "Contemporary".
+        assert!(is_ephemeral_or_build_dir(Path::new(
+            r"C:\Users\alice\AppData\Local\Temp\jeikcode"
+        )));
+        assert!(is_ephemeral_or_build_dir(Path::new("/tmp/jeikcode")));
+        assert!(is_ephemeral_or_build_dir(Path::new(
+            r"D:\repo\target\release"
+        )));
+        assert!(!is_ephemeral_or_build_dir(Path::new(
+            r"C:\Users\Tempest\Contemporary\JeikCode"
+        )));
     }
 
     #[cfg(windows)]

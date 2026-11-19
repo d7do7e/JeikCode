@@ -47,6 +47,7 @@ struct WebuiOrigin {
 enum LinkAction {
     StayInWebview,
     OpenExternal,
+    Block,
 }
 
 /// Tauri 自己的页面。交给系统浏览器会去连一个不存在的 `tauri.localhost`。
@@ -126,37 +127,37 @@ fn resolve_close_request_decision(
     }
 }
 
+fn is_allowed_external_scheme(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
 /// 顶层导航：只有壳页面和这次的 WebUI 留在窗口里。
 /// `http://localhost:3000` 这类本机开发服务改由系统浏览器打开，避免盖掉当前界面。
+/// 非 `http`/`https` 外部协议（如 `file://`、`ms-msdt:`、`search-ms:` 等）一律拦截，
+/// 防止页面内链接触发系统任意程序或本地文件执行。
 fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkAction {
     if is_shell_internal_url(url) {
         return LinkAction::StayInWebview;
     }
-    // 仅允许当前已拉起的 WebUI 端口，或在重启交接时允许配置文件中的目标回环端口；
-    // 不再凭 `desktop=` 查询参数放行任意本地端口。
     if origin.is_some_and(|origin| is_launched_webui(url, origin)) {
         return LinkAction::StayInWebview;
     }
-    if origin.is_some() {
-        if let Some(host) = url.host_str() {
-            if is_loopback_host(host) {
-                let (_h, saved_port, _t) = load_webui_listen();
-                if url.port() == Some(saved_port) {
-                    return LinkAction::StayInWebview;
-                }
-            }
-        }
+    if is_allowed_external_scheme(url) {
+        LinkAction::OpenExternal
+    } else {
+        LinkAction::Block
     }
-    LinkAction::OpenExternal
 }
 
 /// Markdown 链接带 `target="_blank"`，走新窗口而不是顶层导航。
-/// 除 Tauri 虚拟地址外一律交给系统浏览器，包括本机其它端口。
+/// 除 Tauri 虚拟地址外，仅 `http`/`https` 允许交给系统浏览器，其余协议一律拦截。
 fn new_window_action(url: &tauri::Url) -> LinkAction {
     if is_shell_internal_url(url) {
         LinkAction::StayInWebview
-    } else {
+    } else if is_allowed_external_scheme(url) {
         LinkAction::OpenExternal
+    } else {
+        LinkAction::Block
     }
 }
 
@@ -529,14 +530,23 @@ fn external_browser_url(url: &tauri::Url) -> String {
     url.to_string()
 }
 
-fn open_in_external_browser(url: &str) {
-    if url.contains("tauri.localhost")
-        || url.starts_with("tauri://")
-        || url.starts_with("about:")
-        || url.starts_with("data:")
-    {
-        return;
+fn sanitize_external_browser_url(raw: &str) -> Option<String> {
+    let parsed = tauri::Url::parse(raw.trim()).ok()?;
+    if !is_allowed_external_scheme(&parsed) || is_shell_internal_url(&parsed) {
+        return None;
     }
+    let host = parsed.host_str()?;
+    if host.is_empty() || host.eq_ignore_ascii_case("tauri.localhost") {
+        return None;
+    }
+    Some(parsed.as_str().to_string())
+}
+
+fn open_in_external_browser(url: &str) {
+    let Some(safe_url) = sanitize_external_browser_url(url) else {
+        return;
+    };
+    let url = safe_url.as_str();
     #[cfg(target_os = "windows")]
     {
         use std::ffi::OsStr;
@@ -852,16 +862,12 @@ fn main() {
                 }
                 let action = navigation_action(url, current_origin.as_ref());
                 match action {
-                    LinkAction::StayInWebview => {
-                        if !is_shell_internal_url(url) {
-                            remember_webui_origin(&nav_origin, url.as_str());
-                        }
-                        true
-                    }
+                    LinkAction::StayInWebview => true,
                     LinkAction::OpenExternal => {
                         open_in_external_browser(&external_browser_url(url));
                         false
                     }
+                    LinkAction::Block => false,
                 }
             })
             .on_new_window(move |url, _features| {
@@ -1909,11 +1915,31 @@ fn read_url_with_shutdown(
 }
 
 pub fn extract_webui_url(text: &str) -> Option<String> {
-    let start = text.find("http://").or_else(|| text.find("https://"))?;
-    let rest = &text[start..];
-    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches(|c: char| matches!(c, ')' | '。' | '，' | '"' | '\''));
-    url.contains("token=").then(|| url.to_string())
+    let mut offset = 0usize;
+    while let Some(slice) = text.get(offset..) {
+        let Some(rel_start) = [slice.find("http://"), slice.find("https://")]
+            .into_iter()
+            .flatten()
+            .min()
+        else {
+            break;
+        };
+        let abs_start = offset + rel_start;
+        let rest = &text[abs_start..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let candidate =
+            rest[..end].trim_end_matches(|c: char| matches!(c, ')' | '。' | '，' | '"' | '\''));
+        if let Ok(parsed) = tauri::Url::parse(candidate) {
+            if parsed
+                .query_pairs()
+                .any(|(k, v)| k == "token" && !v.is_empty())
+            {
+                return Some(candidate.to_string());
+            }
+        }
+        offset = abs_start + 4;
+    }
+    None
 }
 
 fn health_ready(host: &str, port: u16) -> bool {
@@ -2422,6 +2448,72 @@ mod tests {
         }
         let webui = parse_url("http://127.0.0.1:13457/?token=abc");
         assert_eq!(new_window_action(&webui), LinkAction::OpenExternal);
+
+        // Non-http(s) external URI schemes must be blocked (never ShellExecuteW / open / xdg-open).
+        let launched_origin = origin("127.0.0.1", 13457);
+        for dangerous in [
+            "file:///C:/Windows/System32/calc.exe",
+            "file://attacker/share/doc.pdf",
+            "ms-msdt:/id%20PCWDiagnostic",
+            "search-ms:query=secret",
+            "javascript:alert(1)",
+            "vbscript:msgbox(1)",
+            "smb://10.0.0.1/share",
+        ] {
+            let parsed = parse_url(dangerous);
+            assert_eq!(
+                navigation_action(&parsed, Some(&launched_origin)),
+                LinkAction::Block,
+                "navigation_action must block {dangerous}"
+            );
+            assert_eq!(
+                new_window_action(&parsed),
+                LinkAction::Block,
+                "new_window_action must block {dangerous}"
+            );
+            assert_eq!(
+                super::sanitize_external_browser_url(dangerous),
+                None,
+                "sanitize_external_browser_url must reject {dangerous}"
+            );
+        }
+        assert_eq!(
+            super::sanitize_external_browser_url("https://example.com/path?q=1").as_deref(),
+            Some("https://example.com/path?q=1")
+        );
+        assert_eq!(
+            super::sanitize_external_browser_url("https://evil.example/?ref=tauri.localhost")
+                .as_deref(),
+            Some("https://evil.example/?ref=tauri.localhost")
+        );
+        assert_eq!(
+            super::sanitize_external_browser_url("http://tauri.localhost/index.html"),
+            None
+        );
+
+        // Unlaunched/saved ports must NOT stay in WebView even when an origin is active.
+        assert_eq!(
+            navigation_action(
+                &parse_url("http://127.0.0.1:13459/"),
+                Some(&launched_origin)
+            ),
+            LinkAction::OpenExternal
+        );
+    }
+
+    #[test]
+    fn extract_webui_url_skips_preceding_non_token_urls() {
+        let log = "warning: proxy at https://proxy.example.local:8443/health\n\
+                   notice: docs at http://127.0.0.1:8080/\n\
+                   WebUI ready: http://127.0.0.1:13457/?token=desk-tok-123)\n";
+        assert_eq!(
+            super::extract_webui_url(log).as_deref(),
+            Some("http://127.0.0.1:13457/?token=desk-tok-123")
+        );
+        assert_eq!(
+            super::extract_webui_url("http://127.0.0.1:13457/?token="),
+            None
+        );
     }
 
     #[test]
