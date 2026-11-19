@@ -614,8 +614,7 @@ export function GitPanel({
     setIsFetching(true);
     if (!silent) setPanelError(null);
     try {
-      const fetchTarget = effectiveCwd || cwd;
-      const ok = await gitStore.triggerAutoFetch(fetchTarget, { force: !silent });
+      const ok = await gitStore.triggerAutoFetch(cwd, { force: !silent });
       if (!silent) {
         if (ok) {
           showToast(t('git.fetchSuccess'), 'success');
@@ -632,7 +631,7 @@ export function GitPanel({
     } finally {
       setIsFetching(false);
     }
-  }, [cwd, effectiveCwd, isFetching, t]);
+  }, [cwd, isFetching, t]);
 
   // 综合刷新（阶段一：本地状态毫秒级先到先更；阶段二：网络Fetch异步非阻塞，远端新引用到货后级联重绘图谱并重新落缓存）
   const handleFullRefresh = useCallback(async () => {
@@ -705,7 +704,7 @@ export function GitPanel({
   };
 
   // Stage file or all
-  const handleStage = async (path?: string, all?: boolean) => {
+  const handleStage = async (path?: string, all?: boolean): Promise<boolean> => {
     setActionLoadingPath(path || 'all');
     setError(null);
 
@@ -775,9 +774,11 @@ export function GitPanel({
     try {
       await gitStage({ path, all, cwd: effectiveCwd });
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
+      return true;
     } catch (err: any) {
       setError(err?.message || t('git.stageFailed'));
       await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+      return false;
     } finally {
       setActionLoadingPath(null);
     }
@@ -966,7 +967,10 @@ export function GitPanel({
         return;
       }
       // Auto stage all
-      await handleStage(undefined, true);
+      const stagedOk = await handleStage(undefined, true);
+      if (!stagedOk) {
+        return;
+      }
     }
 
     setIsCommitting(true);

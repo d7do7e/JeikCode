@@ -2802,7 +2802,7 @@ export function Chat({
     attachNeedsDedup: boolean;
     loadGeneration?: number;
     onValidEvent?: () => void;
-    onSyntheticDisconnect?: () => void;
+    onSyntheticDisconnect?: (reason: 'not_active' | 'watch_closed') => void;
     onBeforeForegroundFrame?: (frame: SSEEvent) => 'proceed' | 'skip' | 'handled';
     onForegroundTerminal: () => void;
     onBackgroundTerminal: () => void;
@@ -2813,25 +2813,26 @@ export function Chat({
     let steerAnchor: TurnUserAnchor | undefined;
 
     return (event: SSEEvent) => {
-      params.onValidEvent?.();
       // 握手帧带 cursor。回放帧的 seq 要等决定落笔后再推进：
       // 折叠线以上先按住的帧如果提前记账，断线重连会把还没画上的新回合跳过。
       if (event.type === 'session_start') {
+        params.onValidEvent?.();
         if (Array.isArray(event.caps)) {
           serverCapsRef.current = event.caps;
         }
         writeStreamCursor(params.loadId, event.cursor);
         return;
       }
-      // Ignore synthetic done events from clean idle/watch disconnects.
-      if (
-        event.type === 'done' &&
-        ((event as { stop_reason?: string }).stop_reason === 'not_active' ||
-          (event as { stop_reason?: string }).stop_reason === 'watch_closed')
-      ) {
-        params.onSyntheticDisconnect?.();
+      // Ignore synthetic done events from clean idle/watch disconnects (never reset retryCount).
+      const syntheticReason =
+        event.type === 'done'
+          ? (event as { stop_reason?: string }).stop_reason
+          : undefined;
+      if (syntheticReason === 'not_active' || syntheticReason === 'watch_closed') {
+        params.onSyntheticDisconnect?.(syntheticReason);
         return;
       }
+      params.onValidEvent?.();
 
       // 折叠线以上的工具/正文先按住。被页切掉的提问插回这一轮前面，不能丢掉，也不能补到回答下面。
       const accepted = acceptReplayFrame(
@@ -3043,6 +3044,39 @@ export function Chat({
 
     // 带游标自愈推流循环 (Self-Healing Stream with Cursor)：
     // 彻底解决网络颠簸、TCP假死超时或无报错静默断流导致的“推流停止卡住”顽疾。
+    const queryAuthoritativeRunning = async (sid: string): Promise<boolean | null> => {
+      const [rtRes, activeRes] = await Promise.allSettled([
+        getChatRuntime(sid),
+        getActiveChatSessions(),
+      ]);
+      const rtRunning =
+        rtRes.status === 'fulfilled' ? serverRuntimeRunning(rtRes.value) : null;
+      const listRunning =
+        activeRes.status === 'fulfilled' ? activeRes.value.includes(sid) : null;
+      if (rtRunning === true || listRunning === true) return true;
+      if (rtRunning === false || listRunning === false) return false;
+      return null;
+    };
+
+    const settleFromDetachedAuthority = () => {
+      terminalSeen = true;
+      sessionWatchersRef.current.delete(loadId);
+      localActiveStreamsBySessionRef.current.delete(loadId);
+      backgroundRunningSessionsRef.current.delete(loadId);
+      localTurnSessionsRef.current.delete(loadId);
+      localPostedTurnSessionsRef.current.delete(loadId);
+      onTurnRunningChange?.(loadId, false);
+      archiveBackgroundTodos(loadId);
+      if (activeIdRef.current === loadId) {
+        setBusyAndClock(false);
+        busyRef.current = false;
+        settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+        void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
+      } else if (effectiveProjectHash) {
+        void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
+      }
+    };
+
     const runStreamWithAutoRecovery = async () => {
       let retryCount = 0;
       const maxRetries = 5;
@@ -3062,6 +3096,7 @@ export function Chat({
         const attachCursor = readStreamCursor(loadId);
         const attachAfterSeq = attachCursor ? attachCursor.seq : undefined;
         const attachNeedsDedup = attachAfterSeq === undefined;
+        let syntheticDisconnectReason: 'not_active' | 'watch_closed' | null = null;
 
         try {
           await watchChatSession(
@@ -3076,9 +3111,8 @@ export function Chat({
                 retryCount = 0; // 成功收到有效事件立即重置重试计数器
                 lastFrameAt = Date.now();
               },
-              onSyntheticDisconnect: () => {
-                // 若当前连接已被新回合的新 watcher 取代，或正处于「立即发送」交接/未吐帧保护期，
-                // 绝不能清理继任者的 watcher 或熄灭 busy。
+              onSyntheticDisconnect: (reason) => {
+                syntheticDisconnectReason = reason;
                 if (
                   watchAbort.signal.aborted ||
                   sessionWatchersRef.current.get(loadId) !== watchAbort
@@ -3086,22 +3120,14 @@ export function Chat({
                   terminalSeen = true;
                   return;
                 }
-                if (isSessionTurnHandoverProtected(loadId)) {
+                if (
+                  isSessionTurnHandoverProtected(loadId) ||
+                  hasRunningLocalSend(loadId)
+                ) {
                   return;
                 }
-                terminalSeen = true;
-                sessionWatchersRef.current.delete(loadId);
-                localActiveStreamsBySessionRef.current.delete(loadId);
-                backgroundRunningSessionsRef.current.delete(loadId);
-                localTurnSessionsRef.current.delete(loadId);
-                localPostedTurnSessionsRef.current.delete(loadId);
-                onTurnRunningChange?.(loadId, false);
-                archiveBackgroundTodos(loadId);
-                if (activeIdRef.current === loadId) {
-                  setBusyAndClock(false);
-                  busyRef.current = false;
-                  settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
-                  void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
+                if (reason === 'not_active') {
+                  settleFromDetachedAuthority();
                 }
               },
               onForegroundTerminal: () => {
@@ -3124,16 +3150,30 @@ export function Chat({
         // 终态达成或被主动终止：正常退出自愈循环
         if (terminalSeen || watchAbort.signal.aborted) break;
 
-        // 走到这里说明推流意外中断（未收终态 EOF、假死超时被看门狗中断或网络抖动）
-        // 快速探针：检查后端该会话是否仍在运行
-        try {
-          const actives = await getActiveChatSessions();
-          if (!actives.includes(loadId)) {
-            // 后端该回合已收尾（说明是在最终完成阶段断开），退出循环走磁盘对账
+        if (syntheticDisconnectReason === 'watch_closed') {
+          const confirmed = await queryAuthoritativeRunning(loadId);
+          if (
+            watchAbort.signal.aborted ||
+            sessionWatchersRef.current.get(loadId) !== watchAbort
+          ) {
+            terminalSeen = true;
             break;
           }
-        } catch {
-          // 探针网络异常，继续尝试重连
+          if (
+            confirmed === false &&
+            !isSessionTurnHandoverProtected(loadId) &&
+            !hasRunningLocalSend(loadId)
+          ) {
+            settleFromDetachedAuthority();
+            break;
+          }
+        } else {
+          // 走到这里说明推流意外中断（未收终态 EOF、假死超时被看门狗中断或网络抖动）
+          // 权威探针：同时检查 /chat/runtime 与 /chat/active（覆盖 /loop 与 /goal 睡眠周期）
+          const confirmed = await queryAuthoritativeRunning(loadId);
+          if (confirmed === false) {
+            break;
+          }
         }
 
         if (watchAbort.signal.aborted) break;
@@ -4875,6 +4915,15 @@ export function Chat({
         applySessionStickyTodos(sessionId, cachedTodos ?? null);
       };
       const enterIdleSession = () => {
+        const liveWatcher = sessionWatchersRef.current.get(sessionId);
+        if (
+          localTurnSessionsRef.current.has(sessionId) ||
+          backgroundRunningSessionsRef.current.has(sessionId) ||
+          hasRunningLocalSend(sessionId) ||
+          (liveWatcher && !liveWatcher.signal.aborted)
+        ) {
+          return;
+        }
         setBusyAndClock(false);
         busyRef.current = false;
         // 关键根因修复：切入空闲会话时，保留本会话内存中的未完成清单与画板，并静默拉取磁盘最新消息！
@@ -4890,14 +4939,18 @@ export function Chat({
       } else {
         // A stale IndexedDB canvas must not decide that the session is idle. A
         // new browser/tab has no local running refs, but the daemon may already
-        // be streaming this turn; ask `/chat/active` before attaching standby.
+        // be streaming this turn; ask both `/chat/active` and `/chat/runtime` before attaching standby.
         const checkSid = sessionId;
         const checkGen = sessionGenerationRef.current;
-        void getActiveChatSessions()
-          .then((actives) => {
+        void Promise.allSettled([getActiveChatSessions(), getChatRuntime(checkSid)])
+          .then(([activeRes, runtimeRes]) => {
             if (activeIdRef.current !== checkSid || sessionGenerationRef.current !== checkGen) return;
+            const listActive =
+              activeRes.status === 'fulfilled' && activeRes.value.includes(checkSid);
+            const rtActive =
+              runtimeRes.status === 'fulfilled' && serverRuntimeRunning(runtimeRes.value);
             const lifecycle = resolveSessionLifecycle({
-              serverActive: actives.includes(checkSid),
+              serverActive: listActive || rtActive,
             });
             if (lifecycle.phase === 'live') enterRunningSession();
             else enterIdleSession();
@@ -5416,9 +5469,7 @@ export function Chat({
         }
 
         if (activeResult.status === 'fulfilled' || serverRuntimeRunning(hydratedRuntime)) {
-          const active =
-            (activeResult.status === 'fulfilled' && activeResult.value.includes(loadId)) ||
-            serverRuntimeRunning(hydratedRuntime);
+          const active = serverActive === true;
           const isLocalTurn = localTurnSessionsRef.current.has(loadId);
           const ownsTurn = thisTabOwnsTurn({ isLiveSession: false, isLocalTurn });
           transitionChatRecovery({
@@ -5501,15 +5552,17 @@ export function Chat({
         setHistoryHint(nextHint);
         setLoading(false);
         // 空闲态（非 active）：维持待机 watch，收到对端 turn 推送即升级。
-        // 关键防线：若本页面正在执行本地发送主流（abortRef/activeStream 存在，或 localTurnSessions 包含本会话），
+        // 关键防线：若本页面正在执行本地发送主流、已挂载活跃 watcher、或服务端 runtime 仍处于运行中（含 /loop 与 /goal），
         // 坚决杜绝创建任何待机 watch 连接，彻底斩断双流并行与撕裂隐患！
+        const liveWatcherAfterLoad = sessionWatchersRef.current.get(loadId);
         if (
           activeResult.status === 'fulfilled' &&
-          !activeResult.value.includes(loadId) &&
+          serverActive !== true &&
           abortRef.current === null &&
           activeStreamRequestIdRef.current === null &&
           !localActiveStreamsBySessionRef.current.has(loadId) &&
-          !localTurnSessionsRef.current.has(loadId)
+          !localTurnSessionsRef.current.has(loadId) &&
+          !(liveWatcherAfterLoad && !liveWatcherAfterLoad.signal.aborted)
         ) {
           startIdleWatch(projectHash, loadId, loadGeneration, { replayIfLive: true });
         }
