@@ -30,6 +30,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::Manager;
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn is_shutting_down() -> bool {
+    SHUTDOWN_THREAD_STARTED.load(Ordering::SeqCst) || DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst)
+}
 
 /// 这次桌面壳拉起的 WebUI。端口可能因占用从 13457 顺延。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +209,7 @@ fn show_main_window(window: &tauri::WebviewWindow) {
     publish_host_away(window, false);
 }
 
-fn hide_window_to_tray(window: &tauri::WebviewWindow) {
+fn hide_window_native(window: &tauri::WebviewWindow) {
     let _ = window.hide();
     // 兜底直接调用 Win32 ShowWindow(SW_HIDE)：防止外部快捷方式曾直接操作 HWND 导致
     // tao 内部 WindowFlags::VISIBLE 标志位与真实窗口显隐状态失步而忽略 hide()。
@@ -218,6 +223,10 @@ fn hide_window_to_tray(window: &tauri::WebviewWindow) {
             ShowWindow(hwnd.0 as *mut std::ffi::c_void, 0);
         }
     }
+}
+
+fn hide_window_to_tray(window: &tauri::WebviewWindow) {
+    hide_window_native(window);
     publish_host_away(window, true);
 }
 
@@ -345,16 +354,13 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     let live_origin = app
         .try_state::<LiveOriginSlot>()
         .and_then(|slot| slot.0.lock().unwrap_or_else(|e| e.into_inner()).clone());
-    // 兜底 1：仅当本桌面壳实际拉起过子进程或记录过 live origin 时，才向 /shutdown 发送优雅关停请求，
-    // 避免启动失败页退出时误伤用户独立运行的 daemon。
-    if taken.is_some() || live_origin.is_some() {
-        let (cfg_host, cfg_port, token) = load_webui_listen();
-        let (target_host, target_port) = match live_origin {
-            Some(origin) => (origin.host, origin.port),
-            None => (cfg_host, cfg_port),
-        };
-        if target_port > 0 {
-            send_desktop_shutdown(&target_host, target_port, token.as_deref());
+    // Only send /shutdown when LiveOriginSlot has recorded the child's actual bound port.
+    // During cold start before LiveOriginSlot is set, fall back to direct child termination
+    // below so we never send /shutdown to an unrelated busy daemon on cfg_port.
+    if let Some(origin) = live_origin {
+        let (_cfg_host, _cfg_port, token) = load_webui_listen();
+        if origin.port > 0 {
+            send_desktop_shutdown(&origin.host, origin.port, token.as_deref());
         }
     }
     if let Some(managed) = taken {
@@ -365,19 +371,40 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     cleanup_desktop_owned_children_windows();
 }
 
-fn clear_child_if_pid(app: &tauri::AppHandle, pid: u32) {
-    if let Some(slot) = app.try_state::<ChildSlot>() {
-        let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.as_ref().is_some_and(|c| c.pid == pid) {
-            *guard = None;
-        }
+/// Hide the window immediately on the UI/callback thread, perform blocking child
+/// teardown on a dedicated worker thread, and then call `app.exit(0)`.
+fn request_desktop_exit(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        hide_window_native(&window);
     }
+    if SHUTDOWN_THREAD_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        terminate_managed_child(&app_clone);
+        app_clone.exit(0);
+    });
+}
+
+fn take_child_if_pid(app: &tauri::AppHandle, pid: u32) -> Option<ManagedChild> {
+    let slot = app.try_state::<ChildSlot>()?;
+    let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().is_some_and(|c| c.pid == pid) {
+        guard.take()
+    } else {
+        None
+    }
+}
+
+fn clear_child_if_pid(app: &tauri::AppHandle, pid: u32) {
+    drop(take_child_if_pid(app, pid));
 }
 
 fn store_child_unless_shutting_down(app: &tauri::AppHandle, managed: ManagedChild) -> bool {
     if let Some(slot) = app.try_state::<ChildSlot>() {
         let mut guard = slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        if is_shutting_down() {
             drop(guard);
             managed.terminate_and_wait();
             return false;
@@ -433,8 +460,7 @@ fn handle_desktop_shell_action(
             true
         }
         "/__desktop_action/quit_app" => {
-            terminate_managed_child(app);
-            app.exit(0);
+            request_desktop_exit(app);
             true
         }
         "/__desktop_action/set_close_action" => {
@@ -708,6 +734,9 @@ fn spawn_single_instance_activation_listener(
                 // 必须调度到主事件循环线程执行还原与聚焦，确保 tao 内部 WindowFlags::VISIBLE 100% 同步恢复
                 let win = window_for_thread.clone();
                 let _ = window_for_thread.run_on_main_thread(move || {
+                    if is_shutting_down() {
+                        return;
+                    }
                     show_main_window(&win);
                 });
             }
@@ -904,7 +933,8 @@ fn main() {
                             hide_window_to_tray(&close_window);
                         }
                         CloseRequestDecision::AllowExit => {
-                            terminate_managed_child(&app_handle_for_close);
+                            api.prevent_close();
+                            request_desktop_exit(&app_handle_for_close);
                         }
                         CloseRequestDecision::PromptWebui => {
                             api.prevent_close();
@@ -959,9 +989,11 @@ fn main() {
                     Err(err) => Err(format!("启动任务异常：{err}")),
                 };
                 match start_res {
-                    Ok((url, managed_child, exit_rx, launch)) => {
-                        let initial_pid = managed_child.pid;
-                        if !store_child_unless_shutting_down(&handle, managed_child) {
+                    Ok((url, initial_pid, exit_rx, launch)) => {
+                        if is_shutting_down() {
+                            if let Some(managed) = take_child_if_pid(&handle, initial_pid) {
+                                managed.terminate_and_wait();
+                            }
                             return;
                         }
                         // 必须先记下地址再导航，否则这次 WebUI 会被当成外链弹出浏览器。
@@ -981,7 +1013,9 @@ fn main() {
                         );
                     }
                     Err(err) => {
-                        show_boot_error(&window, &boot_url_for_start, &err);
+                        if !is_shutting_down() {
+                            show_boot_error(&window, &boot_url_for_start, &err);
+                        }
                     }
                 }
             });
@@ -1096,13 +1130,15 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
+                if is_shutting_down() {
+                    return;
+                }
                 if let Some(window) = app.get_webview_window("main") {
                     show_main_window(&window);
                 }
             }
             "quit" => {
-                terminate_managed_child(app);
-                app.exit(0);
+                request_desktop_exit(app);
             }
             _ => {}
         })
@@ -1114,6 +1150,9 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
             } = event
             {
                 let app = tray.app_handle();
+                if is_shutting_down() {
+                    return;
+                }
                 if let Some(window) = app.get_webview_window("main") {
                     let is_visible = window.is_visible().unwrap_or(false);
                     let is_minimized = window.is_minimized().unwrap_or(false);
@@ -1359,7 +1398,7 @@ fn start_webui(
 ) -> Result<
     (
         String,
-        ManagedChild,
+        u32,
         std::sync::mpsc::Receiver<Option<i32>>,
         WebuiLaunch,
     ),
@@ -1380,8 +1419,8 @@ fn start_webui(
         home,
         bundled,
     };
-    let (url, managed_child, exit_rx) =
-        spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
+    let (url, child_pid, exit_rx) =
+        spawn_desktop_server(app, &launch, false, Duration::from_secs(90))?;
     let probe_port = url
         .parse::<tauri::Url>()
         .ok()
@@ -1390,7 +1429,7 @@ fn start_webui(
     // Keep any temporary conflict-fallback port in memory only so user-configured
     // `webui-listen.json` port is never silently overwritten.
     launch.port = probe_port;
-    Ok((url, managed_child, exit_rx, launch))
+    Ok((url, child_pid, exit_rx, launch))
 }
 
 #[cfg(windows)]
@@ -1488,10 +1527,14 @@ fn assign_child_to_desktop_job(child: &std::process::Child) {
 fn assign_child_to_desktop_job(_child: &std::process::Child) {}
 
 fn spawn_desktop_server(
+    app: &tauri::AppHandle,
     launch: &WebuiLaunch,
     exact_port: bool,
     url_timeout: Duration,
-) -> Result<(String, ManagedChild, std::sync::mpsc::Receiver<Option<i32>>), String> {
+) -> Result<(String, u32, std::sync::mpsc::Receiver<Option<i32>>), String> {
+    if is_shutting_down() {
+        return Err("desktop shutting down".to_string());
+    }
     let mut cmd = Command::new(&launch.bin);
     cmd.arg("webui")
         .arg("--host")
@@ -1536,6 +1579,20 @@ fn spawn_desktop_server(
         .map_err(|e| format!("无法启动 {}：{e}", launch.bin.display()))?;
     assign_child_to_desktop_job(&child);
     let stderr = child.stderr.take();
+    // Register child in ChildSlot immediately so any close/quit during read_url
+    // or health_ready cleanly terminates the pending child.
+    let (managed_child, exit_rx) = ManagedChild::spawn_waiter(child);
+    let child_pid = managed_child.pid;
+    if !store_child_unless_shutting_down(app, managed_child) {
+        return Err("desktop shutting down".to_string());
+    }
+
+    let cleanup_pending = || {
+        if let Some(managed) = take_child_if_pid(app, child_pid) {
+            managed.terminate_and_wait();
+        }
+    };
+
     let url_result = match stderr {
         Some(pipe) => read_url(pipe, url_timeout),
         None => Ok(None),
@@ -1543,13 +1600,11 @@ fn spawn_desktop_server(
     let mut url = match url_result {
         Ok(Some(url)) => url,
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            cleanup_pending();
             return Err("jeikcode webui 没有打印出地址".to_string());
         }
         Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            cleanup_pending();
             return Err(err);
         }
     };
@@ -1573,13 +1628,20 @@ fn spawn_desktop_server(
     let ready_deadline = Instant::now() + Duration::from_secs(20);
     let mut ready = false;
     loop {
-        if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+        if is_shutting_down() {
+            cleanup_pending();
             return Err("desktop shutting down".to_string());
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("jeikcode webui 启动后立即退出（{status}）"));
+        match exit_rx.try_recv() {
+            Ok(Some(code)) => {
+                cleanup_pending();
+                return Err(format!("jeikcode webui 启动后立即退出（退出码 {code}）"));
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                cleanup_pending();
+                return Err("jeikcode webui 启动后立即退出".to_string());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
         if health_ready(&probe_host, probe_port) {
             ready = true;
@@ -1591,12 +1653,10 @@ fn spawn_desktop_server(
         std::thread::sleep(Duration::from_millis(40));
     }
     if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
+        cleanup_pending();
         return Err("jeikcode webui 健康检查超时".to_string());
     }
-    let (managed_child, exit_rx) = ManagedChild::spawn_waiter(child);
-    Ok((url, managed_child, exit_rx))
+    Ok((url, child_pid, exit_rx))
 }
 
 /// 纯事件驱动的子进程监管（0 轮询、0 死循环）：
@@ -1657,30 +1717,37 @@ fn supervise_webui(
 
             let spawned = if intentional_restart {
                 // 原地重启交接：锁定原端口并支持退避重试，绝不随意误判漂移端口导致异地失联
-                let mut res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
+                let mut res = spawn_desktop_server(&app, &launch, true, Duration::from_secs(30));
                 for _ in 0..3 {
-                    if res.is_ok() || DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    if res.is_ok() || is_shutting_down() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(400));
-                    if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    if is_shutting_down() {
                         break;
                     }
-                    res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
+                    res = spawn_desktop_server(&app, &launch, true, Duration::from_secs(30));
                 }
                 res
             } else {
-                if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                if is_shutting_down() {
                     return;
                 }
-                spawn_desktop_server(&launch, true, Duration::from_secs(30))
-                    .or_else(|_| spawn_desktop_server(&launch, false, Duration::from_secs(30)))
+                spawn_desktop_server(&app, &launch, true, Duration::from_secs(30)).or_else(|_| {
+                    if is_shutting_down() {
+                        Err("desktop shutting down".to_string())
+                    } else {
+                        spawn_desktop_server(&app, &launch, false, Duration::from_secs(30))
+                    }
+                })
             };
 
             match spawned {
-                Ok((next_url, managed_child, next_exit_rx)) => {
-                    let next_pid = managed_child.pid;
-                    if !store_child_unless_shutting_down(&app, managed_child) {
+                Ok((next_url, next_pid, next_exit_rx)) => {
+                    if is_shutting_down() {
+                        if let Some(managed) = take_child_if_pid(&app, next_pid) {
+                            managed.terminate_and_wait();
+                        }
                         return;
                     }
                     let probe_port = next_url
@@ -1694,7 +1761,9 @@ fn supervise_webui(
                     open_webui_in_shell(&window, &origin, &next_url);
                 }
                 Err(err) => {
-                    show_boot_error(&window, &boot_url_slot, &err);
+                    if !is_shutting_down() {
+                        show_boot_error(&window, &boot_url_slot, &err);
+                    }
                     return;
                 }
             }
@@ -1783,6 +1852,14 @@ fn read_url(
     pipe: impl std::io::Read + Send + 'static,
     timeout: Duration,
 ) -> Result<Option<String>, String> {
+    read_url_with_shutdown(pipe, timeout, &DESKTOP_SHUTTING_DOWN)
+}
+
+fn read_url_with_shutdown(
+    pipe: impl std::io::Read + Send + 'static,
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
@@ -1813,10 +1890,21 @@ fn read_url(
             }
         }
     });
-    match rx.recv_timeout(timeout) {
-        Ok(url) => Ok(Some(url)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("等待 WebUI 启动超时".into()),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+    let deadline = Instant::now() + timeout;
+    loop {
+        if shutdown.load(Ordering::SeqCst) || SHUTDOWN_THREAD_STARTED.load(Ordering::SeqCst) {
+            return Err("desktop shutting down".into());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("等待 WebUI 启动超时".into());
+        }
+        let slice = (deadline - now).min(Duration::from_millis(100));
+        match rx.recv_timeout(slice) {
+            Ok(url) => return Ok(Some(url)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
     }
 }
 
@@ -2030,6 +2118,9 @@ fn prepare_desktop_port_for_launch(
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
+        if is_shutting_down() {
+            return port;
+        }
         if http_loopback_request(host, port, "GET", "/health", None).is_none() {
             return port;
         }
@@ -2725,5 +2816,47 @@ mod tests {
         assert!(super::local_binary_sha256(&missing).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_url_with_shutdown_aborts_promptly_while_pipe_stays_open() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        struct BlockingReader(Arc<AtomicBool>);
+        impl std::io::Read for BlockingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                while !self.0.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(0)
+            }
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            shutdown_trigger.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let res = super::read_url_with_shutdown(
+            BlockingReader(Arc::clone(&done)),
+            Duration::from_secs(15),
+            &shutdown,
+        );
+        let elapsed = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+
+        assert_eq!(res.unwrap_err(), "desktop shutting down");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read_url must abort promptly on shutdown, elapsed={elapsed:?}"
+        );
     }
 }
