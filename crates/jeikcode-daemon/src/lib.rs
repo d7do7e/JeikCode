@@ -18408,57 +18408,103 @@ struct FsRawQuery {
     path: String,
 }
 
+const MAX_FS_READ_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FS_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn validate_fs_rename_target_name(name: &str) -> Result<&str, &'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        return Err("Invalid new_name");
+    }
+    let mut components = std::path::Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(trimmed),
+        _ => Err("Invalid new_name"),
+    }
+}
+
 async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
-    let raw = q.path.trim().trim_start_matches("./");
-    let mut p = std::path::PathBuf::from(raw);
-    if !p.exists() || !p.is_file() {
-        if let Ok(cur) = std::env::current_dir() {
-            let candidate = cur.join(raw);
-            if candidate.exists() && candidate.is_file() {
-                p = candidate;
+    let raw = q.path.trim().trim_start_matches("./").to_string();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        let mut p = std::path::PathBuf::from(&raw);
+        if !p.exists() || !p.is_file() {
+            if let Ok(cur) = std::env::current_dir() {
+                let candidate = cur.join(&raw);
+                if candidate.exists() && candidate.is_file() {
+                    p = candidate;
+                }
             }
         }
-    }
-    if !p.exists() || !p.is_file() {
+        p
+    })
+    .await
+    else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed".into_response());
+    };
+
+    let Ok(file) = tokio::fs::File::open(&resolved).await else {
+        return (StatusCode::NOT_FOUND, "Not found".into_response());
+    };
+    let Ok(meta) = file.metadata().await else {
+        return (StatusCode::NOT_FOUND, "Not found".into_response());
+    };
+    if !meta.is_file() {
         return (StatusCode::NOT_FOUND, "Not found".into_response());
     }
-    match std::fs::read(&p) {
-        Ok(bytes) => {
-            let ext = p
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let mime = match ext.as_str() {
-                "png" => "image/png",
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "webp" => "image/webp",
-                "svg" => "image/svg+xml",
-                "ico" => "image/x-icon",
-                "bmp" => "image/bmp",
-                "pdf" => "application/pdf",
-                "mp4" => "video/mp4",
-                "mp3" => "audio/mpeg",
-                _ => "application/octet-stream",
-            };
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(val) = mime.parse() {
-                headers.insert(axum::http::header::CONTENT_TYPE, val);
-            }
-            headers.insert(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static(
-                    "public, max-age=86400, stale-while-revalidate=604800",
-                ),
-            );
-            (StatusCode::OK, (headers, bytes).into_response())
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e}").into_response(),
-        ),
+
+    let ext = resolved
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(val) = mime.parse() {
+        headers.insert(axum::http::header::CONTENT_TYPE, val);
     }
+    if let Ok(val) = meta.len().to_string().parse() {
+        headers.insert(axum::http::header::CONTENT_LENGTH, val);
+    }
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(
+            "public, max-age=86400, stale-while-revalidate=604800",
+        ),
+    );
+    let stream = futures::stream::try_unfold(file, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => Ok::<_, std::io::Error>(None),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some((axum::body::Bytes::from(buf), f)))
+            }
+            Err(e) => Err(e),
+        }
+    });
+    (
+        StatusCode::OK,
+        (headers, axum::body::Body::from_stream(stream)).into_response(),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -18472,101 +18518,124 @@ async fn fs_action_handler(
     State(state): State<AppState>,
     Json(req): Json<FsActionPayload>,
 ) -> impl IntoResponse {
-    let raw = req.path.trim();
-    let mut p = std::path::PathBuf::from(raw);
-    if !p.is_absolute() {
-        p = state.bind_working_dir.join(raw);
-    }
-    match req.action.as_str() {
-        "create_file" | "create" => {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    let working_dir = state.bind_working_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let raw = req.path.trim();
+        let mut p = std::path::PathBuf::from(raw);
+        if !p.is_absolute() {
+            p = working_dir.join(raw);
+        }
+        match req.action.as_str() {
+            "create_file" | "create" => {
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&p)
+                {
+                    Ok(_) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "message": "File created" })),
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "message": "Already exists" })),
+                    ),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                    ),
+                }
             }
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&p)
-            {
-                Ok(_) => (
+            "create_folder" | "mkdir" => match std::fs::create_dir_all(&p) {
+                Ok(()) => (
                     StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "message": "File created" })),
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "message": "Already exists" })),
+                    Json(serde_json::json!({ "success": true, "message": "Folder created" })),
                 ),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
                 ),
+            },
+            "rename" => {
+                let Some(raw_new_name) = req.new_name.as_deref() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "success": false, "error": "Missing new_name" })),
+                    );
+                };
+                let Ok(new_name) = validate_fs_rename_target_name(raw_new_name) else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "success": false, "error": "Invalid new_name" })),
+                    );
+                };
+                let Some(parent) = p.parent().filter(|parent| !parent.as_os_str().is_empty())
+                else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({ "success": false, "error": "Invalid parent path" }),
+                        ),
+                    );
+                };
+                if p == working_dir {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({ "success": false, "error": "Invalid parent path" }),
+                        ),
+                    );
+                }
+                let new_path = parent.join(new_name);
+                match std::fs::rename(&p, &new_path) {
+                    Ok(()) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "message": "Renamed" })),
+                    ),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                    ),
+                }
             }
-        }
-        "create_folder" | "mkdir" => match std::fs::create_dir_all(&p) {
-            Ok(()) => (
+            "delete" => {
+                if !p.exists() {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "message": "Already deleted" })),
+                    );
+                }
+                let res = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                match res {
+                    Ok(()) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "message": "Deleted" })),
+                    ),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                    ),
+                }
+            }
+            _ => (
                 StatusCode::OK,
-                Json(serde_json::json!({ "success": true, "message": "Folder created" })),
+                Json(serde_json::json!({ "success": true, "message": "Ignored" })),
             ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
-            ),
-        },
-        "rename" => {
-            let Some(new_name) = req
-                .new_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "success": false, "error": "Missing new_name" })),
-                );
-            };
-            let Some(parent) = p.parent() else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "success": false, "error": "Invalid parent path" })),
-                );
-            };
-            let new_path = parent.join(new_name);
-            match std::fs::rename(&p, &new_path) {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "message": "Renamed" })),
-                ),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
-                ),
-            }
         }
-        "delete" => {
-            if !p.exists() {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "message": "Already deleted" })),
-                );
-            }
-            let res = if p.is_dir() {
-                std::fs::remove_dir_all(&p)
-            } else {
-                std::fs::remove_file(&p)
-            };
-            match res {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "message": "Deleted" })),
-                ),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
-                ),
-            }
-        }
-        _ => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "success": true, "message": "Ignored" })),
+    })
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
         ),
     }
 }
@@ -18622,113 +18691,130 @@ fn load_fs_tree_gitignore(
 }
 
 async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) -> impl IntoResponse {
-    let root = state
-        .bind_working_dir
-        .canonicalize()
-        .unwrap_or_else(|_| state.bind_working_dir.clone());
-    let root = jeikcode_capabilities::pathnorm::strip_verbatim_path(&root);
+    let working_dir = state.bind_working_dir.clone();
+    let req_path = q.path.unwrap_or_default();
+    match tokio::task::spawn_blocking(move || {
+        let root = working_dir
+            .canonicalize()
+            .unwrap_or_else(|_| working_dir.clone());
+        let root = jeikcode_capabilities::pathnorm::strip_verbatim_path(&root);
 
-    let req_path = q.path.as_deref().unwrap_or("").trim();
-    let abs_dir = if req_path.is_empty() || req_path == "." {
-        root.to_path_buf()
-    } else {
-        let p = std::path::PathBuf::from(req_path);
-        if p.is_absolute() {
-            p
+        let req_path = req_path.trim();
+        let abs_dir = if req_path.is_empty() || req_path == "." {
+            root.to_path_buf()
         } else {
-            root.join(p)
-        }
-    };
-    let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
-    let abs_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&abs_dir);
+            let p = std::path::PathBuf::from(req_path);
+            if p.is_absolute() {
+                p
+            } else {
+                root.join(p)
+            }
+        };
+        let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
+        let abs_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&abs_dir);
 
-    if !abs_dir.exists() || !abs_dir.is_dir() {
-        return (
-            StatusCode::NOT_FOUND,
+        if !abs_dir.exists() || !abs_dir.is_dir() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "path": abs_dir.to_string_lossy().replace('\\', "/"),
+                    "entries": [],
+                    "dirs": [],
+                    "files": [],
+                    "error": "Directory not found"
+                })),
+            );
+        }
+
+        let gitignore = load_fs_tree_gitignore(&root, &abs_dir);
+
+        let mut entries_res: Vec<FsEntryDto> = Vec::new();
+        let mut dirs: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+
+        if let Ok(read_dir) = std::fs::read_dir(&abs_dir) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".git" {
+                    continue;
+                }
+                let file_type = entry.file_type();
+                let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+                let entry_path = abs_dir.join(&name);
+                let full_p = entry_path.to_string_lossy().replace('\\', "/");
+
+                let is_ignored = {
+                    let rel_opt = entry_path.strip_prefix(&root).ok();
+                    let matched = if let Some(rel) = rel_opt {
+                        gitignore.matched_path_or_any_parents(rel, is_dir)
+                    } else {
+                        gitignore.matched_path_or_any_parents(&entry_path, is_dir)
+                    };
+                    match matched {
+                        ignore::Match::Ignore(_) => true,
+                        ignore::Match::Whitelist(_) => false,
+                        ignore::Match::None => {
+                            name == "target"
+                                || name == "node_modules"
+                                || name == "dist"
+                                || name == ".jeikcode_store"
+                                || name.starts_with('.')
+                        }
+                    }
+                };
+
+                if is_dir {
+                    dirs.push(name.clone());
+                } else {
+                    files.push(name.clone());
+                }
+
+                entries_res.push(FsEntryDto {
+                    name,
+                    path: full_p,
+                    is_dir,
+                    is_ignored,
+                });
+            }
+        }
+
+        entries_res.sort_by(|a, b| {
+            if a.is_dir == b.is_dir {
+                a.name.cmp(&b.name)
+            } else if a.is_dir {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+        dirs.sort();
+        files.sort();
+
+        (
+            StatusCode::OK,
             Json(serde_json::json!({
                 "path": abs_dir.to_string_lossy().replace('\\', "/"),
+                "entries": entries_res,
+                "dirs": dirs,
+                "files": files,
+                "success": true
+            })),
+        )
+    })
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "path": "",
                 "entries": [],
                 "dirs": [],
                 "files": [],
-                "error": "Directory not found"
+                "error": format!("{e}")
             })),
-        );
+        ),
     }
-
-    let gitignore = load_fs_tree_gitignore(&root, &abs_dir);
-
-    let mut entries_res: Vec<FsEntryDto> = Vec::new();
-    let mut dirs: Vec<String> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-
-    if let Ok(read_dir) = std::fs::read_dir(&abs_dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
-                continue;
-            }
-            let file_type = entry.file_type();
-            let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
-            let entry_path = abs_dir.join(&name);
-            let full_p = entry_path.to_string_lossy().replace('\\', "/");
-
-            let is_ignored = {
-                let rel_opt = entry_path.strip_prefix(&root).ok();
-                let matched = if let Some(rel) = rel_opt {
-                    gitignore.matched_path_or_any_parents(rel, is_dir)
-                } else {
-                    gitignore.matched_path_or_any_parents(&entry_path, is_dir)
-                };
-                match matched {
-                    ignore::Match::Ignore(_) => true,
-                    ignore::Match::Whitelist(_) => false,
-                    ignore::Match::None => {
-                        name == "target"
-                            || name == "node_modules"
-                            || name == "dist"
-                            || name == ".jeikcode_store"
-                            || name.starts_with('.')
-                    }
-                }
-            };
-
-            if is_dir {
-                dirs.push(name.clone());
-            } else {
-                files.push(name.clone());
-            }
-
-            entries_res.push(FsEntryDto {
-                name,
-                path: full_p,
-                is_dir,
-                is_ignored,
-            });
-        }
-    }
-
-    entries_res.sort_by(|a, b| {
-        if a.is_dir == b.is_dir {
-            a.name.cmp(&b.name)
-        } else if a.is_dir {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        }
-    });
-    dirs.sort();
-    files.sort();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "path": abs_dir.to_string_lossy().replace('\\', "/"),
-            "entries": entries_res,
-            "dirs": dirs,
-            "files": files,
-            "success": true
-        })),
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -18783,9 +18869,57 @@ fn fs_stamp(meta: &std::fs::Metadata) -> (u64, Option<u64>) {
 }
 
 async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
-    let p = resolve_fs_target(&q.path, q.cwd.as_deref(), &state.bind_working_dir);
+    let raw_path = q.path.clone();
+    let cwd = q.cwd.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(p) = tokio::task::spawn_blocking(move || {
+        resolve_fs_target(&raw_path, cwd.as_deref(), &bind_working_dir)
+    })
+    .await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": "Failed to resolve path",
+                "size": 0,
+                "modified_ms": null
+            })),
+        );
+    };
 
-    if !p.exists() || !p.is_file() {
+    let Ok(file) = tokio::fs::File::open(&p).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": "File not found",
+                "size": 0,
+                "modified_ms": null
+            })),
+        );
+    };
+
+    // 先取戳再读内容：宁可文件在 read 期间又被改一次（下一轮多刷一次），
+    // 也不能让戳比内容更旧，否则轮询会误判“磁盘没变”而留下旧内容。
+    let Ok(meta) = file.metadata().await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": "File not found",
+                "size": 0,
+                "modified_ms": null
+            })),
+        );
+    };
+    if !meta.is_file() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -18799,53 +18933,90 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
         );
     }
 
-    // 先取戳再读内容：宁可文件在 read 期间又被改一次（下一轮多刷一次），
-    // 也不能让戳比内容更旧，否则轮询会误判“磁盘没变”而留下旧内容。
-    let (size, modified_ms) = tokio::fs::metadata(&p)
-        .await
-        .map(|m| fs_stamp(&m))
-        .unwrap_or((0, None));
-
-    match tokio::fs::read_to_string(&p).await {
-        Ok(content) => (
-            StatusCode::OK,
+    let (size, modified_ms) = fs_stamp(&meta);
+    if size > MAX_FS_READ_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "path": p.to_string_lossy().replace('\\', "/"),
-                "content": content,
-                "success": true,
+                "content": "",
+                "success": false,
+                "error": format!("File exceeds {} byte editor limit", MAX_FS_READ_BYTES),
+                "size": size,
+                "modified_ms": modified_ms
+            })),
+        );
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::with_capacity((size as usize).min(MAX_FS_READ_BYTES as usize));
+    match file
+        .take(MAX_FS_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+    {
+        Ok(_) if bytes.len() as u64 > MAX_FS_READ_BYTES => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "path": p.to_string_lossy().replace('\\', "/"),
+                "content": "",
+                "success": false,
+                "error": format!("File exceeds {} byte editor limit", MAX_FS_READ_BYTES),
                 "size": size,
                 "modified_ms": modified_ms
             })),
         ),
-        Err(_) => match tokio::fs::read(&p).await {
-            Ok(bytes) => (
+        Ok(_) => {
+            let content = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
+            (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "path": p.to_string_lossy().replace('\\', "/"),
-                    "content": String::from_utf8_lossy(&bytes).to_string(),
+                    "content": content,
                     "success": true,
                     "size": size,
                     "modified_ms": modified_ms
                 })),
-            ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "path": q.path,
-                    "content": "",
-                    "success": false,
-                    "error": format!("{e}"),
-                    "size": 0,
-                    "modified_ms": null
-                })),
-            ),
-        },
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": format!("{e}"),
+                "size": 0,
+                "modified_ms": null
+            })),
+        ),
     }
 }
 
 /// 轻量文件戳查询：编辑器前台标签轮询它，只有大小/修改时间变化才重新拉全文。
 async fn fs_stat(State(state): State<AppState>, Query(q): Query<FsStatQuery>) -> impl IntoResponse {
-    let p = resolve_fs_target(&q.path, q.cwd.as_deref(), &state.bind_working_dir);
+    let raw_path = q.path.clone();
+    let cwd = q.cwd.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(p) = tokio::task::spawn_blocking(move || {
+        resolve_fs_target(&raw_path, cwd.as_deref(), &bind_working_dir)
+    })
+    .await
+    else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": q.path,
+                "exists": false,
+                "is_file": false,
+                "size": 0,
+                "modified_ms": null
+            })),
+        );
+    };
     match tokio::fs::metadata(&p).await {
         Ok(meta) => {
             let (size, modified_ms) = fs_stamp(&meta);
@@ -18971,10 +19142,26 @@ async fn fs_search(
                     continue;
                 }
                 let p = entry.path();
-                if p.is_dir() {
+                let Ok(meta) = std::fs::metadata(&p) else {
+                    continue;
+                };
+                if meta.is_dir() {
                     walk_search(&p, q, matches, depth + 1);
-                } else if p.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&p) {
+                } else if meta.is_file() && meta.len() <= MAX_FS_SEARCH_FILE_BYTES {
+                    use std::io::Read;
+                    let Ok(file) = std::fs::File::open(&p) else {
+                        continue;
+                    };
+                    let mut buf = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+                    if file
+                        .take(MAX_FS_SEARCH_FILE_BYTES + 1)
+                        .read_to_end(&mut buf)
+                        .is_err()
+                        || buf.len() as u64 > MAX_FS_SEARCH_FILE_BYTES
+                    {
+                        continue;
+                    }
+                    if let Ok(content) = String::from_utf8(buf) {
                         for (idx, line) in content.lines().enumerate() {
                             if line.to_lowercase().contains(q) {
                                 let norm_p = p.to_string_lossy().replace('\\', "/");
@@ -19022,32 +19209,40 @@ async fn fs_locate(
     State(state): State<AppState>,
     Query(q): Query<FsLocateQuery>,
 ) -> impl IntoResponse {
-    let raw_query = q.q.trim().trim_matches('"').trim_matches('\'').trim();
-    let root = q.path.as_deref().unwrap_or("").trim();
-    let search_dir = if root.is_empty() || root == "." {
-        state.bind_working_dir.clone()
-    } else {
-        let p = std::path::PathBuf::from(root);
-        if p.is_absolute() {
-            p
-        } else {
-            state.bind_working_dir.join(p)
-        }
-    };
-    let search_dir = search_dir.canonicalize().unwrap_or(search_dir);
-    let search_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&search_dir);
+    let raw_query =
+        q.q.trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+    let root = q.path.as_deref().unwrap_or("").trim().to_string();
+    let bind_working_dir = state.bind_working_dir.clone();
 
-    if raw_query.is_empty() || !search_dir.exists() {
+    if raw_query.is_empty() {
         return Json(serde_json::json!({
             "query": q.q,
             "results": Vec::<FsLocateItem>::new()
         }));
     }
 
-    let search_dir_clone = search_dir.clone();
-    let query_str = raw_query.to_string();
-
     let results = tokio::task::spawn_blocking(move || {
+        let search_dir = if root.is_empty() || root == "." {
+            bind_working_dir
+        } else {
+            let p = std::path::PathBuf::from(&root);
+            if p.is_absolute() {
+                p
+            } else {
+                bind_working_dir.join(p)
+            }
+        };
+        let search_dir = search_dir.canonicalize().unwrap_or(search_dir);
+        let search_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&search_dir);
+        if !search_dir.exists() {
+            return Vec::<FsLocateItem>::new();
+        }
+        let search_dir_clone = search_dir;
+        let query_str = raw_query;
         let mut matches: Vec<FsLocateItem> = Vec::new();
         let query_normalized = query_str.replace('\\', "/").to_lowercase();
         let is_path_query = query_normalized.contains('/');
@@ -30379,5 +30574,41 @@ mod server_lifecycle_tests {
         ));
         assert!(!inputs.deliver("goal-sess-1", 7, serde_json::json!({"text":"late"})));
         assert!(registry.active_session_ids().await.is_empty());
+    }
+
+    #[test]
+    fn validate_fs_rename_target_name_rejects_traversal_separators_and_special_dirs() {
+        assert_eq!(validate_fs_rename_target_name("  next.rs  "), Ok("next.rs"));
+        for bad in [
+            "", "   ", ".", "..", "../evil", "a/b", "a\\b", "foo/", "foo\\", "C:foo", "a\0b",
+        ] {
+            assert!(
+                validate_fs_rename_target_name(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_returns_413_when_file_exceeds_limit() {
+        use axum::extract::{Query, State};
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let big_path = home.path().join("huge.bin");
+        {
+            let f = std::fs::File::create(&big_path).unwrap();
+            f.set_len(MAX_FS_READ_BYTES + 1).unwrap();
+        }
+        let resp = fs_read(
+            State(state),
+            Query(FsReadQuery {
+                path: big_path.to_string_lossy().into_owned(),
+                cwd: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
