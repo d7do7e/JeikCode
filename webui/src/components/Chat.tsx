@@ -12,6 +12,7 @@ import { InputHistory, canNavigateInputHistory, inputHistoryKey } from '../lib/i
 import { resolveComposerEnterAction, resolveComposerEscapeAction, isMobileComposer, tailQueuedCard } from '../lib/composerShortcuts';
 import { createTimelineFollow } from '../lib/timelineFollow';
 import { collapseComposerTextarea, resizeComposerTextarea } from '../lib/composerLayout';
+import { partitionDroppedFiles, readDroppedFilePreview } from '../lib/droppedFiles';
 
 /** First paint / page size for long transcripts. Older messages load on demand.
  *  Hard cap: a tail must not grow past this when the cut falls mid-turn.
@@ -6380,16 +6381,30 @@ export function Chat({
         return;
       }
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        for (let i = 0; i < e.dataTransfer.files.length; i++) {
-          const file = e.dataTransfer.files[i];
-          const p = (file as any).path || file.name;
-          if (p) {
-            window.dispatchEvent(
-              new CustomEvent('jeikcode:preview:open_file', {
-                detail: { filePath: p, fileName: file.name },
-              }),
-            );
-          }
+        const { paths, memoryFiles } = partitionDroppedFiles(e.dataTransfer.files);
+        for (const p of paths) {
+          window.dispatchEvent(
+            new CustomEvent('jeikcode:preview:open_file', {
+              detail: { filePath: p },
+            }),
+          );
+        }
+        for (const file of memoryFiles) {
+          void readDroppedFilePreview(file)
+            .then((preview) => {
+              if (!preview) {
+                showToast(t('editor.readFailedDesc'), 'error');
+                return;
+              }
+              window.dispatchEvent(
+                new CustomEvent('jeikcode:preview:open_file', {
+                  detail: preview,
+                }),
+              );
+            })
+            .catch(() => {
+              showToast(t('editor.readFailedDesc'), 'error');
+            });
         }
       }
     } catch {}
@@ -6426,12 +6441,27 @@ export function Chat({
         return;
       }
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        for (let i = 0; i < e.dataTransfer.files.length; i++) {
-          const file = e.dataTransfer.files[i];
-          const p = (file as any).path || file.name;
-          if (p) {
-            window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
-          }
+        const { paths, memoryFiles } = partitionDroppedFiles(e.dataTransfer.files);
+        for (const p of paths) {
+          window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
+        }
+        for (const file of memoryFiles) {
+          void readDroppedFilePreview(file)
+            .then((preview) => {
+              if (!preview) {
+                showToast(t('editor.readFailedDesc'), 'error');
+                return;
+              }
+              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+              window.dispatchEvent(
+                new CustomEvent('jeikcode:preview:open_file', {
+                  detail: preview,
+                }),
+              );
+            })
+            .catch(() => {
+              showToast(t('editor.readFailedDesc'), 'error');
+            });
         }
       }
     } catch {}

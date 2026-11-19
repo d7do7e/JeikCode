@@ -22,6 +22,7 @@ import { parseFilePathAndLines } from './lib/displayPath';
 import { dropEditorTabSnapshot, mainEditorStateKey } from './lib/editorTabState';
 import { languageOptions } from './i18n';
 import { triggerBlobDownload } from './lib/download';
+import { partitionDroppedFiles, readDroppedFilePreview } from './lib/droppedFiles';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销。
 // 注意：**每次启动都会渲染**的弹窗绝不能放进这里——懒加载它们没有收益，
@@ -707,17 +708,32 @@ export function App() {
           return;
         }
         if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-          for (let i = 0; i < e.dataTransfer.files.length; i++) {
-            const file = e.dataTransfer.files[i];
-            const p = (file as any).path || file.name;
-            if (p) {
-              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
-              window.dispatchEvent(
-                new CustomEvent('jeikcode:preview:open_file', {
-                  detail: { filePath: p, fileName: file.name },
-                }),
-              );
-            }
+          const { paths, memoryFiles } = partitionDroppedFiles(e.dataTransfer.files);
+          for (const p of paths) {
+            window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+            window.dispatchEvent(
+              new CustomEvent('jeikcode:preview:open_file', {
+                detail: { filePath: p },
+              }),
+            );
+          }
+          for (const file of memoryFiles) {
+            void readDroppedFilePreview(file)
+              .then((preview) => {
+                if (!preview) {
+                  showToast(t('editor.readFailedDesc'), 'error');
+                  return;
+                }
+                window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+                window.dispatchEvent(
+                  new CustomEvent('jeikcode:preview:open_file', {
+                    detail: preview,
+                  }),
+                );
+              })
+              .catch(() => {
+                showToast(t('editor.readFailedDesc'), 'error');
+              });
           }
         }
       } catch {}

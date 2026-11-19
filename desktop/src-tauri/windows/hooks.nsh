@@ -52,27 +52,28 @@ FunctionEnd
   StrCpy $2 0 ; $2 tracks whether PATH was modified
 
   ${If} $0 == ""
-    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$INSTDIR"
+    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$INSTDIR\resources"
     StrCpy $2 1
   ${Else}
-    ; Append $INSTDIR\resources if not already present
-    Push "$0"
-    Push "$INSTDIR\resources"
+    ; Boundary-safe lookup (";$0;") checks exact PATH entries so $INSTDIR\resources
+    ; cannot mask a missing $INSTDIR entry. NSIS StrCmp is case-insensitive.
+    Push ";$0;"
+    Push ";$INSTDIR;"
+    Call StrStr
+    Pop $1
+    ${If} $1 == ""
+      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
+      ReadRegStr $0 HKCU "Environment" "Path"
+      StrCpy $2 1
+    ${EndIf}
+
+    Push ";$0;"
+    Push ";$INSTDIR\resources;"
     Call StrStr
     Pop $1
     ${If} $1 == ""
       WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$0"
       ReadRegStr $0 HKCU "Environment" "Path"
-      StrCpy $2 1
-    ${EndIf}
-
-    ; Append $INSTDIR if not already present
-    Push "$0"
-    Push "$INSTDIR"
-    Call StrStr
-    Pop $1
-    ${If} $1 == ""
-      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
       StrCpy $2 1
     ${EndIf}
   ${EndIf}
@@ -100,6 +101,7 @@ FunctionEnd
   nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
   nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
   nsExec::Exec 'taskkill /F /IM "jeikcode-daemon.exe" /T'
+  nsExec::Exec 'taskkill /F /IM "cli-bin.exe" /T'
   Sleep 800
 !macroend
 

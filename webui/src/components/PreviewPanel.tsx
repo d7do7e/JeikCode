@@ -4,6 +4,7 @@ import { modalConfirm } from './ConfirmDialog';
 import { CodeEditorTab } from './CodeEditorTab';
 import { showToast } from './Toast';
 import { parseFilePathAndLines } from '../lib/displayPath';
+import { partitionDroppedFiles, readDroppedFilePreview } from '../lib/droppedFiles';
 import {
   bumpReloadToken,
   dropEditorTabSnapshot,
@@ -20,6 +21,8 @@ export interface PreviewTab {
   fileStatus?: string;
   startLine?: number;
   endLine?: number;
+  inMemoryContent?: string;
+  inMemoryDataUrl?: string;
 }
 
 export interface PreviewPanelProps {
@@ -168,7 +171,13 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
     // 只有在当前 key 已经从本地存储水合完成后，才允许回写持久化，避免未就绪时空列表冲掉原有项目标签
     if (hydratedKeyRef.current !== storageKeyTabs) return;
     try {
-      localStorage.setItem(storageKeyTabs, JSON.stringify(tabs));
+      const persistableTabs = tabs.filter(
+        (tab) =>
+          !tab.filePath.startsWith('memory://') &&
+          tab.inMemoryContent === undefined &&
+          tab.inMemoryDataUrl === undefined,
+      );
+      localStorage.setItem(storageKeyTabs, JSON.stringify(persistableTabs));
     } catch {}
     onTabsCountChange?.(tabs.length);
   }, [tabs, storageKeyTabs, onTabsCountChange]);
@@ -201,14 +210,22 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
         fileStatus?: string;
         startLine?: number;
         endLine?: number;
+        inMemoryContent?: string;
+        inMemoryDataUrl?: string;
       },
       insertIndex?: number,
     ) => {
       const rawPath = info.filePath;
-      const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } = parseFilePathAndLines(rawPath);
+      const isMemory =
+        rawPath.startsWith('memory://') ||
+        info.inMemoryContent !== undefined ||
+        info.inMemoryDataUrl !== undefined;
+      const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } = isMemory
+        ? { filePath: rawPath, startLine: undefined, endLine: undefined }
+        : parseFilePathAndLines(rawPath);
       const startLine = info.startLine ?? parsedStart;
       const endLine = info.endLine ?? parsedEnd;
-      const absPath = normalizeToAbsolute(cleanRaw, cwd);
+      const absPath = isMemory ? cleanRaw : normalizeToAbsolute(cleanRaw, cwd);
       const fileName = info.fileName || absPath.split(/[\\/]/).pop() || absPath;
       const tabId = `preview_${absPath}`;
 
@@ -222,6 +239,8 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
               ...existingItem,
               startLine,
               endLine,
+              ...(info.inMemoryContent !== undefined ? { inMemoryContent: info.inMemoryContent } : {}),
+              ...(info.inMemoryDataUrl !== undefined ? { inMemoryDataUrl: info.inMemoryDataUrl } : {}),
             };
           }
           if (insertIndex !== undefined && insertIndex !== existingIdx) {
@@ -238,6 +257,8 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
           fileStatus: info.fileStatus || (fileName.split('.').pop() || 'FILE').slice(0, 3).toUpperCase(),
           startLine,
           endLine,
+          inMemoryContent: info.inMemoryContent,
+          inMemoryDataUrl: info.inMemoryDataUrl,
         };
         if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
           const next = [...prev];
@@ -252,6 +273,29 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
     [cwd],
   );
 
+  const openDroppedFiles = useCallback(
+    (files: FileList | null | undefined, insertIndex?: number) => {
+      const { paths, memoryFiles } = partitionDroppedFiles(files);
+      for (const p of paths) {
+        openTab({ filePath: p }, insertIndex);
+      }
+      for (const file of memoryFiles) {
+        void readDroppedFilePreview(file)
+          .then((preview) => {
+            if (!preview) {
+              showToast(t('editor.readFailedDesc'), 'error');
+              return;
+            }
+            openTab(preview, insertIndex);
+          })
+          .catch(() => {
+            showToast(t('editor.readFailedDesc'), 'error');
+          });
+      }
+    },
+    [openTab, t],
+  );
+
   // 监听全局打开预览事件
   useEffect(() => {
     const handleOpenFileEvent = (
@@ -261,6 +305,8 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
         fileStatus?: string;
         startLine?: number;
         endLine?: number;
+        inMemoryContent?: string;
+        inMemoryDataUrl?: string;
       }>,
     ) => {
       if (e.detail?.filePath) {
@@ -400,13 +446,7 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
         return;
       }
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        for (let i = 0; i < e.dataTransfer.files.length; i++) {
-          const file = e.dataTransfer.files[i];
-          const p = (file as any).path || file.name;
-          if (p) {
-            openTab({ filePath: p, fileName: file.name }, targetIndex);
-          }
-        }
+        openDroppedFiles(e.dataTransfer.files, targetIndex);
       }
     } catch {}
     setDraggedTabIndex(null);
@@ -454,13 +494,7 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
         return;
       }
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        for (let i = 0; i < e.dataTransfer.files.length; i++) {
-          const file = e.dataTransfer.files[i];
-          const p = (file as any).path || file.name;
-          if (p) {
-            openTab({ filePath: p, fileName: file.name });
-          }
-        }
+        openDroppedFiles(e.dataTransfer.files);
       }
     } catch {}
   };
@@ -496,13 +530,7 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
             return;
           }
           if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-            for (let i = 0; i < e.dataTransfer.files.length; i++) {
-              const file = e.dataTransfer.files[i];
-              const p = (file as any).path || file.name;
-              if (p) {
-                openTab({ filePath: p, fileName: file.name });
-              }
-            }
+            openDroppedFiles(e.dataTransfer.files);
           }
         } catch {}
       }}
@@ -676,13 +704,7 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
               return;
             }
             if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-              for (let i = 0; i < e.dataTransfer.files.length; i++) {
-                const file = e.dataTransfer.files[i];
-                const p = (file as any).path || file.name;
-                if (p) {
-                  openTab({ filePath: p, fileName: file.name });
-                }
-              }
+              openDroppedFiles(e.dataTransfer.files);
             }
           } catch {}
         }}
@@ -718,6 +740,8 @@ export function PreviewPanel({ cwd, onTabsCountChange, surfaceActive = true }: P
                     cwd={cwd}
                     startLine={tab.startLine}
                     endLine={tab.endLine}
+                    inMemoryContent={tab.inMemoryContent}
+                    inMemoryDataUrl={tab.inMemoryDataUrl}
                     stateKey={previewEditorStateKey(tab.filePath)}
                     defaultViewMode={tabViewModes[tab.id] ?? 'preview'}
                     active={surfaceActive && isActiveTab}

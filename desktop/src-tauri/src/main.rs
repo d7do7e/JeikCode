@@ -684,6 +684,7 @@ fn main() {
             spawn_single_instance_activation_listener(window.clone());
 
             watch_host_presence(window.clone());
+            #[cfg(not(target_os = "windows"))]
             let drop_window = window.clone();
             let close_window = window.clone();
             let app_handle_for_close = app.handle().clone();
@@ -722,6 +723,9 @@ fn main() {
                         }
                     }
                 }
+                // Windows disables native FileDropHandler so HTML5 in-app drag-and-drop works without
+                // DROPEFFECT_NONE; OS file drops on Windows enter WebUI via DataTransfer.files.
+                #[cfg(not(target_os = "windows"))]
                 if let tauri::WindowEvent::DragDrop(drop_event) = event {
                     if let tauri::DragDropEvent::Drop { paths, .. } = drop_event {
                         for path in paths {

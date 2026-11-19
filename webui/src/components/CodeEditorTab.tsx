@@ -20,6 +20,7 @@ import {
 } from '../lib/editorTabState';
 import { fileStampFromRead, type FileStamp } from '../lib/fileStamp';
 import { subscribeFileFreshness, type FileFreshnessSubscription } from '../lib/fsFreshness';
+import { partitionDroppedFiles, readDroppedFilePreview } from '../lib/droppedFiles';
 import { useT } from '../settings';
 
 export interface CodeEditorTabProps {
@@ -48,6 +49,9 @@ export interface CodeEditorTabProps {
   restoreFocusOnActivate?: boolean;
   /** 未保存修改状态变化：预览面板据此显示脏点、关闭/刷新前确认。 */
   onDirtyChange?: (dirty: boolean) => void;
+  /** In-memory content/dataUrl for WebView2 dropped Files that lack an OS `.path`. */
+  inMemoryContent?: string;
+  inMemoryDataUrl?: string;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
@@ -75,22 +79,28 @@ export function CodeEditorTab({
   reloadToken,
   restoreFocusOnActivate = true,
   onDirtyChange,
+  inMemoryContent,
+  inMemoryDataUrl,
 }: CodeEditorTabProps) {
   const t = useT();
+  const isMemoryPreview =
+    filePath.startsWith('memory://') ||
+    inMemoryContent !== undefined ||
+    inMemoryDataUrl !== undefined;
   // 事件作用域：同一个文件可能同时打开在主画布与右侧预览，切换/保存指令必须按标签现场隔离。
   const eventScope = stateKey || filePath;
   const ext = useMemo(() => (filePath.split('.').pop() || '').toLowerCase(), [filePath]);
-  const isImage = useMemo(() => IMAGE_EXTS.has(ext), [ext]);
+  const isImage = useMemo(() => IMAGE_EXTS.has(ext) || inMemoryDataUrl !== undefined, [ext, inMemoryDataUrl]);
   const isArchive = useMemo(() => ARCHIVE_EXTS.has(ext), [ext]);
-  const isBinary = useMemo(() => isArchive || BINARY_EXTS.has(ext), [ext, isArchive]);
+  const isBinary = useMemo(() => !isMemoryPreview && (isArchive || BINARY_EXTS.has(ext)), [isMemoryPreview, ext, isArchive]);
   const isSvg = ext === 'svg';
 
   // 每个标签实例只读取一次现场；本实例随后的写入不会再回灌自己。
   const [restoredSnapshot] = useState<EditorTabSnapshot | null>(() => readEditorTabSnapshot(stateKey));
 
-  const [content, setContent] = useState<string>(() => restoredSnapshot?.content ?? '');
+  const [content, setContent] = useState<string>(() => restoredSnapshot?.content ?? inMemoryContent ?? '');
   const [loading, setLoading] = useState<boolean>(() => {
-    if (isImage || isBinary) return false;
+    if (isImage || isBinary || isMemoryPreview) return false;
     // 已有标签现场时直接渲染，避免重新挂载瞬间闪一次加载态。
     return !restoredSnapshot;
   });
@@ -491,19 +501,19 @@ export function CodeEditorTab({
   // 前台切回时重新校验磁盘（AI 可能刚改过这个文件）；未保存草稿优先，不参与刷新。
   const activationReloadReadyRef = useRef(false);
   useEffect(() => {
-    if (!active) return;
+    if (!active || isMemoryPreview) return;
     if (!activationReloadReadyRef.current) {
       activationReloadReadyRef.current = true;
       return;
     }
     if (isDirtyRef.current) return;
     setReloadTrigger((n) => n + 1);
-  }, [active]);
+  }, [active, isMemoryPreview]);
 
   // 前台标签的磁盘新鲜度轮询：只有可见编辑器才订阅，切走立即退订。
   // 全局单例调度器每轮最多查 2 个目标，标签切换不会形成轮询风暴。
   useEffect(() => {
-    if (!active || isBinary) return;
+    if (!active || isBinary || isMemoryPreview) return;
     const subscription = subscribeFileFreshness({
       key: stateKey || filePath,
       path: filePath,
@@ -532,12 +542,12 @@ export function CodeEditorTab({
       subscription.dispose();
       if (freshnessSubRef.current === subscription) freshnessSubRef.current = null;
     };
-  }, [active, isBinary, stateKey, filePath, cwd]);
+  }, [active, isBinary, isMemoryPreview, stateKey, filePath, cwd]);
 
   // 回到窗口/标签页可见时补一次磁盘校验：不依赖 /fs/stat 是否可用，
   // 保证“离开一段时间后回来”能看到外部程序/其他工具的落盘结果。
   useEffect(() => {
-    if (!active) return;
+    if (!active || isMemoryPreview) return;
     const refreshOnReturn = () => {
       if (document.visibilityState !== 'visible') return;
       // 草稿优先；刚读过盘（打开/切换标签）则不必重复。
@@ -551,7 +561,7 @@ export function CodeEditorTab({
       window.removeEventListener('focus', refreshOnReturn);
       document.removeEventListener('visibilitychange', refreshOnReturn);
     };
-  }, [active]);
+  }, [active, isMemoryPreview]);
 
   // 语法高亮分词 HTML (与 Markdown 预览模式共享黄色搜索高亮与当前项聚焦高亮！)
   const highlightedHtml = useMemo(() => {
@@ -760,6 +770,17 @@ export function CodeEditorTab({
   // 读取文件内容 (非文本类文件直接跳过文本读取，进入图片/二进制视图)
   useEffect(() => {
     let cancelled = false;
+    if (isMemoryPreview) {
+      if (inMemoryContent !== undefined) {
+        setContent(inMemoryContent);
+        historyRef.current = [{ text: inMemoryContent, cursor: 0 }];
+        historyIndexRef.current = 0;
+      }
+      setIsDirty(false);
+      setLoading(false);
+      setLoadError(null);
+      return;
+    }
     if ((isImage && !isSvg) || isBinary) {
       // 图片/二进制没有文本可重读：显式刷新时用版本号打穿缓存（/fs/raw 带 24h 强缓存）。
       const requestedToken = reloadToken ?? 0;
@@ -871,13 +892,13 @@ export function CodeEditorTab({
     return () => {
       cancelled = true;
     };
-  }, [filePath, cwd, reloadTrigger, reloadToken, isImage, isSvg, isBinary]);
+  }, [filePath, cwd, reloadTrigger, reloadToken, isImage, isSvg, isBinary, isMemoryPreview, inMemoryContent]);
 
   // 保存文件
   const handleSave = useCallback(async (e?: any) => {
     e?.preventDefault?.();
     e?.stopPropagation?.();
-    if (saving) return;
+    if (saving || isMemoryPreview) return;
     setSaving(true);
     try {
       const res = await fetchFsWrite(filePath, content);
@@ -1165,16 +1186,31 @@ export function CodeEditorTab({
         return;
       }
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        for (let i = 0; i < e.dataTransfer.files.length; i++) {
-          const file = e.dataTransfer.files[i];
-          const p = (file as any).path || file.name;
-          if (p) {
-            if (onFileDrop) {
-              onFileDrop(String(p));
-              continue;
-            }
-            window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
+        const { paths, memoryFiles } = partitionDroppedFiles(e.dataTransfer.files);
+        for (const p of paths) {
+          if (onFileDrop) {
+            onFileDrop(p);
+            continue;
           }
+          window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
+        }
+        for (const file of memoryFiles) {
+          void readDroppedFilePreview(file)
+            .then((preview) => {
+              if (!preview) {
+                showToast(t('editor.readFailedDesc'), 'error');
+                return;
+              }
+              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+              window.dispatchEvent(
+                new CustomEvent('jeikcode:preview:open_file', {
+                  detail: preview,
+                }),
+              );
+            })
+            .catch(() => {
+              showToast(t('editor.readFailedDesc'), 'error');
+            });
         }
       }
     } catch {}
@@ -1255,76 +1291,84 @@ export function CodeEditorTab({
                 <span class="editor-btn-icon">⤢</span>
                 <span class="editor-btn-text">{t('editor.fitToView')}</span>
               </button>
-              <button
-                type="button"
-                class="editor-tool-btn"
-                onClick={async () => {
-                  try {
-                    await openFileWithOs(filePath);
-                    showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
-                  } catch {
-                    // 系统外壳调用失败时静默忽略
-                  }
-                }}
-                title={t('preview.openWithDefaultApp')}
-              >
-                <span class="editor-btn-icon">🚀</span>
-                <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
-              </button>
-              <button
-                type="button"
-                class="editor-tool-btn"
-                onClick={async () => {
-                  try {
-                    await revealInFileExplorer(filePath);
-                    showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
-                  } catch {
-                    // 系统外壳调用失败时静默忽略
-                  }
-                }}
-                title={t('explorer.revealInOs')}
-              >
-                <span class="editor-btn-icon">📁</span>
-                <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
-              </button>
+              {!isMemoryPreview && (
+                <>
+                  <button
+                    type="button"
+                    class="editor-tool-btn"
+                    onClick={async () => {
+                      try {
+                        await openFileWithOs(filePath);
+                        showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
+                      } catch {
+                        // 系统外壳调用失败时静默忽略
+                      }
+                    }}
+                    title={t('preview.openWithDefaultApp')}
+                  >
+                    <span class="editor-btn-icon">🚀</span>
+                    <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="editor-tool-btn"
+                    onClick={async () => {
+                      try {
+                        await revealInFileExplorer(filePath);
+                        showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
+                      } catch {
+                        // 系统外壳调用失败时静默忽略
+                      }
+                    }}
+                    title={t('explorer.revealInOs')}
+                  >
+                    <span class="editor-btn-icon">📁</span>
+                    <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
+                  </button>
+                </>
+              )}
             </>
           )}
 
           {/* 二进制模式专属控制 */}
           {viewMode === 'binary' && (
             <>
-              <button
-                type="button"
-                class="editor-tool-btn"
-                onClick={async () => {
-                  try {
-                    await openFileWithOs(filePath);
-                    showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
-                  } catch {
-                    // 系统外壳调用失败时静默忽略
-                  }
-                }}
-                title={t('preview.openWithDefaultApp')}
-              >
-                <span class="editor-btn-icon">🚀</span>
-                <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
-              </button>
-              <button
-                type="button"
-                class="editor-tool-btn"
-                onClick={async () => {
-                  try {
-                    await revealInFileExplorer(filePath);
-                    showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
-                  } catch {
-                    // 系统外壳调用失败时静默忽略
-                  }
-                }}
-                title={t('explorer.revealInOs')}
-              >
-                <span class="editor-btn-icon">📁</span>
-                <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
-              </button>
+              {!isMemoryPreview && (
+                <>
+                  <button
+                    type="button"
+                    class="editor-tool-btn"
+                    onClick={async () => {
+                      try {
+                        await openFileWithOs(filePath);
+                        showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
+                      } catch {
+                        // 系统外壳调用失败时静默忽略
+                      }
+                    }}
+                    title={t('preview.openWithDefaultApp')}
+                  >
+                    <span class="editor-btn-icon">🚀</span>
+                    <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="editor-tool-btn"
+                    onClick={async () => {
+                      try {
+                        await revealInFileExplorer(filePath);
+                        showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
+                      } catch {
+                        // 系统外壳调用失败时静默忽略
+                      }
+                    }}
+                    title={t('explorer.revealInOs')}
+                  >
+                    <span class="editor-btn-icon">📁</span>
+                    <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
+                  </button>
+                </>
+              )}
             </>
           )}
 
@@ -1393,8 +1437,8 @@ export function CodeEditorTab({
                 type="button"
                 class="editor-save-btn"
                 onClick={handleSave}
-                disabled={saving || !isDirty}
-                title={t('editor.save')}
+                disabled={saving || !isDirty || isMemoryPreview}
+                title={isMemoryPreview ? t('common.readonly') : t('editor.save')}
               >
                 <span class="editor-btn-icon">{saving ? '⏳' : isDirty ? '💾' : '✓'}</span>
                 <span class="editor-btn-text">{saving ? t('editor.saving') : isDirty ? t('editor.save') : t('editor.saved')}</span>
@@ -1599,7 +1643,12 @@ export function CodeEditorTab({
           <div class="editor-image-stage" onWheel={handleImageWheel}>
             <div class="editor-image-wrapper" style={{ transform: `scale(${imgScale})` }}>
               <img
-                src={getFsRawUrl(filePath) + (assetVersion ? `&v=${assetVersion}` : '')}
+                src={
+                  inMemoryDataUrl
+                    || (isMemoryPreview && isSvg
+                      ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(content)}`
+                      : getFsRawUrl(filePath) + (assetVersion ? `&v=${assetVersion}` : ''))
+                }
                 alt={fileName}
                 class="editor-image-elem"
                 onLoad={(e) => {
@@ -1713,9 +1762,9 @@ export function CodeEditorTab({
               </pre>
               <textarea
                 ref={textareaRef}
-                class={'editor-textarea' + (viewMode === 'preview' ? ' is-preview-readonly' : '')}
+                class={'editor-textarea' + (viewMode === 'preview' || isMemoryPreview ? ' is-preview-readonly' : '')}
                 value={content}
-                readOnly={viewMode === 'preview'}
+                readOnly={viewMode === 'preview' || isMemoryPreview}
                 onDragOver={handleEditorDragOver}
                 onDrop={handleEditorDrop}
                 onSelect={rememberEditorViewport}
