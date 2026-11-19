@@ -197,6 +197,13 @@ impl HubState {
         }
     }
 
+    fn exec_pending(&self) -> &HashMap<RequestId, String> {
+        match self.stashed_execution.as_ref() {
+            Some(stashed) => &stashed.pending_requests,
+            None => &self.pending_requests,
+        }
+    }
+
     fn exec_pending_mut(&mut self) -> &mut HashMap<RequestId, String> {
         match self.stashed_execution.as_mut() {
             Some(stashed) => &mut stashed.pending_requests,
@@ -215,6 +222,13 @@ impl HubState {
         match self.stashed_execution.as_mut() {
             Some(stashed) => &mut stashed.snapshot,
             None => &mut self.snapshot,
+        }
+    }
+
+    fn exec_snapshot_error(&self) -> Option<&String> {
+        match self.stashed_execution.as_ref() {
+            Some(stashed) => stashed.snapshot_error.as_ref(),
+            None => self.snapshot_error.as_ref(),
         }
     }
 
@@ -677,8 +691,8 @@ impl LiveViewHub {
             if current.identity.id != binding.id {
                 return Err(HubError::StaleBinding);
             }
-            if state.turn_active {
-                state.pending_web_steers.push_back(PendingWebSteer {
+            if state.exec_turn_active() {
+                state.exec_steers_mut().push_back(PendingWebSteer {
                     runtime_input: runtime_input.clone(),
                     client_input_id,
                 });
@@ -721,13 +735,13 @@ impl LiveViewHub {
             });
         }
         if matches!(receipt, SubmitReceipt::Started { .. }) {
-            state.replay.clear();
-            state.pending_requests.clear();
+            state.exec_replay_mut().clear();
+            state.exec_pending_mut().clear();
             if correlation_registered {
                 remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
             }
         }
-        state.turn_active = true;
+        state.set_exec_turn_active(true);
         self.publish_view_locked(
             &mut state,
             LiveViewEvent::InputAccepted {
@@ -752,12 +766,12 @@ impl LiveViewHub {
                 actual: status.generation,
             });
         }
-        if !state.turn_active {
-            state.replay.clear();
-            state.pending_web_steers.clear();
+        if !state.exec_turn_active() {
+            state.exec_replay_mut().clear();
+            state.exec_steers_mut().clear();
         }
-        state.turn_active = true;
-        state.pending_requests.clear();
+        state.set_exec_turn_active(true);
+        state.exec_pending_mut().clear();
         self.publish_view_locked(
             &mut state,
             LiveViewEvent::InputAccepted {
@@ -804,8 +818,15 @@ impl LiveViewHub {
                 .map(|(id, _)| *id)
                 .collect()
         };
+        let execution_sid = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .execution_session_id()
+                .unwrap_or(&expected.session_id)
+                .to_string()
+        };
         jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-            &expected.session_id,
+            &execution_sid,
         );
         if ids.is_empty() {
             return;
@@ -1116,7 +1137,7 @@ impl LiveViewHub {
 
     pub fn respond(&self, id: RequestId, value: serde_json::Value) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.pending_requests.contains_key(&id) {
+        if !state.exec_pending().contains_key(&id) {
             return Err(HubError::UnknownRequest(id));
         }
         Self::dispatch_locked(&state, DriverCommand::Respond { id, value })?;
@@ -1131,7 +1152,7 @@ impl LiveViewHub {
     ) -> Result<(), HubError> {
         {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if !state.pending_requests.contains_key(&id) {
+            if !state.exec_pending().contains_key(&id) {
                 return Err(HubError::UnknownRequest(id));
             }
         }
@@ -1151,7 +1172,7 @@ impl LiveViewHub {
         // resolution, not an UnknownRequest failure; publish the peer terminal
         // only while the request is still present in this generation.
         if current.identity.generation == binding.generation
-            && state.pending_requests.contains_key(&id)
+            && state.exec_pending().contains_key(&id)
         {
             self.resolve_request_locked(&mut state, id)?;
         }
@@ -1177,7 +1198,7 @@ impl LiveViewHub {
                     actual: current.identity.generation,
                 });
             }
-            if !state.pending_requests.contains_key(&id) {
+            if !state.exec_pending().contains_key(&id) {
                 return Err(HubError::UnknownRequest(id));
             }
         }
@@ -1207,7 +1228,7 @@ impl LiveViewHub {
                 actual: current.identity.generation,
             });
         }
-        if state.pending_requests.contains_key(&id) {
+        if state.exec_pending().contains_key(&id) {
             self.resolve_request_locked(&mut state, id)?;
         }
         Ok(())
@@ -1237,7 +1258,7 @@ impl LiveViewHub {
                     actual: current.identity.generation,
                 });
             }
-            if state.pending_requests.get(&id).map(String::as_str) != Some(expected_kind) {
+            if state.exec_pending().get(&id).map(String::as_str) != Some(expected_kind) {
                 return Err(HubError::UnknownRequest(id));
             }
         }
@@ -1274,7 +1295,7 @@ impl LiveViewHub {
                 actual: current.identity.generation,
             });
         }
-        if let Some(kind) = state.pending_requests.get(&id) {
+        if let Some(kind) = state.exec_pending().get(&id) {
             if kind != expected_kind {
                 return Err(HubError::UnknownRequest(id));
             }
@@ -1367,8 +1388,11 @@ impl LiveViewHub {
             *state.exec_snapshot_error_mut() = None;
         }
         state.set_exec_last_seq(Some(envelope.sequence));
+        self.apply_and_publish_runtime_event(&mut state, envelope.event);
+        Ok(())
+    }
 
-        let event = envelope.event;
+    fn apply_and_publish_runtime_event(&self, state: &mut HubState, event: CodingRuntimeEvent) {
         let apply_agent_config_reload = matches!(
             &event,
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { .. })
@@ -1383,17 +1407,12 @@ impl LiveViewHub {
             })
             .flatten();
         let reload_working_dir = apply_agent_config_reload
-            .then(|| {
-                state
-                    .binding
-                    .as_ref()
-                    .map(|bound| bound.identity.working_dir.clone())
-            })
+            .then(|| state.execution_working_dir())
             .flatten();
         let mapped_steer = match &event {
             CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => {
                 let anchor = state.exec_last_assistant_message_id();
-                let client_ids = correlate_web_steers_locked(&mut state, inputs);
+                let client_ids = correlate_web_steers_locked(state, inputs);
                 Some((*count, inputs.clone(), client_ids, anchor))
             }
             _ => None,
@@ -1465,10 +1484,7 @@ impl LiveViewHub {
             }
             CodingRuntimeEvent::SessionChanged(changed) => {
                 let execution_sid = state.execution_session_id().map(str::to_string);
-                let current_wd = state
-                    .binding
-                    .as_ref()
-                    .map(|bound| bound.identity.working_dir.clone());
+                let current_wd = state.execution_working_dir();
                 let identity_changed = changed.session_id.as_ref().is_some_and(|session_id| {
                     Some(session_id.as_str()) != execution_sid.as_deref()
                 }) || current_wd
@@ -1476,15 +1492,16 @@ impl LiveViewHub {
                     .is_some_and(|wd| changed.working_dir != *wd);
                 if let Some(session_id) = &changed.session_id {
                     state.execution_session_id = Some(session_id.clone());
-                    if let Some(stashed) = state.stashed_execution.as_mut() {
+                }
+                if let Some(stashed) = state.stashed_execution.as_mut() {
+                    if let Some(session_id) = &changed.session_id {
                         stashed.session_id = session_id.clone();
-                        stashed.working_dir = changed.working_dir.clone();
                     }
-                    if let Some(current) = state.binding.as_mut() {
+                    stashed.working_dir = changed.working_dir.clone();
+                } else if let Some(current) = state.binding.as_mut() {
+                    if let Some(session_id) = &changed.session_id {
                         current.identity.session_id = session_id.clone();
                     }
-                }
-                if let Some(current) = state.binding.as_mut() {
                     current.identity.working_dir = changed.working_dir.clone();
                 }
                 if identity_changed {
@@ -1499,8 +1516,11 @@ impl LiveViewHub {
                 }
             }
             CodingRuntimeEvent::WorkingDirectoryChanged(working_dir) => {
-                let current = state.binding.as_mut().expect("binding checked above");
-                current.identity.working_dir = working_dir.clone();
+                if let Some(stashed) = state.stashed_execution.as_mut() {
+                    stashed.working_dir = working_dir.clone();
+                } else if let Some(current) = state.binding.as_mut() {
+                    current.identity.working_dir = working_dir.clone();
+                }
             }
             CodingRuntimeEvent::ProviderChanged { provider, .. } => {
                 let current = state.binding.as_mut().expect("binding checked above");
@@ -1524,10 +1544,10 @@ impl LiveViewHub {
                 });
             }
         }
-        self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
+        self.publish_view_locked(state, LiveViewEvent::Runtime(event), replay);
         if let Some((count, inputs, client_input_ids, anchor_message_id)) = mapped_steer {
             self.publish_view_locked(
-                &mut state,
+                state,
                 LiveViewEvent::Steered {
                     count,
                     inputs,
@@ -1537,19 +1557,10 @@ impl LiveViewHub {
                 replay,
             );
         }
-        drop(state);
         if let (Some(handle), Some(working_dir)) = (reload_handle, reload_working_dir) {
-            let (reload_provider, reload_session_id, reload_telemetry) = {
-                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                (
-                    state.binding.as_ref().map(|b| b.identity.provider.clone()),
-                    state
-                        .binding
-                        .as_ref()
-                        .map(|b| b.identity.session_id.clone()),
-                    state.telemetry.clone(),
-                )
-            };
+            let reload_provider = state.binding.as_ref().map(|b| b.identity.provider.clone());
+            let reload_session_id = state.execution_session_id().map(str::to_string);
+            let reload_telemetry = state.telemetry.clone();
             tokio::spawn(async move {
                 // The turn just finished; the actor may still be snapshotting.
                 // Retry Busy so the agent-requested remount lands for the next user turn.
@@ -1586,7 +1597,6 @@ impl LiveViewHub {
                 }
             });
         }
-        Ok(())
     }
 
     pub fn publish_unsequenced(
@@ -1594,21 +1604,30 @@ impl LiveViewHub {
         binding: &LiveBinding,
         event: CodingRuntimeEvent,
     ) -> Result<(), HubError> {
-        let envelope = {
-            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-            if current.identity.id != binding.id {
-                return Err(HubError::StaleBinding);
-            }
-            SequencedRuntimeEvent {
-                generation: current.control.status().generation,
-                sequence: state
-                    .last_runtime_sequence
-                    .map_or(0, |sequence| sequence.wrapping_add(1)),
-                event,
-            }
-        };
-        self.publish(binding, envelope)
+        self.publish_unsequenced_with_context(binding, event)
+            .map(|_| ())
+    }
+
+    pub(crate) fn publish_unsequenced_with_context(
+        &self,
+        binding: &LiveBinding,
+        event: CodingRuntimeEvent,
+    ) -> Result<(u64, String, PathBuf), HubError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        if current.identity.id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        let generation = current.identity.generation;
+        self.apply_and_publish_runtime_event(&mut state, event);
+        let session_id = state
+            .execution_session_id()
+            .unwrap_or(&binding.session_id)
+            .to_string();
+        let working_dir = state
+            .execution_working_dir()
+            .unwrap_or_else(|| binding.working_dir.clone());
+        Ok((generation, session_id, working_dir))
     }
 
     fn dispatch_locked(state: &HubState, command: DriverCommand) -> Result<(), HubError> {
@@ -1628,7 +1647,7 @@ impl LiveViewHub {
 
     fn bound_handle(&self) -> Result<(LiveBinding, CodingRuntimeHandle), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(error) = &state.snapshot_error {
+        if let Some(error) = state.exec_snapshot_error() {
             return Err(HubError::SnapshotUnavailable(error.clone()));
         }
         let binding = state.binding.as_ref().ok_or(HubError::Unbound)?;
@@ -3122,6 +3141,265 @@ mod tests {
             .await
             .expect("reload_capabilities_with_config succeeds");
         assert!(changed.generation.0 >= 1);
+        let _ = handle.shutdown().await;
+    }
+
+    #[test]
+    fn publish_unsequenced_does_not_collide_with_subsequent_runtime_sequence() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("exec-1", PathBuf::from("/exec"), snapshot("init"), control)
+            .unwrap();
+
+        // Publish unsequenced before any sequenced event (previously consumed seq=0).
+        hub.publish_unsequenced(
+            &binding,
+            CodingRuntimeEvent::ModeChanged {
+                mode: jeikcode_coding::RuntimeMode::Auto,
+            },
+        )
+        .expect("unsequenced before seq 0 succeeds");
+
+        // Runtime's first sequenced event at seq=0 must still be accepted.
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 0,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+            },
+        )
+        .expect("seq 0 after publish_unsequenced must not be rejected as StaleEvent");
+
+        // Unsequenced after seq 0 must not advance exec_last_seq to 1.
+        hub.publish_unsequenced(
+            &binding,
+            CodingRuntimeEvent::ModeChanged {
+                mode: jeikcode_coding::RuntimeMode::Build,
+            },
+        )
+        .expect("unsequenced after seq 0 succeeds");
+
+        // Switch view only to another session so execution is stashed.
+        hub.switch_view_only("view-2".into(), PathBuf::from("/view"), snapshot("view"))
+            .unwrap();
+
+        // Unsequenced while stashed must succeed and still leave seq=1 valid for runtime.
+        hub.publish_unsequenced(
+            &binding,
+            CodingRuntimeEvent::ModeChanged {
+                mode: jeikcode_coding::RuntimeMode::Auto,
+            },
+        )
+        .expect("unsequenced while stashed succeeds");
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::WorkingDirectoryChanged(PathBuf::from("/exec-next")),
+            },
+        )
+        .expect("seq 1 after stashed unsequenced must not fail");
+
+        assert_eq!(
+            hub.execution_working_dir(),
+            Some(PathBuf::from("/exec-next"))
+        );
+        assert_eq!(hub.binding().unwrap().working_dir, PathBuf::from("/view"));
+    }
+
+    #[test]
+    fn stashed_execution_routes_requests_and_errors_independently_from_view() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind(
+                "exec-1",
+                PathBuf::from("/exec"),
+                snapshot("init"),
+                control.clone(),
+            )
+            .unwrap();
+
+        // Emit a request on the execution session.
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 0,
+                event: CodingRuntimeEvent::Request(jeikcode_coding::RuntimeRequest {
+                    id: 77,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+
+        // View-switch away; execution (with pending request 77) is now stashed.
+        hub.switch_view_only("view-2".into(), PathBuf::from("/view"), snapshot("view"))
+            .unwrap();
+
+        // Resolving request 77 via sync `respond` must inspect stashed exec_pending, not view.
+        hub.respond(77, serde_json::json!({"allow": true}))
+            .expect("respond on stashed execution request must succeed");
+
+        // Trigger SnapshotUnavailable on the stashed execution session, then check bound_handle():
+        // bound_handle() must check exec_snapshot_error(), not view snapshot_error.
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                    turn_id: 1,
+                    reason: jeikcode_kernel::event::StopReason::ProviderError,
+                    error: jeikcode_coding::RuntimeSnapshotError {
+                        message: "disk full".into(),
+                    },
+                    stats: Default::default(),
+                }),
+            },
+        )
+        .unwrap();
+        let err = hub
+            .bound_handle()
+            .err()
+            .expect("bound_handle sees exec snapshot error");
+        assert!(matches!(err, HubError::SnapshotUnavailable(ref msg) if msg == "disk full"));
+    }
+
+    #[tokio::test]
+    async fn stashed_execution_confirmed_methods_route_through_exec_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = jeikcode_config::Config::default();
+        cfg.default_model = Some("m".into());
+        cfg.models.insert(
+            "m".into(),
+            jeikcode_config::config::provider::ModelProfileConfig {
+                account: "acc".into(),
+                model: "m".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 1_000_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                capable_model: None,
+                pricing: None,
+                supports_vision: None,
+                reasoning_model: None,
+            },
+        );
+        cfg.provider_accounts.insert(
+            "acc".into(),
+            jeikcode_config::config::provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("k".into()),
+                base_url: Some("https://example.invalid/v1".into()),
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+        let agent_cfg = crate::kernel_runtime::coding_config_from_runtime(
+            &jeikcode_coding::CodingRuntimeConfig::from_config(
+                &cfg,
+                dir.path(),
+                None,
+                None,
+                true,
+                false,
+            ),
+        );
+        let prepare = jeikcode_coding::PrepareOptions {
+            request_user_input: false,
+            session: jeikcode_coding::SessionMode::Disabled,
+            skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            shared_mcp_registry: None,
+            memory: false,
+            web: false,
+            review: false,
+            rate_limit_source: None,
+        };
+        let start = jeikcode_coding::CodingRuntimeStart {
+            agent: agent_cfg,
+            prepare,
+            provider_factory: crate::runtime_host::coding_provider_factory(),
+            plugin_hooks: crate::runtime_host::installed_plugin_hook_source(),
+            image_preprocessor: None,
+        };
+        let runtime = jeikcode_coding::CodingRuntime::start_with_bootstrap(
+            start,
+            jeikcode_coding::ProviderBootstrap::Required,
+        )
+        .await
+        .expect("start test runtime");
+        let handle = runtime.handle.clone();
+        let hub = LiveViewHub::new();
+        let control: Arc<dyn LiveRuntimeControl> = Arc::new(handle.clone());
+        let binding = hub
+            .bind(
+                "exec-real",
+                dir.path().to_path_buf(),
+                snapshot("init"),
+                control,
+            )
+            .unwrap();
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: binding.generation,
+                sequence: 0,
+                event: CodingRuntimeEvent::Request(jeikcode_coding::RuntimeRequest {
+                    id: 88,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+
+        hub.switch_view_only(
+            "view-other".into(),
+            dir.path().to_path_buf(),
+            snapshot("view"),
+        )
+        .unwrap();
+
+        // Pre-await check inside respond_confirmed_for_runtime must find stashed request 88
+        // instead of failing with UnknownRequest; handle.respond_for_generation rejects
+        // unknown kernel request id as RuntimeRejected, proving it passed Hub lookup.
+        let err = hub
+            .respond_confirmed_for_runtime(
+                &binding.runtime_instance_id,
+                binding.generation,
+                88,
+                "approval",
+                serde_json::json!({"allow": true}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HubError::RuntimeRejected(_)),
+            "expected RuntimeRejected after passing stashed Hub lookup, got {err:?}"
+        );
+
         let _ = handle.shutdown().await;
     }
 }

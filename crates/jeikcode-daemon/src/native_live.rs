@@ -214,6 +214,38 @@ pub fn take_session_draft_provider(session_id: &str) -> Option<String> {
         .remove(session_id)
 }
 
+pub(crate) fn advance_forwarder_target(
+    session_id: &mut String,
+    working_dir: &mut PathBuf,
+    event: &jeikcode_coding::CodingRuntimeEvent,
+) -> bool {
+    match event {
+        jeikcode_coding::CodingRuntimeEvent::SessionChanged(changed) => {
+            let mut updated = false;
+            if let Some(next_id) = changed.session_id.as_ref() {
+                if next_id != session_id {
+                    *session_id = next_id.clone();
+                    updated = true;
+                }
+            }
+            if changed.working_dir != *working_dir {
+                *working_dir = changed.working_dir.clone();
+                updated = true;
+            }
+            updated
+        }
+        jeikcode_coding::CodingRuntimeEvent::WorkingDirectoryChanged(next_dir) => {
+            if *next_dir != *working_dir {
+                *working_dir = next_dir.clone();
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn runtime_start_is_session_in_use(error: &jeikcode_coding::RuntimeStartError) -> bool {
     matches!(
         error,
@@ -442,12 +474,15 @@ pub async fn ensure_registry_runner(
     // can detect a stale-bound request without reaching into runtime config.
     reg.set_provider_fingerprint(&session_id, Some(provider_fingerprint.clone()));
 
-    let forward_id = session_id.clone();
-    let forward_dir = working_dir;
+    let mut forward_id = session_id.clone();
+    let mut forward_dir = working_dir;
     tokio::spawn(async move {
         let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
         let _ = reg.open_or_attach(forward_id.clone(), forward_dir.clone());
         while let Some(envelope) = events.recv().await {
+            if advance_forwarder_target(&mut forward_id, &mut forward_dir, &envelope.event) {
+                let _ = reg.open_or_attach(forward_id.clone(), forward_dir.clone());
+            }
             if let jeikcode_coding::CodingRuntimeEvent::SessionNameSuggested { name } =
                 &envelope.event
             {
@@ -744,11 +779,10 @@ pub fn publish_unsequenced(
     event: jeikcode_coding::CodingRuntimeEvent,
 ) -> Result<(), HubError> {
     let cloned = event.clone();
-    let result = hub().publish_unsequenced(binding, event);
-    if result.is_ok() {
-        dual_write_runtime_event_to_registry(0, cloned, &binding.session_id, &binding.working_dir);
-    }
-    result
+    let (generation, session_id, working_dir) =
+        hub().publish_unsequenced_with_context(binding, event)?;
+    dual_write_runtime_event_to_registry(generation, cloned, &session_id, &working_dir);
+    Ok(())
 }
 
 pub fn join() -> Result<LiveJoin, HubError> {
@@ -1279,9 +1313,16 @@ pub async fn ensure_headless_runtime(
     )
     .await?;
     let event_binding = binding.clone();
+    let mut forward_session_id = binding.session_id.clone();
+    let mut forward_working_dir = binding.working_dir.clone();
     let event_handle = handle.clone();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            advance_forwarder_target(
+                &mut forward_session_id,
+                &mut forward_working_dir,
+                &event.event,
+            );
             let session_change = match &event.event {
                 jeikcode_coding::CodingRuntimeEvent::SessionChanged(changed) => {
                     Some((changed.session_id.clone(), changed.working_dir.clone()))
@@ -1291,11 +1332,11 @@ pub async fn ensure_headless_runtime(
             if let jeikcode_coding::CodingRuntimeEvent::SessionNameSuggested { name } = &event.event
             {
                 let bucket = jeikcode_capabilities::session::SessionManager::project_hash(
-                    &event_binding.working_dir,
+                    &forward_working_dir,
                 );
                 let _ = crate::legacy_convert::apply_ai_catalog_name_in_project(
                     &bucket,
-                    &event_binding.session_id,
+                    &forward_session_id,
                     name,
                 );
             }
@@ -1539,5 +1580,42 @@ mod tests {
                 id: "ed6dc9be-9d25-491f-bab3-c62a8a3ed9f4".into(),
             }
         ));
+    }
+
+    #[test]
+    fn advance_forwarder_target_tracks_session_and_working_dir_changes() {
+        use std::path::PathBuf;
+        let mut sid = "s1".to_string();
+        let mut wd = PathBuf::from("/proj-a");
+
+        assert!(!super::advance_forwarder_target(
+            &mut sid,
+            &mut wd,
+            &jeikcode_coding::CodingRuntimeEvent::SessionNameSuggested {
+                name: "ignore".into(),
+            },
+        ));
+        assert_eq!(sid, "s1");
+        assert_eq!(wd, PathBuf::from("/proj-a"));
+
+        assert!(super::advance_forwarder_target(
+            &mut sid,
+            &mut wd,
+            &jeikcode_coding::CodingRuntimeEvent::SessionChanged(jeikcode_coding::SessionChanged {
+                generation: jeikcode_coding::RuntimeGeneration(2),
+                session_id: Some("s2".into()),
+                working_dir: PathBuf::from("/proj-b"),
+            }),
+        ));
+        assert_eq!(sid, "s2");
+        assert_eq!(wd, PathBuf::from("/proj-b"));
+
+        assert!(super::advance_forwarder_target(
+            &mut sid,
+            &mut wd,
+            &jeikcode_coding::CodingRuntimeEvent::WorkingDirectoryChanged(PathBuf::from("/proj-c")),
+        ));
+        assert_eq!(sid, "s2");
+        assert_eq!(wd, PathBuf::from("/proj-c"));
     }
 }
