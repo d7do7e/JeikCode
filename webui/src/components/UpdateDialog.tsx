@@ -4,6 +4,7 @@ import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, Updat
 import { upgradeErrorText } from '../i18n';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
+import { createLatestRequestGuard } from '../lib/updateCheckGuard';
 import { isDesktopShell } from '../lib/desktop';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { Markdown } from './Markdown';
@@ -57,6 +58,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   const isDesktop = false;
   const isMounted = useRef(true);
+  const checkGuardRef = useRef(createLatestRequestGuard());
   const reloadStarted = useRef(false);
   const sawInstallProgress = useRef(false);
   const targetVersionRef = useRef('');
@@ -72,31 +74,41 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   useEffect(() => {
     isMounted.current = true;
+    const checkGuard = checkGuardRef.current;
     return () => {
       isMounted.current = false;
+      checkGuard.invalidate();
     };
   }, []);
 
   // 检查更新
   const doCheckUpdate = async (targetChannel: 'stable' | 'beta') => {
+    const seq = checkGuardRef.current.next();
+    if (info?.channel && info.channel !== targetChannel) {
+      setInfo(null);
+      setSelectedVersion('');
+      setNotesOpen(false);
+    }
     setIsChecking(true);
     setCheckError(null);
     try {
       const res = await checkUpdate(targetChannel);
-      if (isMounted.current) {
-        setInfo(res);
-        setSelectedVersion('');
-        setNotesOpen(false);
-        if (onUpdateInfoChange) {
-          onUpdateInfoChange(res);
-        }
+      if (!isMounted.current || !checkGuardRef.current.isCurrent(seq)) {
+        return;
+      }
+      setInfo(res);
+      setSelectedVersion('');
+      setNotesOpen(false);
+      if (onUpdateInfoChange) {
+        onUpdateInfoChange(res);
       }
     } catch (err: any) {
-      if (isMounted.current) {
-        setCheckError(err?.message || String(err));
+      if (!isMounted.current || !checkGuardRef.current.isCurrent(seq)) {
+        return;
       }
+      setCheckError(err?.message || String(err));
     } finally {
-      if (isMounted.current) {
+      if (isMounted.current && checkGuardRef.current.isCurrent(seq)) {
         setIsChecking(false);
       }
     }
@@ -104,10 +116,15 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   // 切换更新通道
   const handleSelectChannel = (newChannel: 'stable' | 'beta') => {
-    if (newChannel === channel && info) return;
+    if (newChannel === channel && (info || isChecking)) return;
     setChannel(newChannel);
     localStorage.setItem(STORAGE_KEY_CHANNEL, newChannel);
-    doCheckUpdate(newChannel);
+    if (newChannel !== channel) {
+      setInfo(null);
+      setSelectedVersion('');
+      setNotesOpen(false);
+    }
+    void doCheckUpdate(newChannel);
   };
 
   // 弹窗打开时立即无条件执行一次最新版本探测，彻底消除历史缓存滞后，确保拉取到绝对最新的跨版本数据
@@ -346,7 +363,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                   type="button"
                   class={`update-channel-btn ${channel === 'stable' ? 'active' : ''}`}
                   onClick={() => handleSelectChannel('stable')}
-                  disabled={updating || isChecking}
+                  disabled={updating}
                 >
                   {t('update.channelStable')}
                 </button>
@@ -354,7 +371,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                   type="button"
                   class={`update-channel-btn beta ${channel === 'beta' ? 'active' : ''}`}
                   onClick={() => handleSelectChannel('beta')}
-                  disabled={updating || isChecking}
+                  disabled={updating}
                 >
                   <span>{t('update.channelBeta')}</span>
                   <span class="update-channel-beta-dot" />

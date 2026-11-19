@@ -983,10 +983,6 @@ export function App() {
   const openUpdateDialogWithFreshCheck = () => {
     if (updateDeadRef.current) return;
     setShowUpdateDialog(true);
-    const savedChannel = localStorage.getItem('jeikcode_update_channel') || undefined;
-    checkUpdate(savedChannel)
-      .then((res) => setUpdateInfo(res))
-      .catch(() => {});
   };
 
   const handleManualCheckUpdate = async () => {

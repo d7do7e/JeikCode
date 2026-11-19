@@ -84,6 +84,43 @@ fn is_boot_page_url(url: &tauri::Url) -> bool {
         && url.path().ends_with("index.html")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseRequestDecision {
+    AllowExit,
+    HideToTray,
+    PromptWebui,
+}
+
+fn is_webui_mounted_for_close(
+    current_url: Option<&tauri::Url>,
+    has_child: bool,
+    has_origin: bool,
+) -> bool {
+    if !has_child && !has_origin {
+        return false;
+    }
+    let Some(url) = current_url else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https") && !is_shell_internal_url(url)
+}
+
+fn resolve_close_request_decision(
+    action: &str,
+    tray_available: bool,
+    webui_mounted: bool,
+) -> CloseRequestDecision {
+    if !webui_mounted {
+        return CloseRequestDecision::AllowExit;
+    }
+    match action {
+        "tray" if tray_available => CloseRequestDecision::HideToTray,
+        "tray" | "quit" => CloseRequestDecision::AllowExit,
+        _ if !tray_available => CloseRequestDecision::AllowExit,
+        _ => CloseRequestDecision::PromptWebui,
+    }
+}
+
 /// 顶层导航：只有壳页面和这次的 WebUI 留在窗口里。
 /// `http://localhost:3000` 这类本机开发服务改由系统浏览器打开，避免盖掉当前界面。
 fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkAction {
@@ -844,19 +881,32 @@ fn main() {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     let action = load_close_action();
                     let tray_available = has_system_tray(&app_handle_for_close);
-                    match action.as_str() {
-                        "tray" if tray_available => {
+                    let has_child = app_handle_for_close
+                        .try_state::<ChildSlot>()
+                        .is_some_and(|slot| {
+                            slot.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                        });
+                    let has_origin = app_handle_for_close
+                        .try_state::<LiveOriginSlot>()
+                        .is_some_and(|slot| {
+                            slot.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                        });
+                    let current_url = close_window.url().ok();
+                    let webui_mounted =
+                        is_webui_mounted_for_close(current_url.as_ref(), has_child, has_origin);
+                    match resolve_close_request_decision(
+                        action.as_str(),
+                        tray_available,
+                        webui_mounted,
+                    ) {
+                        CloseRequestDecision::HideToTray => {
                             api.prevent_close();
                             hide_window_to_tray(&close_window);
                         }
-                        "tray" | "quit" => {
+                        CloseRequestDecision::AllowExit => {
                             terminate_managed_child(&app_handle_for_close);
                         }
-                        _ => {
-                            if !tray_available {
-                                terminate_managed_child(&app_handle_for_close);
-                                return;
-                            }
+                        CloseRequestDecision::PromptWebui => {
                             api.prevent_close();
                             // 连点容错兜底：若 1.2 秒内再次点击 X，说明弹窗未能正常捕获或用户强行关闭，立即最小化到托盘
                             let mut last = last_close_for_event
@@ -2551,5 +2601,76 @@ mod tests {
         let _ = live_exit_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("terminated child must exit promptly");
+    }
+
+    #[test]
+    fn close_request_decision_allows_exit_when_webui_unmounted_or_on_boot_page() {
+        let live_url = parse_url("http://127.0.0.1:13457/?token=abc&desktop=1");
+        assert!(super::is_webui_mounted_for_close(
+            Some(&live_url),
+            true,
+            true
+        ));
+        assert!(super::is_webui_mounted_for_close(
+            Some(&live_url),
+            false,
+            true
+        ));
+        assert!(!super::is_webui_mounted_for_close(
+            Some(&live_url),
+            false,
+            false
+        ));
+        assert!(!super::is_webui_mounted_for_close(None, true, true));
+
+        for non_webui in [
+            "http://tauri.localhost/index.html",
+            "http://tauri.localhost/index.html?error=boom",
+            "tauri://localhost/index.html",
+            "about:blank",
+            "data:text/html,error",
+            "chrome-error://chromewebdata/",
+            "edge://settings/",
+            "file:///index.html",
+        ] {
+            let parsed = parse_url(non_webui);
+            assert!(
+                !super::is_webui_mounted_for_close(Some(&parsed), true, true),
+                "{non_webui} must not count as mounted WebUI"
+            );
+        }
+
+        // Unmounted or boot/error pages must never trap the user with PromptWebui or HideToTray.
+        for action in ["ask", "tray", "quit"] {
+            for tray_available in [true, false] {
+                assert_eq!(
+                    super::resolve_close_request_decision(action, tray_available, false),
+                    super::CloseRequestDecision::AllowExit,
+                    "action={action}, tray={tray_available}"
+                );
+            }
+        }
+
+        // When WebUI is mounted, preserve ask/tray/quit semantics.
+        assert_eq!(
+            super::resolve_close_request_decision("ask", true, true),
+            super::CloseRequestDecision::PromptWebui
+        );
+        assert_eq!(
+            super::resolve_close_request_decision("ask", false, true),
+            super::CloseRequestDecision::AllowExit
+        );
+        assert_eq!(
+            super::resolve_close_request_decision("tray", true, true),
+            super::CloseRequestDecision::HideToTray
+        );
+        assert_eq!(
+            super::resolve_close_request_decision("tray", false, true),
+            super::CloseRequestDecision::AllowExit
+        );
+        assert_eq!(
+            super::resolve_close_request_decision("quit", true, true),
+            super::CloseRequestDecision::AllowExit
+        );
     }
 }
