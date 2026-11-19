@@ -21424,16 +21424,28 @@ async fn capabilities_toggle(
 /// After the first signal, arm a **force-exit** path: a second Ctrl+C or a 10s
 /// timeout kills the process. Large monorepos / stuck tool tasks used to make
 /// graceful drain hang so Ctrl+C appeared to do nothing.
-async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+async fn shutdown_signal_with_options(
+    mut shutdown_rx: watch::Receiver<bool>,
+    listen_os_signals: bool,
+    arm_force_exit: bool,
+) {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.ok();
+        if listen_os_signals {
+            tokio::signal::ctrl_c().await.ok();
+        } else {
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut s) = signal(SignalKind::terminate()) {
-            s.recv().await;
+        if listen_os_signals {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut s) = signal(SignalKind::terminate()) {
+                s.recv().await;
+            }
+        } else {
+            std::future::pending::<()>().await;
         }
     };
 
@@ -21441,7 +21453,7 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
     let terminate = std::future::pending::<()>();
 
     let http_shutdown = async {
-        // Wait until the watch channel value becomes true (sent by POST /shutdown)
+        // Wait until the watch channel value becomes true (sent by POST /shutdown or stop_server)
         while !*shutdown_rx.borrow_and_update() {
             if shutdown_rx.changed().await.is_err() {
                 // Sender dropped — treat as shutdown
@@ -21460,70 +21472,75 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
             tracing::info!("Received SIGTERM, starting graceful shutdown");
         }
         _ = http_shutdown => {
-            tracing::info!("Received /shutdown request, starting graceful shutdown");
+            tracing::info!("Received shutdown signal, starting graceful shutdown");
         }
     }
 
-    // Force-exit arm: do not block returning from this future (graceful drain
-    // needs to start). Second Ctrl+C or 10s hang → hard exit.
-    tokio::spawn(async {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("Forced exit (second interrupt)");
-                std::process::exit(130);
+    if arm_force_exit {
+        // Force-exit arm: do not block returning from this future (graceful drain
+        // needs to start). Second Ctrl+C or 10s hang → hard exit.
+        tokio::spawn(async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("Forced exit (second interrupt)");
+                    std::process::exit(130);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    eprintln!("Graceful shutdown timed out after 10s; forcing exit");
+                    std::process::exit(1);
+                }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                eprintln!("Graceful shutdown timed out after 10s; forcing exit");
-                std::process::exit(1);
-            }
-        }
-    });
+        });
+    }
 }
 
 /// Install a panic hook that emits a scrubbed `Event::Panic` telemetry event
 /// before delegating to the default hook (preserving stderr output). (R9.1-R9.4)
 fn install_panic_hook(telemetry: Arc<Telemetry>) {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let home = jeikcode_telemetry::identity::real_home_dir();
-        let cwd = std::env::current_dir().ok();
-        let loc = info
-            .location()
-            .map(|l| format!("{}:{}", l.file(), l.line()))
-            .unwrap_or_else(|| "unknown".into());
-        let msg = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_default();
-        let bt = std::backtrace::Backtrace::force_capture().to_string();
-        let scrubbed_loc =
-            jeikcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
-        let scrubbed_msg = jeikcode_telemetry::scrub::truncate_head(
-            &jeikcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
-            jeikcode_telemetry::scrub::HEAD_MAX,
-        );
-        let frames =
-            jeikcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
-        telemetry.track(Event::Panic {
-            location: scrubbed_loc,
-            message_head: scrubbed_msg,
-            thread: std::thread::current().name().unwrap_or("unknown").into(),
-            backtrace_top_5: frames,
-            error_kind: Some("panic".to_string()),
-            error_data: Some(
-                serde_json::json!({
-                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                    "turns_completed": null,
-                    "last_tool_name": null,
-                    "last_event": null,
-                })
-                .to_string(),
-            ),
-        });
-        default_hook(info); // R9.4: preserve stderr output
-    }));
+    static PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let home = jeikcode_telemetry::identity::real_home_dir();
+            let cwd = std::env::current_dir().ok();
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown".into());
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let scrubbed_loc =
+                jeikcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+            let scrubbed_msg = jeikcode_telemetry::scrub::truncate_head(
+                &jeikcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+                jeikcode_telemetry::scrub::HEAD_MAX,
+            );
+            let frames =
+                jeikcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+            telemetry.track(Event::Panic {
+                location: scrubbed_loc,
+                message_head: scrubbed_msg,
+                thread: std::thread::current().name().unwrap_or("unknown").into(),
+                backtrace_top_5: frames,
+                error_kind: Some("panic".to_string()),
+                error_data: Some(
+                    serde_json::json!({
+                        "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                        "turns_completed": null,
+                        "last_tool_name": null,
+                        "last_event": null,
+                    })
+                    .to_string(),
+                ),
+            });
+            default_hook(info); // R9.4: preserve stderr output
+        }));
+    });
 }
 
 /// Get current unix timestamp in milliseconds.
@@ -21541,12 +21558,12 @@ fn spawn_idle_timeout_task(
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     active_chats: ActiveChatRegistry,
     shutdown_tx: watch::Sender<bool>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if idle_timeout_secs == 0 {
-        return; // Disabled
+        return None; // Disabled
     }
     let timeout_ms = (idle_timeout_secs * 1000) as i64;
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.tick().await; // consume immediate first tick
         loop {
@@ -21570,7 +21587,52 @@ fn spawn_idle_timeout_task(
                 break;
             }
         }
-    });
+    }))
+}
+
+struct TaskAbortGuard(Option<tokio::task::AbortHandle>);
+
+impl TaskAbortGuard {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TaskAbortGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+struct ExtraRemoteGuard(Arc<std::sync::Mutex<Option<ExtraRemoteBind>>>);
+
+impl Drop for ExtraRemoteGuard {
+    fn drop(&mut self) {
+        let bind = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(bind) = bind {
+            bind.abort_all();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StoppingServer {
+    abort: tokio::task::AbortHandle,
+    done_rx: watch::Receiver<bool>,
+}
+
+struct ServerCompletionGuard(watch::Sender<bool>);
+
+impl Drop for ServerCompletionGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 // ============================================================================
@@ -21586,11 +21648,92 @@ struct WebuiHandle {
     port: u16,
     /// server 绑定的地址（如 `127.0.0.1` / `0.0.0.0`）；换绑前需先 stop。
     host: String,
-    /// server task 的 abort handle；用于 `/webui stop` 停止。
+    /// 触发优雅停机的 watch 发送端。
+    shutdown_tx: watch::Sender<bool>,
+    /// server task 的 abort handle；超时兜底中止。
     abort: tokio::task::AbortHandle,
+    /// server task 退出时变为 `true` 的 level-triggered watch 信号。
+    done_rx: watch::Receiver<bool>,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
+static STOPPING_WEBUI: std::sync::Mutex<Vec<StoppingServer>> = std::sync::Mutex::new(Vec::new());
+
+fn initiate_graceful_stop(
+    stopping_list: &'static std::sync::Mutex<Vec<StoppingServer>>,
+    shutdown_tx: watch::Sender<bool>,
+    abort: tokio::task::AbortHandle,
+    mut done_rx: watch::Receiver<bool>,
+) {
+    let _ = shutdown_tx.send(true);
+    if *done_rx.borrow_and_update() || abort.is_finished() {
+        return;
+    }
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let entry = StoppingServer {
+            abort: abort.clone(),
+            done_rx: done_rx.clone(),
+        };
+        {
+            let mut list = stopping_list.lock().unwrap_or_else(|e| e.into_inner());
+            list.retain(|item| !*item.done_rx.borrow() && !item.abort.is_finished());
+            list.push(entry);
+        }
+        rt.spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            loop {
+                if *done_rx.borrow_and_update() || abort.is_finished() {
+                    break;
+                }
+                match tokio::time::timeout_at(deadline, done_rx.changed()).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+            if !*done_rx.borrow_and_update() && !abort.is_finished() {
+                abort.abort();
+            }
+        });
+    } else {
+        abort.abort();
+    }
+}
+
+async fn drain_stopping_servers(stopping_list: &'static std::sync::Mutex<Vec<StoppingServer>>) {
+    let pending: Vec<StoppingServer> = {
+        let mut list = stopping_list.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *list)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    let mut aborted_any = false;
+    for mut entry in pending {
+        loop {
+            if *entry.done_rx.borrow_and_update() || entry.abort.is_finished() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                entry.abort.abort();
+                aborted_any = true;
+                break;
+            }
+            match tokio::time::timeout_at(deadline, entry.done_rx.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    entry.abort.abort();
+                    aborted_any = true;
+                    break;
+                }
+            }
+        }
+    }
+    if aborted_any {
+        tokio::task::yield_now().await;
+    }
+}
 
 async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
     let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
@@ -21998,6 +22141,7 @@ pub async fn ensure_webui(
     let (tokens, actual_port, bound_host) = if let Some((tokens, p, h)) = reuse {
         (tokens, p, h)
     } else {
+        drain_stopping_servers(&STOPPING_WEBUI).await;
         // 2) 预绑定端口：首选 `port`，被占则递增扫描（拿到真实端口）。按请求的 host 绑定。
         let (listener, secondary, actual_port) = match bind_scanning(host, port, 100).await {
             Ok(v) => v,
@@ -22006,6 +22150,8 @@ pub async fn ensure_webui(
             }
         };
         let tokens = auth_token::WebuiTokenStore::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (done_tx, done_rx) = watch::channel(false);
         let opts = ServerOpts {
             host: host.to_string(),
             port: actual_port,
@@ -22033,8 +22179,12 @@ pub async fn ensure_webui(
             startup_footer: None,
             yolo: false,
         };
+        let shutdown_tx_for_task = shutdown_tx.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = run_server(opts).await {
+            let _completion = ServerCompletionGuard(done_tx);
+            if let Err(e) =
+                run_server_with_options(opts, shutdown_tx_for_task, shutdown_rx, true).await
+            {
                 eprintln!("webui server error: {e}");
             }
         });
@@ -22044,7 +22194,9 @@ pub async fn ensure_webui(
                 tokens: tokens.clone(),
                 port: actual_port,
                 host: host.to_string(),
+                shutdown_tx,
                 abort: task.abort_handle(),
+                done_rx,
             });
         }
         (tokens, actual_port, host.to_string())
@@ -22190,7 +22342,12 @@ pub async fn ensure_webui(
 pub fn stop_server() -> String {
     let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
-        handle.abort.abort();
+        initiate_graceful_stop(
+            &STOPPING_WEBUI,
+            handle.shutdown_tx,
+            handle.abort,
+            handle.done_rx,
+        );
         match jeikcode_config::i18n::current_locale() {
             jeikcode_config::locale::Locale::ZhCn => "已停止 webui server".to_string(),
             jeikcode_config::locale::Locale::Vi => "Đã dừng webui server".to_string(),
@@ -22216,10 +22373,14 @@ pub const APP_DEFAULT_PORT: u16 = 13458;
 struct AppServerHandle {
     port: u16,
     host: String,
+    shutdown_tx: watch::Sender<bool>,
     abort: tokio::task::AbortHandle,
+    done_rx: watch::Receiver<bool>,
 }
 
 static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex::new(None);
+static STOPPING_APP_SERVER: std::sync::Mutex<Vec<StoppingServer>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// 起一个进程内 server 供移动端 App 经中继访问，返回 `(bound_host, actual_port)`。
 ///
@@ -22241,7 +22402,7 @@ pub async fn ensure_app_server(
 ) -> Result<(String, u16), String> {
     // 复用仍在运行的实例（含其绑定地址/端口）。
     let reuse = {
-        let guard = APP_SERVER.lock().unwrap();
+        let guard = APP_SERVER.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .as_ref()
             .filter(|h| !h.abort.is_finished())
@@ -22251,9 +22412,13 @@ pub async fn ensure_app_server(
         return Ok((h, p));
     }
 
+    drain_stopping_servers(&STOPPING_APP_SERVER).await;
+
     let (listener, secondary, actual_port) = bind_scanning(host, port, 100)
         .await
         .map_err(|e| format!("绑定 {host}:{port} 失败（{e}）"))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (done_tx, done_rx) = watch::channel(false);
     let opts = ServerOpts {
         host: host.to_string(),
         port: actual_port,
@@ -22272,17 +22437,22 @@ pub async fn ensure_app_server(
         startup_footer: None,
         yolo: false,
     };
+    let shutdown_tx_for_task = shutdown_tx.clone();
     let task = tokio::spawn(async move {
-        if let Err(e) = run_server(opts).await {
+        let _completion = ServerCompletionGuard(done_tx);
+        if let Err(e) = run_server_with_options(opts, shutdown_tx_for_task, shutdown_rx, true).await
+        {
             eprintln!("app server error: {e}");
         }
     });
     {
-        let mut guard = APP_SERVER.lock().unwrap();
+        let mut guard = APP_SERVER.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(AppServerHandle {
             port: actual_port,
             host: host.to_string(),
+            shutdown_tx,
             abort: task.abort_handle(),
+            done_rx,
         });
     }
     Ok((host.to_string(), actual_port))
@@ -22290,9 +22460,14 @@ pub async fn ensure_app_server(
 
 /// 停止 `/app` 进程内 server（若在运行）。返回是否确实停了一个。
 pub fn stop_app_server() -> bool {
-    let mut guard = APP_SERVER.lock().unwrap();
+    let mut guard = APP_SERVER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
-        handle.abort.abort();
+        initiate_graceful_stop(
+            &STOPPING_APP_SERVER,
+            handle.shutdown_tx,
+            handle.abort,
+            handle.done_rx,
+        );
         true
     } else {
         false
@@ -23128,6 +23303,16 @@ pub struct ServerOpts {
 /// attach, legacy session migration) is handled by the binary's `main()` before
 /// calling this; see `src/main.rs`.
 pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    run_server_with_options(opts, shutdown_tx, shutdown_rx, false).await
+}
+
+async fn run_server_with_options(
+    opts: ServerOpts,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    in_process: bool,
+) -> anyhow::Result<()> {
     use axum::routing::{patch, put};
 
     let ServerOpts {
@@ -23224,8 +23409,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // which previously landed as `mode: null`.
     telemetry.set_default_mode(Some(startup_mode));
 
-    // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
-    install_panic_hook(telemetry.clone());
+    // Step 4.5: Install panic hook once for standalone daemon processes (R9.1-R9.4).
+    // In-process servers inside TUI must not wrap TUI's terminal-restoring hook or
+    // chain leaked Arc<Telemetry> closures across restarts.
+    if !in_process {
+        install_panic_hook(telemetry.clone());
+    }
 
     // Emit install_completed when daemon/webui is the first post-install entrypoint.
     telemetry.maybe_emit_install_completed(&jeikcode_dir).await;
@@ -23247,7 +23436,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let mcp_registry = mcp_pool.registry(&initial_mcp_project).await;
 
     // Step 7: Build AppState (R1.4)
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let project_store = Arc::new(RwLock::new(project_state));
@@ -23637,14 +23825,21 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .layer(compression_layer());
     let _ = router_slot.set(app.clone());
 
+    // Ensure any temporary remote listeners bound via /api/remote-access are aborted
+    // when run_server exits or is cancelled, even if AppState clones remain alive.
+    let _extra_remote_guard = ExtraRemoteGuard(state.extra_remote.clone());
+
     // Spawn idle timeout watchdog task
-    spawn_idle_timeout_task(
+    let idle_task = spawn_idle_timeout_task(
         idle_timeout_secs,
         last_activity,
         active_connections,
         active_chats,
         shutdown_tx,
     );
+    let mut idle_guard = idle_task
+        .as_ref()
+        .map(|h| TaskAbortGuard::new(h.abort_handle()));
     if !quiet {
         if idle_timeout_secs > 0 {
             println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
@@ -23846,18 +24041,19 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     // Step 12: Start background Git platform polling engine
     let polling_task = git_adapter::polling::start_git_polling_engine(state.clone());
+    let mut polling_guard = TaskAbortGuard::new(polling_task.abort_handle());
 
     // Step 13: Serve with graceful shutdown (R10.1-R10.5).
     // Optional second listener for IPv6 when dual-stack was requested.
-    // Keep a JoinHandle so if the primary (IPv4) serve returns for any reason
-    // (error or graceful), we abort the v6 task and do not leave a listener
-    // running while the process tears down.
+    // Keep a JoinHandle + RAII TaskAbortGuard so if the primary (IPv4) serve
+    // returns or run_server is cancelled, we abort the v6 task and do not leave
+    // a detached listener running.
     let v6_task = if let Some(v6_listener) = dual_stack_v6 {
         let app_v6 = app.clone();
         let shutdown_rx_v6 = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = axum::serve(v6_listener, app_v6)
-                .with_graceful_shutdown(shutdown_signal(shutdown_rx_v6))
+                .with_graceful_shutdown(shutdown_signal_with_options(shutdown_rx_v6, false, false))
                 .await
             {
                 tracing::error!(?e, "axum::serve (IPv6) error");
@@ -23866,22 +24062,45 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     } else {
         None
     };
+    let mut v6_guard = v6_task
+        .as_ref()
+        .map(|h| TaskAbortGuard::new(h.abort_handle()));
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .with_graceful_shutdown(shutdown_signal_with_options(
+            shutdown_rx,
+            !in_process,
+            !in_process,
+        ))
         .await
         .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
 
+    if let Some(mut guard) = v6_guard.take() {
+        guard.disarm();
+    }
     if let Some(handle) = v6_task {
         handle.abort();
         let _ = handle.await;
     }
 
+    // Stop idle timeout watchdog if active
+    if let Some(mut guard) = idle_guard.take() {
+        guard.disarm();
+    }
+    if let Some(handle) = idle_task {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // Stop background Git platform polling engine
+    polling_guard.disarm();
     polling_task.abort();
     let _ = polling_task.await;
 
-    // Reap project-scoped and session-scoped stdio MCP trees with this host.
-    jeikcode_capabilities::mcp::shutdown_all_mcp_pools().await;
+    // Reap project-scoped and session-scoped stdio MCP trees only for standalone
+    // daemon servers; in-process servers share MCP pools with the host TUI.
+    if !in_process {
+        jeikcode_capabilities::mcp::shutdown_all_mcp_pools().await;
+    }
 
     // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
     telemetry.shutdown(Duration::from_millis(500)).await;
@@ -29882,5 +30101,133 @@ mod client_identity_tests {
         annotate_client_input_ids_with(&mut rows, &map);
         assert_eq!(rows[0].client_input_id.as_deref(), Some("client-steer-1"));
         assert_eq!(rows[1].client_input_id, None);
+    }
+}
+
+#[cfg(test)]
+mod server_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn task_abort_guard_and_extra_remote_guard_abort_on_drop() {
+        let task_a = tokio::spawn(std::future::pending::<()>());
+        let task_b = tokio::spawn(std::future::pending::<()>());
+        let handle_a = task_a.abort_handle();
+        let handle_b = task_b.abort_handle();
+
+        {
+            let _guard = TaskAbortGuard::new(handle_a.clone());
+        }
+        tokio::task::yield_now().await;
+        assert!(handle_a.is_finished(), "TaskAbortGuard must abort on drop");
+
+        let remote_slot = Arc::new(std::sync::Mutex::new(Some(ExtraRemoteBind {
+            host: "127.0.0.1".into(),
+            port: 0,
+            aborts: vec![handle_b.clone()],
+            token: Some("tok".into()),
+        })));
+        {
+            let _remote_guard = ExtraRemoteGuard(remote_slot.clone());
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            handle_b.is_finished(),
+            "ExtraRemoteGuard must abort all extra remote tasks"
+        );
+        assert!(remote_slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_in_process_resolves_via_watch_without_os_signals() {
+        let (tx, rx) = watch::channel(false);
+        let fut = tokio::spawn(shutdown_signal_with_options(rx, false, false));
+        tokio::task::yield_now().await;
+        assert!(!fut.is_finished());
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("watch shutdown must resolve promptly")
+            .unwrap();
+    }
+
+    #[test]
+    fn stop_server_without_tokio_runtime_aborts_cleanly_and_resets_handle() {
+        let _serial = crate::tests::ScopedChatHome::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let (done_tx, done_rx) = watch::channel(false);
+        let task = rt.spawn(async move {
+            let _completion = ServerCompletionGuard(done_tx);
+            std::future::pending::<()>().await;
+        });
+        {
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(WebuiHandle {
+                tokens: auth_token::WebuiTokenStore::new(),
+                port: 0,
+                host: "127.0.0.1".into(),
+                shutdown_tx,
+                abort: task.abort_handle(),
+                done_rx,
+            });
+        }
+
+        // Calling stop_server() outside any Tokio runtime context must not panic,
+        // must clear WEBUI, and must abort the server task immediately.
+        let msg = stop_server();
+        assert!(!msg.is_empty());
+        assert!(WEBUI.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        let err = rt.block_on(task).unwrap_err();
+        assert!(err.is_cancelled(), "no-runtime stop_server must abort task");
+        assert!(STOPPING_WEBUI
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(app_server)]
+    async fn stop_app_server_then_ensure_app_server_handles_open_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let _home = crate::tests::ScopedChatHome::new();
+        let _ = stop_app_server();
+        drain_stopping_servers(&STOPPING_APP_SERVER).await;
+
+        let (host1, port1) = ensure_app_server("127.0.0.1", 0, None)
+            .await
+            .expect("first ensure_app_server");
+        assert_ne!(port1, 0);
+
+        // Hold an open TCP connection to exercise the bounded drain + fallback abort path.
+        let mut open_conn = tokio::net::TcpStream::connect((host1.as_str(), port1))
+            .await
+            .expect("connect to first app server");
+
+        assert!(stop_app_server());
+        let start = std::time::Instant::now();
+        let (_host2, port2) = ensure_app_server("127.0.0.1", 0, None)
+            .await
+            .expect("second ensure_app_server");
+        assert_ne!(port2, 0);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "restart must stay bounded despite open connection: {:?}",
+            start.elapsed()
+        );
+
+        // First server listener and open connection must have been aborted/closed.
+        let mut buf = [0u8; 16];
+        let read_res = tokio::time::timeout(Duration::from_secs(1), open_conn.read(&mut buf))
+            .await
+            .expect("open connection must close after drain+abort");
+        assert!(
+            matches!(read_res, Ok(0) | Err(_)),
+            "expected EOF or reset on aborted first server connection, got {read_res:?}"
+        );
+
+        assert!(stop_app_server());
+        drain_stopping_servers(&STOPPING_APP_SERVER).await;
     }
 }
