@@ -107,7 +107,11 @@ pub mod pathnorm;
 /// honor `no_proxy` without `capabilities` depending on `core`. Compiled
 /// whenever a reqwest-using capability is enabled.
 #[cfg(any(feature = "provider", feature = "web", feature = "mcp"))]
-pub(crate) mod proxy;
+pub mod proxy;
+
+/// Shared SSRF IP/DNS-pinning validation for outbound HTTP fetches.
+#[cfg(feature = "ssrf")]
+pub mod ssrf;
 
 /// Ungated path helpers (leading-`~` expansion, home dir, Windows POSIX `/tmp`
 /// and `/c/Users` mapping) shared by the `tools` and `codeintel` families so

@@ -151,7 +151,8 @@ tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs"
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
-web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
+ssrf = ["tokio/net"]
+web = ["tools", "dep:reqwest", "dep:url", "ssrf"]
 # Code-intelligence tools: code_explore (tree-sitter graph).
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [

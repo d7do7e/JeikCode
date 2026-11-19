@@ -724,6 +724,46 @@ pub(crate) async fn get_session(State(state): State<AppState>, Path(id): Path<St
 
 // ─── Content extraction ─────────────────────────────────────────────────────
 
+const MAX_COMPAT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+async fn fetch_image_bytes(
+    client: &reqwest::Client,
+    parsed: &reqwest::Url,
+) -> Result<ImageInput, String> {
+    let resp = client
+        .get(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| format!("fetch image_url failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("fetch image_url HTTP {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_COMPAT_IMAGE_BYTES as u64 {
+            return Err("image_url exceeds 20MB".into());
+        }
+    }
+    let media_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .filter(|s| s.starts_with("image/"))
+        .unwrap_or_else(|| "image/png".into());
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read image_url body failed: {e}"))?;
+        if chunk.len() > MAX_COMPAT_IMAGE_BYTES.saturating_sub(bytes.len()) {
+            return Err("image_url exceeds 20MB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(ImageInput { media_type, data })
+}
+
 async fn resolve_image_url(url: String) -> Result<ImageInput, String> {
     let url = url.trim().to_string();
     if let Some(rest) = url.strip_prefix("data:") {
@@ -737,53 +777,53 @@ async fn resolve_image_url(url: String) -> Result<ImageInput, String> {
             .filter(|s| !s.is_empty())
             .unwrap_or("image/png")
             .to_string();
+        let max_b64_len = (MAX_COMPAT_IMAGE_BYTES * 4) / 3 + 4;
+        if data.len() > max_b64_len {
+            return Err("image_url exceeds 20MB".into());
+        }
         let raw = if meta.contains(";base64") {
             data.to_string()
         } else {
             // percent-encoded payload — rare for images; keep as-is base64-looking
             data.to_string()
         };
-        // Validate base64 lightly
+        // Validate base64 and decoded byte cap
         use base64::Engine;
-        let _ = base64::engine::general_purpose::STANDARD
+        let decoded = base64::engine::general_purpose::STANDARD
             .decode(raw.as_bytes())
             .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw.as_bytes()))
             .map_err(|e| format!("invalid base64 image: {e}"))?;
+        if decoded.len() > MAX_COMPAT_IMAGE_BYTES {
+            return Err("image_url exceeds 20MB".into());
+        }
         return Ok(ImageInput {
             media_type,
             data: raw,
         });
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("fetch image_url failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("fetch image_url HTTP {}", resp.status()));
+        let parsed = reqwest::Url::parse(&url).map_err(|e| format!("invalid image_url: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("unsupported image_url scheme (use data: or http(s):)".into());
         }
-        let media_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
-            .filter(|s| s.starts_with("image/"))
-            .unwrap_or_else(|| "image/png".into());
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("read image_url body failed: {e}"))?;
-        if bytes.len() > 20 * 1024 * 1024 {
-            return Err("image_url exceeds 20MB".into());
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err("image_url must not contain embedded credentials".into());
         }
-        use base64::Engine;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        return Ok(ImageInput { media_type, data });
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "image_url missing host".to_string())?;
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let pinned = jeikcode_capabilities::ssrf::validate_host_port(host, port).await?;
+        let mut builder =
+            jeikcode_capabilities::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30));
+        if !pinned.is_empty() {
+            builder = builder.resolve_to_addrs(host, &pinned);
+        }
+        let client = builder.build().map_err(|e| e.to_string())?;
+        return fetch_image_bytes(&client, &parsed).await;
     }
     Err("unsupported image_url scheme (use data: or http(s):)".into())
 }
@@ -2096,5 +2136,72 @@ mod tests {
         assert_eq!(normalized.as_deref(), Some("alice_proj"));
         let updated = mgr.read_meta(&sid).unwrap();
         assert_eq!(updated.protocol_key.as_deref(), Some("alice_proj"));
+    }
+
+    #[tokio::test]
+    async fn resolve_image_url_blocks_ssrf_and_userinfo_and_oversized_data_urls() {
+        for bad in [
+            "http://127.0.0.1:8080/a.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/a.png",
+            "http://[::ffff:127.0.0.1]/a.png",
+            "http://user:pass@93.184.216.34/a.png",
+            "file:///etc/passwd",
+        ] {
+            let err = resolve_image_url(bad.to_string()).await.unwrap_err();
+            assert!(!err.is_empty(), "expected error for {bad}");
+        }
+
+        let oversized = format!("data:image/png;base64,{}", "A".repeat(28_000_000));
+        let err = resolve_image_url(oversized).await.unwrap_err();
+        assert!(err.contains("20MB"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_image_bytes_rejects_redirects_and_stream_overflow() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "http://127.0.0.1:1/secret")],
+                    )
+                }),
+            )
+            .route(
+                "/too-big",
+                get(|| async {
+                    let body = vec![0x42u8; MAX_COMPAT_IMAGE_BYTES + 1024];
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/png")],
+                        body,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let redir_url = reqwest::Url::parse(&format!("http://{addr}/redirect")).unwrap();
+        let redir_err = fetch_image_bytes(&client, &redir_url).await.unwrap_err();
+        assert!(redir_err.contains("302"), "{redir_err}");
+
+        let big_url = reqwest::Url::parse(&format!("http://{addr}/too-big")).unwrap();
+        let big_err = fetch_image_bytes(&client, &big_url).await.unwrap_err();
+        assert!(big_err.contains("20MB"), "{big_err}");
+
+        srv.abort();
     }
 }

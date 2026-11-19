@@ -60,7 +60,7 @@ fn force_tls12() -> bool {
 
 /// Apply the process proxy policy to an async reqwest client builder, then cap at
 /// TLS 1.2 when [`force_tls12`] is set.
-pub(crate) fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+pub fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     let builder = if proxy_disabled() {
         builder.no_proxy()
     } else {

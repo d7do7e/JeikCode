@@ -441,105 +441,13 @@ fn validate_scheme(url: &Url) -> Result<(), String> {
     }
 }
 
-/// Reject IPs pointing at the host / local network / cloud metadata (loopback, RFC1918,
-/// link-local 169.254/CGNAT/reserved, IPv6 ULA/link-local, IPv4-mapped v6).
-fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
-    let reject = |cat: &str| {
-        Err(format!(
-            "refusing to connect to {ip} ({cat}) — SSRF protection"
-        ))
-    };
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_loopback() {
-                return reject("loopback 127.0.0.0/8");
-            }
-            if v4.is_private() {
-                return reject("private network");
-            }
-            if v4.is_link_local() {
-                return reject("link-local / cloud metadata");
-            }
-            if v4.is_broadcast() {
-                return reject("broadcast");
-            }
-            if v4.is_multicast() {
-                return reject("multicast");
-            }
-            if v4.is_unspecified() {
-                return reject("unspecified 0.0.0.0");
-            }
-            let o = v4.octets();
-            if o[0] == 0 {
-                return reject("reserved 0.0.0.0/8");
-            }
-            if o[0] >= 240 {
-                return reject("reserved 240.0.0.0/4");
-            }
-            if o[0] == 100 && (o[1] & 0xc0) == 64 {
-                return reject("CGNAT 100.64/10");
-            }
-            Ok(())
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return reject("loopback ::1");
-            }
-            if v6.is_unspecified() {
-                return reject("unspecified ::");
-            }
-            if v6.is_multicast() {
-                return reject("multicast");
-            }
-            let first = v6.segments()[0];
-            if (first & 0xfe00) == 0xfc00 {
-                return reject("unique-local fc00::/7");
-            }
-            if (first & 0xffc0) == 0xfe80 {
-                return reject("link-local fe80::/10");
-            }
-            // Embedded IPv4 — the OS may dial the v4 directly, so a v6 wrapper around an
-            // unsafe v4 must be unwrapped and re-checked. `to_ipv4()` covers BOTH the
-            // IPv4-mapped form (`::ffff:a.b.c.d`) AND the deprecated-but-still-resolvable
-            // IPv4-compatible form (`::a.b.c.d`) — the latter is what `to_ipv4_mapped()`
-            // missed, letting `::127.0.0.1` / `::169.254.169.254` slip through as "safe".
-            // `::1` and `::` are already rejected above; a genuine public v6 yields None
-            // (its high bits are non-zero) so it stays Ok. (NAT64 64:ff9b::/96 not covered.)
-            if let Some(embedded) = v6.to_ipv4() {
-                return is_safe_ip(IpAddr::V4(embedded));
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Resolve the URL's host and require EVERY returned IP to be safe (partial acceptance
-/// would let `[1.2.3.4, 127.0.0.1]` gamble on which reqwest picks). Returns the validated
-/// [`SocketAddr`]s so the caller can PIN them into reqwest (`resolve_to_addrs`) — that
-/// closes the DNS-rebinding TOCTOU window: without pinning, DNS is looked up here and then
-/// a SECOND time by reqwest at connect, and a TTL=0 attacker could rebind the host to a
-/// private IP between the two lookups. Returns an EMPTY vec for a literal-IP host — there
-/// is no DNS to rebind, so reqwest dials the URL's address directly and nothing is pinned.
+/// Resolve the URL's host and require EVERY returned IP to be safe (see [`crate::ssrf`]).
 async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
     let host = url
         .host_str()
         .ok_or_else(|| format!("URL has no host: {url}"))?;
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        is_safe_ip(ip)?; // literal IP — bypass DNS, nothing to pin
-        return Ok(Vec::new());
-    }
     let port = url.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS resolution failed for `{host}`: {e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!("DNS returned no addresses for `{host}`"));
-    }
-    for addr in &addrs {
-        is_safe_ip(addr.ip())?;
-    }
-    Ok(addrs)
+    crate::ssrf::validate_host_port(host, port).await
 }
 
 /// Build the per-request HTTP client. When `pinned` is non-empty the host resolves ONLY to
@@ -1206,6 +1114,7 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_loopback_private_and_metadata() {
+        use crate::ssrf::is_safe_ip;
         assert!(is_safe_ip("127.0.0.1".parse().unwrap()).is_err());
         assert!(is_safe_ip("10.0.0.5".parse().unwrap()).is_err());
         assert!(is_safe_ip("192.168.1.1".parse().unwrap()).is_err());

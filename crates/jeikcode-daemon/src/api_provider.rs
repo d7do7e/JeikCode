@@ -682,6 +682,32 @@ pub(crate) async fn patch_provider(
     }
 }
 
+fn reconcile_default_after_delete(config: &mut jeikcode_config::config::Config, deleted_key: &str) {
+    let selection_valid = config
+        .effective_model_selection()
+        .is_some_and(|s| config.selection_exists(&s));
+    let model_removed = config.default_model.as_deref() == Some(deleted_key);
+    if !selection_valid || model_removed {
+        let next_model = config
+            .models
+            .iter()
+            .filter(|(_, m)| {
+                config.provider_accounts.contains_key(&m.account)
+                    || config.providers.contains_key(&m.account)
+            })
+            .map(|(k, _)| k.clone())
+            .min()
+            .or_else(|| config.models.keys().min().cloned());
+        let next_legacy = config.providers.keys().min().cloned();
+        config.default_model = next_model.clone();
+        config.default_provider = next_model.or(next_legacy).unwrap_or_default();
+    } else if config.default_provider == deleted_key {
+        if let Some(active) = config.effective_model_selection() {
+            config.default_provider = active;
+        }
+    }
+}
+
 /// DELETE /providers/:name - Delete a provider.
 pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoResponse {
     let mut missing = false;
@@ -702,16 +728,7 @@ pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoRespon
             missing = true;
             anyhow::bail!("provider {name:?} not found");
         }
-        if config.default_provider == name || config.default_model.as_deref() == Some(&name) {
-            config.default_model = None;
-            config.default_provider = config
-                .models
-                .keys()
-                .min()
-                .cloned()
-                .or_else(|| config.providers.keys().min().cloned())
-                .unwrap_or_default();
-        }
+        reconcile_default_after_delete(config, &name);
         Ok(())
     }) {
         Ok(config) => config,
@@ -1007,16 +1024,7 @@ pub(crate) async fn delete_provider_account(Path(id): Path<String>) -> impl Into
             anyhow::bail!("account {id:?} not found");
         }
         config.models.retain(|_, m| m.account != id);
-        if config.default_provider == id || config.default_model.as_deref() == Some(&id) {
-            config.default_model = None;
-            config.default_provider = config
-                .models
-                .keys()
-                .min()
-                .cloned()
-                .or_else(|| config.providers.keys().min().cloned())
-                .unwrap_or_default();
-        }
+        reconcile_default_after_delete(config, &id);
         Ok(())
     }) {
         Ok(c) => c,
@@ -1818,5 +1826,112 @@ mod tests {
             .get("gemini")
             .expect("account should exist");
         assert_eq!(acc.base_url.as_deref(), Some("http://127.0.0.1:8046/v2"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_provider_account_reconciles_dangling_default_model_and_provider() {
+        let _guard = jeikcode_config::test_util::isolated_config();
+
+        update_config(|config| {
+            config.provider_accounts.insert(
+                "acc_primary".into(),
+                ProviderAccountConfig {
+                    provider: "openai".into(),
+                    display_name: None,
+                    api_key: Some("k1".into()),
+                    base_url: Some("https://api.openai.com/v1".into()),
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+            config.provider_accounts.insert(
+                "acc_backup".into(),
+                ProviderAccountConfig {
+                    provider: "openai".into(),
+                    display_name: None,
+                    api_key: Some("k2".into()),
+                    base_url: Some("https://api.openai.com/v1".into()),
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+            config.models.insert(
+                "primary-model".into(),
+                ModelProfileConfig {
+                    account: "acc_primary".into(),
+                    model: "gpt-4o".into(),
+                    display_name: None,
+                    system_prompt: None,
+                    context_window: 128_000,
+                    max_tokens: None,
+                    capable_model: None,
+                    thinking_type: None,
+                    thinking_keep: None,
+                    reasoning_history: None,
+                    reasoning_effort: None,
+                    reasoning_levels: None,
+                    thinking_enabled: None,
+                    thinking_budget: None,
+                    pricing: None,
+                    supports_vision: None,
+                    reasoning_model: None,
+                },
+            );
+            config.models.insert(
+                "backup-model".into(),
+                ModelProfileConfig {
+                    account: "acc_backup".into(),
+                    model: "gpt-4o-mini".into(),
+                    display_name: None,
+                    system_prompt: None,
+                    context_window: 128_000,
+                    max_tokens: None,
+                    capable_model: None,
+                    thinking_type: None,
+                    thinking_keep: None,
+                    reasoning_history: None,
+                    reasoning_effort: None,
+                    reasoning_levels: None,
+                    thinking_enabled: None,
+                    thinking_budget: None,
+                    pricing: None,
+                    supports_vision: None,
+                    reasoning_model: None,
+                },
+            );
+            config.default_model = Some("primary-model".into());
+            config.default_provider = "primary-model".into();
+            Ok(())
+        })
+        .unwrap();
+
+        let resp = delete_provider_account(Path("acc_primary".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after_first = load_config().unwrap();
+        assert!(!after_first.models.contains_key("primary-model"));
+        assert_eq!(after_first.default_model.as_deref(), Some("backup-model"));
+        assert_eq!(after_first.default_provider, "backup-model");
+        assert_eq!(
+            after_first.effective_model_selection().as_deref(),
+            Some("backup-model")
+        );
+
+        let resp2 = delete_provider(Path("acc_backup".into()))
+            .await
+            .into_response();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let after_second = load_config().unwrap();
+        assert!(after_second.models.is_empty());
+        assert_eq!(after_second.default_model, None);
+        assert!(after_second.default_provider.is_empty());
     }
 }
