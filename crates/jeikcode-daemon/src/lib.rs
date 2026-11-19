@@ -3335,7 +3335,15 @@ pub(crate) fn session_token_usage_from_meta(
         return None;
     }
 
-    let billing_cached = turn_stat_billing_cached_tokens(stat);
+    // `TurnStat.model_usage` is turn-cumulative billing across all rounds, so only
+    // single-round turns (`round_count <= 1`) can donate `cached_input` as the
+    // last-frame occupancy cache figure. Multi-round turns fall through to
+    // `estimate_cache_from_previous_turn` when `MessageMeta` is unavailable.
+    let billing_cached = if stat.round_count <= 1 {
+        turn_stat_billing_cached_tokens(stat)
+    } else {
+        0
+    };
     let mut cached = 0usize;
     let mut cached_estimated = false;
     if billing_cached > 0 && billing_cached <= prompt {
@@ -12641,6 +12649,43 @@ mod session_token_usage_tests {
             "restart gauge must not exceed the context window from stacked billing"
         );
         assert!(usage.cached <= usage.prompt);
+    }
+
+    #[test]
+    fn multi_round_meta_ignores_summed_billing_cached_even_below_prompt() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![
+            usage_stat(30_000, 100, 20_000),
+            TurnStat {
+                after_message: 4,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 3,
+                tool_call_count: 2,
+                duration_ms: 10_000,
+                total_tokens: 51_000,
+                errored: false,
+                used_tokens: 50_000,
+                ctx_window: 1_000_000,
+                // Summed across 3 rounds (e.g. 12k * 3 = 36k <= 50k prompt),
+                // which would look plausible if not gated on `round_count <= 1`.
+                model_usage: vec![ModelUsageStat {
+                    provider_id: "main".into(),
+                    model_id: "test".into(),
+                    tokens: TokenBreakdown {
+                        input: 14_000,
+                        output: 1_000,
+                        cached_input: 36_000,
+                    },
+                    pricing: None,
+                }],
+            },
+        ];
+        let usage = session_token_usage_from_meta(&meta).unwrap();
+        assert_eq!(usage.prompt, 50_000);
+        assert_eq!(usage.completion, 1_000);
+        assert_eq!(usage.cached, 30_000);
+        assert!(usage.cached_estimated);
     }
 
     #[test]

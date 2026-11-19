@@ -7,11 +7,11 @@
 //!     [`StreamEvent::ToolCall`] at `finish_reason == "tool_calls"`.
 //!   - Usage is LAST-WINS in the kernel: the adapter buffers the final `usage` chunk
 //!     and emits exactly one [`StreamEvent::Usage`] near `Done`.
-//!   - There is NO explicit cache field on this path (OpenAI-compatible caching is
-//!     automatic), so prefix BYTE-STABILITY is the only cache lever — the request
-//!     body is built from ordered `serde_json` literals (BTreeMap-backed `Map`, no
+//!   - Prefix BYTE-STABILITY is the primary cache lever — the request body is
+//!     built from ordered `serde_json` literals (BTreeMap-backed `Map`, no
 //!     `preserve_order`), with no timestamps/uuids, so the same `(messages, tools)`
-//!     always serialize identically.
+//!     always serialize identically. Official OpenAI Chat endpoints also receive
+//!     `prompt_cache_key` when a `session_id` is bound.
 //!   - `reasoning_content` round-trip is policy-driven ([`ReasoningPolicy`]); the
 //!     kernel stores reasoning, this adapter decides Include/Exclude.
 
@@ -177,11 +177,12 @@ pub struct OpenAiCompatProvider {
     client: std::sync::Arc<SwappableClient>,
     url: String,
     /// Stable per-conversation id, bound ONCE via [`bind_session_id`] when the kernel
-    /// spawns the owning Agent. Forwarded as the `x-jeikcode-session-id` and `x-session-id` headers so a
-    /// gateway can pin the conversation to one upstream for prefix-cache affinity.
+    /// spawns the owning Agent. Forwarded as `x-jeikcode-session-id` / `x-session-id` headers
+    /// (and `prompt_cache_key` on official OpenAI Chat endpoints) so a gateway or upstream
+    /// can pin the conversation for prefix-cache affinity.
     /// `OnceLock` (not a lock-on-read mutex) because the id is constant for the
     /// provider's life — a `/session` switch rebuilds the provider, never re-binds.
-    /// Unset ⇒ header omitted (session-less sub-agent / summary).
+    /// Unset ⇒ header/body key omitted (session-less sub-agent / summary).
     session_id: std::sync::OnceLock<String>,
     /// Set once this provider's gateway has rejected a `reasoning_effort` value
     /// with a 400 (e.g. SenseNova accepts low/medium/high/xhigh/none but NOT the
@@ -462,13 +463,17 @@ impl LlmProvider for OpenAiCompatProvider {
         } else {
             options
         };
-        let body = build_request_body(
+        // Read the bound session id (unset ⇒ empty ⇒ header/body key omitted); reused across
+        // the initial open and any mid-stream reopen.
+        let session_id = self.session_id.get().cloned().unwrap_or_default();
+        let body = build_request_body_with_session(
             &self.cfg.model,
             messages,
             tools,
             options,
             &self.cfg,
             self.policy,
+            &session_id,
         );
         super::wire_dump_request(&self.cfg.model, &body); // byte-level dump (JEIKCODE_WIRE_DUMP=1)
                                                           // Serialize once and reuse the exact bytes across retries (hence `.body()`
@@ -492,9 +497,6 @@ impl LlmProvider for OpenAiCompatProvider {
         let url = self.url.clone();
         let signer = self.cfg.request_signer.clone();
         let api_key = self.cfg.api_key.clone();
-        // Read the bound session id (unset ⇒ empty ⇒ header omitted); reused across
-        // the initial open and any mid-stream reopen.
-        let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
@@ -1037,6 +1039,7 @@ fn format_messages(
 /// BTreeMap-backed `Map` (sorted on serialize), values are ordered literals, and the
 /// neutral defaults (Auto tool_choice, None temperature) are OMITTED so the request
 /// is byte-identical to "no opinion".
+#[cfg(test)]
 fn build_request_body(
     model: &str,
     messages: &[Message],
@@ -1044,6 +1047,26 @@ fn build_request_body(
     options: &ChatOptions,
     cfg: &OpenAiCompatConfig,
     policy: ReasoningPolicy,
+) -> Value {
+    build_request_body_with_session(model, messages, tools, options, cfg, policy, "")
+}
+
+fn supports_prompt_cache_key(cfg: &OpenAiCompatConfig) -> bool {
+    let Ok(url) = reqwest::Url::parse(cfg.base_url.trim()) else {
+        return false;
+    };
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+}
+
+fn build_request_body_with_session(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    options: &ChatOptions,
+    cfg: &OpenAiCompatConfig,
+    policy: ReasoningPolicy,
+    session_id: &str,
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -1058,6 +1081,9 @@ fn build_request_body(
     );
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
+    if !session_id.is_empty() && supports_prompt_cache_key(cfg) {
+        body.insert("prompt_cache_key".into(), json!(session_id));
+    }
 
     let m_lower = model.to_ascii_lowercase();
     let is_o_series = m_lower.starts_with("o1")
@@ -3120,6 +3146,45 @@ mod tests {
             body.get("temperature").is_none(),
             "sampling must stay off when reasoning_effort is set: {body}"
         );
+    }
+
+    #[test]
+    fn prompt_cache_key_sent_only_for_official_openai_when_session_bound() {
+        let official = OpenAiCompatConfig::new("k", "https://api.openai.com/v1", "gpt-4o");
+        let body_bound = build_request_body_with_session(
+            "gpt-4o",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &official,
+            ReasoningPolicy::Exclude,
+            "sess-123",
+        );
+        assert_eq!(body_bound["prompt_cache_key"], "sess-123");
+
+        let body_empty = build_request_body_with_session(
+            "gpt-4o",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &official,
+            ReasoningPolicy::Exclude,
+            "",
+        );
+        assert!(body_empty.get("prompt_cache_key").is_none());
+
+        let third_party =
+            OpenAiCompatConfig::new("k", "https://api.deepseek.com/v1", "deepseek-chat");
+        let body_third_party = build_request_body_with_session(
+            "deepseek-chat",
+            &[Message::user("hi")],
+            &[],
+            &ChatOptions::default(),
+            &third_party,
+            ReasoningPolicy::Exclude,
+            "sess-123",
+        );
+        assert!(body_third_party.get("prompt_cache_key").is_none());
     }
 
     #[test]
