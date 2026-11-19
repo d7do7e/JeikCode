@@ -28,11 +28,12 @@ pub struct FsUploadResponse {
 }
 
 pub async fn fs_upload(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut store: Option<PathBuf> = None;
     let mut paths: Vec<String> = Vec::new();
+    let allowed_roots = state.active_workspace_roots().await;
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -54,7 +55,7 @@ pub async fn fs_upload(
                     .into_response();
                 }
             };
-            match prepare_store(&working_dir) {
+            match prepare_store_confined(&working_dir, &allowed_roots) {
                 Ok(dir) => store = Some(dir),
                 Err(e) => return json_error(e.status, e.message).into_response(),
             }
@@ -92,6 +93,33 @@ fn upload_err(status: StatusCode, message: impl Into<String>) -> UploadError {
     }
 }
 
+fn prepare_store_confined(
+    working_dir: &str,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, UploadError> {
+    if working_dir.trim().is_empty() {
+        return Err(upload_err(
+            StatusCode::BAD_REQUEST,
+            "working_dir is required",
+        ));
+    }
+    let raw_cwd = normalize_dir_arg(working_dir);
+    let canon_cwd = raw_cwd.canonicalize().map_err(|_| {
+        upload_err(
+            StatusCode::BAD_REQUEST,
+            format!("working_dir is not a directory: {}", raw_cwd.display()),
+        )
+    })?;
+    let clean_cwd = jeikcode_capabilities::pathnorm::strip_verbatim_path(&canon_cwd);
+    if !crate::is_path_within_roots(&clean_cwd, allowed_roots) {
+        return Err(upload_err(
+            StatusCode::FORBIDDEN,
+            "working_dir is outside allowed workspace roots",
+        ));
+    }
+    prepare_store_at(&clean_cwd)
+}
+
 fn prepare_store(working_dir: &str) -> Result<PathBuf, UploadError> {
     if working_dir.trim().is_empty() {
         return Err(upload_err(
@@ -100,6 +128,10 @@ fn prepare_store(working_dir: &str) -> Result<PathBuf, UploadError> {
         ));
     }
     let cwd = normalize_dir_arg(working_dir);
+    prepare_store_at(&cwd)
+}
+
+fn prepare_store_at(cwd: &Path) -> Result<PathBuf, UploadError> {
     if !cwd.is_dir() {
         return Err(upload_err(
             StatusCode::BAD_REQUEST,

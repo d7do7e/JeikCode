@@ -6217,6 +6217,38 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Canonicalized workspace roots active in this daemon (`bind_working_dir`,
+    /// `/cd` current/previous/recent directories, and live runtime binding).
+    pub(crate) async fn active_workspace_roots(&self) -> Vec<PathBuf> {
+        let mut raw_roots = vec![self.bind_working_dir.clone()];
+        {
+            let project = self.project.read().await;
+            raw_roots.push(project.working_dir.clone());
+            if let Some(prev) = &project.previous_dir {
+                raw_roots.push(prev.clone());
+            }
+            raw_roots.extend(project.recent_dirs.iter().cloned());
+        }
+        if let Ok(binding) = crate::native_live::binding() {
+            raw_roots.push(binding.working_dir);
+        }
+        dedup_canonical_roots(raw_roots)
+    }
+
+    /// Superset of `active_workspace_roots` for read-only previews and OS reveal:
+    /// also allows `~/.jeikcode` (config/prompts/skills/artifacts) and known project
+    /// roots from the session catalog so historical sidebar reveal/previews work.
+    pub(crate) async fn readable_workspace_roots(&self) -> Vec<PathBuf> {
+        let mut raw_roots = self.active_workspace_roots().await;
+        raw_roots.push(jeikcode_config::Config::config_dir());
+        if let Ok(projects) = list_projects() {
+            for p in projects {
+                raw_roots.push(p.working_dir);
+            }
+        }
+        dedup_canonical_roots(raw_roots)
+    }
+
     /// 检查指定会话当前是否处于活动运行中（如第一轮审查正在执行中）
     pub async fn is_session_active(&self, session_id: &str) -> bool {
         self.active_chats
@@ -18364,35 +18396,44 @@ async fn reveal_file_or_folder(
     State(state): State<AppState>,
     Json(req): Json<RevealPathRequest>,
 ) -> impl IntoResponse {
-    let raw = req.path.trim();
-    let mut p = std::path::PathBuf::from(raw);
-    if !p.is_absolute() {
-        if let Some(ref cwd_str) = req.cwd {
-            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
-            if candidate_cwd.exists() {
-                p = candidate_cwd;
-            } else {
-                let candidate = state.bind_working_dir.join(raw);
-                if candidate.exists() {
-                    p = candidate;
-                }
-            }
-        } else {
-            let candidate = state.bind_working_dir.join(raw);
-            if candidate.exists() {
-                p = candidate;
-            }
-        }
-    }
-    let p = p.canonicalize().unwrap_or(p);
-    let p = jeikcode_capabilities::pathnorm::strip_verbatim_path(&p);
-
-    if !p.exists() {
+    let raw = req.path.clone();
+    let cwd = req.cwd.clone();
+    let roots = state.readable_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(
+            &raw,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
+    })
+    .await
+    else {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": shell_open::SHELL_OPEN_FAILED })),
         );
-    }
+    };
+    let p = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "success": false, "error": "Path outside allowed workspace roots" }),
+                ),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
+            );
+        }
+    };
     let is_dir = p.is_dir();
     // 异步派发到一次性后台线程，接口立即返回；线程内失败只记日志，由前端静默忽略。
     if let Err(err) = shell_open::reveal(&p) {
@@ -18416,35 +18457,44 @@ async fn open_file_with_os(
     State(state): State<AppState>,
     Json(req): Json<RevealPathRequest>,
 ) -> impl IntoResponse {
-    let raw = req.path.trim();
-    let mut p = std::path::PathBuf::from(raw);
-    if !p.is_absolute() {
-        if let Some(ref cwd_str) = req.cwd {
-            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
-            if candidate_cwd.exists() {
-                p = candidate_cwd;
-            } else {
-                let candidate = state.bind_working_dir.join(raw);
-                if candidate.exists() {
-                    p = candidate;
-                }
-            }
-        } else {
-            let candidate = state.bind_working_dir.join(raw);
-            if candidate.exists() {
-                p = candidate;
-            }
-        }
-    }
-    let p = p.canonicalize().unwrap_or(p);
-    let p = jeikcode_capabilities::pathnorm::strip_verbatim_path(&p);
-
-    if !p.exists() {
+    let raw = req.path.clone();
+    let cwd = req.cwd.clone();
+    let roots = state.readable_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(
+            &raw,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
+    })
+    .await
+    else {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": shell_open::SHELL_OPEN_FAILED })),
         );
-    }
+    };
+    let p = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "success": false, "error": "Path outside allowed workspace roots" }),
+                ),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
+            );
+        }
+    };
     // 异步派发到一次性后台线程，接口立即返回；线程内失败只记日志，由前端静默忽略。
     if let Err(err) = shell_open::open(&p) {
         tracing::warn!(
@@ -18463,10 +18513,177 @@ async fn open_file_with_os(
 #[derive(Debug, Deserialize)]
 struct FsRawQuery {
     path: String,
+    cwd: Option<String>,
 }
 
 const MAX_FS_READ_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FS_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsConfinementError {
+    OutsideWorkspace,
+    NotFound,
+}
+
+pub(crate) fn dedup_canonical_roots(raw_roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in raw_roots {
+        let canon = root.canonicalize().unwrap_or(root);
+        let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&canon);
+        let key = jeikcode_capabilities::pathnorm::path_case_key(&clean);
+        if seen.insert(key) {
+            out.push(clean);
+        }
+    }
+    out
+}
+
+fn path_starts_with_normalized(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let mut p_comps = path.components();
+    for r_comp in root.components() {
+        let Some(p_comp) = p_comps.next() else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            let a = p_comp.as_os_str().to_string_lossy().to_ascii_lowercase();
+            let b = r_comp.as_os_str().to_string_lossy().to_ascii_lowercase();
+            if a != b {
+                return false;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if p_comp != r_comp {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn is_path_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool {
+    let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(path);
+    roots.iter().any(|root| {
+        let clean_root = jeikcode_capabilities::pathnorm::strip_verbatim_path(root);
+        path_starts_with_normalized(&clean, &clean_root)
+    })
+}
+
+/// Canonicalize `candidate` via its deepest existing ancestor so non-existent targets
+/// (like `/fs/write` or `/fs/action` `create_file`) cannot bypass symlink/junction checks,
+/// and require every non-existent trailing component to be a normal segment.
+pub(crate) fn canonicalize_with_ancestor(
+    candidate: &std::path::Path,
+) -> Result<PathBuf, FsConfinementError> {
+    if candidate.as_os_str().is_empty() {
+        return Err(FsConfinementError::NotFound);
+    }
+    if candidate.exists() {
+        let canon = candidate
+            .canonicalize()
+            .map_err(|_| FsConfinementError::NotFound)?;
+        return Ok(jeikcode_capabilities::pathnorm::strip_verbatim_path(&canon));
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = candidate;
+    loop {
+        if cur.exists() {
+            let canon = cur
+                .canonicalize()
+                .map_err(|_| FsConfinementError::NotFound)?;
+            let mut base = jeikcode_capabilities::pathnorm::strip_verbatim_path(&canon);
+            for seg in tail.into_iter().rev() {
+                base.push(seg);
+            }
+            return Ok(base);
+        }
+        let Some(name) = cur.file_name() else {
+            return Err(FsConfinementError::NotFound);
+        };
+        if name == "." || name == ".." {
+            return Err(FsConfinementError::OutsideWorkspace);
+        }
+        tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            return Err(FsConfinementError::NotFound);
+        };
+        cur = parent;
+    }
+}
+
+fn resolve_candidate_base(
+    raw_path: &str,
+    cwd: Option<&str>,
+    fallback_cwd: &std::path::Path,
+    bind_working_dir: &std::path::Path,
+    must_exist: bool,
+) -> PathBuf {
+    let raw = raw_path.trim().trim_start_matches("./");
+    if raw.is_empty() || raw == "." {
+        return cwd
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    }
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p;
+    }
+    if must_exist {
+        if let Some(cwd_str) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            let c = PathBuf::from(cwd_str).join(raw);
+            if c.exists() {
+                return c;
+            }
+        }
+        let f = fallback_cwd.join(raw);
+        if f.exists() {
+            return f;
+        }
+        bind_working_dir.join(raw)
+    } else {
+        cwd.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|c| PathBuf::from(c).join(raw))
+            .unwrap_or_else(|| fallback_cwd.join(raw))
+    }
+}
+
+pub(crate) fn resolve_confined_existing_path(
+    raw_path: &str,
+    cwd: Option<&str>,
+    fallback_cwd: &std::path::Path,
+    bind_working_dir: &std::path::Path,
+    roots: &[PathBuf],
+) -> Result<PathBuf, FsConfinementError> {
+    let candidate = resolve_candidate_base(raw_path, cwd, fallback_cwd, bind_working_dir, true);
+    let canon = candidate
+        .canonicalize()
+        .map_err(|_| FsConfinementError::NotFound)?;
+    let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&canon);
+    if !is_path_within_roots(&clean, roots) {
+        return Err(FsConfinementError::OutsideWorkspace);
+    }
+    Ok(clean)
+}
+
+pub(crate) fn resolve_confined_target_path(
+    raw_path: &str,
+    cwd: Option<&str>,
+    fallback_cwd: &std::path::Path,
+    bind_working_dir: &std::path::Path,
+    roots: &[PathBuf],
+) -> Result<PathBuf, FsConfinementError> {
+    let candidate = resolve_candidate_base(raw_path, cwd, fallback_cwd, bind_working_dir, false);
+    let clean = canonicalize_with_ancestor(&candidate)?;
+    if !is_path_within_roots(&clean, roots) {
+        return Err(FsConfinementError::OutsideWorkspace);
+    }
+    Ok(clean)
+}
 
 fn validate_fs_rename_target_name(name: &str) -> Result<&str, &'static str> {
     let trimmed = name.trim();
@@ -18486,23 +18703,36 @@ fn validate_fs_rename_target_name(name: &str) -> Result<&str, &'static str> {
     }
 }
 
-async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
-    let raw = q.path.trim().trim_start_matches("./").to_string();
-    let Ok(resolved) = tokio::task::spawn_blocking(move || {
-        let mut p = std::path::PathBuf::from(&raw);
-        if !p.exists() || !p.is_file() {
-            if let Ok(cur) = std::env::current_dir() {
-                let candidate = cur.join(&raw);
-                if candidate.exists() && candidate.is_file() {
-                    p = candidate;
-                }
-            }
-        }
-        p
+async fn fs_raw_handler(
+    State(state): State<AppState>,
+    Query(q): Query<FsRawQuery>,
+) -> impl IntoResponse {
+    let raw = q.path.clone();
+    let cwd = q.cwd.clone();
+    let roots = state.readable_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(resolved_res) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(
+            &raw,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
     })
     .await
     else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed".into_response());
+    };
+    let resolved = match resolved_res {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (StatusCode::FORBIDDEN, "Forbidden".into_response());
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (StatusCode::NOT_FOUND, "Not found".into_response());
+        }
     };
 
     let Ok(file) = tokio::fs::File::open(&resolved).await else {
@@ -18541,6 +18771,27 @@ async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
         headers.insert(axum::http::header::CONTENT_LENGTH, val);
     }
     headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    if ext == "svg" {
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            ),
+        );
+    } else if mime == "application/pdf" || mime == "application/octet-stream" {
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("default-src 'none'; sandbox"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            axum::http::HeaderValue::from_static("attachment"),
+        );
+    }
+    headers.insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static(
             "public, max-age=86400, stale-while-revalidate=604800",
@@ -18569,19 +18820,49 @@ struct FsActionPayload {
     action: String,
     path: String,
     new_name: Option<String>,
+    cwd: Option<String>,
 }
 
 async fn fs_action_handler(
     State(state): State<AppState>,
     Json(req): Json<FsActionPayload>,
 ) -> impl IntoResponse {
-    let working_dir = state.bind_working_dir.clone();
+    let roots = state.active_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
     match tokio::task::spawn_blocking(move || {
-        let raw = req.path.trim();
-        let mut p = std::path::PathBuf::from(raw);
-        if !p.is_absolute() {
-            p = working_dir.join(raw);
-        }
+        let p = match resolve_confined_target_path(
+            &req.path,
+            req.cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        ) {
+            Ok(p) => p,
+            Err(FsConfinementError::OutsideWorkspace) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Path outside allowed workspace roots"
+                    })),
+                );
+            }
+            Err(FsConfinementError::NotFound) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Invalid target path"
+                    })),
+                );
+            }
+        };
+        let is_exact_root = roots.iter().any(|r| {
+            let clean_r = jeikcode_capabilities::pathnorm::strip_verbatim_path(r);
+            jeikcode_capabilities::pathnorm::path_case_key(&p)
+                == jeikcode_capabilities::pathnorm::path_case_key(&clean_r)
+        });
         match req.action.as_str() {
             "create_file" | "create" => {
                 if let Some(parent) = p.parent() {
@@ -18617,6 +18898,14 @@ async fn fs_action_handler(
                 ),
             },
             "rename" => {
+                if is_exact_root {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({ "success": false, "error": "Invalid parent path" }),
+                        ),
+                    );
+                }
                 let Some(raw_new_name) = req.new_name.as_deref() else {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -18638,15 +18927,16 @@ async fn fs_action_handler(
                         ),
                     );
                 };
-                if p == working_dir {
+                let new_path = parent.join(new_name);
+                if !is_path_within_roots(&new_path, &roots) {
                     return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({ "success": false, "error": "Invalid parent path" }),
-                        ),
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "Path outside allowed workspace roots"
+                        })),
                     );
                 }
-                let new_path = parent.join(new_name);
                 match std::fs::rename(&p, &new_path) {
                     Ok(()) => (
                         StatusCode::OK,
@@ -18659,6 +18949,15 @@ async fn fs_action_handler(
                 }
             }
             "delete" => {
+                if is_exact_root {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "Cannot delete workspace root"
+                        })),
+                    );
+                }
                 if !p.exists() {
                     return (
                         StatusCode::OK,
@@ -18748,27 +19047,49 @@ fn load_fs_tree_gitignore(
 }
 
 async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) -> impl IntoResponse {
-    let working_dir = state.bind_working_dir.clone();
+    let roots = state.active_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
     let req_path = q.path.unwrap_or_default();
     match tokio::task::spawn_blocking(move || {
-        let root = working_dir
-            .canonicalize()
-            .unwrap_or_else(|_| working_dir.clone());
-        let root = jeikcode_capabilities::pathnorm::strip_verbatim_path(&root);
-
-        let req_path = req_path.trim();
-        let abs_dir = if req_path.is_empty() || req_path == "." {
-            root.to_path_buf()
-        } else {
-            let p = std::path::PathBuf::from(req_path);
-            if p.is_absolute() {
-                p
-            } else {
-                root.join(p)
+        let abs_dir = match resolve_confined_existing_path(
+            &req_path,
+            None,
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        ) {
+            Ok(p) => p,
+            Err(FsConfinementError::OutsideWorkspace) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "path": "",
+                        "entries": [],
+                        "dirs": [],
+                        "files": [],
+                        "error": "Path outside allowed workspace roots"
+                    })),
+                );
+            }
+            Err(FsConfinementError::NotFound) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "path": req_path,
+                        "entries": [],
+                        "dirs": [],
+                        "files": [],
+                        "error": "Directory not found"
+                    })),
+                );
             }
         };
-        let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
-        let abs_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&abs_dir);
+        let root = roots
+            .iter()
+            .find(|r| is_path_within_roots(&abs_dir, std::slice::from_ref(r)))
+            .cloned()
+            .unwrap_or_else(|| abs_dir.clone());
 
         if !abs_dir.exists() || !abs_dir.is_dir() {
             return (
@@ -18928,9 +19249,17 @@ fn fs_stamp(meta: &std::fs::Metadata) -> (u64, Option<u64>) {
 async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
     let raw_path = q.path.clone();
     let cwd = q.cwd.clone();
+    let roots = state.readable_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
     let bind_working_dir = state.bind_working_dir.clone();
-    let Ok(p) = tokio::task::spawn_blocking(move || {
-        resolve_fs_target(&raw_path, cwd.as_deref(), &bind_working_dir)
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(
+            &raw_path,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
     })
     .await
     else {
@@ -18945,6 +19274,35 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
                 "modified_ms": null
             })),
         );
+    };
+    let p = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "content": "",
+                    "success": false,
+                    "error": "Path outside allowed workspace roots",
+                    "size": 0,
+                    "modified_ms": null
+                })),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "content": "",
+                    "success": false,
+                    "error": "File not found",
+                    "size": 0,
+                    "modified_ms": null
+                })),
+            );
+        }
     };
 
     let Ok(file) = tokio::fs::File::open(&p).await else {
@@ -19057,9 +19415,17 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
 async fn fs_stat(State(state): State<AppState>, Query(q): Query<FsStatQuery>) -> impl IntoResponse {
     let raw_path = q.path.clone();
     let cwd = q.cwd.clone();
+    let roots = state.readable_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
     let bind_working_dir = state.bind_working_dir.clone();
-    let Ok(p) = tokio::task::spawn_blocking(move || {
-        resolve_fs_target(&raw_path, cwd.as_deref(), &bind_working_dir)
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(
+            &raw_path,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
     })
     .await
     else {
@@ -19073,6 +19439,34 @@ async fn fs_stat(State(state): State<AppState>, Query(q): Query<FsStatQuery>) ->
                 "modified_ms": null
             })),
         );
+    };
+    let p = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "exists": false,
+                    "is_file": false,
+                    "size": 0,
+                    "modified_ms": null,
+                    "error": "Path outside allowed workspace roots"
+                })),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "exists": false,
+                    "is_file": false,
+                    "size": 0,
+                    "modified_ms": null
+                })),
+            );
+        }
     };
     match tokio::fs::metadata(&p).await {
         Ok(meta) => {
@@ -19106,17 +19500,58 @@ async fn fs_stat(State(state): State<AppState>, Query(q): Query<FsStatQuery>) ->
 struct FsWritePayload {
     path: String,
     content: Option<String>,
+    cwd: Option<String>,
 }
 
 async fn fs_write(
     State(state): State<AppState>,
     Json(body): Json<FsWritePayload>,
 ) -> impl IntoResponse {
-    let raw = body.path.trim();
-    let mut p = std::path::PathBuf::from(raw);
-    if !p.is_absolute() {
-        p = state.bind_working_dir.join(raw);
-    }
+    let raw = body.path.clone();
+    let cwd = body.cwd.clone();
+    let roots = state.active_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_target_path(
+            &raw,
+            cwd.as_deref(),
+            &fallback_cwd,
+            &bind_working_dir,
+            &roots,
+        )
+    })
+    .await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Failed to resolve target path"
+            })),
+        );
+    };
+    let p = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Path outside allowed workspace roots"
+                })),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Invalid target path"
+                })),
+            );
+        }
+    };
     if let Some(parent) = p.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -19159,15 +19594,37 @@ async fn fs_search(
     Query(q): Query<FsSearchQuery>,
 ) -> impl IntoResponse {
     let query_str = q.q.trim().to_string();
-    let root = q.path.as_deref().unwrap_or("").trim();
-    let search_dir = if root.is_empty() {
-        state.bind_working_dir.clone()
-    } else {
-        let p = std::path::PathBuf::from(root);
-        if p.is_absolute() {
-            p
-        } else {
-            state.bind_working_dir.join(p)
+    let root = q.path.unwrap_or_default();
+    let roots = state.active_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
+    let bind_working_dir = state.bind_working_dir.clone();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(&root, None, &fallback_cwd, &bind_working_dir, &roots)
+    })
+    .await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "query": q.q, "results": [] })),
+        );
+    };
+    let search_dir = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "query": q.q,
+                    "results": [],
+                    "error": "Path outside allowed workspace roots"
+                })),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "query": q.q, "results": [] })),
+            );
         }
     };
 
@@ -19242,10 +19699,13 @@ async fn fs_search(
     .await
     .unwrap_or_default();
 
-    Json(serde_json::json!({
-        "query": q.q,
-        "results": results
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "query": q.q,
+            "results": results
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -19272,29 +19732,55 @@ async fn fs_locate(
             .trim_matches('\'')
             .trim()
             .to_string();
-    let root = q.path.as_deref().unwrap_or("").trim().to_string();
+    let root = q.path.unwrap_or_default();
+    let roots = state.active_workspace_roots().await;
+    let fallback_cwd = state.project.read().await.working_dir.clone();
     let bind_working_dir = state.bind_working_dir.clone();
 
     if raw_query.is_empty() {
-        return Json(serde_json::json!({
-            "query": q.q,
-            "results": Vec::<FsLocateItem>::new()
-        }));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "query": q.q,
+                "results": Vec::<FsLocateItem>::new()
+            })),
+        );
     }
 
+    let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_confined_existing_path(&root, None, &fallback_cwd, &bind_working_dir, &roots)
+    })
+    .await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "query": q.q, "results": Vec::<FsLocateItem>::new() })),
+        );
+    };
+    let search_dir = match resolved {
+        Ok(p) => p,
+        Err(FsConfinementError::OutsideWorkspace) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "query": q.q,
+                    "results": Vec::<FsLocateItem>::new(),
+                    "error": "Path outside allowed workspace roots"
+                })),
+            );
+        }
+        Err(FsConfinementError::NotFound) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "query": q.q,
+                    "results": Vec::<FsLocateItem>::new()
+                })),
+            );
+        }
+    };
+
     let results = tokio::task::spawn_blocking(move || {
-        let search_dir = if root.is_empty() || root == "." {
-            bind_working_dir
-        } else {
-            let p = std::path::PathBuf::from(&root);
-            if p.is_absolute() {
-                p
-            } else {
-                bind_working_dir.join(p)
-            }
-        };
-        let search_dir = search_dir.canonicalize().unwrap_or(search_dir);
-        let search_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&search_dir);
         if !search_dir.exists() {
             return Vec::<FsLocateItem>::new();
         }
@@ -19447,10 +19933,13 @@ async fn fs_locate(
     .await
     .unwrap_or_default();
 
-    Json(serde_json::json!({
-        "query": q.q,
-        "results": results
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "query": q.q,
+            "results": results
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -23972,8 +24461,8 @@ async fn run_server_with_options(
         .route("/api/skills", get(get_skills))
         .route("/commands", get(get_commands))
         .route("/api/commands", get(get_commands))
-        // Filesystem API
-        .route("/fs/list", get(fs_tree))
+        // Filesystem API (`/fs/list` uses `fs_list` for directory browsing; `/fs/tree` is workspace-confined)
+        .route("/fs/list", get(fs_list))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/pick_dir", post(fs_pick_dir))
         .route(
@@ -30652,7 +31141,7 @@ mod server_lifecycle_tests {
 
         let home = crate::tests::ScopedChatHome::new();
         let state = crate::tests::chat_test_state(&home);
-        let big_path = home.path().join("huge.bin");
+        let big_path = state.bind_working_dir.join("huge.bin");
         {
             let f = std::fs::File::create(&big_path).unwrap();
             f.set_len(MAX_FS_READ_BYTES + 1).unwrap();
@@ -30667,5 +31156,82 @@ mod server_lifecycle_tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn fs_endpoints_confine_paths_to_workspaces_and_sandbox_svg_raw() {
+        use axum::extract::{Query, State};
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_secret = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_secret, b"top-secret").unwrap();
+
+        // Outside-workspace reads/writes/stats/raw/actions must return 403 Forbidden.
+        let read_resp = fs_read(
+            State(state.clone()),
+            Query(FsReadQuery {
+                path: outside_secret.to_string_lossy().into_owned(),
+                cwd: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_resp.status(), StatusCode::FORBIDDEN);
+
+        let write_resp = fs_write(
+            State(state.clone()),
+            Json(FsWritePayload {
+                path: outside_dir
+                    .path()
+                    .join("pwn.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                content: Some("evil".into()),
+                cwd: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(write_resp.status(), StatusCode::FORBIDDEN);
+        assert!(!outside_dir.path().join("pwn.txt").exists());
+
+        // Switching project via update_project_state (/cd) opens access to the new workspace.
+        let new_proj = outside_dir.path().join("switched-proj");
+        std::fs::create_dir_all(&new_proj).unwrap();
+        let svg_file = new_proj.join("diagram.svg");
+        std::fs::write(&svg_file, b"<svg><script>alert(1)</script></svg>").unwrap();
+        {
+            let mut proj = state.project.write().await;
+            crate::update_project_state(&mut proj, &new_proj);
+        }
+
+        let svg_resp = fs_raw_handler(
+            State(state),
+            Query(FsRawQuery {
+                path: svg_file.to_string_lossy().into_owned(),
+                cwd: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(svg_resp.status(), StatusCode::OK);
+        assert_eq!(
+            svg_resp
+                .headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        let csp = svg_resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            csp.contains("sandbox") && csp.contains("default-src 'none'"),
+            "{csp}"
+        );
     }
 }

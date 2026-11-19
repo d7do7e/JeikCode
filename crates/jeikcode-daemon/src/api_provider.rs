@@ -1086,11 +1086,127 @@ struct UpstreamResolve {
     skip_tls_verify: bool,
 }
 
+/// Check whether `candidate` URL shares the same `(scheme, host, effective_port)` and
+/// equals or extends the path prefix of `saved` (so a caller cannot redirect a stored
+/// credential to a different host or a sibling tenant path on a shared proxy).
+fn urls_match_origin_and_prefix(candidate: &str, saved: &str) -> bool {
+    let Ok(cand_url) = reqwest::Url::parse(candidate.trim()) else {
+        return false;
+    };
+    let Ok(saved_url) = reqwest::Url::parse(saved.trim()) else {
+        return false;
+    };
+    if cand_url.scheme() != saved_url.scheme() {
+        return false;
+    }
+    let Some(cand_host) = cand_url.host_str() else {
+        return false;
+    };
+    let Some(saved_host) = saved_url.host_str() else {
+        return false;
+    };
+    if !cand_host.eq_ignore_ascii_case(saved_host) {
+        return false;
+    }
+    if cand_url.port_or_known_default() != saved_url.port_or_known_default() {
+        return false;
+    }
+    let cand_path = cand_url.path().trim_end_matches('/');
+    let saved_path = saved_url.path().trim_end_matches('/');
+    if saved_path.is_empty() {
+        return true;
+    }
+    cand_path == saved_path || cand_path.starts_with(&format!("{saved_path}/"))
+}
+
+/// Validate an upstream URL for `POST /providers/upstream-models` (`probe=false` and
+/// `probe=true`): allows http/https and local/private Ollama/vLLM hosts while blocking
+/// dangerous URI schemes, cloud metadata hostnames, and link-local / metadata IP ranges
+/// (including IPv4-mapped IPv6 addresses).
+fn validate_upstream_url(raw: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(raw.trim()).map_err(|e| format!("Invalid base_url: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "Unsupported base_url scheme `{}`; only http and https are allowed",
+            parsed.scheme()
+        ));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("base_url must include a host".into());
+    };
+    let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+    let lower_host = clean_host.to_ascii_lowercase();
+    if matches!(
+        lower_host.as_str(),
+        "metadata.google.internal" | "metadata.goog" | "instance-data"
+    ) {
+        return Err(format!("Blocked metadata host `{clean_host}`"));
+    }
+    if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+        check_upstream_ip_allowed(ip)?;
+    }
+    Ok(parsed)
+}
+
+fn check_upstream_ip_allowed(ip: std::net::IpAddr) -> Result<(), String> {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_link_local() || v4.is_multicast() {
+                return Err(format!("Blocked upstream IP `{v4}`"));
+            }
+            Ok(())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return check_upstream_ip_allowed(std::net::IpAddr::V4(mapped));
+            }
+            let segs = v6.segments();
+            let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+            let is_ec2_metadata = segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254];
+            if is_link_local || is_ec2_metadata || v6.is_multicast() {
+                return Err(format!("Blocked upstream IP `{v6}`"));
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn validate_upstream_dns_and_pin(
+    url: &reqwest::Url,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let Some(host) = url.host_str() else {
+        return Err("base_url must include a host".into());
+    };
+    let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+    if clean_host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(Vec::new());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((clean_host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for `{clean_host}`: {e}"))?
+        .collect();
+    for addr in &addrs {
+        check_upstream_ip_allowed(addr.ip())?;
+    }
+    Ok(addrs)
+}
+
+const MAX_UPSTREAM_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Fill blank form fields from `account` (then `provider_name`), matching TUI
-/// `upstream_spec_for_account`.
+/// `upstream_spec_for_account`. Never attaches a stored/env API key when the
+/// caller overrides `base_url` with a non-matching origin/prefix.
 fn resolve_upstream_request(req: &UpstreamModelsRequest) -> Result<UpstreamResolve, String> {
     let mut protocol = req.protocol.trim().to_string();
-    let mut base_url = req.base_url.trim().to_string();
+    let caller_base_url = req.base_url.trim().to_string();
+    let mut base_url = caller_base_url.clone();
+    let caller_supplied_key = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
     let mut api_key = req
         .api_key
         .as_deref()
@@ -1110,29 +1226,45 @@ fn resolve_upstream_request(req: &UpstreamModelsRequest) -> Result<UpstreamResol
         if let Some(config) = config.as_ref() {
             if let Some(acc) = config.logical_accounts().get(account_id) {
                 let preset = provider_preset::preset_or_compatible(&acc.provider);
+                let saved_base_url = acc
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| preset.default_base_url.map(str::to_string));
                 if base_url.is_empty() {
-                    base_url = acc
-                        .base_url
-                        .clone()
-                        .or_else(|| preset.default_base_url.map(str::to_string))
-                        .unwrap_or_default();
+                    if let Some(saved) = &saved_base_url {
+                        base_url = saved.clone();
+                    }
                 }
                 // Account owns the wire protocol. Form may still send the preset
                 // id (e.g. `deepseek`); always probe with the resolved wire type.
                 protocol = preset.provider_type.wire().to_string();
-                if api_key.is_empty() {
-                    api_key = acc
-                        .api_key
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("")
-                        .to_string();
-                }
-                if api_key.is_empty() {
+                let mut account_key = acc
+                    .api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                if account_key.is_empty() {
                     if let Some(env) = preset.api_key_env {
-                        api_key = std::env::var(env).unwrap_or_default();
+                        account_key = std::env::var(env).unwrap_or_default();
                     }
+                }
+                if !caller_supplied_key && !account_key.is_empty() {
+                    if !caller_base_url.is_empty()
+                        && !saved_base_url.as_deref().is_some_and(|saved| {
+                            urls_match_origin_and_prefix(&caller_base_url, saved)
+                        })
+                    {
+                        return Err(
+                            "Cannot supply a custom base_url without an explicit api_key when referencing a saved account"
+                                .into(),
+                        );
+                    }
+                    api_key = account_key;
                 }
                 skip_tls_verify = skip_tls_verify || acc.skip_tls_verify;
             }
@@ -1148,17 +1280,30 @@ fn resolve_upstream_request(req: &UpstreamModelsRequest) -> Result<UpstreamResol
         {
             if let Some(config) = config.as_ref() {
                 if let Some(p) = config.provider_config_for_selection(name) {
-                    if let Some(key) = p.resolved_api_key() {
-                        api_key = key;
+                    let saved_base_url = p
+                        .base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    if let Some(key) = p.resolved_api_key().filter(|k| !k.trim().is_empty()) {
+                        if !caller_supplied_key {
+                            if !caller_base_url.is_empty()
+                                && !saved_base_url.as_deref().is_some_and(|saved| {
+                                    urls_match_origin_and_prefix(&caller_base_url, saved)
+                                })
+                            {
+                                return Err(
+                                    "Cannot supply a custom base_url without an explicit api_key when referencing a saved provider"
+                                        .into(),
+                                );
+                            }
+                            api_key = key;
+                        }
                     }
                     if base_url.is_empty() {
-                        if let Some(url) = p
-                            .base_url
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            base_url = url.to_string();
+                        if let Some(url) = saved_base_url {
+                            base_url = url;
                         }
                     }
                     if protocol.is_empty() {
@@ -1173,6 +1318,7 @@ fn resolve_upstream_request(req: &UpstreamModelsRequest) -> Result<UpstreamResol
     if base_url.trim().is_empty() {
         return Err("base_url is required".into());
     }
+    let _ = validate_upstream_url(&base_url)?;
     if protocol.trim().is_empty() {
         protocol = "openai".into();
     }
@@ -1191,6 +1337,13 @@ pub(crate) async fn list_upstream_models(
         Ok(v) => v,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
+    let parsed_url = match validate_upstream_url(&resolved.base_url) {
+        Ok(u) => u,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = validate_upstream_dns_and_pin(&parsed_url).await {
+        return json_error(StatusCode::BAD_REQUEST, error).into_response();
+    }
     // 探活分支：走与真实对话相同的 provider 链路，只发一条「Hi」（无工具/无系统提示词），
     // 无论成败都返回 200，由前端渲染 OK(绿)/Failed(红)。
     if req.probe {
@@ -1411,9 +1564,18 @@ async fn fetch_upstream_model_ids(
     skip_tls_verify: bool,
 ) -> Result<Vec<String>, String> {
     let url = models_endpoint(protocol, base_url);
+    let parsed_url = validate_upstream_url(&url)?;
+    let pinned_addrs = validate_upstream_dns_and_pin(&parsed_url).await?;
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
-        .connect_timeout(std::time::Duration::from_secs(5));
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none());
+    if !pinned_addrs.is_empty() {
+        if let Some(host) = parsed_url.host_str() {
+            let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+            builder = builder.resolve_to_addrs(clean_host, &pinned_addrs);
+        }
+    }
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -1434,11 +1596,29 @@ async fn fetch_upstream_model_ids(
     } else if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let mut resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_UPSTREAM_MODELS_BODY_BYTES as u64 {
+            return Err(format!(
+                "Upstream response exceeded {} byte cap",
+                MAX_UPSTREAM_MODELS_BODY_BYTES
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if body.len().saturating_add(chunk.len()) > MAX_UPSTREAM_MODELS_BODY_BYTES {
+            return Err(format!(
+                "Upstream response exceeded {} byte cap",
+                MAX_UPSTREAM_MODELS_BODY_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&body);
     Ok(parse_model_ids(&text))
 }
 
@@ -1933,5 +2113,93 @@ mod tests {
         assert!(after_second.models.is_empty());
         assert_eq!(after_second.default_model, None);
         assert!(after_second.default_provider.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_upstream_blocks_custom_base_url_key_exfiltration_and_metadata_ssrf() {
+        let _cfg = jeikcode_config::test_util::isolated_config();
+        update_config(|config| {
+            config.provider_accounts.insert(
+                "corp-openai".into(),
+                ProviderAccountConfig {
+                    provider: "openai".into(),
+                    display_name: None,
+                    api_key: Some("sk-secret-do-not-leak".into()),
+                    base_url: Some("https://api.openai.com/v1".into()),
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+            Ok(())
+        })
+        .expect("seed account");
+
+        // Attacker supplies saved account + attacker base_url while omitting api_key.
+        let exfil_err = resolve_upstream_request(&UpstreamModelsRequest {
+            protocol: "openai".into(),
+            base_url: "https://attacker.example/v1".into(),
+            api_key: None,
+            account: Some("corp-openai".into()),
+            provider_name: None,
+            skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
+        })
+        .unwrap_err();
+        assert!(exfil_err.contains("custom base_url"), "{exfil_err}");
+
+        // Sibling tenant path on same proxy origin must also be rejected without explicit key.
+        assert!(resolve_upstream_request(&UpstreamModelsRequest {
+            protocol: "openai".into(),
+            base_url: "https://api.openai.com/attacker-hook".into(),
+            api_key: None,
+            account: Some("corp-openai".into()),
+            provider_name: None,
+            skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
+        })
+        .is_err());
+
+        // Same origin + explicit api_key override succeeds, and local Ollama succeeds.
+        assert!(resolve_upstream_request(&UpstreamModelsRequest {
+            protocol: "openai".into(),
+            base_url: "https://attacker.example/v1".into(),
+            api_key: Some("sk-caller-key".into()),
+            account: Some("corp-openai".into()),
+            provider_name: None,
+            skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
+        })
+        .is_ok());
+        assert!(resolve_upstream_request(&UpstreamModelsRequest {
+            protocol: "ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            api_key: None,
+            account: None,
+            provider_name: None,
+            skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
+        })
+        .is_ok());
+
+        // Cloud metadata & IPv4-mapped IPv6 metadata & non-http(s) schemes are blocked.
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/v1",
+            "http://[fd00:ec2::254]/latest",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                super::validate_upstream_url(bad).is_err(),
+                "must reject SSRF/scheme URL: {bad}"
+            );
+        }
     }
 }
