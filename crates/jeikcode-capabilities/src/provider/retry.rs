@@ -259,6 +259,107 @@ pub(crate) fn is_stale_connection_error(err: &reqwest::Error) -> bool {
     chain_has_transient_io(err) || chain_has_incomplete_message(err)
 }
 
+/// True if a mid-stream body read error belongs to the transient transport drop
+/// class (`io::Error` reset/abort/EOF or hyper `IncompleteMessage`) rather than
+/// a deterministic body/decode failure.
+pub(crate) fn is_transient_stream_read_error(err: &reqwest::Error) -> bool {
+    is_stale_connection_error(err)
+}
+
+/// Shared guard bounding silent mid-stream HTTP-200 body reopens across
+/// providers (`anthropic`, `openai_compat`, `gemini`, `ollama`).
+///
+/// Fast connection drops (`< 10s` attempt, `< 25s` cumulative) transparently
+/// reopen up to `max_attempts` (6). Slow upstream drops (e.g. a proxy thinking
+/// for ~20s before aborting SSE) stop silent reopen immediately so the kernel
+/// can surface a visible retry warning and enforce a strict slow-attempt cap
+/// instead of hanging silently for 2–4 minutes.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamReopenBudget {
+    started_at: tokio::time::Instant,
+    attempt_started_at: tokio::time::Instant,
+    attempt: u32,
+    reconnect_attempts: u32,
+    max_attempts: u32,
+    slow_attempt_threshold: Duration,
+    max_cumulative_slow_elapsed: Duration,
+}
+
+impl Default for StreamReopenBudget {
+    fn default() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            started_at: now,
+            attempt_started_at: now,
+            attempt: 1,
+            reconnect_attempts: 0,
+            max_attempts: 6,
+            slow_attempt_threshold: Duration::from_secs(10),
+            max_cumulative_slow_elapsed: Duration::from_secs(25),
+        }
+    }
+}
+
+impl StreamReopenBudget {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_thresholds(
+        max_attempts: u32,
+        slow_attempt_threshold: Duration,
+        max_cumulative_slow_elapsed: Duration,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            started_at: now,
+            attempt_started_at: now,
+            attempt: 1,
+            reconnect_attempts: 0,
+            max_attempts,
+            slow_attempt_threshold,
+            max_cumulative_slow_elapsed,
+        }
+    }
+
+    pub(crate) fn can_reopen_fast(&self, err: &reqwest::Error) -> bool {
+        is_transient_stream_read_error(err)
+            && self.attempt < self.max_attempts
+            && self.attempt_started_at.elapsed() < self.slow_attempt_threshold
+            && self.started_at.elapsed() < self.max_cumulative_slow_elapsed
+    }
+
+    pub(crate) fn begin_reopen(&mut self) {
+        self.reconnect_attempts += 1;
+        self.attempt_started_at = tokio::time::Instant::now();
+    }
+
+    pub(crate) fn commit_reopen(&mut self) {
+        self.attempt += 1;
+    }
+
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub(crate) fn reconnect_attempts(&self) -> u32 {
+        self.reconnect_attempts
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.attempt >= self.max_attempts
+    }
+
+    /// Whether handing off an un-recovered pre-content read failure to the
+    /// kernel should be marked `retryable` (only for transient transport drops
+    /// when fast reopens stopped early due to slow-attempt budget, never after
+    /// exhausting all `max_attempts`).
+    pub(crate) fn should_retry_in_kernel(&self, err: &reqwest::Error) -> bool {
+        is_transient_stream_read_error(err) && !self.exhausted()
+    }
+}
+
 /// Render an error plus its full `source()` chain as `top: cause: root`.
 /// reqwest's Display for a transport failure is only the opaque shell
 /// ("error sending request for url (…)"); the actionable cause
@@ -965,5 +1066,37 @@ mod tests {
         // It stays covered by is_connect(); behavior unchanged.
         assert!(e.is_connect());
         assert!(is_retryable_reqwest_error(&e));
+    }
+
+    #[tokio::test]
+    async fn stream_reopen_budget_allows_fast_reopens_and_blocks_slow_loops() {
+        let err = incomplete_message_error().await;
+
+        tokio::time::pause();
+        let mut fast = StreamReopenBudget::with_thresholds(
+            6,
+            Duration::from_secs(10),
+            Duration::from_secs(25),
+        );
+        for _ in 0..5 {
+            assert!(fast.can_reopen_fast(&err));
+            fast.begin_reopen();
+            fast.commit_reopen();
+        }
+        // Exhausted all 6 attempts -> no fast reopen and no kernel retry amplification.
+        assert!(!fast.can_reopen_fast(&err));
+        assert!(fast.exhausted());
+        assert!(!fast.should_retry_in_kernel(&err));
+
+        // Slow attempt (>=10s) -> stops silent fast reopen immediately, but allows kernel retry.
+        let slow = StreamReopenBudget::with_thresholds(
+            6,
+            Duration::from_secs(10),
+            Duration::from_secs(25),
+        );
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!slow.can_reopen_fast(&err));
+        assert!(!slow.exhausted());
+        assert!(slow.should_retry_in_kernel(&err));
     }
 }

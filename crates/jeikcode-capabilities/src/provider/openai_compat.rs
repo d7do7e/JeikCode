@@ -498,6 +498,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let idle = self.cfg.idle_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let mut reopen_budget = retry::StreamReopenBudget::new();
         let resp = match open_stream(
             &client,
             &url,
@@ -529,16 +530,8 @@ impl LlmProvider for OpenAiCompatProvider {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
             // replay-sensitive event has reached the consumer is safe to redo
             // wholesale — metadata may repeat, but no text/tool-call/UI delta was
-            // committed. Common cause: gateways that reset the
-            // connection under load (surfaces as "error decoding response body" /
-            // "unexpected EOF during chunk size line"). Once replay-sensitive output
-            // has been emitted, retry would duplicate it, so the error is surfaced.
-            // 1 initial open + up to 2 transparent reopens. A gateway resetting
-            // connections under load can drop more than one attempt before a
-            // healthy backend answers, so a single reopen is not enough.
-            const MAX_STREAM_ATTEMPTS: u32 = 6;
-            let mut stream_attempt = 1u32;
-            let mut reconnect_attempts = 0u32;
+            // committed. Fast drops transparently reopen up to 6 attempts; slow
+            // attempts (>=10s) hand off to the kernel after attempt 1.
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = SseDecoder::new();
@@ -576,15 +569,16 @@ impl LlmProvider for OpenAiCompatProvider {
                         }
                         Ok(Some(Err(e))) => {
                             // No replay-sensitive output reached the consumer yet → re-open
-                            // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
-                                reconnect_attempts += 1;
+                            // fast transient drops transparently (bounded by StreamReopenBudget).
+                            if !emitted_replay_sensitive && reopen_budget.can_reopen_fast(&e) {
+                                let delay = retry::compute_backoff(reopen_budget.attempt(), &policy);
+                                reopen_budget.begin_reopen();
                                 // Brief backoff so an immediate reopen does not slam a
                                 // gateway that is resetting under load. Bounded and
                                 // esc-interruptible: the kernel races the whole
                                 // stream.next() against cancellation, so a sleep here is
                                 // cancelled with the turn.
-                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
+                                tokio::time::sleep(delay).await;
                                 // A body that died mid-read on a half-closed pooled socket
                                 // is the canonical poisoned-pool trigger. Rebuild BEFORE the
                                 // reopen so its FIRST attempt gets a fresh (empty) pool instead
@@ -603,25 +597,28 @@ impl LlmProvider for OpenAiCompatProvider {
                                         return;
                                     }
                                 }
-                                if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
-                                {
-                                    stream_attempt += 1;
-                                    resp = fresh;
-                                    continue 'reopen;
+                                match open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await {
+                                    Ok(fresh) => {
+                                        reopen_budget.commit_reopen();
+                                        resp = fresh;
+                                        continue 'reopen;
+                                    }
+                                    Err(open_err) => {
+                                        yield StreamEvent::Error(open_err);
+                                        return;
+                                    }
                                 }
-                                // Re-open failed: fall through and surface the
-                                // original mid-stream error below.
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: !emitted_replay_sensitive
+                                    && reopen_budget.should_retry_in_kernel(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {
                                         retry::StreamReadRecovery::PartialResponse
                                     } else {
                                         retry::StreamReadRecovery::RetryExhausted {
-                                            attempts: reconnect_attempts,
+                                            attempts: reopen_budget.reconnect_attempts(),
                                         }
                                     },
                                 ),

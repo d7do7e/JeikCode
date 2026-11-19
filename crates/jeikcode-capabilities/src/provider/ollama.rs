@@ -156,6 +156,7 @@ impl LlmProvider for OllamaProvider {
         let idle = self.cfg.idle_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let mut reopen_budget = retry::StreamReopenBudget::new();
         let resp = open_stream(
             &client,
             &url,
@@ -171,12 +172,8 @@ impl LlmProvider for OllamaProvider {
         let s = async_stream::stream! {
             // A body that dies before replay-sensitive output reaches the consumer is
             // safe to redo wholesale. Metadata may repeat; content and tool data may not.
-            // 1 initial open + up to 2 transparent reopens — a gateway resetting
-            // connections under load can drop more than one attempt before a
-            // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 6;
-            let mut stream_attempt = 1u32;
-            let mut reconnect_attempts = 0u32;
+            // Fast transient drops reopen up to 6 attempts; slow attempts (>=10s) surface
+            // to the kernel after attempt 1.
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = OllamaNdjsonDecoder::new();
@@ -211,26 +208,34 @@ impl LlmProvider for OllamaProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
-                                reconnect_attempts += 1;
+                            if !emitted_replay_sensitive && reopen_budget.can_reopen_fast(&e) {
+                                let delay = retry::compute_backoff(reopen_budget.attempt(), &policy);
+                                reopen_budget.begin_reopen();
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
-                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await {
-                                    stream_attempt += 1;
-                                    resp = fresh;
-                                    continue 'reopen;
+                                tokio::time::sleep(delay).await;
+                                match open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await {
+                                    Ok(fresh) => {
+                                        reopen_budget.commit_reopen();
+                                        resp = fresh;
+                                        continue 'reopen;
+                                    }
+                                    Err(open_err) => {
+                                        yield StreamEvent::Error(open_err);
+                                        return;
+                                    }
                                 }
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: !emitted_replay_sensitive
+                                    && reopen_budget.should_retry_in_kernel(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {
                                         retry::StreamReadRecovery::PartialResponse
                                     } else {
                                         retry::StreamReadRecovery::RetryExhausted {
-                                            attempts: reconnect_attempts,
+                                            attempts: reopen_budget.reconnect_attempts(),
                                         }
                                     },
                                 ),

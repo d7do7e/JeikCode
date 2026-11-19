@@ -526,6 +526,13 @@ pub struct Conversation {
     /// 0. ADDITIVE: `#[serde(default)]` so a v1 snapshot still deserializes (→ 0).
     #[serde(default)]
     pub cache_epoch: u64,
+    /// Deterministic FNV-1a hashes of frozen-prefix context blocks (`<memory>`,
+    /// `<project_instructions>`, `<available_skills>`, `<mcp_server_instructions>`)
+    /// last delivered to the model. Used once assistant history exists so prefix-preserving
+    /// reconciles append tail updates only when content actually changes, and compaction
+    /// draining a tail update does not trigger repeated re-injection.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub delivered_context_hashes: std::collections::BTreeMap<String, u64>,
 }
 
 impl Conversation {
@@ -841,6 +848,22 @@ fn system_block_order(text: &str) -> u8 {
     }
 }
 
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn context_block_hash(block: Option<&str>) -> u64 {
+    match block {
+        Some(text) => fnv1a_64(text.as_bytes()),
+        None => fnv1a_64(b"\0__jeikcode_context_cleared__"),
+    }
+}
+
 fn frozen_user_block_order(text: &str) -> u8 {
     if text.starts_with("<available_skills>") || text.starts_with("=== AVAILABLE SKILLS") {
         30
@@ -907,6 +930,44 @@ impl Conversation {
     /// from the system run, re-inserted as an ordered synthetic user) so resume
     /// stays compaction-safe and does not grow a duplicate.
     pub fn reconcile_frozen_user_block(&mut self, header: &str, block: Option<String>) {
+        // Once the conversation has assistant history, mutating the leading prefix
+        // breaks upstream prompt caching and orphans sessions on content-anchored
+        // proxies. Preserve the prefix byte-identically and append a single tail
+        // synthetic-user update only if the rendered block differs from the last
+        // delivered copy.
+        if self.messages.iter().any(|m| m.role == Role::Assistant) {
+            let next_hash = context_block_hash(block.as_deref());
+            let prev_hash = self
+                .delivered_context_hashes
+                .get(header)
+                .copied()
+                .unwrap_or_else(|| {
+                    let first_real_user = self
+                        .messages
+                        .iter()
+                        .position(|m| m.role == Role::User && !m.synthetic)
+                        .unwrap_or(self.messages.len());
+                    let existing = self.messages[..first_real_user].iter().find(|m| {
+                        ((m.role == Role::User && m.synthetic) || m.role == Role::System)
+                            && m.text.starts_with(header)
+                    });
+                    context_block_hash(existing.map(|m| m.text.as_str()))
+                });
+            if next_hash == prev_hash {
+                return;
+            }
+            self.delivered_context_hashes
+                .insert(header.to_string(), next_hash);
+            let update_body = match block {
+                Some(text) => format!("<!-- jeikcode:context-update:{header} -->\n{text}"),
+                None => format!(
+                    "<!-- jeikcode:context-update:{header} -->\n[Context cleared: {header} is now empty]"
+                ),
+            };
+            self.push(Message::synthetic_user(update_body));
+            return;
+        }
+
         let existing = self.find_before_first_real_user(header);
         let target_order = frozen_user_block_order(header);
 
@@ -1188,6 +1249,7 @@ impl Conversation {
                 Some(Conversation {
                     messages: candidate,
                     cache_epoch: epoch_after,
+                    delivered_context_hashes: self.delivered_context_hashes.clone(),
                 }),
             )
         } else {
@@ -1461,6 +1523,8 @@ pub struct SessionSnapshot {
     pub turn_counter: u64,
     #[serde(default)]
     pub request_counter: u64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub delivered_context_hashes: std::collections::BTreeMap<String, u64>,
 }
 
 impl SessionSnapshot {
@@ -1475,6 +1539,7 @@ impl SessionSnapshot {
             model: None,
             turn_counter,
             request_counter,
+            delivered_context_hashes: std::collections::BTreeMap::new(),
         }
     }
     /// Snapshot a live conversation losslessly at the current version, carrying its
@@ -1492,6 +1557,7 @@ impl SessionSnapshot {
             model: None,
             turn_counter,
             request_counter,
+            delivered_context_hashes: convo.delivered_context_hashes.clone(),
         }
     }
     /// Max `meta.turn_id` / `meta.request_id` over the messages (0 when none carry meta).
@@ -2632,6 +2698,7 @@ mod tests {
             let mut c = Conversation {
                 messages: base.clone(),
                 cache_epoch: 0,
+                delivered_context_hashes: std::collections::BTreeMap::new(),
             };
             let floor = c.sacred_floor();
             let view = CompactionView {
@@ -2906,5 +2973,54 @@ mod tests {
         let plan = NoCompaction.plan(&view).await;
         assert!(plan.is_noop(), "NoCompaction must return a noop plan");
         assert_eq!(plan, CompactionPlan::noop());
+    }
+
+    #[test]
+    fn reconcile_frozen_user_block_preserves_prefix_and_dedups_tail_after_assistant_history() {
+        let mut c = Conversation::new();
+        c.push(Message::system("<environment>\npersona"));
+        c.push(Message::synthetic_user("<memory>\n- old fact\n</memory>"));
+        c.push(Message::user("first task"));
+        c.push(Message::assistant("done", vec![]));
+
+        let prefix_mem_before = c.messages[1].clone();
+
+        // Unchanged memory after assistant history: no-op.
+        c.reconcile_frozen_user_block("<memory>", Some("<memory>\n- old fact\n</memory>".into()));
+        assert_eq!(c.messages.len(), 4);
+        assert_eq!(c.messages[1], prefix_mem_before);
+
+        // Changed memory after assistant history: prefix untouched, tail update appended once.
+        let updated = "<memory>\n- old fact\n- new fact\n</memory>".to_string();
+        c.reconcile_frozen_user_block("<memory>", Some(updated.clone()));
+        assert_eq!(c.messages.len(), 5);
+        assert_eq!(
+            c.messages[1], prefix_mem_before,
+            "messages prefix must stay byte-identical"
+        );
+        assert!(c.messages[4].synthetic);
+        assert!(c.messages[4]
+            .text
+            .starts_with("<!-- jeikcode:context-update:<memory> -->\n"));
+        assert!(c.messages[4].text.contains("- new fact"));
+
+        // Repeated reconcile with identical updated block is a no-op.
+        c.reconcile_frozen_user_block("<memory>", Some(updated.clone()));
+        assert_eq!(c.messages.len(), 5);
+
+        // Even if compaction drains the tail update message, delivered_context_hashes survives
+        // and prevents re-injecting the already-delivered update.
+        c.messages.remove(4);
+        c.reconcile_frozen_user_block("<memory>", Some(updated));
+        assert_eq!(c.messages.len(), 4);
+
+        // Clearing the store (None) after assistant history appends an explicit cleared notice
+        // without mutating the prefix.
+        c.reconcile_frozen_user_block("<memory>", None);
+        assert_eq!(c.messages.len(), 5);
+        assert_eq!(c.messages[1], prefix_mem_before);
+        assert!(c.messages[4]
+            .text
+            .contains("[Context cleared: <memory> is now empty]"));
     }
 }

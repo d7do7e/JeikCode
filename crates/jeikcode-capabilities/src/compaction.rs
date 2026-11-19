@@ -3200,6 +3200,7 @@ Dependencies verified.
         let convo = jeikcode_kernel::message::Conversation {
             messages: msgs,
             cache_epoch: 0,
+            ..Default::default()
         };
         let floor = convo.sacred_floor();
         assert_eq!(
@@ -3517,6 +3518,7 @@ Dependencies verified.
         let mut convo = jeikcode_kernel::message::Conversation {
             messages: msgs,
             cache_epoch: 0,
+            ..Default::default()
         };
         let report = convo.apply_plan(plan, floor);
         assert!(report.committed, "intra-turn compaction plan must commit");

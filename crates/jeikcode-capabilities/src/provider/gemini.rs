@@ -143,6 +143,7 @@ impl LlmProvider for GeminiProvider {
         let api_key = self.cfg.api_key.clone();
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let mut reopen_budget = retry::StreamReopenBudget::new();
         let resp = open_stream(
             &client,
             &url,
@@ -156,9 +157,6 @@ impl LlmProvider for GeminiProvider {
         .await?;
 
         let s = async_stream::stream! {
-            const MAX_STREAM_ATTEMPTS: u32 = 6;
-            let mut stream_attempt = 1u32;
-            let mut reconnect_attempts = 0u32;
             let mut resp = resp;
 
             'reopen: loop {
@@ -204,11 +202,12 @@ impl LlmProvider for GeminiProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
-                                reconnect_attempts += 1;
-                                tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
+                            if !emitted_replay_sensitive && reopen_budget.can_reopen_fast(&e) {
+                                let delay = retry::compute_backoff(reopen_budget.attempt(), &policy);
+                                reopen_budget.begin_reopen();
+                                tokio::time::sleep(delay).await;
                                 let _ = client.rebuild(false);
-                                if let Ok(fresh) = open_stream(
+                                match open_stream(
                                     &client,
                                     &url,
                                     &body,
@@ -218,20 +217,27 @@ impl LlmProvider for GeminiProvider {
                                     rate_limit_retry_owner,
                                     open_timeout,
                                 ).await {
-                                    stream_attempt += 1;
-                                    resp = fresh;
-                                    continue 'reopen;
+                                    Ok(fresh) => {
+                                        reopen_budget.commit_reopen();
+                                        resp = fresh;
+                                        continue 'reopen;
+                                    }
+                                    Err(open_err) => {
+                                        yield StreamEvent::Error(open_err);
+                                        return;
+                                    }
                                 }
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: !emitted_replay_sensitive
+                                    && reopen_budget.should_retry_in_kernel(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {
                                         retry::StreamReadRecovery::PartialResponse
                                     } else {
                                         retry::StreamReadRecovery::RetryExhausted {
-                                            attempts: reconnect_attempts,
+                                            attempts: reopen_budget.reconnect_attempts(),
                                         }
                                     },
                                 ),

@@ -231,6 +231,7 @@ async fn unsupported_snapshot_version_errors_and_starts_empty() {
         model: None,
         turn_counter: 0,
         request_counter: 0,
+        delivered_context_hashes: std::collections::BTreeMap::new(),
     };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![
@@ -431,6 +432,7 @@ async fn unsupported_snapshot_fallback_seeds_persona_like_fresh() {
         model: None,
         turn_counter: 0,
         request_counter: 0,
+        delivered_context_hashes: std::collections::BTreeMap::new(),
     };
 
     let provider = Arc::new(RecordingProvider::new(vec![vec![

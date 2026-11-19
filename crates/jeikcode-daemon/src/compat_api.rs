@@ -544,6 +544,8 @@ fn list_project_sessions(working_dir: &std::path::Path) -> Vec<(String, SessionS
             preferred_model: meta.as_ref().and_then(|m| m.preferred_model.clone()),
             reasoning_effort: meta.as_ref().and_then(|m| m.reasoning_effort.clone()),
             thinking_budget: meta.as_ref().and_then(|m| m.thinking_budget),
+            origin: entry.origin,
+            schedule_id: entry.schedule_id.clone(),
             protocol_key: meta.as_ref().and_then(|m| m.protocol_key.clone()),
         };
         out.push((entry.project_bucket, summary));

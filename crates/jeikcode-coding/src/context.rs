@@ -449,6 +449,7 @@ mod tests {
         let convo = Conversation {
             messages: msgs.clone(),
             cache_epoch: 0,
+            ..Default::default()
         };
         let expected_wire_non_sys = convo
             .model_history()

@@ -2083,6 +2083,7 @@ impl RunningAgent {
             })
             .count();
         convo.messages.truncate(prefix_len);
+        convo.delivered_context_hashes.clear();
         self.hooks.session_start(convo, true).await;
         let handoff = handoff_summary.trim();
         if !handoff.is_empty() {
@@ -2249,6 +2250,7 @@ impl RunningAgent {
                 let mut c = Conversation {
                     messages: snap.messages.clone(),
                     cache_epoch: snap.cache_epoch,
+                    delivered_context_hashes: snap.delivered_context_hashes.clone(),
                 };
                 // An externally-supplied or mid-turn-persisted snapshot may be
                 // API-INVALID: a DANGLING assistant tool_call (a tool_use with no
@@ -3147,6 +3149,11 @@ impl RunningAgent {
         let mut rate_limit_waits: u32 = 0;
         // Dedicated HTTP 529 / `overloaded_error` retry counter (reset on natural completion).
         let mut overload_retries: u32 = 0;
+        // Mid-stream retryable error counters (NOT reset by `Ok(s)` open at HTTP 200;
+        // reset only on natural round completion). Tracks slow attempts separately so a
+        // hanging proxy fails fast after 1 retry (2 attempts total) with a visible warning.
+        let mut midstream_error_retries: u32 = 0;
+        let mut slow_midstream_attempts: u32 = 0;
         // EMPTY-RESPONSE retry counter for the WHOLE turn: incremented on each re-issue
         // after a content-free 200. UNLIKE the two above it is NOT reset per round —
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
@@ -4314,6 +4321,67 @@ impl RunningAgent {
                         retry_this_round = true;
                         break;
                     }
+                    StreamEvent::Error(e) if !saw_stream_content && e.retryable => {
+                        let attempt_elapsed_ms =
+                            (self.clock.now_millis().saturating_sub(start)).max(0) as u64;
+                        if attempt_elapsed_ms >= SLOW_EMPTY_ATTEMPT_MS {
+                            slow_midstream_attempts = slow_midstream_attempts.saturating_add(1);
+                        }
+                        let limit = if midstream_error_retries >= MAX_PROVIDER_RETRIES
+                            || slow_midstream_attempts >= SLOW_EMPTY_MAX_ATTEMPTS
+                        {
+                            None
+                        } else if slow_midstream_attempts > 0 {
+                            let remaining_slow =
+                                SLOW_EMPTY_MAX_ATTEMPTS.saturating_sub(slow_midstream_attempts);
+                            Some(
+                                (midstream_error_retries + remaining_slow)
+                                    .min(MAX_PROVIDER_RETRIES),
+                            )
+                        } else {
+                            Some(MAX_PROVIDER_RETRIES)
+                        };
+                        if let Some(effective_max) = limit {
+                            midstream_error_retries += 1;
+                            let wait = (midstream_error_retries as u64 * 3).min(15);
+                            self.rt
+                                .emit(AgentEvent::Warning(i18n::format_agent_retry_api(
+                                    &retry_reason(&e),
+                                    wait,
+                                    midstream_error_retries,
+                                    effective_max,
+                                )));
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                            }
+                            retry_this_round = true;
+                            break;
+                        }
+                        Self::persist_interrupted_turn(
+                            convo,
+                            &assistant_text,
+                            &reasoning,
+                            &reasoning_blocks,
+                            &pending_calls,
+                            suppress_internal_stream,
+                            Some(&assistant_message_id),
+                            Some(e.message.as_str()),
+                        );
+                        self.hooks.on_error(&e.message).await;
+                        self.rt.emit(AgentEvent::Error {
+                            message: e.message,
+                            http_status: e.http_status,
+                            code: e.code,
+                        });
+                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                            .await;
+                        return;
+                    }
                     StreamEvent::Error(e) => {
                         Self::persist_interrupted_turn(
                             convo,
@@ -4362,6 +4430,8 @@ impl RunningAgent {
             // error event, and resetting there would disable the five-wait fuse.
             rate_limit_waits = 0;
             overload_retries = 0;
+            midstream_error_retries = 0;
+            slow_midstream_attempts = 0;
             // The stream reached its natural end this round (no timeout, no 429
             // retry) — refill the reconnect budget so a LATER round's stall gets a
             // fresh MAX_STREAM_RETRIES.
@@ -8742,5 +8812,81 @@ mod synthetic_send_tests {
                 reason: StopReason::ToolLoopDetected
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn midstream_retryable_error_caps_slow_attempts_without_resetting_on_open() {
+        use crate::clock::Clock;
+        use crate::stream::ProviderError;
+        use crate::testkit::RecordingProvider;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct SlowStepClock(AtomicU64);
+        impl Clock for SlowStepClock {
+            fn now_millis(&self) -> u64 {
+                self.0.fetch_add(15_000, Ordering::SeqCst)
+            }
+        }
+
+        // Three slow pre-content retryable stream errors. With SLOW_EMPTY_MAX_ATTEMPTS = 2
+        // (1 initial + 1 slow retry), the kernel must emit 1 Warning, make only 2 provider
+        // calls (NOT loop infinitely or retry 6 times), and fail with ProviderError.
+        let err = ProviderError {
+            retryable: true,
+            message: "stream dropped".into(),
+            ..Default::default()
+        };
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![StreamEvent::Error(err.clone())],
+            vec![StreamEvent::Error(err)],
+            vec![StreamEvent::TextDelta(
+                "should never reach attempt 3".into(),
+            )],
+        ]));
+        let calls = provider.calls();
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .clock(Arc::new(SlowStepClock(AtomicU64::new(1_000))))
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut stop_reason = None;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Warning(w) => warnings.push(w),
+                AgentEvent::Error { message, .. } => errors.push(message),
+                AgentEvent::TurnComplete { reason } => {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "slow midstream errors cap at 2 attempts"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected 1 visible retry warning: {warnings:?}"
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(stop_reason, Some(StopReason::ProviderError));
     }
 }
