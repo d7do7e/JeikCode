@@ -1265,12 +1265,13 @@ impl Conversation {
                 if let Some(meta) = candidate
                     .iter_mut()
                     .rev()
-                    .find(|m| m.role == Role::Assistant)
+                    .find(|m| m.role == Role::Assistant && !m.is_display_only() && m.meta.is_some())
                     .and_then(|m| m.meta.as_mut())
                 {
                     meta.utilization = (meta.utilization as f64 * ratio) as f32;
                     meta.used_tokens = (meta.used_tokens as f64 * ratio).round() as u32;
                     meta.tokens.prompt = (meta.tokens.prompt as f64 * ratio).round() as u32;
+                    meta.tokens.cached = meta.tokens.cached.min(meta.tokens.prompt);
                 }
             }
             let epoch_after = epoch_before + 1;
@@ -3158,5 +3159,73 @@ mod tests {
 
         assert_eq!(c.last_pressure(), (100_000, 12_000, 0.12));
         assert_eq!(c.last_context_tokens(), 15_000);
+    }
+
+    #[test]
+    fn prepare_plan_pressure_relief_skips_diagnostic_and_clamps_cached() {
+        let mut c = Conversation::new();
+        c.push(Message::system("sys"));
+        c.push(Message::user("first"));
+        let mut a1 = Message::assistant("x".repeat(400), vec![]);
+        a1.meta = Some(MessageMeta {
+            tokens: crate::stream::TokenUsage {
+                prompt: 40_000,
+                completion: 500,
+                cached: 35_000,
+            },
+            used_tokens: 40_000,
+            ctx_window: 100_000,
+            utilization: 0.40,
+            ..Default::default()
+        });
+        c.push(a1);
+        c.push(Message::user("second"));
+        let mut a2 = Message::assistant("real reply", vec![]);
+        a2.meta = Some(MessageMeta {
+            tokens: crate::stream::TokenUsage {
+                prompt: 80_000,
+                completion: 1_000,
+                cached: 70_000,
+            },
+            used_tokens: 80_000,
+            ctx_window: 100_000,
+            utilization: 0.80,
+            ..Default::default()
+        });
+        c.push(a2);
+
+        // Trailing diagnostic and empty metaless assistant rows must not block pressure relief.
+        let mut diag = Message::assistant("transient error", vec![]);
+        diag.internal_origin = Some(TURN_DIAGNOSTIC_ORIGIN.into());
+        c.push(diag);
+        c.push(Message::assistant("", vec![]));
+
+        let plan = CompactionPlan {
+            drain_from: 1,
+            drain_to: 3,
+            summary: Some("short".into()),
+            rewrites: vec![],
+            resume_note: None,
+        };
+        let report = c.apply_plan(plan, 1);
+        assert!(report.committed);
+
+        let (_win, used, util) = c.last_pressure();
+        assert!(used < 80_000, "used_tokens must scale down, got {used}");
+        assert!(util < 0.80, "utilization must scale down, got {util}");
+
+        let meta = c
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == Role::Assistant && !m.is_display_only())
+            .find_map(|m| m.meta.as_ref())
+            .expect("surviving assistant meta");
+        assert!(
+            meta.tokens.cached <= meta.tokens.prompt,
+            "cached ({}) must be clamped to scaled prompt ({})",
+            meta.tokens.cached,
+            meta.tokens.prompt
+        );
     }
 }
