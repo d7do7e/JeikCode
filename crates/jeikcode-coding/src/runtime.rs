@@ -2444,6 +2444,12 @@ impl CodingRuntimeControlReceiver {
     pub async fn recv(&mut self) -> Option<CodingRuntimeControl> {
         self.rx.recv().await
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_phase_for_test(&self, phase: RuntimePhase) {
+        self.state
+            .store(runtime_phase_state(0, phase), Ordering::Release);
+    }
 }
 
 #[doc(hidden)]

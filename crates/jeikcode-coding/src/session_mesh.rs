@@ -148,6 +148,22 @@ impl MeshLocalState {
 
     pub(crate) fn bind_hop_context(&self, turn_id: Option<u64>, ctx: MeshHopContext) {
         if let Ok(mut guard) = self.active_hop.write() {
+            if let Some((Some(existing_id), existing_ctx)) = guard.as_mut() {
+                if turn_id == Some(*existing_id) {
+                    existing_ctx.hop_depth = existing_ctx.hop_depth.max(ctx.hop_depth);
+                    for s in ctx.visited_sessions {
+                        if !existing_ctx.visited_sessions.iter().any(|seen| seen == &s) {
+                            existing_ctx.visited_sessions.push(s);
+                        }
+                    }
+                    for s in ctx.waiting_sessions {
+                        if !existing_ctx.waiting_sessions.iter().any(|seen| seen == &s) {
+                            existing_ctx.waiting_sessions.push(s);
+                        }
+                    }
+                    return;
+                }
+            }
             *guard = Some((turn_id, ctx));
         }
     }
@@ -700,7 +716,6 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 visited_sessions: next_visited,
                 waiting_sessions: next_waiting,
             };
-            local.bind_hop_context(None, hop_context.clone());
 
             let repo_scope_attr = if same_repo {
                 "same_repo"
@@ -743,7 +758,6 @@ async fn dispatch_ipc_request(local: &MeshLocalState, payload: MeshRequest) -> M
                 Ok(SubmitReceipt::Started { turn_id, .. })
                 | Ok(SubmitReceipt::Steered { turn_id, .. }) => turn_id,
                 Err(err) => {
-                    local.clear_hop_context();
                     return MeshResponse::Error {
                         message: format!("target session `{session_id}` rejected submit: {err}"),
                     };
@@ -854,3 +868,7 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "session_mesh_tests.rs"]
+mod tests;
