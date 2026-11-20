@@ -3,6 +3,8 @@
 //! minus the coding enrichments (file_history backup, file_store/read_cache
 //! invalidation, LSP notify).
 
+use std::path::Path;
+
 use super::{err, ok, resolve_path};
 use crate::tool_feedback::parse_tool_args;
 use async_trait::async_trait;
@@ -11,6 +13,78 @@ use serde::Deserialize;
 use serde_json::json;
 
 pub struct WriteFileTool;
+
+fn has_symlink_after_temp_root(path: &Path) -> bool {
+    let lex = crate::pathnorm::lexical_normalize(path);
+    let temp_bases = [
+        crate::pathnorm::lexical_normalize(&std::env::temp_dir()),
+        Path::new("/tmp").to_path_buf(),
+    ];
+    for base in &temp_bases {
+        if let Ok(rel) = lex.strip_prefix(base) {
+            let mut cur = base.clone();
+            for comp in rel.components() {
+                cur.push(comp);
+                if std::fs::symlink_metadata(&cur)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
+
+fn validate_write_target(resolved: &Path, target_fs: &Path, cwd: &Path) -> Result<(), String> {
+    let lexical = crate::pathnorm::lexical_normalize(resolved);
+    if crate::pathnorm::path_case_key(&lexical) == crate::pathnorm::path_case_key(target_fs) {
+        return Ok(());
+    }
+    let resolved_str = target_fs.to_string_lossy();
+    let lexical_str = lexical.to_string_lossy();
+    let inside = crate::tools::write_approval::path_in_workspace(&resolved_str, cwd);
+    let marker_args = serde_json::json!({
+        "file_path": crate::pathnorm::to_display(target_fs),
+    })
+    .to_string();
+    let sensitive = crate::tools::path_is_sensitive(target_fs)
+        || crate::tools::references_sensitive_path(&marker_args)
+        || crate::ignore_policy::IgnorePolicy::is_sensitive_at(cwd, target_fs);
+    let lexical_sensitive = crate::tools::path_is_sensitive(&lexical);
+    let final_is_symlink = std::fs::symlink_metadata(resolved)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if inside && lexical_sensitive && !final_is_symlink {
+        return Ok(());
+    }
+    if inside && !sensitive {
+        return Ok(());
+    }
+    let lexical_under_cwd = lexical.starts_with(crate::pathnorm::lexical_normalize(cwd));
+    let temp_alias_ok = !final_is_symlink
+        && !lexical_under_cwd
+        && crate::tools::write_approval::path_in_temp_dir(&lexical_str, cwd)
+        && crate::tools::write_approval::path_in_temp_dir(&resolved_str, cwd)
+        && !has_symlink_after_temp_root(resolved);
+    if temp_alias_ok && !sensitive {
+        return Ok(());
+    }
+    Err(format!(
+        "write: {} resolves through a symlink/junction to {} ({}). \
+         Use the explicit target path so approval can classify it. \
+         The file was NOT modified.",
+        crate::pathnorm::to_display(resolved),
+        crate::pathnorm::to_display(target_fs),
+        if sensitive {
+            "sensitive target"
+        } else {
+            "outside the workspace"
+        }
+    ))
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -69,6 +143,16 @@ impl Tool for WriteFileTool {
             };
         let path = resolve_path(&a.path, &ctx.working_dir);
         let disp = crate::pathnorm::to_display(&path);
+
+        let Some(resolved_target) = super::sensitive_path::try_resolved_filesystem_path(&path)
+        else {
+            return err(format!(
+                "write: {disp} cannot be safely resolved (symlink loop or unresolved parent traversal). The file was NOT modified."
+            ));
+        };
+        if let Err(msg) = validate_write_target(&path, &resolved_target, &ctx.working_dir) {
+            return err(msg);
+        }
 
         // State machine check: if file exists, enforce read confirmation in current turn
         if path.exists()
@@ -558,5 +642,77 @@ mod tests {
             "Turn 3 blind write must be intercepted again: {}",
             r3.content
         );
+    }
+
+    #[tokio::test]
+    async fn unresolved_parent_traversal_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let r = WriteFileTool
+            .execute(
+                r#"{"path":"missing/../../escape.txt","content":"bad\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            r.is_error,
+            "unresolved traversal must be refused: {}",
+            r.content
+        );
+        assert!(!d.path().join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_and_live_symlink_escapes_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+
+        let dangling_out = outside.join("created_via_dangling.txt");
+        symlink(&dangling_out, ws.join("out.txt")).unwrap();
+        let r1 = WriteFileTool
+            .execute(r#"{"path":"out.txt","content":"pwn\n"}"#, &ctx(&ws))
+            .await;
+        assert!(
+            r1.is_error,
+            "dangling outside symlink must be refused: {}",
+            r1.content
+        );
+        assert!(
+            !dangling_out.exists(),
+            "must not create target outside workspace"
+        );
+
+        let dangling_ssh = outside.join(".ssh").join("authorized_keys");
+        symlink(&dangling_ssh, ws.join("key.txt")).unwrap();
+        let r2 = WriteFileTool
+            .execute(r#"{"path":"key.txt","content":"ssh-rsa ...\n"}"#, &ctx(&ws))
+            .await;
+        assert!(
+            r2.is_error,
+            "dangling sensitive symlink must be refused: {}",
+            r2.content
+        );
+        assert!(!dangling_ssh.exists(), "must not create sensitive target");
+
+        let live_out = outside.join("real.txt");
+        std::fs::write(&live_out, "original\n").unwrap();
+        symlink(&live_out, ws.join("live.txt")).unwrap();
+        let r3 = WriteFileTool
+            .execute(
+                r#"{"path":"live.txt","content":"overwritten\n"}"#,
+                &ctx(&ws),
+            )
+            .await;
+        assert!(
+            r3.is_error,
+            "live outside symlink must be refused: {}",
+            r3.content
+        );
+        assert_eq!(std::fs::read_to_string(&live_out).unwrap(), "original\n");
     }
 }

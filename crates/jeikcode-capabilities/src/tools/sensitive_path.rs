@@ -395,9 +395,130 @@ fn local_read_targets(tool: &str, args: &str, cwd: &Path) -> Vec<PathBuf> {
     }
 }
 
+const MAX_SYMLINK_DEPTH: usize = 32;
+
+#[derive(Clone)]
+enum PathToken {
+    PrefixOrRoot(std::ffi::OsString),
+    ParentDir,
+    Normal(std::ffi::OsString),
+}
+
+fn push_path_tokens(path: &Path, into: &mut std::collections::VecDeque<PathToken>, prepend: bool) {
+    let tokens: Vec<PathToken> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::CurDir => None,
+            Component::Prefix(p) => Some(PathToken::PrefixOrRoot(p.as_os_str().to_os_string())),
+            Component::RootDir => Some(PathToken::PrefixOrRoot(c.as_os_str().to_os_string())),
+            Component::ParentDir => Some(PathToken::ParentDir),
+            Component::Normal(n) => Some(PathToken::Normal(n.to_os_string())),
+        })
+        .collect();
+    if prepend {
+        for tok in tokens.into_iter().rev() {
+            into.push_front(tok);
+        }
+    } else {
+        into.extend(tokens);
+    }
+}
+
+/// Canonicalize as much of `path` as exists, following both live and dangling symlinks
+/// (up to `MAX_SYMLINK_DEPTH` hops), then re-attach any missing suffix.
+///
+/// Returns `None` when `path` traverses `..` over a non-existent prefix, pops above a
+/// relative root, hits a symlink loop, or encounters an unreadable/empty symlink target.
+pub(crate) fn try_resolved_filesystem_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(canon) = crate::pathnorm::canonicalize(path) {
+        return Some(canon);
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    push_path_tokens(path, &mut queue, false);
+
+    let mut cur = PathBuf::new();
+    let mut hops = 0usize;
+    let mut missing_prefix = false;
+
+    while let Some(tok) = queue.pop_front() {
+        match tok {
+            PathToken::PrefixOrRoot(os) => {
+                cur.push(os);
+                if !missing_prefix && cur.components().any(|c| matches!(c, Component::RootDir)) {
+                    if let Ok(canon) = crate::pathnorm::canonicalize(&cur) {
+                        cur = canon;
+                    }
+                }
+            }
+            PathToken::ParentDir => {
+                if missing_prefix {
+                    return None;
+                }
+                if !cur.pop() && !cur.components().any(|c| matches!(c, Component::RootDir)) {
+                    return None;
+                }
+            }
+            PathToken::Normal(name) => {
+                let next = cur.join(&name);
+                if !missing_prefix {
+                    match std::fs::symlink_metadata(&next) {
+                        Ok(meta) => {
+                            let is_symlink = meta.file_type().is_symlink();
+                            if is_symlink || crate::pathnorm::canonicalize(&next).is_err() {
+                                match std::fs::read_link(&next) {
+                                    Ok(target) if !target.as_os_str().is_empty() => {
+                                        hops += 1;
+                                        if hops > MAX_SYMLINK_DEPTH {
+                                            return None;
+                                        }
+                                        let target = crate::pathnorm::strip_verbatim_path(&target);
+                                        match target.components().next() {
+                                            Some(Component::Prefix(_)) => cur.clear(),
+                                            Some(Component::RootDir) => {
+                                                let prefix =
+                                                    cur.components().find_map(|c| match c {
+                                                        Component::Prefix(p) => {
+                                                            Some(p.as_os_str().to_os_string())
+                                                        }
+                                                        _ => None,
+                                                    });
+                                                cur.clear();
+                                                if let Some(p) = prefix {
+                                                    cur.push(p);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        push_path_tokens(&target, &mut queue, true);
+                                        continue;
+                                    }
+                                    _ if is_symlink => return None,
+                                    _ => {}
+                                }
+                            }
+                            cur = crate::pathnorm::canonicalize(&next).unwrap_or(next);
+                            continue;
+                        }
+                        Err(_) => {
+                            missing_prefix = true;
+                        }
+                    }
+                }
+                cur = next;
+            }
+        }
+    }
+
+    if let Ok(canon) = crate::pathnorm::canonicalize(&cur) {
+        return Some(canon);
+    }
+    Some(crate::pathnorm::strip_verbatim_path(&cur))
+}
+
 /// Canonicalize as much of `path` as exists, then re-attach any missing suffix.
-/// This resolves symlink/junction parents for not-yet-created write targets such as
-/// `workspace/link/new.txt` where `link` points into `~/.ssh`.
+/// This resolves symlink/junction parents (including dangling symlinks) for
+/// not-yet-created write targets such as `workspace/out.txt` -> `~/.ssh/authorized_keys`.
 pub(crate) fn has_unresolved_parent_traversal(path: &Path) -> bool {
     crate::pathnorm::canonicalize(path).is_err()
         && path
@@ -406,30 +527,7 @@ pub(crate) fn has_unresolved_parent_traversal(path: &Path) -> bool {
 }
 
 pub(crate) fn resolved_filesystem_path(path: &Path) -> PathBuf {
-    if let Ok(canon) = crate::pathnorm::canonicalize(path) {
-        return canon;
-    }
-
-    // A missing prefix followed by `..` cannot be reduced safely without first
-    // creating that prefix: lexical normalization would be wrong across symlinks,
-    // while deepest-existing-ancestor fallback can incorrectly classify an escape
-    // as inside the workspace. Keep the unresolved spelling so callers can fail
-    // closed instead of manufacturing a misleading canonical identity.
-    if has_unresolved_parent_traversal(path) {
-        return path.to_path_buf();
-    }
-
-    let mut ancestor = path.parent();
-    while let Some(existing) = ancestor {
-        if let Ok(canon) = crate::pathnorm::canonicalize(existing) {
-            if let Ok(suffix) = path.strip_prefix(existing) {
-                return canon.join(suffix);
-            }
-            return canon;
-        }
-        ancestor = existing.parent();
-    }
-    path.to_path_buf()
+    try_resolved_filesystem_path(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Classify the actual filesystem target, not just the model-supplied spelling.
@@ -438,10 +536,9 @@ pub(crate) fn resolved_filesystem_path(path: &Path) -> PathBuf {
 /// docker config, `.env.*`, etc.) after a benign symlink name has been resolved.
 pub(crate) fn resolved_target_sensitivity(raw: &str, cwd: &Path) -> (bool, PathBuf) {
     let resolved = super::resolve_path(raw, cwd);
-    if has_unresolved_parent_traversal(&resolved) {
+    let Some(identity) = try_resolved_filesystem_path(&resolved) else {
         return (true, resolved);
-    }
-    let identity = resolved_filesystem_path(&resolved);
+    };
     let marker_args = serde_json::json!({
         "file_path": crate::pathnorm::to_display(&identity),
     })
@@ -471,10 +568,13 @@ fn local_read_target_sensitivity(tool: &str, args: &str, cwd: &Path) -> Option<(
     let mut any_sensitive = false;
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        if has_unresolved_parent_traversal(&target) {
-            any_sensitive = true;
-        }
-        let identity = resolved_filesystem_path(&target);
+        let identity = match try_resolved_filesystem_path(&target) {
+            Some(identity) => identity,
+            None => {
+                any_sensitive = true;
+                target
+            }
+        };
         let marker_args = serde_json::json!({
             "file_path": crate::pathnorm::to_display(&identity),
         })
@@ -1021,6 +1121,150 @@ mod tests {
         assert!(
             targets.iter().any(|p| p.ends_with("custom_secrets")),
             "relative glob prefix must be extracted for sensitivity check: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn try_resolved_filesystem_path_handles_existing_and_missing_parent_traversals() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+
+        let valid = try_resolved_filesystem_path(&ws.join("sub/../new_file.txt"))
+            .expect("existing prefix before .. must resolve cleanly");
+        assert_eq!(
+            valid,
+            crate::pathnorm::canonicalize(&ws)
+                .unwrap()
+                .join("new_file.txt")
+        );
+
+        assert!(
+            try_resolved_filesystem_path(&ws.join("missing/../escape.txt")).is_none(),
+            "missing prefix before .. must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlink_and_loop_fail_closed_in_sensitive_path_gate() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+
+        let dangling_ssh = ws.join("out.txt");
+        let ssh_target = outside.join(".ssh").join("authorized_keys");
+        symlink(&ssh_target, &dangling_ssh).unwrap();
+
+        let (sens, resolved) = resolved_target_sensitivity("out.txt", &ws);
+        assert!(
+            sens,
+            "dangling symlink to ~/.ssh/authorized_keys must be sensitive"
+        );
+        assert!(
+            resolved.ends_with("authorized_keys"),
+            "resolved identity must follow dangling symlink: {}",
+            resolved.display()
+        );
+
+        // Symlink loop must fail closed as sensitive in both resolved_target_sensitivity and SensitivePathGate.
+        let loop_a = ws.join("loop_a");
+        let loop_b = ws.join("loop_b");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        let (loop_sens, _) = resolved_target_sensitivity("loop_a", &ws);
+        assert!(loop_sens, "symlink loop must fail closed as sensitive");
+
+        let gate = SensitivePathGate::pinned(ws);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"out.txt"}"#.into(),
+        };
+        let res = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            res.is_deny(),
+            "dangling symlink to sensitive path must trigger approval (fail closed)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dangling_windows_junction_to_sensitive_dir_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside_ssh = dir.path().join("outside").join(".ssh");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_ssh).unwrap();
+
+        let junction = ws.join("benign_dir");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside_ssh)
+            .output()
+            .expect("mklink /J must run");
+        assert!(
+            status.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        // Remove the target directory so the junction becomes dangling.
+        std::fs::remove_dir(&outside_ssh).unwrap();
+
+        let (sens, resolved) = resolved_target_sensitivity("benign_dir/authorized_keys", &ws);
+        assert!(
+            sens,
+            "dangling Windows junction to .ssh must be flagged sensitive: {}",
+            resolved.display()
+        );
+        assert!(
+            resolved
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with(".ssh/authorized_keys"),
+            "resolved path must follow dangling junction: {}",
+            resolved.display()
+        );
+        assert!(
+            !crate::tools::write_approval::path_in_workspace("benign_dir/authorized_keys", &ws),
+            "dangling junction escaping workspace must NOT be classified in-workspace"
+        );
+
+        // WriteFileTool::execute itself must refuse to write through the dangling junction.
+        let write_res = crate::tools::write::WriteFileTool
+            .execute(
+                r#"{"path":"benign_dir/authorized_keys","content":"bad\n"}"#,
+                &jeikcode_kernel::tool::ToolContext {
+                    working_dir: ws.clone(),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    progress: jeikcode_kernel::tool::ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await;
+        assert!(
+            write_res.is_error,
+            "WriteFileTool must refuse dangling junction escape: {}",
+            write_res.content
+        );
+
+        let gate = SensitivePathGate::pinned(ws);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"benign_dir/authorized_keys"}"#.into(),
+        };
+        let res = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            res.is_deny(),
+            "dangling junction to .ssh must trigger SensitivePathGate approval"
         );
     }
 }

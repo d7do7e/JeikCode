@@ -95,39 +95,31 @@ fn write_targets(tool: &str, args: &str) -> Vec<String> {
 static TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     [std::env::temp_dir(), PathBuf::from("/tmp")]
         .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter_map(|p| crate::pathnorm::canonicalize(p).ok())
         .collect()
 });
 
-/// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Walks the target's
-/// ancestors, canonicalizing the deepest one that EXISTS (so a not-yet-created leaf is
-/// classified by its parent) — canonicalization resolves `..` traversal and symlinks, so a
-/// path that escapes every root via `..` or a symlink is correctly NOT matched.
+/// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Resolves symlinks
+/// (including dangling symlinks) via `try_resolved_filesystem_path` so a dangling symlink or
+/// unresolved `..` traversal that escapes every root is NOT matched.
 fn path_under_any(raw: &str, cwd: &Path, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return false;
     }
     let target = resolve_path(raw, cwd);
-    if super::sensitive_path::has_unresolved_parent_traversal(&target) {
+    let Some(resolved) = super::sensitive_path::try_resolved_filesystem_path(&target) else {
         return false;
-    }
-    let mut cur: Option<&Path> = Some(target.as_path());
-    while let Some(p) = cur {
-        if let Ok(canon) = std::fs::canonicalize(p) {
-            return roots.iter().any(|r| canon.starts_with(r));
-        }
-        cur = p.parent();
-    }
-    false
+    };
+    roots.iter().any(|r| resolved.starts_with(r))
 }
 
 /// True iff `raw` (resolved against `cwd`) lands INSIDE the workspace. Handles a not-yet-created
-/// file by canonicalizing its deepest EXISTING ancestor, and rejects `..` escapes because both
-/// the root and the (existing-prefix of the) target are canonicalized before the prefix check —
-/// a purely lexical `starts_with` would let `ws/../etc` through. CONSERVATIVE: an
+/// file by resolving existing prefixes and symlinks (including dangling symlinks), and rejects `..`
+/// escapes because both the root and target are resolved before the prefix check — a purely lexical
+/// `starts_with` would let `ws/../etc` or dangling symlinks through. CONSERVATIVE: an
 /// un-canonicalizable root returns `false` (→ defer to the prompt).
 pub(crate) fn path_in_workspace(raw: &str, cwd: &Path) -> bool {
-    match std::fs::canonicalize(cwd) {
+    match crate::pathnorm::canonicalize(cwd) {
         Ok(root) => path_under_any(raw, cwd, std::slice::from_ref(&root)),
         Err(_) => false,
     }
@@ -148,13 +140,15 @@ pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
 /// files under `~/Downloads/…`), without opening any other location.
 pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     let resolved = resolve_path(raw, cwd);
-    // Scope to the parent directory, which usually EXISTS even when the file being
-    // created does not — so canonicalizing it gives a stable key across the
-    // create-then-edit sequence. Fall back to the resolved path if there is no parent.
-    let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
-    super::sensitive_path::resolved_filesystem_path(&dir)
-        .to_string_lossy()
-        .into_owned()
+    // Resolve symlinks (including dangling leaf/parent symlinks) BEFORE taking `.parent()`
+    // so two symlinks inside `ws` targeting different external directories never collapse
+    // onto `ws` and share a `writedir::` / `bashdir::` grant.
+    let resolved_target = super::sensitive_path::resolved_filesystem_path(&resolved);
+    let dir = resolved_target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(resolved_target);
+    dir.to_string_lossy().into_owned()
 }
 
 /// Grant key for an out-of-workspace write. Free fn (no `self`) so it can run inside
@@ -1012,5 +1006,130 @@ mod tests {
             out_outside.is_deny(),
             "out-of-workspace search_replace must prompt (fail closed), got {out_outside:?}"
         );
+    }
+
+    #[test]
+    fn existing_subdir_parent_traversal_stays_in_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("sub")).unwrap();
+        assert!(
+            path_in_workspace("sub/../in_ws_new.rs", ws.path()),
+            "existing subdir followed by .. back into workspace must stay in-workspace"
+        );
+        assert!(
+            !path_in_workspace("../outside_new.rs", ws.path()),
+            "parent traversal out of workspace must not be in-workspace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlink_escape_and_sensitive_target_do_not_auto_approve() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let escape_link = ws.join("out.txt");
+        symlink(outside.join("new_outside.txt"), &escape_link).unwrap();
+        assert!(
+            !path_in_workspace("out.txt", &ws),
+            "dangling symlink escaping workspace must NOT classify as in-workspace"
+        );
+
+        let gate = WriteApprovalGate::pinned(ws.clone());
+        let tool = write_tool();
+        let mut call_out = write_call("out.txt");
+        let res_out = gate.before(&mut call_out, &tool, &silent_rt()).await;
+        assert!(
+            res_out.is_deny(),
+            "dangling symlink escaping workspace must prompt (fail closed), got {res_out:?}"
+        );
+
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+        let ssh_link = ws.join("key.txt");
+        symlink(outside.join(".ssh").join("authorized_keys"), &ssh_link).unwrap();
+        let mut call_ssh = write_call("key.txt");
+        let res_ssh = gate.before(&mut call_ssh, &tool, &silent_rt()).await;
+        assert!(
+            res_ssh.is_deny(),
+            "dangling symlink to ~/.ssh/authorized_keys must prompt as sensitive"
+        );
+        assert!(
+            res_ssh.deny_reason().unwrap().contains("sensitive"),
+            "expected sensitive denial reason, got {:?}",
+            res_ssh.deny_reason()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_in_workspace_targeting_distinct_external_dirs_get_distinct_grant_keys() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside_a = dir.path().join("outside_a");
+        let outside_b = dir.path().join("outside_b");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_a).unwrap();
+        std::fs::create_dir_all(&outside_b).unwrap();
+
+        symlink(outside_a.join("file_a.txt"), ws.join("link_a")).unwrap();
+        symlink(outside_b.join("file_b.txt"), ws.join("link_b")).unwrap();
+
+        let key_a = canonical_dir_key("link_a", &ws);
+        let key_b = canonical_dir_key("link_b", &ws);
+        let ws_canon = crate::pathnorm::canonicalize(&ws).unwrap();
+
+        assert_ne!(
+            key_a, key_b,
+            "symlinks in ws targeting distinct external dirs must not share a grant key"
+        );
+        assert_ne!(
+            key_a,
+            ws_canon.to_string_lossy().as_ref(),
+            "grant key must resolve to external parent, not workspace root"
+        );
+        assert!(key_a.contains("outside_a"), "got {key_a}");
+        assert!(key_b.contains("outside_b"), "got {key_b}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_in_workspace_targeting_distinct_external_dirs_get_distinct_grant_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside_a = dir.path().join("outside_a");
+        let outside_b = dir.path().join("outside_b");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_a).unwrap();
+        std::fs::create_dir_all(&outside_b).unwrap();
+
+        for (link_name, target) in [("link_a", &outside_a), ("link_b", &outside_b)] {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(ws.join(link_name))
+                .arg(target)
+                .output()
+                .expect("mklink /J must run");
+            assert!(
+                out.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let key_a = canonical_dir_key("link_a/file_a.txt", &ws);
+        let key_b = canonical_dir_key("link_b/file_b.txt", &ws);
+        assert_ne!(
+            key_a, key_b,
+            "junctions targeting distinct external dirs must get distinct grant keys"
+        );
+        assert!(key_a.contains("outside_a"), "got {key_a}");
+        assert!(key_b.contains("outside_b"), "got {key_b}");
     }
 }

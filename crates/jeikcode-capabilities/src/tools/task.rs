@@ -77,8 +77,26 @@ impl DenySensitivePaths {
                 return false;
             }
             let resolved = crate::tools::resolve_path(trimmed, wd);
-            crate::tools::path_is_sensitive(&resolved)
-                || crate::ignore_policy::IgnorePolicy::is_sensitive_at(wd, &resolved)
+            let identity =
+                match crate::tools::sensitive_path::try_resolved_filesystem_path(&resolved) {
+                    Some(identity) => identity,
+                    None => {
+                        // For a real workspace on disk, an unresolvable path (symlink loop or
+                        // `missing/..` traversal) must fail closed as sensitive; keep the lexical
+                        // fallback only for synthetic non-existent test roots.
+                        if crate::pathnorm::canonicalize(wd).is_ok() {
+                            return true;
+                        }
+                        crate::pathnorm::lexical_normalize(&resolved)
+                    }
+                };
+            let marker_args = serde_json::json!({
+                "file_path": crate::pathnorm::to_display(&identity),
+            })
+            .to_string();
+            crate::tools::path_is_sensitive(&identity)
+                || crate::tools::references_sensitive_path(&marker_args)
+                || crate::ignore_policy::IgnorePolicy::is_sensitive_at(wd, &identity)
         })
     }
 
@@ -334,15 +352,25 @@ impl WorkerScopeGate {
     }
 
     /// Resolve `raw` (absolute, or relative to the working dir) to a working-dir-relative,
-    /// `.`/`..`-collapsed path with `/` separators. `None` if it escapes the working dir
-    /// (absolute-outside, or `..` above the root) — such writes are denied.
+    /// symlink-resolved, `.`/`..`-collapsed path with `/` separators. `None` if it escapes the
+    /// working dir (absolute-outside, `..` above the root, symlink/dangling-symlink escape, or
+    /// symlink loop) — such writes are denied.
     fn workspace_relative(&self, raw: &str) -> Option<String> {
         let joined = crate::pathutil::resolve_path(raw, &self.working_dir);
-        let base = lexical_normalize(&self.working_dir);
-        let full = lexical_normalize(&joined);
-        full.strip_prefix(&base)
-            .ok()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+        if crate::pathnorm::canonicalize(&self.working_dir).is_ok() {
+            let base =
+                crate::tools::sensitive_path::try_resolved_filesystem_path(&self.working_dir)?;
+            let full = crate::tools::sensitive_path::try_resolved_filesystem_path(&joined)?;
+            full.strip_prefix(&base)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        } else {
+            let base = lexical_normalize(&self.working_dir);
+            let full = lexical_normalize(&joined);
+            full.strip_prefix(&base)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        }
     }
 
     /// Whether a working-dir-relative DIRECTORY (a `search_replace` root) is within scope: it
@@ -3037,6 +3065,128 @@ mod tests {
         assert!(g_srcrs
             .violation("edit_file", r#"{"file_path":"src/main.rs"}"#)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn real_workspace_worker_scope_and_deny_sensitive_handle_parent_traversals() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("src/auth")).unwrap();
+
+        let g = WorkerScopeGate::new(&["src/auth/**".into()], &ws);
+        assert!(
+            g.violation("write", r#"{"path":"src/auth/../auth/new.rs"}"#)
+                .is_none(),
+            "valid .. over existing dir returning inside scope must be allowed"
+        );
+        assert!(
+            g.violation("write", r#"{"path":"../outside.rs"}"#)
+                .is_some(),
+            "out-of-workspace .. must be denied by WorkerScopeGate"
+        );
+        assert!(
+            g.violation("write", r#"{"path":"missing/../src/auth/new.rs"}"#)
+                .is_some(),
+            "unresolved missing/.. traversal must fail closed"
+        );
+
+        let deny_gate = DenySensitivePaths::new(&ws);
+        let tool: Arc<dyn Tool> = Arc::new(super::super::write::WriteFileTool);
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let rt = RequestCtx::new(events, None);
+        let mut outside_call = ToolCall {
+            id: "1".into(),
+            name: "write".into(),
+            arguments: r#"{"path":"../outside.rs","content":"x"}"#.into(),
+        };
+        assert!(
+            !deny_gate
+                .before(&mut outside_call, &tool, &rt)
+                .await
+                .is_deny(),
+            "non-sensitive ../outside.rs must not trigger DenySensitivePaths (WorkerScopeGate owns it)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_and_live_symlinks_are_blocked_by_worker_scope_and_deny_sensitive() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+
+        // 1. Dangling symlink inside scoped dir pointing outside workspace.
+        symlink(outside.join("new_outside.rs"), ws.join("src/escape.rs")).unwrap();
+        // 2. Live symlink inside scoped dir pointing outside workspace.
+        let live_outside = outside.join("real.rs");
+        std::fs::write(&live_outside, "ok").unwrap();
+        symlink(&live_outside, ws.join("src/live.rs")).unwrap();
+        // 3. Dangling symlink inside scoped dir pointing to another in-workspace file outside scope.
+        symlink(ws.join("Cargo.toml"), ws.join("src/cargo_link.rs")).unwrap();
+        // 4. Symlink loop inside scoped dir.
+        symlink(ws.join("src/loop_b"), ws.join("src/loop_a")).unwrap();
+        symlink(ws.join("src/loop_a"), ws.join("src/loop_b")).unwrap();
+
+        let g = WorkerScopeGate::new(&["src/**".into()], &ws);
+        assert!(
+            g.violation("write", r#"{"path":"src/escape.rs"}"#)
+                .is_some(),
+            "dangling symlink escaping workspace must be denied by WorkerScopeGate"
+        );
+        assert!(
+            g.violation("write", r#"{"path":"src/live.rs"}"#).is_some(),
+            "live symlink escaping workspace must be denied by WorkerScopeGate"
+        );
+        assert!(
+            g.violation("write", r#"{"path":"src/cargo_link.rs"}"#)
+                .is_some(),
+            "symlink to out-of-scope workspace file must be denied by WorkerScopeGate"
+        );
+        assert!(
+            g.violation("write", r#"{"path":"src/loop_a"}"#).is_some(),
+            "symlink loop must fail closed in WorkerScopeGate"
+        );
+
+        // 5. DenySensitivePaths catches dangling symlink to ~/.ssh/authorized_keys and symlink loops.
+        symlink(
+            outside.join(".ssh").join("authorized_keys"),
+            ws.join("benign_out.txt"),
+        )
+        .unwrap();
+        let deny_gate = DenySensitivePaths::new(&ws);
+        let write_tool: Arc<dyn Tool> = Arc::new(super::super::write::WriteFileTool);
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let rt = RequestCtx::new(events, None);
+
+        let mut ssh_call = ToolCall {
+            id: "1".into(),
+            name: "write".into(),
+            arguments: r#"{"path":"benign_out.txt","content":"key"}"#.into(),
+        };
+        assert!(
+            matches!(
+                deny_gate.before(&mut ssh_call, &write_tool, &rt).await,
+                BeforeOutcome::DenyTurn { .. }
+            ),
+            "dangling symlink to ~/.ssh/authorized_keys must trigger DenySensitivePaths"
+        );
+
+        let mut loop_call = ToolCall {
+            id: "2".into(),
+            name: "write".into(),
+            arguments: r#"{"path":"src/loop_a","content":"x"}"#.into(),
+        };
+        assert!(
+            matches!(
+                deny_gate.before(&mut loop_call, &write_tool, &rt).await,
+                BeforeOutcome::DenyTurn { .. }
+            ),
+            "symlink loop must fail closed in DenySensitivePaths"
+        );
     }
 
     #[test]
