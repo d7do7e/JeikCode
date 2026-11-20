@@ -452,14 +452,10 @@ pub async fn ensure_registry_runner(
         task,
         ..
     } = runtime;
-    handle
-        .set_mode(mode)
-        .await
-        .map_err(|error| format!("failed to set registry runner mode: {error}"))?;
-    let _ = handle
-        .wait_mcp_ready(jeikcode_capabilities::mcp::FIRST_TURN_SOFT_WAIT)
-        .await;
 
+    // Bind into SessionRuntimeRegistry BEFORE awaiting set_mode / wait_mcp_ready so
+    // concurrent requests/observers immediately attach to this handle instead of
+    // hitting SessionInUse while MCP servers initialize (>1s).
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
     let _ = reg.open_or_attach(session_id.clone(), working_dir.clone());
     if !reg.bind_handle(&session_id, handle.clone(), None) {
@@ -503,6 +499,14 @@ pub async fn ensure_registry_runner(
         }
         let _ = task.await;
     });
+
+    handle
+        .set_mode(mode)
+        .await
+        .map_err(|error| format!("failed to set registry runner mode: {error}"))?;
+    let _ = handle
+        .wait_mcp_ready(jeikcode_capabilities::mcp::FIRST_TURN_SOFT_WAIT)
+        .await;
     Ok(())
 }
 
