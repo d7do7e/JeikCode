@@ -147,7 +147,10 @@ fn resolve_git_bash_path() -> String {
             return path.clone();
         }
     }
-    if let Ok(out) = std::process::Command::new("where").arg("bash").output() {
+    let mut cmd = std::process::Command::new("where");
+    cmd.arg("bash");
+    jeikcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
+    if let Ok(out) = cmd.output() {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
@@ -385,12 +388,13 @@ pub(crate) fn kill_terminal_process(proc: &LiveTerminalProcess) {
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        jeikcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
+        let _ = cmd.status();
     }
     #[cfg(unix)]
     {
