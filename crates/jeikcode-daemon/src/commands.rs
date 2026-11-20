@@ -131,14 +131,14 @@ fn command_project_bucket(
     Ok(bucket)
 }
 
-fn load_native_command_session(
+fn load_native_command_session_in_root(
+    sessions_root: &Path,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     id: &str,
 ) -> anyhow::Result<Option<NativeCommandSession>> {
     let bucket = command_project_bucket(working_dir, project_hash)?;
-    let manager =
-        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(bucket));
+    let manager = NativeSessionManager::with_root(sessions_root.join(bucket));
     let has_existing = [
         manager.meta_path(id)?,
         manager.snapshot_path(id)?,
@@ -159,13 +159,14 @@ fn load_native_command_session(
     }))
 }
 
-fn load_command_session_view(
+fn load_command_session_view_in_root(
+    sessions_root: &Path,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     id: &str,
 ) -> anyhow::Result<crate::legacy_convert::CatalogSessionView> {
     let bucket = command_project_bucket(working_dir, project_hash)?;
-    crate::legacy_convert::load_catalog_session_view_in_project(&bucket, id)?
+    crate::legacy_convert::load_catalog_session_view_in_project_root(sessions_root, &bucket, id)?
         .ok_or_else(|| anyhow::anyhow!("session {id:?} not found"))
 }
 
@@ -374,11 +375,16 @@ async fn exec_native_compact(
     arg: &str,
     session: NativeCommandSession,
     working_dir: &std::path::Path,
+    config_path: &Path,
     telemetry: Arc<jeikcode_telemetry::Telemetry>,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<NativeCompactOutcome> {
-    let config =
-        jeikcode_config::config::Config::load(&jeikcode_config::config::Config::default_path())?;
+    let config_path_owned = config_path.to_path_buf();
+    let config = tokio::task::spawn_blocking(move || {
+        jeikcode_config::config::Config::load(&config_path_owned)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("config load task failed: {e}"))??;
     let resolved = crate::live_api::resolve_provider_name(&config, provider_name);
     // Validate the provider up front for a clean error (the old core path did
     // `providers.get(...).ok_or("Provider not found")`); without this a missing
@@ -419,34 +425,44 @@ async fn exec_native_compact(
     let mut notice_text = None;
     let mut revision = None;
     if compacted.outcome.committed {
-        let mgr_root = session.manager.root().to_path_buf();
-        // 先用压缩前的完整会话把 v4 显示日志补齐，再改写 snapshot 并追加压缩边界。
-        // 否则一旦此前 `/undo` 或编辑使 display.jsonl 失效，`append_display_notice`
-        // 会返回 `None`，压缩成功标记就退化成仅发起端可见的本地瞬态提示。
-        crate::ensure_v4_display_for_session(&session.manager, &session.loaded);
-        commit_native_compaction(
-            session,
-            compacted.messages,
-            compacted.mutation,
-            compacted.outcome.estimated_tokens_after as u64,
-        )?;
         let mark = jeikcode_config::i18n::format_compaction_mark(
             compacted.outcome.removed_messages,
             compacted.outcome.estimated_tokens_before,
             compacted.outcome.estimated_tokens_after,
         );
         notice_text = Some(mark.clone());
-        let mgr = NativeSessionManager::with_root(mgr_root);
-        // 压缩边界是转录里的正式记录：保留显示日志分配的权威 `seq`/`id`，
-        // 交给调用方原样广播，所有实例按同一序号摆放。
-        notice = mgr
-            .append_display_notice(&sid_for_notice, mark, None)
-            .ok()
-            .flatten();
-        revision = mgr
-            .load_snapshot(&sid_for_notice)
-            .ok()
-            .map(|snap| snap.cache_epoch);
+        let after_tokens = compacted.outcome.estimated_tokens_after as u64;
+        let compacted_messages = compacted.messages;
+        let compaction_mutation = compacted.mutation;
+        let (committed_notice, committed_rev) = tokio::task::spawn_blocking(move || {
+            let mgr_root = session.manager.root().to_path_buf();
+            // 先用压缩前的完整会话把 v4 显示日志补齐，再改写 snapshot 并追加压缩边界。
+            // 否则一旦此前 `/undo` 或编辑使 display.jsonl 失效，`append_display_notice`
+            // 会返回 `None`，压缩成功标记就退化成仅发起端可见的本地瞬态提示。
+            crate::ensure_v4_display_for_session(&session.manager, &session.loaded);
+            commit_native_compaction(
+                session,
+                compacted_messages,
+                compaction_mutation,
+                after_tokens,
+            )?;
+            let mgr = NativeSessionManager::with_root(mgr_root);
+            // 压缩边界是转录里的正式记录：保留显示日志分配的权威 `seq`/`id`，
+            // 交给调用方原样广播，所有实例按同一序号摆放。
+            let notice = mgr
+                .append_display_notice(&sid_for_notice, mark, None)
+                .ok()
+                .flatten();
+            let revision = mgr
+                .load_snapshot(&sid_for_notice)
+                .ok()
+                .map(|snap| snap.cache_epoch);
+            anyhow::Ok((notice, revision))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("compaction commit task failed: {e}"))??;
+        notice = committed_notice;
+        revision = committed_rev;
     }
     Ok(NativeCompactOutcome {
         result: CommandResult::Compact {
@@ -461,15 +477,17 @@ async fn exec_native_compact(
     })
 }
 
-fn exec_undo(
+fn exec_undo_in_root(
+    sessions_root: &Path,
     working_dir: &Path,
     session_id: Option<&str>,
     arg: &str,
     project_hash: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for undo"))?;
-    let native = load_native_command_session(working_dir, project_hash, sid)?
-        .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
+    let native =
+        load_native_command_session_in_root(sessions_root, working_dir, project_hash, sid)?
+            .ok_or_else(|| anyhow::anyhow!("session {sid:?} not found"))?;
     exec_native_undo(native, arg)
 }
 
@@ -495,32 +513,38 @@ async fn exec_context(
     session_id: Option<&str>,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
-    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for context"))?;
-    let session = load_command_session_view(working_dir, project_hash, sid)?;
-    // Report the SAME context the live (native) turn tracks: the prompt tokens the
-    // provider reported on the last assistant turn, projected onto the CURRENT
-    // provider window. No parallel core tool-assembly (which diverged from the
-    // native turn's actual tools/prompt and produced misleading per-zone numbers).
-    let config =
-        jeikcode_config::config::Config::load(&jeikcode_config::config::Config::default_path())?;
-    let resolved = crate::live_api::resolve_provider_name(&config, provider);
-    let provider_config = config
-        .provider_config_for_selection(&resolved)
-        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
-    let ctx_window = provider_config.context_window as u32;
-    let used_tokens = snapshot_used_tokens(&session.snapshot.messages);
-    let utilization = if ctx_window > 0 {
-        used_tokens as f32 / ctx_window as f32
-    } else {
-        0.0
-    };
-    Ok(CommandResult::Context {
-        used_tokens: used_tokens as usize,
-        total_messages: session.snapshot.messages.len(),
-        ctx_window: ctx_window as usize,
-        utilization,
-        ctx_name: provider_config.model.clone(),
+    let sid = session_id
+        .ok_or_else(|| anyhow::anyhow!("session_id required for context"))?
+        .to_string();
+    let sessions_root = NativeSessionManager::sessions_root();
+    let config_path = jeikcode_config::config::Config::default_path();
+    let wd = working_dir.to_path_buf();
+    let ph = project_hash.map(str::to_string);
+    let prov = provider.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let session = load_command_session_view_in_root(&sessions_root, &wd, ph.as_deref(), &sid)?;
+        let config = jeikcode_config::config::Config::load(&config_path)?;
+        let resolved = crate::live_api::resolve_provider_name(&config, prov.as_deref());
+        let provider_config = config
+            .provider_config_for_selection(&resolved)
+            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", resolved))?;
+        let ctx_window = provider_config.context_window as u32;
+        let used_tokens = snapshot_used_tokens(&session.snapshot.messages);
+        let utilization = if ctx_window > 0 {
+            used_tokens as f32 / ctx_window as f32
+        } else {
+            0.0
+        };
+        Ok(CommandResult::Context {
+            used_tokens: used_tokens as usize,
+            total_messages: session.snapshot.messages.len(),
+            ctx_window: ctx_window as usize,
+            utilization,
+            ctx_name: provider_config.model.clone(),
+        })
     })
+    .await
+    .map_err(|e| anyhow::anyhow!("context task failed: {e}"))?
 }
 
 /// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
@@ -534,13 +558,27 @@ pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
     (false, arg)
 }
 
+#[cfg(test)]
 fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
+    exec_remember_with_store(MemoryStore::global(), working_dir, arg)
+}
+
+#[cfg(test)]
+fn exec_forget(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
+    exec_forget_with_store(MemoryStore::global(), working_dir, arg)
+}
+
+fn exec_remember_with_store(
+    global_store: MemoryStore,
+    working_dir: &Path,
+    arg: &str,
+) -> anyhow::Result<CommandResult> {
     let (global, content) = parse_remember_arg(arg);
     if content.is_empty() {
         anyhow::bail!("remember needs content");
     }
     let store = if global {
-        MemoryStore::global()
+        global_store
     } else {
         MemoryStore::project(working_dir)
     };
@@ -550,19 +588,26 @@ fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult>
     })
 }
 
-fn exec_forget(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
+fn exec_forget_with_store(
+    global_store: MemoryStore,
+    working_dir: &Path,
+    arg: &str,
+) -> anyhow::Result<CommandResult> {
     let keyword = arg.trim();
     if keyword.is_empty() {
         anyhow::bail!("forget needs a keyword");
     }
-    let mut removed = MemoryStore::global().remove_matching(keyword)?;
+    let mut removed = global_store.remove_matching(keyword)?;
     removed.extend(MemoryStore::project(working_dir).remove_matching(keyword)?);
     Ok(CommandResult::Forget { removed })
 }
 
-fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
+fn exec_memory_with_store(
+    global_store: MemoryStore,
+    working_dir: &Path,
+) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Memory {
-        global: MemoryStore::global().load(),
+        global: global_store.load(),
         project: MemoryStore::project(working_dir).load(),
     })
 }
@@ -632,13 +677,29 @@ async fn exec_compact(
         .await;
 
     let operation_id = admission.operation_id.clone();
-    let outcome = match load_native_command_session(&working_dir, project_hash.as_deref(), sid) {
+    let sessions_root = NativeSessionManager::sessions_root();
+    let config_path = jeikcode_config::config::Config::default_path();
+    let wd_for_load = working_dir.clone();
+    let ph_for_load = project_hash.clone();
+    let sid_for_load = sid.to_string();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        load_native_command_session_in_root(
+            &sessions_root,
+            &wd_for_load,
+            ph_for_load.as_deref(),
+            &sid_for_load,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("session load task failed: {e}"))?
+    {
         Ok(Some(native)) => {
             exec_native_compact(
                 provider.as_deref(),
                 &arg,
                 native,
                 &working_dir,
+                &config_path,
                 telemetry,
                 admission.cancellation,
             )
@@ -721,9 +782,8 @@ async fn exec_compact(
     outcome.map(|outcome| outcome.result)
 }
 
-fn exec_config() -> anyhow::Result<CommandResult> {
-    let path = jeikcode_config::config::Config::default_path();
-    let provider = jeikcode_config::config::Config::load(&path)
+fn exec_config_at(path: &Path) -> anyhow::Result<CommandResult> {
+    let provider = jeikcode_config::config::Config::load(path)
         .map(|c| c.default_provider)
         .unwrap_or_default();
     Ok(CommandResult::Config {
@@ -747,12 +807,16 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
     Ok(CommandResult::Diff { stat })
 }
 
-fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+fn render_context_file_status_block_with(
+    config_dir: &Path,
+    global_memory: MemoryStore,
+    working_dir: &std::path::Path,
+) -> String {
     use jeikcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     use jeikcode_config::i18n::{t, Msg};
-    let instructions = LayeredInstructions::load(working_dir);
+    let instructions = LayeredInstructions::load_with_config_dir(config_dir, working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for line in instructions.status_lines(working_dir) {
+    for line in instructions.status_lines_with_config_dir(config_dir, working_dir) {
         let scope = t(match line.level {
             InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
             InstructionLevel::Project => Msg::StatusInstructionScopeProject,
@@ -775,10 +839,7 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
     out.push('\n');
     out.push_str(&t(Msg::StatusMemoryFilesHeader));
     for (scope_msg, store) in [
-        (
-            Msg::StatusMemoryScopeGlobal,
-            jeikcode_config::config::memory::MemoryStore::global(),
-        ),
+        (Msg::StatusMemoryScopeGlobal, global_memory),
         (
             Msg::StatusMemoryScopeProject,
             jeikcode_config::config::memory::MemoryStore::project(working_dir),
@@ -801,6 +862,15 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
     out
 }
 
+#[cfg(test)]
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    render_context_file_status_block_with(
+        &jeikcode_config::config::Config::config_dir(),
+        MemoryStore::global(),
+        working_dir,
+    )
+}
+
 fn assemble_status(body: &str, proxy: &str, instructions: &str) -> String {
     let mut txt = String::with_capacity(body.len() + proxy.len() + instructions.len() + 16);
     txt.push_str(body);
@@ -810,13 +880,15 @@ fn assemble_status(body: &str, proxy: &str, instructions: &str) -> String {
     txt
 }
 
-fn exec_status(
+fn exec_status_with(
+    config_dir: &Path,
+    config_path: &Path,
+    global_memory: MemoryStore,
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     use jeikcode_config::i18n::{t, Msg};
-    let config_path = jeikcode_config::config::Config::default_path();
-    let config = jeikcode_config::config::Config::load(&config_path).ok();
+    let config = jeikcode_config::config::Config::load(config_path).ok();
     let provider_name = provider
         .map(|s| s.to_string())
         .or_else(|| config.as_ref().map(|c| c.default_provider.clone()))
@@ -841,7 +913,7 @@ fn exec_status(
     let text = assemble_status(
         &body,
         &proxy_line,
-        &render_context_file_status_block(working_dir),
+        &render_context_file_status_block_with(config_dir, global_memory, working_dir),
     );
 
     Ok(CommandResult::Status {
@@ -855,13 +927,14 @@ fn exec_status(
     })
 }
 
-fn exec_cost(
+fn exec_cost_in_root(
+    sessions_root: &Path,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for cost"))?;
-    let session = load_command_session_view(working_dir, project_hash, sid)?;
+    let session = load_command_session_view_in_root(sessions_root, working_dir, project_hash, sid)?;
     let report = jeikcode_capabilities::session::aggregate_session_cost(&session.meta);
     Ok(CommandResult::Cost {
         total_tokens: report.total_tokens as usize,
@@ -884,13 +957,14 @@ fn exec_cost(
     })
 }
 
-fn exec_todo(
+fn exec_todo_in_root(
+    sessions_root: &Path,
     working_dir: &std::path::Path,
     project_hash: Option<&str>,
     session_id: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for todo"))?;
-    let session = load_command_session_view(working_dir, project_hash, sid)?;
+    let session = load_command_session_view_in_root(sessions_root, working_dir, project_hash, sid)?;
 
     let _ = session;
     Ok(CommandResult::Todo {
@@ -1224,15 +1298,45 @@ pub(crate) async fn run_command(
         }
     };
     let result = match req.command.as_str() {
-        "undo" => exec_undo(
-            &working_dir,
-            req.session_id.as_deref(),
-            &req.arg,
-            req.project_hash.as_deref(),
-        ),
-        "remember" => exec_remember(&working_dir, &req.arg),
-        "forget" => exec_forget(&working_dir, &req.arg),
-        "memory" => exec_memory(&working_dir),
+        "undo" => {
+            let sessions_root = NativeSessionManager::sessions_root();
+            let wd = working_dir.clone();
+            let sid = req.session_id.clone();
+            let arg = req.arg.clone();
+            let ph = req.project_hash.clone();
+            tokio::task::spawn_blocking(move || {
+                exec_undo_in_root(&sessions_root, &wd, sid.as_deref(), &arg, ph.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("undo task failed: {e}"))
+            .and_then(|res| res)
+        }
+        "remember" => {
+            let global_store = MemoryStore::global();
+            let wd = working_dir.clone();
+            let arg = req.arg.clone();
+            tokio::task::spawn_blocking(move || exec_remember_with_store(global_store, &wd, &arg))
+                .await
+                .map_err(|e| anyhow::anyhow!("remember task failed: {e}"))
+                .and_then(|res| res)
+        }
+        "forget" => {
+            let global_store = MemoryStore::global();
+            let wd = working_dir.clone();
+            let arg = req.arg.clone();
+            tokio::task::spawn_blocking(move || exec_forget_with_store(global_store, &wd, &arg))
+                .await
+                .map_err(|e| anyhow::anyhow!("forget task failed: {e}"))
+                .and_then(|res| res)
+        }
+        "memory" => {
+            let global_store = MemoryStore::global();
+            let wd = working_dir.clone();
+            tokio::task::spawn_blocking(move || exec_memory_with_store(global_store, &wd))
+                .await
+                .map_err(|e| anyhow::anyhow!("memory task failed: {e}"))
+                .and_then(|res| res)
+        }
         "context" => {
             exec_context(
                 &working_dir,
@@ -1260,19 +1364,63 @@ pub(crate) async fn run_command(
                 Err(error) => Err(anyhow::anyhow!("compaction task failed: {error}")),
             }
         }
-        "config" => exec_config(),
-        "diff" => exec_diff(&working_dir),
-        "status" => exec_status(&working_dir, req.provider.as_deref()),
-        "cost" => exec_cost(
-            &working_dir,
-            req.project_hash.as_deref(),
-            req.session_id.as_deref(),
-        ),
-        "todo" => exec_todo(
-            &working_dir,
-            req.project_hash.as_deref(),
-            req.session_id.as_deref(),
-        ),
+        "config" => {
+            let path = jeikcode_config::config::Config::default_path();
+            tokio::task::spawn_blocking(move || exec_config_at(&path))
+                .await
+                .map_err(|e| anyhow::anyhow!("config task failed: {e}"))
+                .and_then(|res| res)
+        }
+        "diff" => {
+            let wd = working_dir.clone();
+            tokio::task::spawn_blocking(move || exec_diff(&wd))
+                .await
+                .map_err(|e| anyhow::anyhow!("diff task failed: {e}"))
+                .and_then(|res| res)
+        }
+        "status" => {
+            let config_dir = jeikcode_config::config::Config::config_dir();
+            let config_path = jeikcode_config::config::Config::default_path();
+            let global_memory = MemoryStore::global();
+            let wd = working_dir.clone();
+            let prov = req.provider.clone();
+            tokio::task::spawn_blocking(move || {
+                exec_status_with(
+                    &config_dir,
+                    &config_path,
+                    global_memory,
+                    &wd,
+                    prov.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("status task failed: {e}"))
+            .and_then(|res| res)
+        }
+        "cost" => {
+            let sessions_root = NativeSessionManager::sessions_root();
+            let wd = working_dir.clone();
+            let ph = req.project_hash.clone();
+            let sid = req.session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                exec_cost_in_root(&sessions_root, &wd, ph.as_deref(), sid.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("cost task failed: {e}"))
+            .and_then(|res| res)
+        }
+        "todo" => {
+            let sessions_root = NativeSessionManager::sessions_root();
+            let wd = working_dir.clone();
+            let ph = req.project_hash.clone();
+            let sid = req.session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                exec_todo_in_root(&sessions_root, &wd, ph.as_deref(), sid.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("todo task failed: {e}"))
+            .and_then(|res| res)
+        }
         "goal" => {
             exec_goal(
                 &state,

@@ -10914,7 +10914,7 @@ async fn rename_session(
 }
 
 /// Request to patch an existing session message in place
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PatchMessageRequest {
     pub text: String,
     #[serde(default)]
@@ -10946,7 +10946,7 @@ pub struct DeleteMessageQuery {
 }
 
 /// Request to truncate session history to a target point
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TruncateSessionRequest {
     pub target_index: usize,
     #[serde(default)]
@@ -11180,6 +11180,153 @@ async fn get_session_inputs(
     }))
 }
 
+async fn prepare_session_mutation_lease_guard(
+    state: &AppState,
+    id: &str,
+) -> Result<bool, axum::response::Response> {
+    if !state
+        .active_chats
+        .stop_and_wait(id.to_string(), Some(std::time::Duration::from_millis(1500)))
+        .await
+    {
+        return Err(delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session has an active turn. Stop it, then try again.",
+        )
+        .into_response());
+    }
+    if crate::native_live::live_turn_running(id) {
+        let _ = crate::native_live::cancel_via_registry(id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while crate::native_live::live_turn_running(id) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if crate::native_live::live_turn_running(id) {
+            return Err(delete_session_api_error(
+                StatusCode::CONFLICT,
+                "SESSION_IN_USE",
+                "This session has an active turn. Stop it, then try again.",
+            )
+            .into_response());
+        }
+    }
+    match crate::native_live::release_idle_session_for_mutation(id).await {
+        Ok(was_viewing) => Ok(was_viewing),
+        Err(crate::live_hub::HubError::ActiveTurn) => Err(delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session has an active turn. Stop it, then try again.",
+        )
+        .into_response()),
+        Err(crate::live_hub::HubError::StaleBinding)
+        | Err(crate::live_hub::HubError::RuntimeGenerationChanged { .. })
+        | Err(crate::live_hub::HubError::Unbound) => Ok(false),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %id,
+                error = ?error,
+                "failed to release live owner before session mutation"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to release active session owner: {error:?}")
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
+fn open_session_for_mutation_in_root(
+    sessions_root: &std::path::Path,
+    hash: &str,
+    id: &str,
+) -> Result<
+    (
+        NativeSessionManager,
+        jeikcode_capabilities::session::SessionLease,
+        jeikcode_kernel::message::SessionSnapshot,
+        jeikcode_capabilities::session::SessionMeta,
+    ),
+    axum::response::Response,
+> {
+    let bucket = if valid_project_bucket(hash) {
+        let candidate = NativeSessionManager::with_root(sessions_root.join(hash));
+        let exists = [
+            candidate.meta_path(id),
+            candidate.snapshot_path(id),
+            candidate.legacy_path(id),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|p| p.exists());
+        if exists {
+            Some(hash.to_string())
+        } else {
+            resolve_session_in_root(sessions_root, id)
+                .ok()
+                .flatten()
+                .map(|r| r.project_hash)
+        }
+    } else {
+        resolve_session_in_root(sessions_root, id)
+            .ok()
+            .flatten()
+            .map(|r| r.project_hash)
+    };
+    let Some(bucket) = bucket.filter(|b| valid_project_bucket(b)) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+        )
+            .into_response());
+    };
+    let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
+    let lease = match manager.acquire_lease(id) {
+        Ok(lease) => lease,
+        Err(SessionStoreError::SessionInUse { .. }) => {
+            return Err(delete_session_api_error(
+                StatusCode::CONFLICT,
+                "SESSION_IN_USE",
+                "This session is active. Stop it, then try again.",
+            )
+            .into_response());
+        }
+        Err(SessionStoreError::NotFound { .. }) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "success": false, "error": "session not found" })),
+            )
+                .into_response());
+        }
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": err.to_string() })),
+            )
+                .into_response());
+        }
+    };
+    if let Err(err) = crate::legacy_convert::converge_session(&manager, &lease) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": err.to_string() })),
+        )
+            .into_response());
+    }
+    match (manager.load_snapshot(id), manager.read_meta(id)) {
+        (Ok(s), Ok(m)) => Ok((manager, lease, s, m)),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+        )
+            .into_response()),
+    }
+}
+
 /// PATCH /projects/:hash/sessions/:id/messages/:index - Mutate message in place
 async fn patch_session_message(
     State(state): State<AppState>,
@@ -11190,179 +11337,179 @@ async fn patch_session_message(
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
-        let _ = state_clone
-            .active_chats
-            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
-            .await;
-        let _ = crate::native_live::cancel_via_registry(&id);
-
+        let was_viewing = match prepare_session_mutation_lease_guard(&state_clone, &id).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let sessions_root = NativeSessionManager::sessions_root();
-        let bucket = if valid_project_bucket(&hash) {
-            hash.clone()
-        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-            resolved.project_hash
-        } else {
-            hash.clone()
-        };
-        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
-        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
-            (Ok(s), Ok(m)) => (manager, s, m),
-            _ => {
-                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
-                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
-                        (mgr, s, m)
-                    } else {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                        )
-                            .into_response();
-                    }
-                } else {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                    )
-                        .into_response();
-                }
-            }
-        };
-
-        let target_idx = resolve_target_message_index(
-            &snapshot.messages,
-            index,
-            req.expected_text.as_deref(),
-            req.expected_role.as_deref(),
-            req.expected_message_id.as_deref(),
-        );
-        let real_index = match target_idx {
-            Some(idx) => idx,
-            None => {
-                if req.expected_role.as_deref() == Some("user") || req.expected_message_id.is_some() {
-                    let mut user_msg = jeikcode_kernel::message::Message::user(req.expected_text.as_deref().unwrap_or(""));
-                    user_msg.id = req.expected_message_id.clone();
-                    snapshot.messages.push(user_msg);
-                    snapshot.messages.len() - 1
-                } else {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "success": false, "error": "message not found" })),
-                    )
-                    .into_response();
-                }
-            }
-        };
-        let display_target_id = snapshot.messages[real_index]
-            .id
-            .clone()
-            .or_else(|| req.expected_message_id.clone());
-        snapshot.messages[real_index].text = req.text.clone();
-        if let Some(imgs) = req.images.as_ref() {
-            snapshot.messages[real_index].images = imgs
-                .iter()
-                .map(|img| jeikcode_kernel::message::ImageContent {
-                    media_type: img.media_type.clone(),
-                    data: img.data.clone(),
-                })
-                .collect();
-        }
-        let truncate_after = req.truncate_after.unwrap_or(false);
-        let mut derived_turns: Option<std::collections::BTreeSet<u64>> = None;
-        if truncate_after {
-            // Edit = rewrite: the edited prompt is now the tail of the model
-            // context. Every later message, stat, display-only row, transcript
-            // turn and presentation anchor must disappear with it.
-            let keep_count = real_index + 1;
-            snapshot.messages.truncate(keep_count);
-            let (turn_c, req_c) =
-                jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
-            snapshot.turn_counter = turn_c;
-            snapshot.request_counter = req_c;
-            derived_turns = prune_rewound_turn_stats(&mut meta, keep_count);
-        }
-        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        // 显式变更改写了上下文：压缩估算的占用不再成立。
-        meta.compacted_context_tokens = None;
-        meta.updated_at = jeikcode_capabilities::session::now_ms();
-        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
-        if truncate_after {
-            resync_todo_board_after_rewind(&id, &snapshot.messages);
-        }
-        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-            )
-                .into_response();
-        }
-        manager.clear_inflight_snapshot(&id);
-        if truncate_after {
-            // Identity, not timestamp: any durable input whose user row is not
-            // in the surviving snapshot belongs to a removed branch. This also
-            // cleans a stale branch left by an EARLIER rewind whose rows can be
-            // older than the current target.
-            let surviving_ids: std::collections::HashSet<String> = snapshot
-                .messages
-                .iter()
-                .filter_map(|message| message.id.clone())
-                .collect();
-            let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
-                &id,
-                &surviving_ids,
+        let hash_owned = hash.clone();
+        let id_owned = id.clone();
+        let req_cloned = req.clone();
+        let mutation_res = tokio::task::spawn_blocking(move || {
+            let (manager, lease, mut snapshot, meta_before) =
+                open_session_for_mutation_in_root(&sessions_root, &hash_owned, &id_owned)?;
+            let target_idx = resolve_target_message_index(
+                &snapshot.messages,
+                index,
+                req_cloned.expected_text.as_deref(),
+                req_cloned.expected_role.as_deref(),
+                req_cloned.expected_message_id.as_deref(),
             );
-            jeikcode_capabilities::session::partial::clear_global(&id);
-            jeikcode_capabilities::session::partial::clear_archived_global(&id);
-        }
-        let _ = manager.write_meta(&meta);
-        if let Some(surviving) = derived_turns.as_ref() {
-            prune_derived_turns(&manager, &id, surviving);
-        }
-        // In-place v4 mutation: preserve every row before the edit (including
-        // display-only/presentation rows), drop the downstream tail, refresh the
-        // edited row. Only fall back to invalidation when the log/target id is
-        // unavailable (legacy/missing v4).
-        let display_images: Vec<ImageData> = req
-            .images
-            .as_ref()
-            .map(|images| {
-                images
+            let real_index = match target_idx {
+                Some(idx) => idx,
+                None => {
+                    if req_cloned.expected_role.as_deref() == Some("user")
+                        || req_cloned.expected_message_id.is_some()
+                    {
+                        let mut user_msg = jeikcode_kernel::message::Message::user(
+                            req_cloned.expected_text.as_deref().unwrap_or(""),
+                        );
+                        user_msg.id = req_cloned.expected_message_id.clone();
+                        snapshot.messages.push(user_msg);
+                        snapshot.messages.len() - 1
+                    } else {
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({ "success": false, "error": "message not found" })),
+                        )
+                            .into_response());
+                    }
+                }
+            };
+            let display_target_id = snapshot.messages[real_index]
+                .id
+                .clone()
+                .or_else(|| req_cloned.expected_message_id.clone());
+            snapshot.messages[real_index].text = req_cloned.text.clone();
+            if let Some(imgs) = req_cloned.images.as_ref() {
+                snapshot.messages[real_index].images = imgs
                     .iter()
-                    .map(|image| ImageData {
-                        media_type: image.media_type.clone(),
-                        data: image.data.clone(),
-                        missing: false,
+                    .map(|img| jeikcode_kernel::message::ImageContent {
+                        media_type: img.media_type.clone(),
+                        data: img.data.clone(),
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let surviving_last_turn = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid)
-            .map(|stat| stat.turn_id)
-            .max()
-            .unwrap_or(0);
-        let completed_turns: Vec<u64> = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid && stat.turn_id != 0)
-            .map(|stat| stat.turn_id)
-            .collect();
-        let rewritten = rewrite_display_for_mutation(
-            &manager,
-            &id,
-            DisplayMutation::Patch {
-                target_id: display_target_id.as_deref(),
-                text: &req.text,
-                images: &display_images,
-                truncate_after,
-            },
-            surviving_last_turn,
-            &completed_turns,
-        );
-        if !rewritten {
-            let _ = manager.invalidate_display(&id);
+                    .collect();
+            }
+            let truncate_after = req_cloned.truncate_after.unwrap_or(false);
+            if truncate_after {
+                let keep_count = real_index + 1;
+                snapshot.messages.truncate(keep_count);
+                let (turn_c, req_c) =
+                    jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+                snapshot.turn_counter = turn_c;
+                snapshot.request_counter = req_c;
+            }
+            snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+            let keep_count = snapshot.messages.len();
+            let working_dir_for_view = meta_before.working_dir.clone();
+            let snapshot_for_commit = snapshot.clone();
+            let committed_meta = manager
+                .commit_native_runtime_mutation(
+                    &lease,
+                    &snapshot_for_commit,
+                    |_, meta, presentation| {
+                        let derived_turns = if truncate_after {
+                            prune_rewound_turn_stats(meta, keep_count)
+                        } else {
+                            None
+                        };
+                        if let Some(surviving) = derived_turns.as_ref() {
+                            presentation.retain_turns(surviving);
+                        }
+                        meta.compacted_context_tokens = None;
+                        meta.updated_at = jeikcode_capabilities::session::now_ms();
+                        meta.message_count = u32::try_from(keep_count).unwrap_or(0);
+                        Ok((meta.clone(), derived_turns))
+                    },
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                    )
+                        .into_response()
+                })?;
+            let (meta, derived_turns) = committed_meta;
+            manager.clear_inflight_snapshot(&id_owned);
+            if truncate_after {
+                resync_todo_board_after_rewind(&id_owned, &snapshot.messages);
+                let surviving_ids: std::collections::HashSet<String> = snapshot
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.id.clone())
+                    .collect();
+                let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
+                    &id_owned,
+                    &surviving_ids,
+                );
+                jeikcode_capabilities::session::partial::clear_global(&id_owned);
+                jeikcode_capabilities::session::partial::clear_archived_global(&id_owned);
+            }
+            if let Some(surviving) = derived_turns.as_ref() {
+                prune_derived_turns(&manager, &id_owned, surviving);
+            }
+            let display_images: Vec<ImageData> = req_cloned
+                .images
+                .as_ref()
+                .map(|images| {
+                    images
+                        .iter()
+                        .map(|image| ImageData {
+                            media_type: image.media_type.clone(),
+                            data: image.data.clone(),
+                            missing: false,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let surviving_last_turn = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid)
+                .map(|stat| stat.turn_id)
+                .max()
+                .unwrap_or(0);
+            let completed_turns: Vec<u64> = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid && stat.turn_id != 0)
+                .map(|stat| stat.turn_id)
+                .collect();
+            let rewritten = rewrite_display_for_mutation(
+                &manager,
+                &id_owned,
+                DisplayMutation::Patch {
+                    target_id: display_target_id.as_deref(),
+                    text: &req_cloned.text,
+                    images: &display_images,
+                    truncate_after,
+                },
+                surviving_last_turn,
+                &completed_turns,
+            );
+            if !rewritten {
+                let _ = manager.invalidate_display(&id_owned);
+            }
+            Ok((snapshot, real_index, truncate_after, working_dir_for_view))
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": format!("mutation task failed: {e}") })),
+            )
+                .into_response()
+        });
+        let (snapshot, real_index, truncate_after, working_dir_for_view) = match mutation_res {
+            Ok(Ok(v)) => v,
+            Ok(Err(resp)) | Err(resp) => return resp,
+        };
+        if was_viewing {
+            crate::native_live::rebind_live_view_after_mutation(
+                &id,
+                working_dir_for_view.into(),
+                snapshot.clone(),
+            );
         }
 
         let now = std::time::SystemTime::now()
@@ -11417,80 +11564,52 @@ async fn delete_session_message(
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
-        let _ = state_clone
-            .active_chats
-            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
-            .await;
-        let _ = crate::native_live::cancel_via_registry(&id);
-
+        let was_viewing = match prepare_session_mutation_lease_guard(&state_clone, &id).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let sessions_root = NativeSessionManager::sessions_root();
-        let bucket = if valid_project_bucket(&hash) {
-            hash.clone()
-        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-            resolved.project_hash
-        } else {
-            hash.clone()
-        };
-        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
-        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
-            (Ok(s), Ok(m)) => (manager, s, m),
-            _ => {
-                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
-                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
-                        (mgr, s, m)
-                    } else {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                        )
-                            .into_response();
-                    }
-                } else {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                    )
-                        .into_response();
-                }
-            }
-        };
-
-        let target_idx = resolve_target_message_index(
-            &snapshot.messages,
-            index,
-            query.expected_text.as_deref(),
-            query.expected_role.as_deref(),
-            query.expected_message_id.as_deref(),
-        );
-        let Some(real_index) = target_idx else {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ "success": true, "notFound": true })),
-            )
-                .into_response();
-        };
-        let display_target_id = snapshot.messages[real_index]
-            .id
-            .clone()
-            .or_else(|| query.expected_message_id.clone());
-
+        let hash_owned = hash.clone();
+        let id_owned = id.clone();
+        let expected_text = query.expected_text.clone();
+        let expected_role = query.expected_role.clone();
+        let expected_message_id = query.expected_message_id.clone();
         let delete_turn = query.delete_turn.unwrap_or(false);
-        let before_len = snapshot.messages.len();
-        let mutation_start_idx;
-        if delete_turn {
-            // 用户消息删除（整回合删除：删除该用户消息以及随后的整轮 Agent 中间输出和回答）
-            mutation_start_idx = real_index;
-            let mut end = real_index + 1;
-            while end < snapshot.messages.len()
-                && snapshot.messages[end].role != jeikcode_kernel::message::Role::User
-            {
-                end += 1;
-            }
-            snapshot.messages.drain(real_index..end);
-        } else {
-            // Agent 消息删除（删除当轮 Agent 的所有中间输出、工具调用和最终回答，保留前置 User 消息）
-            if snapshot.messages[real_index].role == jeikcode_kernel::message::Role::Assistant
+        let mutation_res = tokio::task::spawn_blocking(move || {
+            let (manager, lease, mut snapshot, meta_before) =
+                open_session_for_mutation_in_root(&sessions_root, &hash_owned, &id_owned)?;
+            let target_idx = resolve_target_message_index(
+                &snapshot.messages,
+                index,
+                expected_text.as_deref(),
+                expected_role.as_deref(),
+                expected_message_id.as_deref(),
+            );
+            let Some(real_index) = target_idx else {
+                return Err((
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "notFound": true })),
+                )
+                    .into_response());
+            };
+            let display_target_id = snapshot.messages[real_index]
+                .id
+                .clone()
+                .or_else(|| expected_message_id.clone());
+
+            let before_len = snapshot.messages.len();
+            let mutation_start_idx;
+            if delete_turn {
+                mutation_start_idx = real_index;
+                let mut end = real_index + 1;
+                while end < snapshot.messages.len()
+                    && snapshot.messages[end].role != jeikcode_kernel::message::Role::User
+                {
+                    end += 1;
+                }
+                snapshot.messages.drain(real_index..end);
+            } else if snapshot.messages[real_index].role
+                == jeikcode_kernel::message::Role::Assistant
                 || snapshot.messages[real_index].role == jeikcode_kernel::message::Role::Tool
             {
                 let mut start = real_index;
@@ -11511,72 +11630,101 @@ async fn delete_session_message(
                 mutation_start_idx = real_index;
                 snapshot.messages.remove(real_index);
             }
-        }
 
-        let removed_count = before_len.saturating_sub(snapshot.messages.len());
-        let derived_turns =
-            prune_deleted_turn_stats(&mut meta, mutation_start_idx, removed_count);
-        let (turn_c, req_c) =
-            jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
-        snapshot.turn_counter = turn_c;
-        snapshot.request_counter = req_c;
-        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        // 显式变更改写了上下文：压缩估算的占用不再成立。
-        meta.compacted_context_tokens = None;
-        meta.updated_at = jeikcode_capabilities::session::now_ms();
-        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
-        resync_todo_board_after_rewind(&id, &snapshot.messages);
-        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
-            return (
+            let removed_count = before_len.saturating_sub(snapshot.messages.len());
+            let (turn_c, req_c) =
+                jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+            snapshot.turn_counter = turn_c;
+            snapshot.request_counter = req_c;
+            snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+            let msg_count = snapshot.messages.len();
+            let working_dir_for_view = meta_before.working_dir.clone();
+            let snapshot_for_commit = snapshot.clone();
+            let (meta, derived_turns) = manager
+                .commit_native_runtime_mutation(
+                    &lease,
+                    &snapshot_for_commit,
+                    |_, meta, presentation| {
+                        let derived_turns =
+                            prune_deleted_turn_stats(meta, mutation_start_idx, removed_count);
+                        if let Some(surviving) = derived_turns.as_ref() {
+                            presentation.retain_turns(surviving);
+                        }
+                        meta.compacted_context_tokens = None;
+                        meta.updated_at = jeikcode_capabilities::session::now_ms();
+                        meta.message_count = u32::try_from(msg_count).unwrap_or(0);
+                        Ok((meta.clone(), derived_turns))
+                    },
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                    )
+                        .into_response()
+                })?;
+            manager.clear_inflight_snapshot(&id_owned);
+            resync_todo_board_after_rewind(&id_owned, &snapshot.messages);
+            let surviving_ids: std::collections::HashSet<String> = snapshot
+                .messages
+                .iter()
+                .filter_map(|message| message.id.clone())
+                .collect();
+            let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
+                &id_owned,
+                &surviving_ids,
+            );
+            jeikcode_capabilities::session::partial::clear_global(&id_owned);
+            jeikcode_capabilities::session::partial::clear_archived_global(&id_owned);
+            if let Some(surviving) = derived_turns.as_ref() {
+                prune_derived_turns(&manager, &id_owned, surviving);
+            }
+            let surviving_last_turn = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid)
+                .map(|stat| stat.turn_id)
+                .max()
+                .unwrap_or(0);
+            let completed_turns: Vec<u64> = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid && stat.turn_id != 0)
+                .map(|stat| stat.turn_id)
+                .collect();
+            let rewritten = rewrite_display_for_mutation(
+                &manager,
+                &id_owned,
+                DisplayMutation::Delete {
+                    target_id: display_target_id.as_deref(),
+                    delete_turn,
+                },
+                surviving_last_turn,
+                &completed_turns,
+            );
+            if !rewritten {
+                let _ = manager.invalidate_display(&id_owned);
+            }
+            Ok((snapshot, mutation_start_idx, working_dir_for_view))
+        })
+        .await
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                Json(serde_json::json!({ "success": false, "error": format!("mutation task failed: {e}") })),
             )
-                .into_response();
-        }
-        manager.clear_inflight_snapshot(&id);
-        // Deleting a user turn removes its input identity; deleting a model run
-        // keeps the user prompt. In both cases only inputs represented in the
-        // surviving snapshot may remain projectable.
-        let surviving_ids: std::collections::HashSet<String> = snapshot
-            .messages
-            .iter()
-            .filter_map(|message| message.id.clone())
-            .collect();
-        let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
-            &id,
-            &surviving_ids,
-        );
-        jeikcode_capabilities::session::partial::clear_global(&id);
-        jeikcode_capabilities::session::partial::clear_archived_global(&id);
-        let _ = manager.write_meta(&meta);
-        if let Some(surviving) = derived_turns.as_ref() {
-            prune_derived_turns(&manager, &id, surviving);
-        }
-        let surviving_last_turn = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid)
-            .map(|stat| stat.turn_id)
-            .max()
-            .unwrap_or(0);
-        let completed_turns: Vec<u64> = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid && stat.turn_id != 0)
-            .map(|stat| stat.turn_id)
-            .collect();
-        let rewritten = rewrite_display_for_mutation(
-            &manager,
-            &id,
-            DisplayMutation::Delete {
-                target_id: display_target_id.as_deref(),
-                delete_turn,
-            },
-            surviving_last_turn,
-            &completed_turns,
-        );
-        if !rewritten {
-            let _ = manager.invalidate_display(&id);
+                .into_response()
+        });
+        let (snapshot, mutation_start_idx, working_dir_for_view) = match mutation_res {
+            Ok(Ok(v)) => v,
+            Ok(Err(resp)) | Err(resp) => return resp,
+        };
+        if was_viewing {
+            crate::native_live::rebind_live_view_after_mutation(
+                &id,
+                working_dir_for_view.into(),
+                snapshot.clone(),
+            );
         }
 
         let now = std::time::SystemTime::now()
@@ -11623,143 +11771,149 @@ async fn truncate_session(
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
-        let _ = state_clone
-            .active_chats
-            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
-            .await;
-        let _ = crate::native_live::cancel_via_registry(&id);
-
+        let was_viewing = match prepare_session_mutation_lease_guard(&state_clone, &id).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let sessions_root = NativeSessionManager::sessions_root();
-        let bucket = if valid_project_bucket(&hash) {
-            hash.clone()
-        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-            resolved.project_hash
-        } else {
-            hash.clone()
-        };
-        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
-        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
-            (Ok(s), Ok(m)) => (manager, s, m),
-            _ => {
-                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
-                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
-                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
-                        (mgr, s, m)
+        let hash_owned = hash.clone();
+        let id_owned = id.clone();
+        let req_cloned = req.clone();
+        let mutation_res = tokio::task::spawn_blocking(move || {
+            let (manager, lease, mut snapshot, meta_before) =
+                open_session_for_mutation_in_root(&sessions_root, &hash_owned, &id_owned)?;
+            let target_idx = resolve_target_message_index(
+                &snapshot.messages,
+                req_cloned.target_index,
+                req_cloned.expected_text.as_deref(),
+                req_cloned.expected_role.as_deref(),
+                req_cloned.target_message_id.as_deref(),
+            );
+            let real_index = match target_idx {
+                Some(idx) => idx,
+                None => {
+                    if req_cloned.expected_role.as_deref() == Some("user")
+                        || req_cloned.target_message_id.is_some()
+                    {
+                        let mut user_msg = jeikcode_kernel::message::Message::user(
+                            req_cloned.expected_text.as_deref().unwrap_or(""),
+                        );
+                        user_msg.id = req_cloned.target_message_id.clone();
+                        snapshot.messages.push(user_msg);
+                        snapshot.messages.len() - 1
                     } else {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                        return Err((
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "success": true, "notFound": true })),
                         )
-                            .into_response();
+                            .into_response());
                     }
-                } else {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
-                    )
-                        .into_response();
                 }
-            }
-        };
+            };
 
-        let target_idx = resolve_target_message_index(
-            &snapshot.messages,
-            req.target_index,
-            req.expected_text.as_deref(),
-            req.expected_role.as_deref(),
-            req.target_message_id.as_deref(),
-        );
-        let real_index = match target_idx {
-            Some(idx) => idx,
-            None => {
-                if req.expected_role.as_deref() == Some("user") || req.target_message_id.is_some() {
-                    let mut user_msg = jeikcode_kernel::message::Message::user(req.expected_text.as_deref().unwrap_or(""));
-                    user_msg.id = req.target_message_id.clone();
-                    snapshot.messages.push(user_msg);
-                    snapshot.messages.len() - 1
-                } else {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({ "success": true, "notFound": true })),
+            let display_target_id = snapshot.messages[real_index]
+                .id
+                .clone()
+                .or_else(|| req_cloned.target_message_id.clone());
+            let inclusive = req_cloned.inclusive.unwrap_or(false);
+            let keep_count = if inclusive {
+                (real_index + 1).min(snapshot.messages.len())
+            } else {
+                real_index.min(snapshot.messages.len())
+            };
+
+            snapshot.messages.truncate(keep_count);
+            let (turn_c, req_c) =
+                jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+            snapshot.turn_counter = turn_c;
+            snapshot.request_counter = req_c;
+            snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+            let working_dir_for_view = meta_before.working_dir.clone();
+            let snapshot_for_commit = snapshot.clone();
+            let (meta, derived_turns) = manager
+                .commit_native_runtime_mutation(
+                    &lease,
+                    &snapshot_for_commit,
+                    |_, meta, presentation| {
+                        let derived_turns = prune_rewound_turn_stats(meta, keep_count);
+                        if let Some(surviving) = derived_turns.as_ref() {
+                            presentation.retain_turns(surviving);
+                        }
+                        meta.compacted_context_tokens = None;
+                        meta.updated_at = jeikcode_capabilities::session::now_ms();
+                        meta.message_count = u32::try_from(keep_count).unwrap_or(0);
+                        Ok((meta.clone(), derived_turns))
+                    },
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
                     )
-                    .into_response();
-                }
+                        .into_response()
+                })?;
+            manager.clear_inflight_snapshot(&id_owned);
+            resync_todo_board_after_rewind(&id_owned, &snapshot.messages);
+            let surviving_ids: std::collections::HashSet<String> = snapshot
+                .messages
+                .iter()
+                .filter_map(|message| message.id.clone())
+                .collect();
+            let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
+                &id_owned,
+                &surviving_ids,
+            );
+            jeikcode_capabilities::session::partial::clear_global(&id_owned);
+            jeikcode_capabilities::session::partial::clear_archived_global(&id_owned);
+            if let Some(surviving) = derived_turns.as_ref() {
+                prune_derived_turns(&manager, &id_owned, surviving);
             }
-        };
-
-        let display_target_id = snapshot.messages[real_index]
-            .id
-            .clone()
-            .or_else(|| req.target_message_id.clone());
-        let keep_count = if req.inclusive.unwrap_or(false) {
-            (real_index + 1).min(snapshot.messages.len())
-        } else {
-            real_index.min(snapshot.messages.len())
-        };
-
-        snapshot.messages.truncate(keep_count);
-        let derived_turns = prune_rewound_turn_stats(&mut meta, keep_count);
-        let (turn_c, req_c) =
-            jeikcode_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
-        snapshot.turn_counter = turn_c;
-        snapshot.request_counter = req_c;
-        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        // 显式变更改写了上下文：压缩估算的占用不再成立。
-        meta.compacted_context_tokens = None;
-        meta.updated_at = jeikcode_capabilities::session::now_ms();
-        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
-        resync_todo_board_after_rewind(&id, &snapshot.messages);
-        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
-            return (
+            let surviving_last_turn = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid)
+                .map(|stat| stat.turn_id)
+                .max()
+                .unwrap_or(0);
+            let completed_turns: Vec<u64> = meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid && stat.turn_id != 0)
+                .map(|stat| stat.turn_id)
+                .collect();
+            let rewritten = rewrite_display_for_mutation(
+                &manager,
+                &id_owned,
+                DisplayMutation::Truncate {
+                    target_id: display_target_id.as_deref(),
+                    inclusive,
+                },
+                surviving_last_turn,
+                &completed_turns,
+            );
+            if !rewritten {
+                let _ = manager.invalidate_display(&id_owned);
+            }
+            Ok((snapshot, keep_count, working_dir_for_view))
+        })
+        .await
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                Json(serde_json::json!({ "success": false, "error": format!("mutation task failed: {e}") })),
             )
-                .into_response();
-        }
-        manager.clear_inflight_snapshot(&id);
-        // Identity-based cleanup: the target survives or disappears according
-        // to `inclusive`; either way, only rows represented in the surviving
-        // snapshot may remain projectable.
-        let surviving_ids: std::collections::HashSet<String> = snapshot
-            .messages
-            .iter()
-            .filter_map(|message| message.id.clone())
-            .collect();
-        let _ = jeikcode_capabilities::session::inputs::mark_rewound_not_in_global(
-            &id,
-            &surviving_ids,
-        );
-        jeikcode_capabilities::session::partial::clear_global(&id);
-        jeikcode_capabilities::session::partial::clear_archived_global(&id);
-        let _ = manager.write_meta(&meta);
-        if let Some(surviving) = derived_turns.as_ref() {
-            prune_derived_turns(&manager, &id, surviving);
-        }
-        let surviving_last_turn = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid)
-            .map(|stat| stat.turn_id)
-            .max()
-            .unwrap_or(0);
-        let completed_turns: Vec<u64> = meta
-            .turn_stats
-            .iter()
-            .filter(|stat| stat.position_valid && stat.turn_id != 0)
-            .map(|stat| stat.turn_id)
-            .collect();
-        let rewritten = rewrite_display_for_mutation(
-            &manager,
-            &id,
-            DisplayMutation::Truncate {
-                target_id: display_target_id.as_deref(),
-                inclusive: req.inclusive.unwrap_or(false),
-            },
-            surviving_last_turn,
-            &completed_turns,
-        );
-        if !rewritten {
-            let _ = manager.invalidate_display(&id);
+                .into_response()
+        });
+        let (snapshot, keep_count, working_dir_for_view) = match mutation_res {
+            Ok(Ok(v)) => v,
+            Ok(Err(resp)) | Err(resp) => return resp,
+        };
+        if was_viewing {
+            crate::native_live::rebind_live_view_after_mutation(
+                &id,
+                working_dir_for_view.into(),
+                snapshot.clone(),
+            );
         }
 
         let now = std::time::SystemTime::now()
@@ -31393,5 +31547,108 @@ mod server_lifecycle_tests {
                 .expect("late watcher receives recorded error terminal"),
             (_, ChatEvent::Error { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn patch_delete_and_truncate_fail_closed_409_when_session_lease_is_held() {
+        use axum::extract::{Extension, Path, Query, State};
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let working_dir = home.path().join("proj");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let bucket = NativeSessionManager::project_hash(&working_dir);
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let lease = manager.acquire_lease(sid).unwrap();
+        let now = jeikcode_capabilities::session::now_ms();
+        let mut meta = jeikcode_capabilities::session::SessionMeta::new(
+            sid,
+            working_dir.to_string_lossy(),
+            now,
+        );
+        meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        meta.message_count = 1;
+        let snapshot = jeikcode_kernel::message::SessionSnapshot::new(vec![
+            jeikcode_kernel::message::Message::user("hello"),
+        ]);
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&jeikcode_capabilities::session::PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // While another owner holds the exclusive lease, all three mutations fail closed with 409.
+        let patch_resp = patch_session_message(
+            State(state.clone()),
+            Extension(SessionMode::Webui),
+            Path((bucket.clone(), sid.to_string(), 0)),
+            Json(PatchMessageRequest {
+                text: "edited".into(),
+                images: None,
+                expected_text: None,
+                expected_message_id: None,
+                expected_role: Some("user".into()),
+                truncate_after: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(patch_resp.status(), StatusCode::CONFLICT);
+
+        let del_resp = delete_session_message(
+            State(state.clone()),
+            Extension(SessionMode::Webui),
+            Path((bucket.clone(), sid.to_string(), 0)),
+            Query(DeleteMessageQuery {
+                delete_turn: Some(true),
+                expected_text: None,
+                expected_message_id: None,
+                expected_role: Some("user".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(del_resp.status(), StatusCode::CONFLICT);
+
+        let trunc_resp = truncate_session(
+            State(state.clone()),
+            Extension(SessionMode::Webui),
+            Path((bucket.clone(), sid.to_string())),
+            Json(TruncateSessionRequest {
+                target_index: 0,
+                target_message_id: None,
+                expected_text: None,
+                expected_role: Some("user".into()),
+                inclusive: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(trunc_resp.status(), StatusCode::CONFLICT);
+
+        // Once the lease drops, patch succeeds and commits atomically under its own lease.
+        drop(lease);
+        let ok_resp = patch_session_message(
+            State(state),
+            Extension(SessionMode::Webui),
+            Path((bucket, sid.to_string(), 0)),
+            Json(PatchMessageRequest {
+                text: "edited".into(),
+                images: None,
+                expected_text: None,
+                expected_message_id: None,
+                expected_role: Some("user".into()),
+                truncate_after: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let reloaded = manager.load_snapshot(sid).unwrap();
+        assert_eq!(reloaded.messages[0].text, "edited");
     }
 }

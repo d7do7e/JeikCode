@@ -12571,6 +12571,10 @@ export function Chat({
           }
         } catch (err) {
           missing = mutationTargetCompacted(err);
+          if (!missing) {
+            showToast(err instanceof Error ? err.message : String(err), 'error');
+            return;
+          }
           console.warn('[Chat] Failed to delete session turn on backend:', err);
         }
         if (missing) {
@@ -12758,6 +12762,10 @@ export function Chat({
           }
         } catch (err) {
           missing = mutationTargetCompacted(err);
+          if (!missing) {
+            showToast(err instanceof Error ? err.message : String(err), 'error');
+            return;
+          }
           console.warn('[Chat] Failed to delete assistant message on backend:', err);
         }
         if (missing) {

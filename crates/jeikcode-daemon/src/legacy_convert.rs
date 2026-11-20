@@ -1228,7 +1228,7 @@ pub(crate) fn prepare_catalog_session_resume_in_project_root(
     }))
 }
 
-fn load_catalog_session_view_in_project_root(
+pub(crate) fn load_catalog_session_view_in_project_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,
     id: &str,

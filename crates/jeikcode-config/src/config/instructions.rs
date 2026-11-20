@@ -73,8 +73,10 @@ impl LayeredInstructions {
     /// - Global:  `~/.jeikcode/AGENTS.md` → `~/.jeikcode/JEIKCODE.md`
     /// - Project: `<project_root>/AGENTS.md` (open standard), `.jeikcode.md`,
     ///   `JEIKCODE.md`, `CLAUDE.md`, or `claude.md` (first match wins)
-    pub fn load(project_root: &Path) -> Self {
-        let config_dir = crate::config::Config::config_dir();
+    /// Load layered instructions using an explicit `config_dir` (safe to call from
+    /// `tokio::task::spawn_blocking` workers when `Config::config_dir()` was captured on
+    /// the caller thread under thread-local `IsolatedHome` tests).
+    pub fn load_with_config_dir(config_dir: &Path, project_root: &Path) -> Self {
         let global = GLOBAL_INSTRUCTION_FILES
             .iter()
             .find_map(|name| Self::try_load(&config_dir.join(name), InstructionLevel::Global));
@@ -85,6 +87,10 @@ impl LayeredInstructions {
             .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
         Self { global, project }
+    }
+
+    pub fn load(project_root: &Path) -> Self {
+        Self::load_with_config_dir(&crate::config::Config::config_dir(), project_root)
     }
 
     fn try_load(path: &Path, level: InstructionLevel) -> Option<InstructionFile> {
@@ -123,14 +129,17 @@ impl LayeredInstructions {
         parts.join("\n\n")
     }
 
-    /// Return status for both levels with either the loaded path or the
-    /// preferred path to create when that level is missing.
-    pub fn status_lines(&self, project_root: &Path) -> Vec<InstructionStatusLine> {
+    /// Return status for both levels with an explicit `config_dir`.
+    pub fn status_lines_with_config_dir(
+        &self,
+        config_dir: &Path,
+        project_root: &Path,
+    ) -> Vec<InstructionStatusLine> {
         vec![
             InstructionStatusLine::new(
                 InstructionLevel::Global,
                 self.global.as_ref(),
-                crate::config::Config::config_dir().join(GLOBAL_INSTRUCTION_FILES[0]),
+                config_dir.join(GLOBAL_INSTRUCTION_FILES[0]),
             ),
             InstructionStatusLine::new(
                 InstructionLevel::Project,
@@ -138,6 +147,12 @@ impl LayeredInstructions {
                 project_root.join(PROJECT_INSTRUCTION_FILES[0]),
             ),
         ]
+    }
+
+    /// Return status for both levels with either the loaded path or the
+    /// preferred path to create when that level is missing.
+    pub fn status_lines(&self, project_root: &Path) -> Vec<InstructionStatusLine> {
+        self.status_lines_with_config_dir(&crate::config::Config::config_dir(), project_root)
     }
 
     pub fn has_any(&self) -> bool {

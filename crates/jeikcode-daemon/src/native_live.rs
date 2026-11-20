@@ -1016,6 +1016,24 @@ pub(crate) fn session_delete_release(
 /// on the bound runtime — that runtime may still be executing a different
 /// session, which is what made idle WebUI deletes report SESSION_IN_USE.
 pub async fn release_idle_session_for_delete(session_id: &str) -> Result<(), HubError> {
+    release_idle_session_inner(session_id, true).await
+}
+
+/// Release an idle in-process owner of `session_id` before in-place disk mutation
+/// (edit/delete/truncate), preserving the user's current live view on `session_id`
+/// via `switch_view_only` after refreshing from the updated disk snapshot.
+pub async fn release_idle_session_for_mutation(session_id: &str) -> Result<bool, HubError> {
+    let was_viewing = hub()
+        .binding()
+        .is_ok_and(|binding| binding.session_id == session_id);
+    release_idle_session_inner(session_id, false).await?;
+    Ok(was_viewing)
+}
+
+async fn release_idle_session_inner(
+    session_id: &str,
+    _deleting_session: bool,
+) -> Result<(), HubError> {
     let key = session_id.to_string();
     let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
     // A view-only `open_or_attach` row has no handle and holds no lease.
@@ -1058,6 +1076,16 @@ pub async fn release_idle_session_for_delete(session_id: &str) -> Result<(), Hub
         }
         SessionDeleteRelease::FilesOnly => Ok(()),
     }
+}
+
+/// Reproject an edited/rewound session snapshot back onto the live view hub if
+/// the hub was viewing `session_id` before releasing the idle execution lease.
+pub fn rebind_live_view_after_mutation(
+    session_id: &str,
+    working_dir: PathBuf,
+    snapshot: jeikcode_kernel::message::SessionSnapshot,
+) {
+    let _ = hub().switch_view_only(session_id.to_string(), working_dir, snapshot);
 }
 
 pub async fn change_directory(
