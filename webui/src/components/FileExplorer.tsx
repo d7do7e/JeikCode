@@ -273,16 +273,24 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
   // 智能递归轻量同步已展开的各层节点（对齐 Git 面板的 Single-flight 与 0ms 热恢复机制）
   const treeRef = useRef(tree);
   treeRef.current = tree;
+  const refreshEpochRef = useRef(0);
 
   const refreshTree = useCallback(async (isSilent = true) => {
+    const reqRoot = rootPath;
+    const reqEpoch = ++refreshEpochRef.current;
+    const isStale = () =>
+      activeRootRef.current !== reqRoot || refreshEpochRef.current !== reqEpoch;
+
     if (!isSilent) setLoading(true);
     try {
-      const res = await fetchFsTree(rootPath);
+      const res = await fetchFsTree(reqRoot);
+      if (isStale()) return;
       const currentTree = treeRef.current;
 
       const syncNodes = async (entries: FsEntry[], oldNodes: TreeNode[], parentIgnored = false): Promise<TreeNode[]> => {
         const result: TreeNode[] = [];
         for (const e of entries) {
+          if (isStale()) return result;
           const old = oldNodes.find((n) => n.path === e.path);
           const isExpanded = Boolean(old?.expanded);
           let children = old?.children;
@@ -298,6 +306,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
           if (e.is_dir && isExpanded) {
             try {
               const subRes = await fetchFsTree(e.path);
+              if (isStale()) return result;
               children = await syncNodes(subRes.entries, old?.children || [], isIgnored);
               loaded = true;
             } catch {}
@@ -318,12 +327,15 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       };
 
       const updated = await syncNodes(res.entries, currentTree);
+      if (isStale()) return;
       setTree(updated);
-      setCachedTree(rootPath, updated);
+      setCachedTree(reqRoot, updated);
     } catch {
       // 容错静默
     } finally {
-      if (!isSilent) setLoading(false);
+      if (!isSilent && activeRootRef.current === reqRoot && refreshEpochRef.current === reqEpoch) {
+        setLoading(false);
+      }
     }
   }, [rootPath]);
 
@@ -526,8 +538,16 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
         void refreshTree(true);
       }
 
+      const reqRoot = rootPath;
       setTimeout(() => {
-        const el = containerRef.current?.querySelector(`[title*="${normTarget}"]`) as HTMLElement | null;
+        if (activeRootRef.current !== reqRoot) return;
+        const container = containerRef.current;
+        if (!container) return;
+        const candidates = Array.from(container.querySelectorAll<HTMLElement>('[title]'));
+        const el = candidates.find((node) => {
+          const title = node.getAttribute('title') || '';
+          return title.replace(/\\/g, '/').includes(normTarget);
+        });
         if (el) {
           el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
