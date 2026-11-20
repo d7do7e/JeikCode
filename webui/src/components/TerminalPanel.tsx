@@ -18,6 +18,10 @@ import {
   MAX_TERMINAL_RECONNECT_ATTEMPTS,
   nextTerminalReconnectDelayMs,
 } from '../lib/chatTerminal';
+import {
+  executeCloseAllTabsTransition,
+  isTerminalSyncStale,
+} from '../lib/terminalSync';
 
 function measureTerminalGrid(term: Terminal, container: HTMLElement): { cols: number; rows: number } | null {
   const core = (term as unknown as {
@@ -321,6 +325,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   const tabsScopeRef = useRef(sessionScopeKey);
   const scratchpadScopeRef = useRef(sessionScopeKey);
   const syncGenerationRef = useRef(0);
+  const closingAllCountRef = useRef(0);
 
   const stableDefaultId = useMemo(() => {
     const norm = (cwd || 'default').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
@@ -763,7 +768,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   // 绑定或挂载 Terminal 实例到对应 DOM 容器，装配全套官方 Addons 并连接 WebSocket PTY 串流
   const bindTerminalContainer = useCallback(
     (tab: TerminalTab, el: HTMLElement | null) => {
-      if (!el) return;
+      if (!el || closingAllCountRef.current > 0) return;
       const tabId = tab.id;
       let record = termMap.current.get(tabId);
       if (!record) {
@@ -957,6 +962,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   // 激活 Tab 切换 / 终端面板重新可见时：检查连接自愈、平滑重测；
   // 只有用户主动打开终端（或点击终端页签）才把焦点交给 xterm。
   useEffect(() => {
+    if (closingAllCountRef.current > 0) return;
     const activeNow = active !== false;
     const becameActive = activeNow && !panelActiveRef.current;
     panelActiveRef.current = activeNow;
@@ -1023,6 +1029,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         stalePaintRef.current = true;
         return;
       }
+      if (closingAllCountRef.current > 0) return;
       for (const tab of tabs) {
         const record = termMap.current.get(tab.id);
         if (record) {
@@ -1054,13 +1061,20 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
   // 同步并拉取后端项目常驻终端会话（跨页面刷新、多标签、异地访问保持强一致广播同步，彻底消除死尸缓存污染）
   const syncWithBackend = useCallback(async () => {
+    if (closingAllCountRef.current > 0) return;
     const targetCwd = cwd;
     const targetScope = sessionScopeKey;
     const gen = syncGenerationRef.current;
     const stale = () =>
-      syncGenerationRef.current !== gen ||
-      activeCwdRef.current !== targetCwd ||
-      activeScopeRef.current !== targetScope;
+      isTerminalSyncStale({
+        syncGeneration: syncGenerationRef.current,
+        expectedGeneration: gen,
+        activeCwd: activeCwdRef.current,
+        targetCwd,
+        activeScope: activeScopeRef.current,
+        targetScope,
+        closingAllCount: closingAllCountRef.current,
+      });
     try {
       const res = await fetchTerminalList(targetCwd);
       if (stale()) return;
@@ -1320,30 +1334,59 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   };
 
   // 关闭所有终端标签（终止所有任务，恢复纯净初始终端）
-  // 使用新唯一 ID 而非复用 stableDefaultId，避免并发在途的 DELETE /terminal/:id 误杀刚重建的同 ID PTY。
+  // 串行等待旧终端关闭并先在后端注册新会话（同时屏蔽期间的 SSE 同步与重渲染挂载），
+  // 避免 ConPTY 尚在初始化时 `syncWithBackend` 看到空列表并把新建 WebSocket 销毁回退到 `stableDefaultId`。
   const closeAllTabs = () => {
+    const targetCwd = cwd;
+    const targetScope = sessionScopeKey;
     const oldTabs = tabs;
-    oldTabs.forEach((tab) => {
-      const record = termMap.current.get(tab.id);
-      if (record) {
-        disposeTerminalRecord(record);
-        termMap.current.delete(tab.id);
-      }
-      void closeTerminalSession(tab.id);
+    const shell = preferredShell;
+    void executeCloseAllTabsTransition({
+      oldTabs,
+      preferredShell: shell,
+      targetCwd,
+      targetScope,
+      getClosingAllCount: () => closingAllCountRef.current,
+      incrementClosingAllCount: () => {
+        closingAllCountRef.current += 1;
+      },
+      decrementClosingAllCount: () => {
+        closingAllCountRef.current = Math.max(0, closingAllCountRef.current - 1);
+      },
+      bumpSyncGeneration: () => {
+        syncGenerationRef.current += 1;
+        return syncGenerationRef.current;
+      },
+      getSyncGeneration: () => syncGenerationRef.current,
+      getActiveCwd: () => activeCwdRef.current,
+      getActiveScope: () => activeScopeRef.current,
+      disposeAllActiveRecords: () => {
+        for (const record of termMap.current.values()) {
+          disposeTerminalRecord(record);
+        }
+        termMap.current.clear();
+      },
+      closeTerminalSession,
+      createTerminalSession,
+      commitReplacementTab: (newTab) => {
+        setTabs([newTab]);
+        focusOnNextLayoutRef.current = true;
+        setActiveTabId(newTab.id);
+        saveSessions([newTab], targetCwd);
+      },
+      broadcastSync: (syncCwd) => {
+        try {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const bc = new BroadcastChannel('jeikcode:terminal:sync');
+            bc.postMessage({ type: 'sync', cwd: syncCwd });
+            bc.close();
+          }
+        } catch {}
+      },
+      notifyClosed: () => {
+        showToast(t('terminal.allClosed') || '已关闭所有终端标签并终止任务', 'info');
+      },
     });
-    const newId = `term_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const newTab: TerminalTab = {
-      id: newId,
-      name: `${preferredShell} 1`,
-      cwd: cwd || '.',
-      shell: preferredShell,
-      timestamp: Date.now(),
-    };
-    setTabs([newTab]);
-    focusOnNextLayoutRef.current = true;
-    setActiveTabId(newId);
-    saveSessions([newTab], cwd);
-    showToast(t('terminal.allClosed') || '已关闭所有终端标签并终止任务', 'info');
   };
 
   return (

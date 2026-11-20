@@ -1873,18 +1873,27 @@ async fn async_main() {
         if launch.token.is_none() {
             launch.token = inherited_token.clone();
         }
-        let msg = jeikcode_daemon::ensure_webui(
+        match jeikcode_daemon::ensure_webui_checked(
             &launch.host,
             launch.port,
             !launch.no_open,
             launch.token.as_deref(),
             None,
         )
-        .await;
-        eprintln!("{msg}");
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        wait_until_webui_stopped().await;
-        std::process::exit(0);
+        .await
+        {
+            Ok(msg) => {
+                eprintln!("{msg}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                wait_until_webui_stopped().await;
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                std::process::exit(1);
+            }
+        }
     }
 
     let process_start = std::time::Instant::now();
@@ -2285,17 +2294,35 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
                     .or_else(|| inherited_token.clone());
-                let msg =
-                    jeikcode_daemon::ensure_webui(&host, port, !no_open, token.as_deref(), None)
-                        .await;
-                eprintln!("{msg}");
-                // server 是后台 task；有控制台时等 Ctrl+C，没有控制台时一直听着。
-                wait_until_webui_stopped().await;
-                // Shutdown telemetry after Ctrl+C.
-                telemetry
-                    .shutdown(std::time::Duration::from_millis(500))
-                    .await;
-                return Ok(0);
+                match jeikcode_daemon::ensure_webui_checked(
+                    &host,
+                    port,
+                    !no_open,
+                    token.as_deref(),
+                    None,
+                )
+                .await
+                {
+                    Ok(msg) => {
+                        eprintln!("{msg}");
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        // server 是后台 task；有控制台时等 Ctrl+C，没有控制台时一直听着。
+                        wait_until_webui_stopped().await;
+                        // Shutdown telemetry after Ctrl+C.
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
+                        return Ok(0);
+                    }
+                    Err(err) => {
+                        eprintln!("{err}");
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        telemetry
+                            .shutdown(std::time::Duration::from_millis(500))
+                            .await;
+                        return Ok(1);
+                    }
+                }
             }
             Commands::Serve {
                 mut host,

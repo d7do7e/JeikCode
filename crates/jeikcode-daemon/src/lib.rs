@@ -23143,6 +23143,21 @@ pub async fn ensure_webui(
     fixed_token: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
+    ensure_webui_checked(host, port, open_browser, fixed_token, session_id)
+        .await
+        .unwrap_or_else(|err| err)
+}
+
+/// Same as [`ensure_webui`], but returns `Err(message)` when port binding or
+/// token setup fails so CLI/desktop subprocesses can exit non-zero immediately
+/// instead of blocking in `wait_until_webui_stopped()`.
+pub async fn ensure_webui_checked(
+    host: &str,
+    port: u16,
+    open_browser: bool,
+    fixed_token: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<String, String> {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -23155,18 +23170,24 @@ pub async fn ensure_webui(
         }
     };
 
-    let (tokens, actual_port, bound_host) = if let Some((tokens, p, h)) = reuse {
-        (tokens, p, h)
+    let (tokens, actual_port, bound_host, token) = if let Some((tokens, p, h)) = reuse {
+        let token = startup_webui_token(&tokens, fixed_token)?;
+        (tokens, p, h, token)
     } else {
         drain_stopping_servers(&STOPPING_WEBUI).await;
         // 2) 预绑定端口：首选 `port`，被占则递增扫描（拿到真实端口）。按请求的 host 绑定。
         let (listener, secondary, actual_port) = match bind_scanning(host, port, 100).await {
             Ok(v) => v,
             Err(e) => {
-                return format!("webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）");
+                return Err(format!(
+                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）"
+                ));
             }
         };
         let tokens = auth_token::WebuiTokenStore::new();
+        // Validate/register token BEFORE spawning the server task or inserting
+        // into `WEBUI` so a token error never leaks a listening server.
+        let token = startup_webui_token(&tokens, fixed_token)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(false);
         let opts = ServerOpts {
@@ -23216,13 +23237,9 @@ pub async fn ensure_webui(
                 done_rx,
             });
         }
-        (tokens, actual_port, host.to_string())
+        (tokens, actual_port, host.to_string(), token)
     };
-
-    let token = match startup_webui_token(&tokens, fixed_token) {
-        Ok(token) => token,
-        Err(err) => return err,
-    };
+    let _ = &tokens;
     // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），在 CLI 模式下同步写回配置；
     // 桌面托管模式发生临时端口顺延（含父进程启动前探测避让或 bind_scanning 顺延）时保留用户配置端口，
     // 仅同步最新 token，避免临时冲突覆写用户配置。
@@ -23352,7 +23369,7 @@ pub async fn ensure_webui(
         msg.push_str(warn);
     }
 
-    msg
+    Ok(msg)
 }
 
 /// 停止进程内 webui server（若在运行）。返回状态串。
@@ -31650,5 +31667,34 @@ mod server_lifecycle_tests {
         assert_eq!(ok_resp.status(), StatusCode::OK);
         let reloaded = manager.load_snapshot(sid).unwrap();
         assert_eq!(reloaded.messages[0].text, "edited");
+    }
+
+    #[test]
+    fn bind_scanning_and_startup_webui_token_fail_cleanly_without_spawning() {
+        let _serial = crate::tests::ScopedChatHome::new();
+        {
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // An unresolvable host fails `bind_scanning` immediately with an Err rather than hanging.
+            let bind_err = bind_scanning("invalid.host.example.invalid", 0, 1).await;
+            assert!(bind_err.is_err());
+
+            // `ensure_webui_checked` surfaces bind failures as `Err` without populating `WEBUI`.
+            let checked =
+                ensure_webui_checked("invalid.host.example.invalid", 0, false, None, None).await;
+            assert!(checked.is_err());
+        });
+        assert!(WEBUI.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+
+        // `startup_webui_token` mints when `fixed_token` is `None` or whitespace, and registers
+        // explicit tokens when non-empty.
+        let store = auth_token::WebuiTokenStore::new();
+        let minted = startup_webui_token(&store, Some("   ")).unwrap();
+        assert!(!minted.is_empty());
+        let fixed = startup_webui_token(&store, Some("tok-123")).unwrap();
+        assert_eq!(fixed, "tok-123");
     }
 }

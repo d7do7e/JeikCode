@@ -417,6 +417,10 @@ pub async fn ensure_registry_runner(
         &working_dir,
         Some(&session_id),
     );
+    // Apply the caller's requested permission mode BEFORE spawning/binding into
+    // SessionRuntimeRegistry so concurrent `/live/message` requests arriving
+    // while MCP servers initialize cannot execute in `RuntimeMode::Auto`.
+    runtime_config.initial_mode = mode;
 
     let session_mode = if let Ok(snapshot) = load_snapshot(&working_dir, &session_id) {
         let _ = take_session_draft(&session_id);
@@ -472,7 +476,7 @@ pub async fn ensure_registry_runner(
 
     let mut forward_id = session_id.clone();
     let mut forward_dir = working_dir;
-    tokio::spawn(async move {
+    let forward_task = tokio::spawn(async move {
         let reg = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
         let _ = reg.open_or_attach(forward_id.clone(), forward_dir.clone());
         while let Some(envelope) = events.recv().await {
@@ -500,14 +504,32 @@ pub async fn ensure_registry_runner(
         let _ = task.await;
     });
 
-    handle
-        .set_mode(mode)
-        .await
-        .map_err(|error| format!("failed to set registry runner mode: {error}"))?;
+    if let Err(error) = handle.set_mode(mode).await {
+        cleanup_failed_registry_runner(reg, &session_id, &handle, forward_task).await;
+        return Err(format!("failed to set registry runner mode: {error}"));
+    }
     let _ = handle
         .wait_mcp_ready(jeikcode_capabilities::mcp::FIRST_TURN_SOFT_WAIT)
         .await;
     Ok(())
+}
+
+async fn cleanup_failed_registry_runner(
+    reg: &jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry,
+    session_id: &str,
+    handle: &jeikcode_coding::CodingRuntimeHandle,
+    mut forward_task: tokio::task::JoinHandle<()>,
+) {
+    let key = session_id.to_string();
+    let _ = reg.force_remove(&key);
+    let _ = handle.shutdown().await;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut forward_task)
+        .await
+        .is_err()
+    {
+        forward_task.abort();
+        let _ = forward_task.await;
+    }
 }
 
 pub fn prefer_registry_live_stream(requested_session_id: &str) -> bool {
@@ -1649,5 +1671,114 @@ mod tests {
         ));
         assert_eq!(sid, "s2");
         assert_eq!(wd, PathBuf::from("/proj-c"));
+    }
+
+    #[tokio::test]
+    async fn registry_runner_cleanup_removes_entry_and_drains_forwarder() {
+        use jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry;
+        use jeikcode_coding::{
+            CodingRuntime, CodingRuntimeConfig, CodingRuntimeStart, PrepareOptions,
+            ProviderBootstrap, RuntimeMode, SessionMode,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "").unwrap();
+        let store = jeikcode_config::ConfigStore::new(&cfg_path);
+        let mut cfg = store.read().unwrap().config;
+        cfg.default_model = Some("m".into());
+        cfg.models.insert(
+            "m".into(),
+            jeikcode_config::config::provider::ModelProfileConfig {
+                account: "acc".into(),
+                model: "m".into(),
+                display_name: None,
+                system_prompt: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                capable_model: None,
+                pricing: None,
+                supports_vision: None,
+                reasoning_model: None,
+            },
+        );
+        cfg.provider_accounts.insert(
+            "acc".into(),
+            jeikcode_config::config::provider::ProviderAccountConfig {
+                provider: "openai".into(),
+                display_name: None,
+                api_key: Some("k".into()),
+                base_url: Some("https://example.invalid/v1".into()),
+                user_agent: None,
+                skip_tls_verify: false,
+                enterprise_url: None,
+                ephemeral: false,
+            },
+        );
+
+        let mut runtime_cfg =
+            CodingRuntimeConfig::from_config(&cfg, dir.path(), None, None, true, false);
+        runtime_cfg.initial_mode = RuntimeMode::Plan;
+        assert_eq!(runtime_cfg.initial_mode, RuntimeMode::Plan);
+
+        let agent_cfg = crate::kernel_runtime::coding_config_from_runtime(&runtime_cfg);
+        let prepare = PrepareOptions {
+            request_user_input: false,
+            session: SessionMode::Disabled,
+            skill_dirs: None,
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            shared_mcp_registry: None,
+            memory: false,
+            web: false,
+            review: false,
+            rate_limit_source: None,
+        };
+        let start = CodingRuntimeStart {
+            agent: agent_cfg,
+            prepare,
+            provider_factory: crate::runtime_host::coding_provider_factory(),
+            plugin_hooks: crate::runtime_host::installed_plugin_hook_source(),
+            image_preprocessor: None,
+        };
+        let CodingRuntime {
+            handle,
+            mut events,
+            task,
+            ..
+        } = CodingRuntime::start_with_bootstrap(start, ProviderBootstrap::Required)
+            .await
+            .expect("start test runtime");
+
+        let reg = SessionRuntimeRegistry::new();
+        let key = "cleanup-sess".to_string();
+        let _ = reg.open_or_attach(key.clone(), dir.path().to_path_buf());
+        assert!(reg.bind_handle(&key, handle.clone(), None));
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = finished.clone();
+        let forward_task = tokio::spawn(async move {
+            while events.recv().await.is_some() {}
+            let _ = task.await;
+            finished_flag.store(true, Ordering::SeqCst);
+        });
+
+        super::cleanup_failed_registry_runner(&reg, &key, &handle, forward_task).await;
+
+        assert!(
+            reg.lookup(&key).is_none(),
+            "failed registry runner cleanup must remove the bound entry"
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "cleanup must drain the forwarder and runtime task"
+        );
     }
 }
