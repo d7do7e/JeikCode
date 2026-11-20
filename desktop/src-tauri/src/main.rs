@@ -41,6 +41,7 @@ fn is_shutting_down() -> bool {
 struct WebuiOrigin {
     host: String,
     port: u16,
+    token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,9 +169,15 @@ fn remember_webui_origin(slot: &Mutex<Option<WebuiOrigin>>, url: &str) {
     let (Some(host), Some(port)) = (parsed.host_str(), parsed.port()) else {
         return;
     };
+    let token = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty());
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(WebuiOrigin {
         host: host.to_string(),
         port,
+        token,
     });
 }
 
@@ -359,7 +366,7 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
     // During cold start before LiveOriginSlot is set, fall back to direct child termination
     // below so we never send /shutdown to an unrelated busy daemon on cfg_port.
     if let Some(origin) = live_origin {
-        let (_cfg_host, _cfg_port, token) = load_webui_listen();
+        let token = origin.token.clone().or_else(|| load_webui_listen().2);
         if origin.port > 0 {
             send_desktop_shutdown(&origin.host, origin.port, token.as_deref());
         }
@@ -2343,6 +2350,7 @@ mod tests {
         WebuiOrigin {
             host: host.to_string(),
             port,
+            token: None,
         }
     }
 
@@ -2566,7 +2574,9 @@ mod tests {
         let slot = Mutex::new(None);
         remember_webui_origin(&slot, "http://127.0.0.1:13480/?token=abc&desktop=1");
         let stored = slot.lock().unwrap().clone().unwrap();
-        assert_eq!(stored, origin("127.0.0.1", 13480));
+        assert_eq!(stored.host, "127.0.0.1");
+        assert_eq!(stored.port, 13480);
+        assert_eq!(stored.token.as_deref(), Some("abc"));
     }
 
     #[test]
