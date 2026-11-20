@@ -97,6 +97,11 @@ export function TasksPanel({
   const [clearRunsOpen, setClearRunsOpen] = useState(false);
   const [clearingRuns, setClearingRuns] = useState(false);
 
+  // Monotonic request guards: prevent slow loads from overwriting newer SSE updates,
+  // and prevent in-flight save/toggle from writing errors/selection into a switched task.
+  const schedulesReqSeqRef = useRef(0);
+  const formContextSeqRef = useRef(0);
+
   // Run history for selected task
   const [runs, setRuns] = useState<SessionMetaWithProject[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
@@ -117,11 +122,14 @@ export function TasksPanel({
 
   const loadSchedules = useCallback(
     async (silent = false) => {
+      const seq = ++schedulesReqSeqRef.current;
       if (!silent) setLoading(true);
       try {
         const resp = await getSchedules();
+        if (seq !== schedulesReqSeqRef.current) return;
         setData(resp);
       } catch (err: any) {
+        if (seq !== schedulesReqSeqRef.current) return;
         if (!silent) {
           showToast(
             t('tasks.loadFailed', { error: err?.message || t('tasks.unknownError') }),
@@ -129,7 +137,7 @@ export function TasksPanel({
           );
         }
       } finally {
-        if (!silent) setLoading(false);
+        if (seq === schedulesReqSeqRef.current) setLoading(false);
       }
     },
     [t],
@@ -151,6 +159,7 @@ export function TasksPanel({
 
   // Populate form when switching between creatingNew and selectedTask
   useEffect(() => {
+    formContextSeqRef.current += 1;
     setFormError(null);
     if (creatingNew) {
       setOsWarning(null);
@@ -282,6 +291,7 @@ export function TasksPanel({
 
   const handleSave = async (e: Event) => {
     e.preventDefault();
+    const formSeq = formContextSeqRef.current;
     setFormError(null);
     setOsWarning(null);
     const schedule = buildScheduleSpec();
@@ -297,10 +307,12 @@ export function TasksPanel({
           notify,
           enabled,
         });
-        if (res.os_warning) setOsWarning(res.os_warning);
         showToast(t('tasks.createdToast'), 'success');
-        onCreatingChange(false);
-        if (res.task?.id) onSelectTaskId(res.task.id);
+        if (formSeq === formContextSeqRef.current) {
+          if (res.os_warning) setOsWarning(res.os_warning);
+          onCreatingChange(false);
+          if (res.task?.id) onSelectTaskId(res.task.id);
+        }
         await loadSchedules(true);
       } else if (selectedTask) {
         const res = await updateSchedule(selectedTask.id, {
@@ -312,13 +324,17 @@ export function TasksPanel({
           notify,
           enabled,
         });
-        if (res.os_warning) setOsWarning(res.os_warning);
         showToast(t('tasks.savedToast'), 'success');
+        if (formSeq === formContextSeqRef.current && res.os_warning) {
+          setOsWarning(res.os_warning);
+        }
         await loadSchedules(true);
       }
     } catch (err: any) {
       const msg = err?.message || t('tasks.unknownError');
-      setFormError(msg);
+      if (formSeq === formContextSeqRef.current) {
+        setFormError(msg);
+      }
       showToast(t('tasks.saveFailed', { error: msg }), 'error');
     } finally {
       setSaving(false);
@@ -360,9 +376,12 @@ export function TasksPanel({
   };
 
   const handleToggle = async (task: ScheduleTaskItem) => {
+    const formSeq = formContextSeqRef.current;
     try {
       const res = await toggleSchedule(task.id, !task.enabled);
-      if (res.os_warning) setOsWarning(res.os_warning);
+      if (formSeq === formContextSeqRef.current && selectedTask?.id === task.id && res.os_warning) {
+        setOsWarning(res.os_warning);
+      }
       await loadSchedules(true);
     } catch (err: any) {
       showToast(t('tasks.toggleFailed', { error: err?.message || err }), 'error');

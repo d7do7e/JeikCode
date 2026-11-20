@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   getSchedules,
   ScheduleTaskItem,
@@ -25,16 +25,19 @@ export function TasksSidebar({
   const [tasks, setTasks] = useState<ScheduleTaskItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const reqSeqRef = useRef(0);
 
   const load = useCallback(async (silent = false) => {
+    const seq = ++reqSeqRef.current;
     if (!silent) setLoading(true);
     try {
       const resp = await getSchedules();
+      if (seq !== reqSeqRef.current) return;
       setTasks(resp.tasks);
     } catch {
       /* errors surface in main TasksPanel */
     } finally {
-      if (!silent) setLoading(false);
+      if (seq === reqSeqRef.current) setLoading(false);
     }
   }, []);
 
