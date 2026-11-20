@@ -927,6 +927,33 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
     [isDark, t, cwd, preferredShell, connectTabSocket]
   );
 
+  // Defense-in-depth if TerminalPanel stays mounted across a cwd switch (must run BEFORE
+  // activeTab/reconnect effects so old termMap entries are never reconnected under the new cwd).
+  useEffect(() => {
+    if (tabsScopeRef.current === sessionScopeKey && scratchpadScopeRef.current === sessionScopeKey) {
+      return;
+    }
+    syncGenerationRef.current += 1;
+    for (const record of termMap.current.values()) {
+      disposeTerminalRecord(record);
+    }
+    termMap.current.clear();
+    const saved = getSavedSessions(cwd);
+    const nextTabs = saved && saved.length > 0 ? saved : buildDefaultTerminalTabs(cwd);
+    tabsScopeRef.current = sessionScopeKey;
+    setTabs(nextTabs);
+    const savedActive = getSavedActiveTab(cwd);
+    setActiveTabIdState(
+      savedActive && nextTabs.some((t) => t.id === savedActive) ? savedActive : (nextTabs[0]?.id || ''),
+    );
+    scratchpadScopeRef.current = sessionScopeKey;
+    try {
+      setScratchpadText(window.sessionStorage?.getItem(getProjectScratchpadStorageKey(cwd)) || '');
+    } catch {
+      setScratchpadText('');
+    }
+  }, [cwd, sessionScopeKey, disposeTerminalRecord]);
+
   // 激活 Tab 切换 / 终端面板重新可见时：检查连接自愈、平滑重测；
   // 只有用户主动打开终端（或点击终端页签）才把焦点交给 xterm。
   useEffect(() => {
@@ -1103,32 +1130,6 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
       }
     } catch {}
   }, [cwd, sessionScopeKey, preferredShell, hostPlatform, stableDefaultId, disposeTerminalRecord]);
-
-  // Defense-in-depth if TerminalPanel stays mounted across a cwd switch.
-  useEffect(() => {
-    if (tabsScopeRef.current === sessionScopeKey && scratchpadScopeRef.current === sessionScopeKey) {
-      return;
-    }
-    syncGenerationRef.current += 1;
-    for (const record of termMap.current.values()) {
-      disposeTerminalRecord(record);
-    }
-    termMap.current.clear();
-    const saved = getSavedSessions(cwd);
-    const nextTabs = saved && saved.length > 0 ? saved : buildDefaultTerminalTabs(cwd);
-    tabsScopeRef.current = sessionScopeKey;
-    setTabs(nextTabs);
-    const savedActive = getSavedActiveTab(cwd);
-    setActiveTabIdState(
-      savedActive && nextTabs.some((t) => t.id === savedActive) ? savedActive : (nextTabs[0]?.id || ''),
-    );
-    scratchpadScopeRef.current = sessionScopeKey;
-    try {
-      setScratchpadText(window.sessionStorage?.getItem(getProjectScratchpadStorageKey(cwd)) || '');
-    } catch {
-      setScratchpadText('');
-    }
-  }, [cwd, sessionScopeKey, disposeTerminalRecord]);
 
   useEffect(() => {
     void syncWithBackend();
@@ -1319,8 +1320,10 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
   };
 
   // 关闭所有终端标签（终止所有任务，恢复纯净初始终端）
+  // 使用新唯一 ID 而非复用 stableDefaultId，避免并发在途的 DELETE /terminal/:id 误杀刚重建的同 ID PTY。
   const closeAllTabs = () => {
-    tabs.forEach((tab) => {
+    const oldTabs = tabs;
+    oldTabs.forEach((tab) => {
       const record = termMap.current.get(tab.id);
       if (record) {
         disposeTerminalRecord(record);
@@ -1328,7 +1331,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
       }
       void closeTerminalSession(tab.id);
     });
-    const newId = stableDefaultId;
+    const newId = `term_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newTab: TerminalTab = {
       id: newId,
       name: `${preferredShell} 1`,
