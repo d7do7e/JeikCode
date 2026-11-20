@@ -419,9 +419,25 @@ pub fn remove(id: &str) -> std::io::Result<()> {
     remove_in(&schedules_root(), id)
 }
 
-/// Next fire time (epoch secs, UTC) for simple frequencies. `Cron` returns None
-/// because OS cron translation is not handled here.
+/// Next fire time (epoch secs) for simple frequencies. `Daily` and `Weekly`
+/// evaluate wall-clock `time` / `weekday` against the host's local timezone
+/// (matching OS schedulers: systemd timers, launchd, Windows Task Scheduler);
+/// `Cron` returns None because OS cron translation is not handled here.
 pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
+    next_run_with_offset(
+        schedule,
+        now_epoch_secs,
+        local_utc_offset_secs(now_epoch_secs),
+    )
+}
+
+/// Pure helper with explicit UTC offset in seconds so tests can verify
+/// non-UTC timezones and day-boundary rollovers deterministically.
+pub fn next_run_with_offset(
+    schedule: &Schedule,
+    now_epoch_secs: i64,
+    utc_offset_secs: i64,
+) -> Option<i64> {
     match schedule {
         Schedule::Interval { every_minutes } => {
             (*every_minutes > 0).then(|| now_epoch_secs + (*every_minutes as i64) * 60)
@@ -432,35 +448,141 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
         }
         Schedule::Daily { time } => {
             let (h, m) = parse_hhmm(time).ok()?;
-            let day = now_epoch_secs.div_euclid(86400) * 86400;
-            let target = day + (h as i64) * 3600 + (m as i64) * 60;
-            Some(if target > now_epoch_secs {
-                target
+            let local_now = now_epoch_secs + utc_offset_secs;
+            let local_day = local_now.div_euclid(86400) * 86400;
+            let local_target = local_day + (h as i64) * 3600 + (m as i64) * 60;
+            let next_local = if local_target > local_now {
+                local_target
             } else {
-                target + 86400
-            })
+                local_target + 86400
+            };
+            Some(next_local - utc_offset_secs)
         }
         Schedule::Weekly { weekday, time } => {
             if !(1..=7).contains(weekday) {
                 return None;
             }
             let (h, m) = parse_hhmm(time).ok()?;
-            let days_since_epoch = now_epoch_secs.div_euclid(86400);
+            let local_now = now_epoch_secs + utc_offset_secs;
+            let local_days_since_epoch = local_now.div_euclid(86400);
             // 1970-01-01 was Thursday (ISO weekday 4).
-            let current_weekday = (days_since_epoch + 3).rem_euclid(7) + 1;
+            let current_weekday = (local_days_since_epoch + 3).rem_euclid(7) + 1;
             let target_weekday = *weekday as i64;
             let mut delta_days = (target_weekday - current_weekday).rem_euclid(7);
-            let mut target =
-                (days_since_epoch + delta_days) * 86400 + (h as i64) * 3600 + (m as i64) * 60;
-            if target <= now_epoch_secs {
+            let mut local_target =
+                (local_days_since_epoch + delta_days) * 86400 + (h as i64) * 3600 + (m as i64) * 60;
+            if local_target <= local_now {
                 delta_days += 7;
-                target =
-                    (days_since_epoch + delta_days) * 86400 + (h as i64) * 3600 + (m as i64) * 60;
+                local_target = (local_days_since_epoch + delta_days) * 86400
+                    + (h as i64) * 3600
+                    + (m as i64) * 60;
             }
-            Some(target)
+            Some(local_target - utc_offset_secs)
         }
         Schedule::Cron { .. } => None,
     }
+}
+
+/// Host local-time offset from UTC in seconds at `epoch_secs`, queried via OS
+/// libc/Win32 APIs without adding a `chrono` dependency to the leaf config crate.
+fn local_utc_offset_secs(epoch_secs: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        let t = epoch_secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::localtime_r(&t, &mut tm) };
+        if res.is_null() {
+            return 0;
+        }
+        // On glibc/BSD/macOS `tm_gmtoff` holds seconds east of UTC.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "android",
+            target_os = "ios",
+        ))]
+        {
+            return tm.tm_gmtoff as i64;
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "android",
+            target_os = "ios",
+        )))]
+        {
+            return civil_to_days(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday) * 86400
+                + (tm.tm_hour as i64) * 3600
+                + (tm.tm_min as i64) * 60
+                + (tm.tm_sec as i64)
+                - epoch_secs;
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Tm {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+        }
+        extern "C" {
+            fn _localtime64_s(tm: *mut Tm, time: *const i64) -> i32;
+        }
+        let mut tm = Tm::default();
+        let rc = unsafe { _localtime64_s(&mut tm, &epoch_secs) };
+        if rc != 0 {
+            return 0;
+        }
+        return civil_to_days(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday) * 86400
+            + (tm.tm_hour as i64) * 3600
+            + (tm.tm_min as i64) * 60
+            + (tm.tm_sec as i64)
+            - epoch_secs;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = epoch_secs;
+        0
+    }
+}
+
+#[cfg(any(
+    windows,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "android",
+        target_os = "ios",
+    ))
+))]
+fn civil_to_days(year: i32, month: i32, day: i32) -> i64 {
+    let y = (year as i64) - if month <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + (day as i64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -578,15 +700,69 @@ mod tests {
     fn next_run_weekly_respects_target_weekday() {
         // 1970-01-01 08:00 UTC (Thursday, weekday=4) -> target Monday (weekday=1) at 09:00 is +4 days.
         let now = 8 * 3600;
-        let nr = next_run(
+        let nr = next_run_with_offset(
             &Schedule::Weekly {
                 weekday: 1,
                 time: "09:00".into(),
             },
             now,
+            0,
         )
         .unwrap();
         assert_eq!(nr, 4 * 86400 + 9 * 3600);
+    }
+
+    #[test]
+    fn next_run_daily_and_weekly_respect_local_utc_offset() {
+        // At 1970-01-01 23:30 UTC (Thursday), in UTC+8 it is 1970-01-02 07:30 (Friday, weekday=5).
+        let now = 23 * 3600 + 1800;
+        let utc_plus_8 = 8 * 3600;
+
+        // Daily 09:00 local -> 1970-01-02 09:00+08:00 = 1970-01-02 01:00 UTC (+90 minutes from now).
+        let daily = next_run_with_offset(
+            &Schedule::Daily {
+                time: "09:00".into(),
+            },
+            now,
+            utc_plus_8,
+        )
+        .unwrap();
+        assert_eq!(daily - now, 90 * 60);
+
+        // Weekly Friday (weekday=5) 09:00 local -> same morning (+90 minutes), NOT +7 days!
+        let weekly = next_run_with_offset(
+            &Schedule::Weekly {
+                weekday: 5,
+                time: "09:00".into(),
+            },
+            now,
+            utc_plus_8,
+        )
+        .unwrap();
+        assert_eq!(weekly - now, 90 * 60);
+
+        // Negative UTC offset (-5h): at 1970-01-02 01:00 UTC (Friday), local is 1970-01-01 20:00 (Thursday, weekday=4).
+        let now_neg = 86400 + 3600;
+        let utc_minus_5 = -5 * 3600;
+        let daily_neg = next_run_with_offset(
+            &Schedule::Daily {
+                time: "21:00".into(),
+            },
+            now_neg,
+            utc_minus_5,
+        )
+        .unwrap();
+        assert_eq!(daily_neg - now_neg, 3600);
+        let weekly_neg = next_run_with_offset(
+            &Schedule::Weekly {
+                weekday: 4,
+                time: "21:00".into(),
+            },
+            now_neg,
+            utc_minus_5,
+        )
+        .unwrap();
+        assert_eq!(weekly_neg - now_neg, 3600);
     }
 
     #[test]
