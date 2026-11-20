@@ -899,7 +899,11 @@ impl Tool for TaskTool {
                 SubagentRole::Verifier => VERIFIER_PERSONA,
                 SubagentRole::Explore => EXPLORE_PERSONA,
             };
-            let persona = super::subagent_context::build_child_persona(
+            #[cfg(feature = "codeintel")]
+            let has_codegraph = crate::codeintel::has_nonempty_codegraph(&ctx.working_dir);
+            #[cfg(not(feature = "codeintel"))]
+            let has_codegraph = false;
+            let persona = super::subagent_context::build_child_persona_with_codegraph(
                 base_persona,
                 role,
                 &scope,
@@ -908,6 +912,7 @@ impl Tool for TaskTool {
                 } else {
                     project_instructions.as_deref()
                 },
+                has_codegraph,
             );
             let wd = ctx.working_dir.clone();
             let label = format!("{}#{}", role.as_str(), idx + 1);
@@ -1167,6 +1172,7 @@ async fn spawn_and_run_child(
         .working_dir(wd.clone())
         .cancel_token(child_cancel)
         .graceful_final_synthesis(true)
+        .reserve_final_synthesis_round(true)
         .hook(progress_hook.clone());
     if let Some(ctx) = inherited_context {
         builder = builder.hook(Arc::new(

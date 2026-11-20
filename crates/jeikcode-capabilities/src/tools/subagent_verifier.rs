@@ -20,7 +20,7 @@ use super::bash::{
     bash_invocations, check_destructive_command, is_read_only_bash, output_redirect_target,
     BashInvocation,
 };
-use super::subagent_context::build_child_persona;
+use super::subagent_context::build_child_persona_with_codegraph;
 use super::task::{DenyOfflineNetwork, DenySensitivePaths};
 
 /// Subagent execution role parsed from `SubTask.subagent_type`.
@@ -694,7 +694,11 @@ pub async fn run_blind_verifier_with_context(
     max_rounds: u32,
     cancel: CancellationToken,
 ) -> Result<VerifierVerdict, String> {
-    let persona = build_child_persona(
+    #[cfg(feature = "codeintel")]
+    let has_codegraph = crate::codeintel::has_nonempty_codegraph(&working_dir);
+    #[cfg(not(feature = "codeintel"))]
+    let has_codegraph = false;
+    let persona = build_child_persona_with_codegraph(
         VERIFIER_PERSONA,
         SubagentRole::Verifier,
         &[],
@@ -703,6 +707,7 @@ pub async fn run_blind_verifier_with_context(
         } else {
             project_instructions.as_deref()
         },
+        has_codegraph,
     );
     let mut builder = Agent::builder()
         .provider(provider)
@@ -711,6 +716,7 @@ pub async fn run_blind_verifier_with_context(
         .working_dir(working_dir.clone())
         .cancel_token(cancel)
         .graceful_final_synthesis(true)
+        .reserve_final_synthesis_round(true)
         .tool_loop_policy(ToolLoopPolicy::default())
         .middleware(Arc::new(DenySensitivePaths::new(working_dir)))
         .middleware(Arc::new(DenyOfflineNetwork))

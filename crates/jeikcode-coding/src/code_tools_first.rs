@@ -17,8 +17,9 @@ use jeikcode_kernel::message::Conversation;
 use jeikcode_kernel::middleware::{AfterOutcome, ToolMiddleware};
 use jeikcode_kernel::tool::{Tool, ToolResult};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 const WANDER_WINDOW: u8 = 10;
 const WANDER_NUDGE_AT: u8 = 8;
@@ -82,10 +83,27 @@ fn append_reminder(text: &mut String, body: &str, needle: &str) {
 pub struct CodeToolsFirstHook {
     enabled: bool,
     session_key: String,
+    working_dir: Option<std::sync::Arc<RwLock<PathBuf>>>,
 }
 
 impl CodeToolsFirstHook {
     pub fn new(code_explore_mounted: bool, session_id: Option<&str>) -> Self {
+        Self::create(code_explore_mounted, session_id, None)
+    }
+
+    pub fn with_working_dir(
+        code_explore_mounted: bool,
+        session_id: Option<&str>,
+        working_dir: std::sync::Arc<RwLock<PathBuf>>,
+    ) -> Self {
+        Self::create(code_explore_mounted, session_id, Some(working_dir))
+    }
+
+    fn create(
+        code_explore_mounted: bool,
+        session_id: Option<&str>,
+        working_dir: Option<std::sync::Arc<RwLock<PathBuf>>>,
+    ) -> Self {
         static ANON: AtomicU64 = AtomicU64::new(1);
         let session_key = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
@@ -94,7 +112,19 @@ impl CodeToolsFirstHook {
         Self {
             enabled: code_explore_mounted,
             session_key,
+            working_dir,
         }
+    }
+
+    fn has_active_codegraph(&self) -> bool {
+        let Some(working_dir) = &self.working_dir else {
+            return true;
+        };
+        let cwd = working_dir
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        jeikcode_capabilities::codeintel::has_nonempty_codegraph(&cwd)
     }
 }
 
@@ -108,7 +138,7 @@ impl LifecycleHooks for CodeToolsFirstHook {
 #[async_trait]
 impl ToolMiddleware for CodeToolsFirstHook {
     async fn after(&self, result: &mut ToolResult, tool: Option<&dyn Tool>) -> AfterOutcome {
-        if !self.enabled {
+        if !self.enabled || !self.has_active_codegraph() {
             return AfterOutcome::Proceed;
         }
         let Some(tool) = tool else {
@@ -294,6 +324,33 @@ mod tests {
         }
         let nudged = after_named(&hook, "grep", "x").await;
         assert!(nudged.contains(WANDER_NEEDLE), "{nudged}");
+        hook.session_end(&Conversation::default()).await;
+    }
+
+    #[tokio::test]
+    async fn with_working_dir_skips_nudge_when_codegraph_absent_and_nudges_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::sync::Arc::new(RwLock::new(dir.path().to_path_buf()));
+        let hook = CodeToolsFirstHook::with_working_dir(true, Some("sess-no-cg"), cwd.clone());
+        for _ in 0..8 {
+            let out = after_named(&hook, "grep", "hits").await;
+            assert!(
+                !out.contains(WANDER_NEEDLE),
+                "must not nudge without .jeikcode/codegraph: {out}"
+            );
+        }
+
+        std::fs::write(dir.path().join("lib.rs"), "pub fn ping() -> u32 { 1 }\n").unwrap();
+        jeikcode_capabilities::codeintel::init_workspace_index(dir.path(), true, &|_| {})
+            .expect("codegraph init should succeed");
+        let mut last = String::new();
+        for _ in 0..8 {
+            last = after_named(&hook, "grep", "hits").await;
+        }
+        assert!(
+            last.contains(WANDER_NEEDLE),
+            "must nudge once non-empty .jeikcode/codegraph exists: {last}"
+        );
         hook.session_end(&Conversation::default()).await;
     }
 }

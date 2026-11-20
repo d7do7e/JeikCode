@@ -38,6 +38,13 @@ const EXPLORE_TOOL_GUIDANCE: &str = "\
 - You are strictly READ-ONLY. Cite exact file paths, line numbers, and verified symbols in your findings.
 </explore_strategy>";
 
+const EXPLORE_TOOL_GUIDANCE_NO_CODEGRAPH: &str = "\
+<explore_strategy>
+- Prefer dedicated tools over shell commands: use `grep` for exact symbols/regex, `glob` for file patterns, and `read` in generous chunks (several hundred lines or full files).
+- Concurrency first: batch independent `read`, `grep`, and `glob` calls in the same turn.
+- You are strictly READ-ONLY. Cite exact file paths, line numbers, and verified symbols in your findings.
+</explore_strategy>";
+
 const WORKER_TOOL_GUIDANCE: &str = "\
 <explore_strategy>
 - Prefer dedicated tools: use `code_explore` (directory scope), `grep`, `glob`, and generous `read` calls before editing; use `edit` / `write` (never `sed`/`awk`/redirects) strictly within your declared `scope`.
@@ -45,9 +52,23 @@ const WORKER_TOOL_GUIDANCE: &str = "\
 - Use `run_command` only for builds, tests, or checks dedicated tools cannot cover; run one focused verification check after edits, and never run pagers or interactive/watch commands.
 </explore_strategy>";
 
+const WORKER_TOOL_GUIDANCE_NO_CODEGRAPH: &str = "\
+<explore_strategy>
+- Prefer dedicated tools: use `grep`, `glob`, and generous `read` calls before editing; use `edit` / `write` (never `sed`/`awk`/redirects) strictly within your declared `scope`.
+- Concurrency first: batch independent reads/searches or independent in-scope edits in the same turn.
+- Use `run_command` only for builds, tests, or checks dedicated tools cannot cover; run one focused verification check after edits, and never run pagers or interactive/watch commands.
+</explore_strategy>";
+
 const VERIFIER_TOOL_GUIDANCE: &str = "\
 <explore_strategy>
 - Prefer dedicated tools (`read` in generous chunks, `code_explore` on directory scopes, `grep`, `glob`) to inspect changed code and callers/callees concurrently.
+- Use `run_command` ONLY for read-only inspection and verification checks (`cargo check`, `cargo test`, `cargo fmt --check`, `npm test`, `pytest`, `git diff`, etc.). File mutations and output redirects are hard-blocked.
+- Verify independently from fresh workspace state; cite exact commands run, pass/fail output, and file:line evidence.
+</explore_strategy>";
+
+const VERIFIER_TOOL_GUIDANCE_NO_CODEGRAPH: &str = "\
+<explore_strategy>
+- Prefer dedicated tools (`read` in generous chunks, `grep`, `glob`) to inspect changed code and callers/callees concurrently.
 - Use `run_command` ONLY for read-only inspection and verification checks (`cargo check`, `cargo test`, `cargo fmt --check`, `npm test`, `pytest`, `git diff`, etc.). File mutations and output redirects are hard-blocked.
 - Verify independently from fresh workspace state; cite exact commands run, pass/fail output, and file:line evidence.
 </explore_strategy>";
@@ -173,11 +194,24 @@ impl LifecycleHooks for SubagentInheritedContextHook {
 
 /// Assemble the child subagent system prompt from its base role persona, declared worker
 /// scope, `<explore_strategy>` tool guidance, and bounded `<project_instructions>`.
+#[allow(dead_code)]
 pub(crate) fn build_child_persona(
     base_persona: &str,
     role: SubagentRole,
     scope: &[String],
     project_instructions: Option<&str>,
+) -> String {
+    build_child_persona_with_codegraph(base_persona, role, scope, project_instructions, true)
+}
+
+/// Assemble the child subagent system prompt, selecting `<explore_strategy>` guidance
+/// that avoids `code_explore` nudges when the workspace lacks a codegraph index.
+pub(crate) fn build_child_persona_with_codegraph(
+    base_persona: &str,
+    role: SubagentRole,
+    scope: &[String],
+    project_instructions: Option<&str>,
+    has_codegraph: bool,
 ) -> String {
     let mut parts = vec![base_persona.to_string()];
     match role {
@@ -194,13 +228,34 @@ pub(crate) fn build_child_persona(
                     non_empty.join(", ")
                 ));
             }
-            parts.push(WORKER_TOOL_GUIDANCE.to_string());
+            parts.push(
+                if has_codegraph {
+                    WORKER_TOOL_GUIDANCE
+                } else {
+                    WORKER_TOOL_GUIDANCE_NO_CODEGRAPH
+                }
+                .to_string(),
+            );
         }
         SubagentRole::Verifier => {
-            parts.push(VERIFIER_TOOL_GUIDANCE.to_string());
+            parts.push(
+                if has_codegraph {
+                    VERIFIER_TOOL_GUIDANCE
+                } else {
+                    VERIFIER_TOOL_GUIDANCE_NO_CODEGRAPH
+                }
+                .to_string(),
+            );
         }
         SubagentRole::Explore => {
-            parts.push(EXPLORE_TOOL_GUIDANCE.to_string());
+            parts.push(
+                if has_codegraph {
+                    EXPLORE_TOOL_GUIDANCE
+                } else {
+                    EXPLORE_TOOL_GUIDANCE_NO_CODEGRAPH
+                }
+                .to_string(),
+            );
         }
     }
     if let Some(instr) = project_instructions
@@ -291,8 +346,23 @@ mod tests {
 
         let verifier = build_child_persona("VERIFIER", SubagentRole::Verifier, &[], None);
         assert!(verifier.contains("<explore_strategy>"));
+        assert!(verifier.contains("code_explore"));
         assert!(verifier.contains("File mutations and output redirects are hard-blocked"));
         assert!(!verifier.contains("Declared writable scope"));
+
+        for role in [
+            SubagentRole::Explore,
+            SubagentRole::Worker,
+            SubagentRole::Verifier,
+        ] {
+            let no_cg = build_child_persona_with_codegraph("BASE", role, &[], None, false);
+            assert!(no_cg.contains("<explore_strategy>"));
+            assert!(
+                !no_cg.contains("code_explore"),
+                "no-codegraph guidance must omit code_explore for {role:?}: {no_cg}"
+            );
+            assert!(no_cg.contains("grep") && no_cg.contains("glob") && no_cg.contains("read"));
+        }
     }
 
     #[tokio::test]

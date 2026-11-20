@@ -1734,6 +1734,8 @@ pub struct Agent {
     round_cap_checkpoint: bool,
     /// See `AgentBuilder::graceful_final_synthesis`.
     graceful_final_synthesis: bool,
+    /// See `AgentBuilder::reserve_final_synthesis_round`.
+    reserve_final_synthesis_round: bool,
 }
 
 impl Agent {
@@ -1807,6 +1809,7 @@ impl Agent {
             keep_interrupted_context: self.keep_interrupted_context,
             round_cap_checkpoint: self.round_cap_checkpoint,
             graceful_final_synthesis: self.graceful_final_synthesis,
+            reserve_final_synthesis_round: self.reserve_final_synthesis_round,
         };
         let session_scope = running.session_id.clone();
         let task = tokio::spawn(crate::tool::with_session_scope(
@@ -1936,6 +1939,8 @@ struct RunningAgent {
     round_cap_checkpoint: bool,
     /// See `AgentBuilder::graceful_final_synthesis`.
     graceful_final_synthesis: bool,
+    /// See `AgentBuilder::reserve_final_synthesis_round`.
+    reserve_final_synthesis_round: bool,
 }
 
 impl RunningAgent {
@@ -3212,9 +3217,12 @@ impl RunningAgent {
         // Re-armable round cap: on each checkpoint "continue" this grows by the base
         // `max_rounds`, giving a CONSTANT interval between confirmations.
         let mut round_cap = self.max_rounds;
-        // One-shot tool-less final synthesis pass when `graceful_final_synthesis` is enabled.
+        // One-shot tool-less final synthesis pass when `graceful_final_synthesis` or
+        // `reserve_final_synthesis_round` is enabled.
         let mut in_final_synthesis = false;
         let mut synthesis_used = false;
+        let mut penultimate_reminder_sent = false;
+        let mut synthesis_retried = false;
         let mut read_loop_guard = IntraTurnReadLoopGuard::default();
         let mut last_counted_drain_round: Option<u32> = None;
         let mut token_budget_guard = TurnTokenBudgetGuard::new(convo.cache_epoch);
@@ -3243,6 +3251,33 @@ impl RunningAgent {
             // run 1 final `ToolChoice::None` synthesis round (keeping tools mounted so
             // prior tool_use history stays wire-valid) before stopping with `StopReason::MaxRounds`.
             if let Some(cap) = round_cap {
+                if self.reserve_final_synthesis_round
+                    && !self.round_cap_checkpoint
+                    && cap >= 2
+                    && round == cap - 1
+                    && !penultimate_reminder_sent
+                    && !cancel.is_cancelled()
+                {
+                    penultimate_reminder_sent = true;
+                    convo.push(Message::synthetic_user(
+                        "One tool round remaining before your final synthesis round. Complete any essential read/check tool calls now; on the next round tools will be disabled for final output."
+                            .to_string(),
+                    ));
+                }
+                if self.reserve_final_synthesis_round
+                    && !self.round_cap_checkpoint
+                    && cap >= 2
+                    && round == cap
+                    && !synthesis_used
+                    && !cancel.is_cancelled()
+                {
+                    synthesis_used = true;
+                    in_final_synthesis = true;
+                    convo.push(Message::synthetic_user(
+                        "Final round reached. Do NOT call any tools — immediately output your complete final synthesis, findings, or verdict from the evidence already gathered."
+                            .to_string(),
+                    ));
+                }
                 if round > cap {
                     if self.graceful_final_synthesis && !synthesis_used && !cancel.is_cancelled() {
                         synthesis_used = true;
@@ -4518,6 +4553,15 @@ impl RunningAgent {
             // never catch this: an empty 200 OPENS successfully (`Ok`), so it is
             // neither a retryable `Err` nor a context overflow.
             if in_final_synthesis && assistant_text.trim().is_empty() {
+                if !synthesis_retried && !cancel.is_cancelled() {
+                    synthesis_retried = true;
+                    convo.push(Message::synthetic_user(
+                        "Your previous synthesis response was empty. Output your complete final synthesis, findings, or verdict as plain text now without calling any tools."
+                            .to_string(),
+                    ));
+                    round -= 1;
+                    continue;
+                }
                 let cap = round_cap.unwrap_or(round.saturating_sub(1));
                 self.rt.emit(AgentEvent::Error {
                     message: format!("max rounds ({cap}) reached"),
@@ -5749,6 +5793,10 @@ pub struct AgentBuilder {
     /// (keeping `tools` mounted for wire compatibility) before stopping with
     /// `StopReason::MaxRounds` so subagents do not discard gathered findings. Default `false`.
     graceful_final_synthesis: bool,
+    /// When true (with `max_rounds = Some(cap)` where `cap >= 2`), reserves round `cap`
+    /// inside the budget as a tool-less `ToolChoice::None` synthesis round, sends a
+    /// penultimate reminder at `cap - 1`, and performs a 1-shot empty-text retry. Default `false`.
+    reserve_final_synthesis_round: bool,
 }
 
 impl Default for AgentBuilder {
@@ -5806,6 +5854,7 @@ impl Default for AgentBuilder {
             keep_interrupted_context: false,
             round_cap_checkpoint: false,
             graceful_final_synthesis: false,
+            reserve_final_synthesis_round: false,
         }
     }
 }
@@ -5862,6 +5911,11 @@ impl AgentBuilder {
     /// See `AgentBuilder.graceful_final_synthesis`. Default false.
     pub fn graceful_final_synthesis(mut self, on: bool) -> Self {
         self.graceful_final_synthesis = on;
+        self
+    }
+    /// See `AgentBuilder.reserve_final_synthesis_round`. Default false.
+    pub fn reserve_final_synthesis_round(mut self, on: bool) -> Self {
+        self.reserve_final_synthesis_round = on;
         self
     }
     /// Enable conservative exact tool-loop detection for this live session.
@@ -6125,6 +6179,7 @@ impl AgentBuilder {
             keep_interrupted_context: self.keep_interrupted_context,
             round_cap_checkpoint: self.round_cap_checkpoint,
             graceful_final_synthesis: self.graceful_final_synthesis,
+            reserve_final_synthesis_round: self.reserve_final_synthesis_round,
         }
     }
 }
@@ -8107,6 +8162,7 @@ mod provider_message_pairing_tests {
             keep_interrupted_context: false,
             round_cap_checkpoint: false,
             graceful_final_synthesis: false,
+            reserve_final_synthesis_round: false,
         };
         let mut attempted_stages = [false, false];
         running
@@ -9461,5 +9517,137 @@ mod synthetic_send_tests {
         );
         assert_eq!(compacted_events, 1);
         assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod reserve_final_synthesis_tests {
+    use super::*;
+    use crate::provider::ToolChoice;
+    use crate::testkit::{EchoTool, RecordingProvider};
+    use crate::tool::ToolRegistry;
+    use async_trait::async_trait;
+
+    #[tokio::test]
+    async fn reserves_final_round_inside_cap_with_penultimate_reminder_and_empty_retry() {
+        let r1 = vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"one"}"#.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ];
+        let r2 = vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "c2".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"two"}"#.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ];
+        let r3_empty = vec![StreamEvent::Done { truncated: false }];
+        let r3_retry = vec![
+            StreamEvent::TextDelta("RESERVED_SYNTHESIS_COMPLETE".into()),
+            StreamEvent::Done { truncated: false },
+        ];
+
+        let seen_choices: Arc<std::sync::Mutex<Vec<(usize, ToolChoice)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen_choices);
+
+        struct ChoiceWrapper {
+            inner: Arc<RecordingProvider>,
+            seen: Arc<std::sync::Mutex<Vec<(usize, ToolChoice)>>>,
+        }
+        #[async_trait]
+        impl LlmProvider for ChoiceWrapper {
+            fn model_name(&self) -> &str {
+                self.inner.model_name()
+            }
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                tools: &[crate::tool::ToolDef],
+                opts: &ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, StreamEvent>,
+                crate::stream::ProviderError,
+            > {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((messages.len(), opts.tool_choice.clone()));
+                self.inner.chat_stream(messages, tools, opts).await
+            }
+        }
+
+        let inner = Arc::new(RecordingProvider::new(vec![r1, r2, r3_empty, r3_retry]));
+        let calls = inner.calls();
+        let provider = Arc::new(ChoiceWrapper {
+            inner,
+            seen: seen_clone,
+        });
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let outcome = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo"]))
+            .max_rounds(3)
+            .graceful_final_synthesis(true)
+            .reserve_final_synthesis_round(true)
+            .build()
+            .run_to_completion("investigate", AutoRespond::AllowAll)
+            .await;
+
+        assert_eq!(outcome.stop, StopReason::MaxRounds);
+        assert_eq!(outcome.text, "RESERVED_SYNTHESIS_COMPLETE");
+        assert!(
+            outcome.error.is_none(),
+            "unexpected error: {:?}",
+            outcome.error
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        assert!(!recorded[0]
+            .0
+            .iter()
+            .any(|m| m.text.contains("One tool round remaining")));
+        assert_eq!(
+            recorded[1]
+                .0
+                .iter()
+                .filter(|m| m.text.contains("One tool round remaining"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded[2]
+                .0
+                .iter()
+                .filter(|m| m.text.contains("Final round reached"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded[3]
+                .0
+                .iter()
+                .filter(|m| m.text.contains("Final round reached"))
+                .count(),
+            1
+        );
+        assert!(recorded[3]
+            .0
+            .iter()
+            .any(|m| m.text.contains("previous synthesis response was empty")));
+
+        let choices = seen_choices.lock().unwrap();
+        assert_eq!(choices[0].1, ToolChoice::Auto);
+        assert_eq!(choices[1].1, ToolChoice::Auto);
+        assert_eq!(choices[2].1, ToolChoice::None);
+        assert_eq!(choices[3].1, ToolChoice::None);
     }
 }

@@ -948,6 +948,97 @@ async fn task_max_rounds_runs_graceful_tool_less_synthesis_preserving_partial_ma
 }
 
 #[tokio::test]
+async fn task_reserve_final_synthesis_round_synthesizes_within_cap_on_max_rounds_3() {
+    use jeikcode_kernel::provider::ToolChoice;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn beta() {}\n").unwrap();
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+
+    let seen_choices: Arc<Mutex<Vec<(usize, ToolChoice)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sc = seen_choices.clone();
+
+    struct ReservedRoundProvider {
+        step: AtomicUsize,
+        seen: Arc<Mutex<Vec<(usize, ToolChoice)>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ReservedRoundProvider {
+        fn model_name(&self) -> &str {
+            "reserved-synth-mock"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            tools: &[ToolDef],
+            opts: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let n = self.step.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((tools.len(), opts.tool_choice.clone()));
+            if n < 2 {
+                Ok(stream::iter(vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("c{n}"),
+                        name: "read".into(),
+                        arguments: r#"{"path":"src.rs"}"#.into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ])
+                .boxed())
+            } else {
+                Ok(stream::iter(vec![
+                    StreamEvent::TextDelta("WITHIN_CAP_SYNTHESIS: beta checked".into()),
+                    StreamEvent::Done { truncated: false },
+                ])
+                .boxed())
+            }
+        }
+    }
+
+    let make_provider = move || {
+        Arc::new(ReservedRoundProvider {
+            step: AtomicUsize::new(0),
+            seen: sc.clone(),
+        }) as Arc<dyn LlmProvider>
+    };
+    let tool = TaskTool::new(
+        make_provider.clone(),
+        make_provider,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read"]),
+    );
+
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"reserved synthesis","prompt":"check src.rs","subagent_type":"explore","max_rounds":3}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("WITHIN_CAP_SYNTHESIS: beta checked"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("rounds=\"3\""),
+        "must complete within max_rounds=3 without needing a 4th round: {}",
+        out.content
+    );
+    let choices = seen_choices.lock().unwrap();
+    assert_eq!(choices.len(), 3);
+    assert_eq!(choices[0].1, ToolChoice::Auto);
+    assert_eq!(choices[1].1, ToolChoice::Auto);
+    assert_eq!(choices[2].1, ToolChoice::None);
+}
+
+#[tokio::test]
 async fn bind_session_switch_cancels_prior_background_subagent_while_turn_cancel_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let reg = build_test_registry();

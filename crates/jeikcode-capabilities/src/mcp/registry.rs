@@ -706,8 +706,20 @@ impl McpRegistry {
                             };
 
                             let mut cancel_rx = cancelled.subscribe();
+                            let init_timeout =
+                                super::CONNECT_TIMEOUT.min(Duration::from_millis(timeout_ms.max(1)));
                             let initialization = tokio::select! {
-                                result = client.initialize() => Some(result),
+                                result = tokio::time::timeout(init_timeout, client.initialize()) => match result {
+                                    Ok(res) => Some(res),
+                                    Err(_) => {
+                                        client.kill_now();
+                                        Some(Err(anyhow::anyhow!(
+                                            "MCP server '{}' initialize timed out after {}ms",
+                                            name,
+                                            init_timeout.as_millis()
+                                        )))
+                                    }
+                                },
                                 _ = wait_for_true(&mut cancel_rx) => None,
                             };
                             let Some(initialization) = initialization else {
@@ -1380,7 +1392,15 @@ impl McpRegistry {
         let mut pending: FuturesUnordered<_> = server_snapshot
             .into_iter()
             .map(|(server_name, client)| async move {
-                let result = client.list_tools().await;
+                let list_timeout = self.list_tools_timeout(&server_name).await;
+                let result = match tokio::time::timeout(list_timeout, client.list_tools()).await {
+                    Ok(res) => res,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "MCP tools/list on '{}' timed out after {}ms",
+                        server_name,
+                        list_timeout.as_millis()
+                    )),
+                };
                 (server_name, result)
             })
             .collect();
@@ -1571,6 +1591,25 @@ impl McpRegistry {
     }
 
     #[doc(hidden)]
+    /// Test-only helper: seed a synthetic connected server's cached tools and
+    /// instructions without spawning an external process.
+    pub async fn seed_server_for_test(
+        &self,
+        server_name: &str,
+        instructions: Option<&str>,
+        tools: Vec<McpToolInfo>,
+    ) {
+        if let Ok(mut names) = self.configured_servers.write() {
+            names.insert(server_name.to_string());
+        }
+        self.record_server_instructions(server_name, instructions);
+        self.tool_cache
+            .write()
+            .await
+            .insert(server_name.to_string(), tools);
+        self.finish_initial_connections();
+    }
+
     pub fn set_last_activity_for_test(&self, ago: Duration) {
         *self
             .last_activity

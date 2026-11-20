@@ -136,12 +136,20 @@ pub fn resolve_timeout_ms(configured: Option<u64>) -> u64 {
     configured.unwrap_or(default_ms).max(1).min(hard_cap_ms())
 }
 
-/// Raw MCP config file format (for deserialization).
+/// Raw MCP config file format (for deserialization in legacy tests).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct McpConfigFile {
     /// JSON key `mcpServers`（与 Cursor 等工具一致）；`servers` 仍可作为别名读取旧配置。
     #[serde(default, rename = "mcpServers", alias = "servers")]
     mcp_servers: BTreeMap<String, McpServerEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AutoApproveField {
+    Bool(bool),
+    List(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,9 +177,9 @@ struct McpServerEntry {
     /// `trust: true` ⇒ auto-approve every tool from this server (skip the prompt).
     #[serde(default)]
     trust: bool,
-    /// `autoApprove: ["query", ...]` ⇒ per-tool auto-approve allowlist.
+    /// `autoApprove: ["query", ...]` or `autoApprove: true|false` ⇒ per-tool allowlist or full-server approval.
     #[serde(default, rename = "autoApprove", alias = "auto_approve")]
-    auto_approve: Vec<String>,
+    auto_approve: Option<AutoApproveField>,
     /// Per-project shared transport concurrency. Stateful servers can set 1;
     /// stateless/high-latency servers normally keep the default of 8.
     #[serde(
@@ -397,28 +405,56 @@ fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServe
         return Ok(Vec::new());
     }
 
-    let raw: McpConfigFile = serde_json::from_str(&strip_json_comments(&content))
+    let root: Value = serde_json::from_str(&strip_json_comments(&content))
         .with_context(|| format!("Failed to parse MCP config from {}", path.display()))?;
+    let root_obj = root.as_object().ok_or_else(|| {
+        anyhow::anyhow!("MCP config {} root must be a JSON object", path.display())
+    })?;
 
+    let raw_servers = collect_merged_mcp_server_maps(root_obj);
     let mut configs = Vec::new();
 
-    for (name, entry) in raw.mcp_servers {
+    for (name, raw_entry) in raw_servers {
+        let entry: McpServerEntry = match serde_json::from_value(raw_entry) {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!(
+                    "[mcp] Skipping malformed server '{name}' in {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         // A disabled-only marker (`{ "disabled": true }`) carries no transport: it
         // exists solely to disable a server defined at the OTHER scope. Skip it here
         // (load_mcp_config filters disabled out anyway) instead of failing the file.
         if entry.disabled && entry.command.is_none() && entry.url.is_none() {
             continue;
         }
-        let mut config = server_entry_to_config(&name, entry)?;
-        config.source = source;
-        configs.push(config);
+        match server_entry_to_config(&name, entry) {
+            Ok(mut config) => {
+                config.source = source;
+                configs.push(config);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[mcp] Skipping invalid server '{name}' in {}: {error}",
+                    path.display()
+                );
+            }
+        }
     }
 
     Ok(configs)
 }
 
 fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServerConfig> {
-    let trust = entry.trust;
+    let (auto_approve_all, auto_approve) = match entry.auto_approve {
+        Some(AutoApproveField::Bool(v)) => (v, Vec::new()),
+        Some(AutoApproveField::List(list)) => (false, list),
+        None => (false, Vec::new()),
+    };
+    let trust = entry.trust || auto_approve_all;
     let disabled = entry.disabled;
     let transport = if let Some(command) = entry.command {
         McpTransportConfig::Stdio {
@@ -478,7 +514,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         config: transport,
         source: McpConfigSource::Project, // default; overwritten by load_config_file
         trust,
-        auto_approve: entry.auto_approve,
+        auto_approve,
         max_concurrent_calls,
         scope: entry.scope,
     })
@@ -1974,5 +2010,43 @@ mod capability_tests {
         assert!(remove_mcp_server_from_json_file(&path, "datumref").unwrap());
         let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(after["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_file_isolates_invalid_server_entries_and_accepts_bool_auto_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "mcpServers": {
+                    "broken_no_transport": { "args": ["--foo"] },
+                    "broken_bad_types": { "command": "npx", "args": 123 },
+                    "broken_concurrency": { "command": "npx", "maxConcurrentCalls": 0 },
+                    "datumref": { "command": "datumref-mcp", "autoApprove": true },
+                    "partial_ok": { "url": "https://example.com/mcp", "autoApprove": false }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let configs = load_config_file(&path, McpConfigSource::Project)
+            .expect("valid entries must still load when sibling entries are invalid");
+        assert_eq!(configs.len(), 2);
+
+        let datumref = configs.iter().find(|c| c.name == "datumref").unwrap();
+        assert!(
+            datumref.trust,
+            "autoApprove: true must enable full-server trust"
+        );
+        assert!(datumref.auto_approve.is_empty());
+
+        let partial = configs.iter().find(|c| c.name == "partial_ok").unwrap();
+        assert!(
+            !partial.trust,
+            "autoApprove: false must leave trust disabled"
+        );
+        assert!(partial.auto_approve.is_empty());
     }
 }

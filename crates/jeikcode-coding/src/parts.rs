@@ -854,12 +854,16 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         }
         None => jeikcode_capabilities::session::WriteStateHook::with_dir(&cfg.working_dir),
     }));
+    let shared_cwd = std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone()));
     // Per-session code_explore wander meter: the tool middleware is registered in
     // `assemble`, and this lifecycle handle keeps the session-end cleanup.
-    let code_tools_first = Arc::new(crate::code_tools_first::CodeToolsFirstHook::new(
-        code_explore_mounted,
-        session.as_ref().map(|b| b.id.as_str()),
-    ));
+    let code_tools_first = Arc::new(
+        crate::code_tools_first::CodeToolsFirstHook::with_working_dir(
+            code_explore_mounted,
+            session.as_ref().map(|b| b.id.as_str()),
+            Arc::clone(&shared_cwd),
+        ),
+    );
     hooks.push(code_tools_first.clone());
     // NOTE: the `RateLimitHook` is NOT built here. It gates CodingPlan-specific 429
     // messaging on `cfg.base_url` being the gateway, so — like the turn-level
@@ -908,7 +912,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     Ok(CodingParts {
         bash_runtime: Arc::clone(&bash_runtime),
-        shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
+        shared_cwd,
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1421,14 +1425,21 @@ async fn publish_ready_mcp_tools(
     if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    // Discovery is network I/O. Keep it outside the publication lock so a
-    // fail-closed withdrawal is never delayed by an MCP server timeout.
-    let mut adapters: Vec<Arc<dyn jeikcode_kernel::tool::Tool>> = Vec::new();
-    let mut aliases = std::collections::HashSet::new();
-    for mcp_registry in mcp_registries {
+    // Discovery is network I/O. Keep it outside the publication lock and run
+    // per-registry lookups concurrently so a slow registry never stalls peers.
+    let discovery_futs = mcp_registries.into_iter().map(|mcp_registry| async move {
         let tool_infos = tokio::select! {
             tools = mcp_registry.list_all_tools_cached() => tools,
-            _ = mcp_registry.wait_for_cancellation() => return,
+            _ = mcp_registry.wait_for_cancellation() => return None,
+        };
+        Some((mcp_registry, tool_infos))
+    });
+    let discovered_per_registry = futures::future::join_all(discovery_futs).await;
+    let mut adapters: Vec<Arc<dyn jeikcode_kernel::tool::Tool>> = Vec::new();
+    let mut aliases = std::collections::HashSet::new();
+    for entry in discovered_per_registry {
+        let Some((mcp_registry, tool_infos)) = entry else {
+            return;
         };
         for info in tool_infos {
             match jeikcode_capabilities::mcp::McpToolAdapter::new(mcp_registry.clone(), info) {
@@ -4090,5 +4101,147 @@ mod tests {
             .map(|m| m.text.as_str())
             .collect();
         assert_eq!(child_r2_frozen, child_frozen);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_and_instructions_survive_compact_and_fresh_epoch_reset() {
+        use jeikcode_capabilities::mcp::McpToolInfo;
+        use jeikcode_kernel::event::{AgentCommand, AgentEvent};
+        use jeikcode_kernel::message::Role;
+        use jeikcode_kernel::stream::StreamEvent;
+        use jeikcode_kernel::testkit::RecordingProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://unused", "test-model", dir.path());
+        let shared = Arc::new(McpRegistry::new());
+        shared
+            .seed_server_for_test(
+                "datumref",
+                Some("Use datumref_ping before mutating boards."),
+                vec![McpToolInfo {
+                    server_name: "datumref".to_string(),
+                    tool_name: "ping".to_string(),
+                    description: "Ping datumref".to_string(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                    read_only: true,
+                }],
+            )
+            .await;
+
+        let mut opts = io_free_opts();
+        opts.mcp = true;
+        opts.shared_mcp_registry = Some(shared);
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("turn 1".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("turn 2 after compact".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("turn 3 after fresh epoch".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let calls = provider.calls();
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let mut handle = agent.spawn();
+
+        async fn drain_until(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+            pred: impl Fn(&AgentEvent) -> bool,
+        ) {
+            while let Some(ev) = rx.recv().await {
+                if pred(&ev) {
+                    return;
+                }
+            }
+            panic!("agent event stream closed before expected event");
+        }
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "first".into(),
+                images: vec![],
+            })
+            .unwrap();
+        drain_until(&mut handle.events, |e| {
+            matches!(e, AgentEvent::TurnComplete { .. })
+        })
+        .await;
+
+        handle
+            .commands
+            .send(AgentCommand::Compact { focus: None })
+            .unwrap();
+        drain_until(&mut handle.events, |e| {
+            matches!(e, AgentEvent::Compacted { .. })
+        })
+        .await;
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "second".into(),
+                images: vec![],
+            })
+            .unwrap();
+        drain_until(&mut handle.events, |e| {
+            matches!(e, AgentEvent::TurnComplete { .. })
+        })
+        .await;
+
+        handle
+            .commands
+            .send(AgentCommand::ResetToFreshEpoch {
+                handoff_summary: "carryover".into(),
+            })
+            .unwrap();
+        drain_until(&mut handle.events, |e| {
+            matches!(e, AgentEvent::Compacted { .. })
+        })
+        .await;
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "third".into(),
+                images: vec![],
+            })
+            .unwrap();
+        drain_until(&mut handle.events, |e| {
+            matches!(e, AgentEvent::TurnComplete { .. })
+        })
+        .await;
+
+        drop(handle.commands);
+        let _ = handle.task.await;
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        for (idx, (msgs, defs, _opts)) in recorded.iter().enumerate() {
+            assert!(
+                defs.iter().any(|d| d.name == "mcp__datumref__ping"),
+                "turn {} must retain MountedTools MCP catalog: {:?}",
+                idx + 1,
+                defs.iter().map(|d| &d.name).collect::<Vec<_>>()
+            );
+            assert!(
+                msgs.iter().any(|m| {
+                    m.role == Role::User
+                        && m.synthetic
+                        && m.text.starts_with("<mcp_server_instructions>")
+                        && m.text.contains("Use datumref_ping before mutating boards.")
+                }),
+                "turn {} must retain Block 4 <mcp_server_instructions>: {:?}",
+                idx + 1,
+                msgs
+            );
+        }
     }
 }

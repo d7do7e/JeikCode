@@ -320,11 +320,19 @@ async fn shutdown_distinct(stale: Option<ProjectMcpSlot>, current: &Arc<McpRegis
 fn spawn_mcp_registry_warmup(project_dir: PathBuf, registry: Arc<McpRegistry>) {
     tokio::spawn(async move {
         tokio::select! {
-            _ = registry.wait_until_initial_connections_done() => {}
+            res = tokio::time::timeout(super::CONNECT_TIMEOUT, registry.wait_until_initial_connections_done()) => {
+                if res.is_err() {
+                    return;
+                }
+            }
             _ = registry.wait_for_cancellation() => return,
         }
         let _statuses = registry.server_statuses().await;
-        let tools = registry.list_all_tools_cached().await;
+        let Ok(tools) =
+            tokio::time::timeout(super::CONNECT_TIMEOUT, registry.list_all_tools_cached()).await
+        else {
+            return;
+        };
         let instructions = registry.server_instructions_snapshot();
         if !tools.is_empty() || !instructions.is_empty() {
             super::schema_cache::record_project_mcp_schema(&project_dir, tools, instructions).await;

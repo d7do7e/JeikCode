@@ -1800,7 +1800,6 @@ impl CodingRuntimeHandle {
         ) {
             return Err(RuntimeError::Busy);
         }
-        self.withdraw_mcp_tools().await?;
         self.reprepare_target(ReprepareTarget::Reload {
             plugin_skill_dirs,
             config,
@@ -5398,16 +5397,6 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         };
                         let operation = input.operation;
-                        if withdraws_mcp {
-                            // Config, trust, and auth are mutable security inputs.
-                            // Remove the old scope before reading them so a failed
-                            // replacement cannot leave revoked MCP authority mounted.
-                            // Pool reload is owned by the driver (`/mcp reload`, daemon
-                            // `POST /mcp/reload`, TUI `request_capability_reload`) so
-                            // every runtime for one project shares a single shutdown/build
-                            // cutover instead of racing duplicate reload_full calls.
-                            runtime.parts.withdraw_mcp_tools().await;
-                        }
                         let reuses_current_session = runtime
                             .parts
                             .session
@@ -5433,6 +5422,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
+                        }
+                        if withdraws_mcp {
+                            // Config, trust, and auth are mutable security inputs.
+                            // Remove the old scope only after Busy/input checks pass and
+                            // before reading them so a failed replacement cannot leave
+                            // revoked MCP authority mounted.
+                            runtime.parts.withdraw_mcp_tools().await;
                         }
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();

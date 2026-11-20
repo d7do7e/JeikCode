@@ -24,6 +24,15 @@ fn _isolate_jeikcode_home() {
     jeikcode_kernel::test_support::isolate_home();
 }
 
+fn assert_uncertain_reconnect_error(error: &anyhow::Error, context: &str) {
+    let msg = format!("{error:#}");
+    assert!(
+        msg.contains("MCP connection dropped while awaiting response")
+            && msg.contains("verify whether it took effect before deciding whether to retry"),
+        "{context}: {msg}"
+    );
+}
+
 /// A stdio server config pointing at the in-tree `mcp-test-server` fixture binary.
 fn test_server_config(name: &str) -> McpServerConfig {
     test_server_config_with_env(name, BTreeMap::new())
@@ -136,10 +145,7 @@ async fn stdio_multiplexed_calls_share_one_reconnect_after_server_exit() {
         let uncertain = result.expect_err(
             "both multiplexed calls reached the dying generation and must not be replayed",
         );
-        assert!(
-            uncertain.to_string().contains("result is unknown"),
-            "unexpected error: {uncertain:#}"
-        );
+        assert_uncertain_reconnect_error(&uncertain, "unexpected error");
     }
     let mut recovered = false;
     for _ in 0..100 {
@@ -224,10 +230,7 @@ async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
         Ok(_) => panic!("write and response delays must share one deadline"),
     };
 
-    assert!(
-        error.to_string().contains("result is unknown"),
-        "timed out tool result must stay unknown: {error:#}"
-    );
+    assert_uncertain_reconnect_error(&error, "timed out tool result must stay unknown");
     assert!(
         elapsed < std::time::Duration::from_millis(700),
         "the foreground tool call must not wait for the delayed reconnect: {elapsed:?}"
@@ -332,10 +335,7 @@ async fn concurrent_failures_reconnect_the_generation_that_actually_failed() {
 
     for result in [first, second] {
         let error = result.expect_err("fixture should terminate both tool calls");
-        assert!(
-            error.to_string().contains("result is unknown"),
-            "sent tool calls must not be replayed: {error:#}"
-        );
+        assert_uncertain_reconnect_error(&error, "sent tool calls must not be replayed");
     }
     let mut first_recovered = false;
     for _ in 0..100 {
@@ -361,10 +361,7 @@ async fn concurrent_failures_reconnect_the_generation_that_actually_failed() {
         )
         .await
         .expect_err("the fixture should terminate the second generation too");
-    assert!(
-        second_generation.to_string().contains("result is unknown"),
-        "sent tool call must not be replayed: {second_generation:#}"
-    );
+    assert_uncertain_reconnect_error(&second_generation, "sent tool call must not be replayed");
     let mut recovered = false;
     for _ in 0..100 {
         if spawn_count(&counter) == 3
