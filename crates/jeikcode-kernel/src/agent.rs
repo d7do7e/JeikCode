@@ -224,6 +224,11 @@ const DUP_READ_SLICE_SOFT_STEER_HITS: usize = 4;
 const DUP_READ_SLICE_HARD_STOP_HITS: usize = 8;
 const READONLY_HARD_STOP_ROUNDS: usize = 60;
 const COMPACTIONS_WITHOUT_MUTATION_STOP: usize = 2;
+/// Hard ceiling on drain+summary compactions inside a single agentic turn,
+/// even when mutations occur between compactions. On hitting a 4th drain
+/// attempt, the turn exits cleanly with `StopReason::MaxRounds` so `/goal`
+/// can trigger `ResetToFreshEpoch` instead of thrashing the prefix cache.
+const MAX_INTRA_TURN_DRAIN_COMPACTIONS: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CompactionRunOutcome {
@@ -405,6 +410,7 @@ struct TurnTokenBudgetGuard {
     last_observed_epoch: u64,
     peak_cached_in_epoch: u32,
     consecutive_cache_collapses: u32,
+    total_drain_compactions: usize,
 }
 
 impl TurnTokenBudgetGuard {
@@ -415,11 +421,20 @@ impl TurnTokenBudgetGuard {
             last_observed_epoch: cache_epoch,
             peak_cached_in_epoch: 0,
             consecutive_cache_collapses: 0,
+            total_drain_compactions: 0,
         }
     }
 
     fn reset(&mut self, cache_epoch: u64) {
         *self = Self::new(cache_epoch);
+    }
+
+    fn note_drain_compaction(&mut self) {
+        self.total_drain_compactions = self.total_drain_compactions.saturating_add(1);
+    }
+
+    fn drain_compaction_limit_reached(&self) -> bool {
+        self.total_drain_compactions >= MAX_INTRA_TURN_DRAIN_COMPACTIONS
     }
 
     fn observe_round(
@@ -3446,6 +3461,17 @@ impl RunningAgent {
                             !(escalated_to_summary || grew_materially)
                         });
                     if !gated_by_noop && will_summarize {
+                        if token_budget_guard.drain_compaction_limit_reached() {
+                            let stop_msg = format!(
+                                "stopped: reached {} drain compactions in a single turn; yielding to start a fresh epoch",
+                                MAX_INTRA_TURN_DRAIN_COMPACTIONS
+                            );
+                            self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                            Self::persist_turn_diagnostic(convo, &stop_msg);
+                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                                .await;
+                            return;
+                        }
                         let epoch_before = convo.cache_epoch;
                         let outcome = self
                             .run_compaction_with_floor(
@@ -3454,9 +3480,12 @@ impl RunningAgent {
                                 Some(estimated_prompt),
                             )
                             .await;
-                        if outcome.drained && last_counted_drain_round != Some(round) {
-                            last_counted_drain_round = Some(round);
-                            read_loop_guard.note_drain_compaction();
+                        if outcome.drained {
+                            token_budget_guard.note_drain_compaction();
+                            if last_counted_drain_round != Some(round) {
+                                last_counted_drain_round = Some(round);
+                                read_loop_guard.note_drain_compaction();
+                            }
                         }
                         if convo.cache_epoch != epoch_before {
                             midturn_noop_gate = None;
@@ -3507,13 +3536,27 @@ impl RunningAgent {
                     && est(&messages).saturating_add(tool_defs_est) >= limit as u64
                     && attempts < MAX_OVERFLOW_ATTEMPTS
                 {
+                    if attempts >= 2 && token_budget_guard.drain_compaction_limit_reached() {
+                        let stop_msg = format!(
+                            "stopped: reached {} drain compactions in a single turn; yielding to start a fresh epoch",
+                            MAX_INTRA_TURN_DRAIN_COMPACTIONS
+                        );
+                        self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                        Self::persist_turn_diagnostic(convo, &stop_msg);
+                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                            .await;
+                        return;
+                    }
                     let before = est(&convo.messages);
                     let outcome = self
                         .run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
                         .await;
-                    if outcome.drained && last_counted_drain_round != Some(round) {
-                        last_counted_drain_round = Some(round);
-                        read_loop_guard.note_drain_compaction();
+                    if outcome.drained {
+                        token_budget_guard.note_drain_compaction();
+                        if last_counted_drain_round != Some(round) {
+                            last_counted_drain_round = Some(round);
+                            read_loop_guard.note_drain_compaction();
+                        }
                     }
                     let ran_attempt = attempts;
                     attempts += 1;
@@ -3670,6 +3713,18 @@ impl RunningAgent {
                 // the error. This is the ONLY place compaction runs mid-turn, and only after
                 // a real provider rejection — pressure never triggers it.
                 Err(e) if e.is_context_overflow() && overflow_attempt < MAX_OVERFLOW_ATTEMPTS => {
+                    if overflow_attempt >= 2 && token_budget_guard.drain_compaction_limit_reached()
+                    {
+                        let stop_msg = format!(
+                            "stopped: reached {} drain compactions in a single turn; yielding to start a fresh epoch",
+                            MAX_INTRA_TURN_DRAIN_COMPACTIONS
+                        );
+                        self.rt.emit(AgentEvent::Warning(stop_msg.clone()));
+                        Self::persist_turn_diagnostic(convo, &stop_msg);
+                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                            .await;
+                        return;
+                    }
                     self.rt.emit(AgentEvent::Warning(format!(
                         "context overflow on round {round} (attempt {overflow_attempt}); compacting and retrying"
                     )));
@@ -3681,9 +3736,12 @@ impl RunningAgent {
                             },
                         )
                         .await;
-                    if outcome.drained && last_counted_drain_round != Some(round) {
-                        last_counted_drain_round = Some(round);
-                        read_loop_guard.note_drain_compaction();
+                    if outcome.drained {
+                        token_budget_guard.note_drain_compaction();
+                        if last_counted_drain_round != Some(round) {
+                            last_counted_drain_round = Some(round);
+                            read_loop_guard.note_drain_compaction();
+                        }
                     }
                     overflow_attempt += 1;
                     round -= 1; // a RETRY of the same logical round, not a new one
@@ -8703,6 +8761,16 @@ mod synthetic_send_tests {
                 .is_some_and(|s| s.contains("4000000 uncached input tokens")),
             "4M cumulative uncached tokens must stop turn: {stop_obs:?}"
         );
+
+        // 6. Drain compaction limit reaches cap at 3 and clears on reset().
+        assert!(!guard.drain_compaction_limit_reached());
+        guard.note_drain_compaction();
+        guard.note_drain_compaction();
+        assert!(!guard.drain_compaction_limit_reached());
+        guard.note_drain_compaction();
+        assert!(guard.drain_compaction_limit_reached());
+        guard.reset(2);
+        assert!(!guard.drain_compaction_limit_reached());
     }
 
     #[tokio::test]
@@ -8941,6 +9009,130 @@ mod synthetic_send_tests {
             ev,
             AgentEvent::TurnComplete {
                 reason: StopReason::ToolLoopDetected
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn intra_turn_drain_compaction_cap_yields_with_max_rounds_before_fourth_drain() {
+        use crate::message::{CompactionPlan, CompactionStrategy, CompactionView};
+        use crate::testkit::MockProvider;
+        use crate::tool::{Tool, ToolCall, ToolContext, ToolResult};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DummyWriteTool;
+        #[async_trait::async_trait]
+        impl Tool for DummyWriteTool {
+            fn name(&self) -> &str {
+                "write"
+            }
+            fn description(&self) -> &str {
+                "test write tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "i": { "type": "integer" } },
+                    "required": ["i"]
+                })
+            }
+            async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+                ToolResult {
+                    call_id: String::new(),
+                    content: format!("wrote {args}: {}", "x".repeat(400)),
+                    is_error: false,
+                    images: vec![],
+                }
+            }
+        }
+
+        struct CountingDrainStrategy {
+            drains_attempted: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl CompactionStrategy for CountingDrainStrategy {
+            async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+                self.drains_attempted.fetch_add(1, Ordering::Relaxed);
+                let floor = view.sacred_floor;
+                if view.messages.len() >= floor + 2 {
+                    CompactionPlan {
+                        drain_from: floor,
+                        drain_to: floor + 2,
+                        summary: Some("short summary".into()),
+                        rewrites: vec![],
+                        resume_note: None,
+                    }
+                } else {
+                    CompactionPlan::noop()
+                }
+            }
+
+            fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+                view.messages.len() >= view.sacred_floor + 2
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DummyWriteTool));
+
+        let rounds: Vec<Vec<StreamEvent>> = (1..=6)
+            .map(|i| {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("w{i}"),
+                        name: "write".into(),
+                        arguments: format!(r#"{{"i":{i}}}"#),
+                    }),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 900,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ]
+            })
+            .collect();
+        let provider = Arc::new(MockProvider::new(rounds).with_ctx_window(1_000));
+        let strat = Arc::new(CountingDrainStrategy {
+            drains_attempted: AtomicUsize::new(0),
+        });
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["write"]))
+            .compaction(strat.clone())
+            .compact_threshold(0.5)
+            .compact_on_turn_end(false)
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            let done = matches!(ev, AgentEvent::TurnComplete { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert_eq!(
+            strat.drains_attempted.load(Ordering::Relaxed),
+            MAX_INTRA_TURN_DRAIN_COMPACTIONS,
+            "must stop before attempting a 4th intra-turn drain compaction"
+        );
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            AgentEvent::TurnComplete {
+                reason: StopReason::MaxRounds
             }
         )));
     }

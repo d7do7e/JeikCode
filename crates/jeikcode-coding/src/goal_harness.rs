@@ -804,6 +804,7 @@ pub(crate) async fn create_milestone_checkpoint_async(
 pub(crate) struct StallTracker {
     pub baseline_fingerprint: Option<String>,
     pub baseline_untracked: Vec<String>,
+    pub last_head_sha: Option<String>,
     pub last_fingerprint: Option<String>,
     pub last_verified_fingerprint: Option<String>,
     pub last_reason_sig: Option<String>,
@@ -858,7 +859,19 @@ impl StallTracker {
                 self.recent_fingerprints.pop_front();
             }
         }
-        self.rounds_since_verified_progress = self.rounds_since_verified_progress.saturating_add(1);
+        let head_advanced = match (&self.last_head_sha, &fingerprint.head_sha) {
+            (Some(prev), Some(curr)) => prev != curr,
+            _ => false,
+        };
+        if let Some(sha) = fingerprint.head_sha.as_ref() {
+            self.last_head_sha = Some(sha.clone());
+        }
+        if head_advanced {
+            self.rounds_since_verified_progress = 0;
+        } else {
+            self.rounds_since_verified_progress =
+                self.rounds_since_verified_progress.saturating_add(1);
+        }
 
         self.last_fingerprint = Some(fingerprint.hash.clone());
         self.last_reason_sig = Some(sig);
@@ -1257,5 +1270,42 @@ mod tests {
             !dir.path().join("junk_agent.rs").exists(),
             "post-checkpoint agent untracked file must be cleaned on rollback"
         );
+    }
+
+    #[test]
+    fn stall_tracker_resets_unverified_round_budget_only_when_head_sha_advances() {
+        let mut tracker = StallTracker::default();
+        let make_fp = |head: Option<&str>, hash: &str| WorkspaceFingerprint {
+            is_git_repo: true,
+            head_sha: head.map(str::to_string),
+            hash: hash.into(),
+            changed_files: vec![],
+            untracked_files: vec![],
+        };
+
+        // Round 1 seeds `last_head_sha` without treating initial seed as advancement.
+        assert!(!tracker.record_not_met(&make_fp(Some("sha-1"), "h1"), "r1", true, 3));
+        assert_eq!(tracker.rounds_since_verified_progress, 1);
+
+        // Uncommitted churn on the same HEAD still accumulates toward futile_budget.
+        for i in 2..=5 {
+            assert!(!tracker.record_not_met(
+                &make_fp(Some("sha-1"), &format!("h{i}")),
+                &format!("r{i}"),
+                true,
+                3,
+            ));
+            assert_eq!(tracker.rounds_since_verified_progress, i);
+        }
+
+        // Transient git `head_sha == None` does not clobber `last_head_sha` or reset counter.
+        assert!(tracker.record_not_met(&make_fp(None, "h6"), "r6", true, 3));
+        assert_eq!(tracker.last_head_sha.as_deref(), Some("sha-1"));
+        assert_eq!(tracker.rounds_since_verified_progress, 6);
+
+        // Advancing `head_sha` to a new commit resets `rounds_since_verified_progress` to 0.
+        assert!(!tracker.record_not_met(&make_fp(Some("sha-2"), "h7"), "r7", true, 3));
+        assert_eq!(tracker.rounds_since_verified_progress, 0);
+        assert_eq!(tracker.last_head_sha.as_deref(), Some("sha-2"));
     }
 }

@@ -1424,6 +1424,7 @@ mod tests {
                         duration: std::time::Duration::from_millis(1),
                         turn_count: 1,
                         tool_call_count: 0,
+                        ..Default::default()
                     },
                 },
             ),

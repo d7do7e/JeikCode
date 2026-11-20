@@ -433,6 +433,11 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeTurnStats {
     pub last_usage: Option<MessageMeta>,
+    pub total_prompt_tokens: u64,
+    pub total_uncached_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub drain_compactions: u32,
     pub duration: std::time::Duration,
     pub turn_count: usize,
     pub tool_call_count: usize,
@@ -3481,14 +3486,88 @@ fn spawn_runtime_owner_with_optional_agent(
                                     finish_reason = Some(StopReason::MaxRounds);
                                     keep_goal_on_eval = true;
                                 } else {
+                                    let turn_drain_compactions = held_turn
+                                        .as_ref()
+                                        .map_or(0, |(_, _, _, stats)| stats.drain_compactions);
+                                    let last_turn_used = held_turn
+                                        .as_ref()
+                                        .and_then(|(_, _, _, stats)| {
+                                            stats
+                                                .last_usage
+                                                .as_ref()
+                                                .map(|m| m.used_tokens as usize)
+                                                .filter(|&v| v > 0)
+                                        });
+                                    let current_tokens = last_turn_used
+                                        .or(observed_tokens)
+                                        .or_else(|| {
+                                            held_turn.as_ref().and_then(|(_, _, snap, _)| {
+                                                snap.messages
+                                                    .iter()
+                                                    .rev()
+                                                    .find(|m| {
+                                                        m.role
+                                                            == jeikcode_kernel::message::Role::Assistant
+                                                    })
+                                                    .and_then(|m| m.meta.as_ref())
+                                                    .map(|m| m.used_tokens as usize)
+                                                    .filter(|&v| v > 0)
+                                                    .or_else(|| {
+                                                        Some(
+                                                            snap.messages
+                                                                .iter()
+                                                                .map(|m| {
+                                                                    m.estimate_tokens_conservative()
+                                                                        as usize
+                                                                })
+                                                                .sum(),
+                                                        )
+                                                    })
+                                            })
+                                        })
+                                        .unwrap_or(0);
+                                    let trigger_tokens = resources
+                                        .as_ref()
+                                        .map(|rt| {
+                                            let watermark = crate::config::watermark_input_budget(
+                                                rt.config.context_window,
+                                            );
+                                            (watermark as f32
+                                                * rt.config.effective_compact_threshold())
+                                                as usize
+                                        })
+                                        .unwrap_or(0);
+                                    let high_occupancy = trigger_tokens > 0
+                                        && current_tokens >= (trigger_tokens.saturating_mul(4)) / 5;
+
                                     let mut rolled_over = false;
+                                    let mut fresh_epoch_triggered = false;
                                     if state.batch_rollover_due() {
-                                        state.rollover_batch();
+                                        if state.options.fresh_epoch {
+                                            state.record_fresh_epoch_reset();
+                                            fresh_epoch_triggered = true;
+                                        } else {
+                                            state.rollover_batch();
+                                        }
                                         rolled_over = true;
                                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                             format!(
                                                 "goal continuous batch #{} rolled over (total rounds: {}, tokens: {})",
                                                 state.rollovers, state.total_rounds, state.tokens_used
+                                            ),
+                                        ));
+                                    } else if state.options.fresh_epoch
+                                        && (turn_drain_compactions > 0 || high_occupancy)
+                                    {
+                                        state.record_fresh_epoch_reset();
+                                        fresh_epoch_triggered = true;
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                            format!(
+                                                "goal fresh-epoch reset #{} triggered (drain_compactions: {}, tokens: {}, total rounds: {})",
+                                                state.rollovers,
+                                                turn_drain_compactions,
+                                                state.tokens_used,
+                                                state.total_rounds
                                             ),
                                         ));
                                     }
@@ -3498,7 +3577,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             Some(&verdict),
                                         ));
                                     }
-                                    if rolled_over && state.options.fresh_epoch {
+                                    if (rolled_over || fresh_epoch_triggered)
+                                        && state.options.fresh_epoch
+                                    {
                                         let recap = state
                                             .progress_recap_str()
                                             .unwrap_or("(no prior recap)");
@@ -3517,44 +3598,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             state.condition
                                         ));
                                     } else if rolled_over {
-                                        if let Some(rt) = resources.as_ref() {
-                                            let watermark = crate::config::watermark_input_budget(
-                                                rt.config.context_window,
-                                            );
-                                            let trigger_tokens = (watermark as f32
-                                                * rt.config.effective_compact_threshold())
-                                                as usize;
-                                            let current_tokens = observed_tokens
-                                                .or_else(|| {
-                                                    held_turn.as_ref().and_then(|(_, _, snap, _)| {
-                                                        snap.messages
-                                                            .iter()
-                                                            .rev()
-                                                            .find(|m| {
-                                                                m.role
-                                                                    == jeikcode_kernel::message::Role::Assistant
-                                                            })
-                                                            .and_then(|m| m.meta.as_ref())
-                                                            .map(|m| m.used_tokens as usize)
-                                                            .filter(|&v| v > 0)
-                                                            .or_else(|| {
-                                                                Some(
-                                                                    snap.messages
-                                                                        .iter()
-                                                                        .map(|m| {
-                                                                            m.estimate_tokens_conservative()
-                                                                                as usize
-                                                                        })
-                                                                        .sum(),
-                                                                )
-                                                            })
-                                                    })
-                                                })
-                                                .unwrap_or(0);
-                                            if trigger_tokens > 0 && current_tokens >= trigger_tokens {
-                                                rollover_compact_focus =
-                                                    Some("goal batch rollover".to_string());
-                                            }
+                                        if trigger_tokens > 0 && current_tokens >= trigger_tokens {
+                                            rollover_compact_focus =
+                                                Some("goal batch rollover".to_string());
                                         }
                                     }
                                     continuation =
@@ -6439,6 +6485,22 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .send(CodingRuntimeEvent::ControllerWarning(warning));
                             }
                         }
+                        if matches!(
+                            &event,
+                            AgentEvent::Compacted {
+                                trigger,
+                                removed,
+                                committed: true,
+                                ..
+                            } if *removed > 0
+                                && !matches!(
+                                    trigger,
+                                    jeikcode_kernel::message::CompactTrigger::Manual { .. }
+                                )
+                        ) {
+                            turn_stats.drain_compactions =
+                                turn_stats.drain_compactions.saturating_add(1);
+                        }
                         let event = handle_compaction_event(
                             event,
                             &mut compactions,
@@ -6521,6 +6583,20 @@ fn spawn_runtime_owner_with_optional_agent(
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
                                 turn_stats.turn_count = turn_stats.turn_count.saturating_add(1);
+                                let uncached_prompt =
+                                    meta.tokens.prompt.saturating_sub(meta.tokens.cached) as u64;
+                                turn_stats.total_prompt_tokens = turn_stats
+                                    .total_prompt_tokens
+                                    .saturating_add(meta.tokens.prompt as u64);
+                                turn_stats.total_uncached_prompt_tokens = turn_stats
+                                    .total_uncached_prompt_tokens
+                                    .saturating_add(uncached_prompt);
+                                turn_stats.total_completion_tokens = turn_stats
+                                    .total_completion_tokens
+                                    .saturating_add(meta.tokens.completion as u64);
+                                turn_stats.total_cached_tokens = turn_stats
+                                    .total_cached_tokens
+                                    .saturating_add(meta.tokens.cached as u64);
                                 turn_stats.last_usage = Some(meta.clone());
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),
@@ -6818,9 +6894,16 @@ fn spawn_runtime_owner_with_optional_agent(
                                         }
                                     }
                                     if let Some(state) = goal.as_mut().filter(|state| state.active) {
-                                        if let Some(meta) = stats.last_usage.as_ref() {
+                                        let turn_tokens = stats
+                                            .total_prompt_tokens
+                                            .saturating_add(stats.total_completion_tokens);
+                                        if turn_tokens > 0 {
+                                            state.tokens_used =
+                                                state.tokens_used.saturating_add(turn_tokens);
+                                        } else if let Some(meta) = stats.last_usage.as_ref() {
                                             state.tokens_used = state.tokens_used.saturating_add(
-                                                (meta.tokens.prompt + meta.tokens.completion) as u64,
+                                                (meta.tokens.prompt as u64)
+                                                    .saturating_add(meta.tokens.completion as u64),
                                             );
                                         }
                                         // Keep one bounded runtime-owned recap. It survives
@@ -6874,7 +6957,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let eval_round = state.total_rounds.max(state.round);
                                             let checkpoint_requested =
                                                 options.checkpoint_milestones
-                                                    && state.batch_rollover_due();
+                                                    && state.will_rollover_after_not_met();
                                             let eval_setup = resources.as_ref().and_then(|runtime| {
                                                 let session_id = runtime
                                                     .parts
@@ -16084,6 +16167,127 @@ mod tests {
             }
         }
         assert!(saw_rollover_notice, "expected continuous rollover warning");
+
+        handle.stop_goal().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_goal_accumulates_multi_round_usage_and_triggers_early_fresh_epoch_on_drain()
+    {
+        #[derive(Default)]
+        struct DistinctNotMetFactory {
+            count: std::sync::atomic::AtomicUsize,
+        }
+        impl CodingProviderFactory for DistinctNotMetFactory {
+            fn build(
+                &self,
+                _config: &CodingAgentConfig,
+                _session_id: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                let n = self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(jeikcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        jeikcode_kernel::stream::StreamEvent::TextDelta(format!(
+                            "Verdict: no step {n} still remaining"
+                        )),
+                        jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ],
+                ])))
+            }
+        }
+
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 300;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(Arc::new(DistinctNotMetFactory::default()), config)
+            .await;
+
+        handle
+            .start_goal("--until-stopped --fresh-epoch keep polishing")
+            .await
+            .unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(Pursuing)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        // Emit multiple Usage events and a committed Auto drain compaction in one turn.
+        for round in 1..=3 {
+            kernel_events
+                .send(AgentEvent::Usage(MessageMeta {
+                    tokens: jeikcode_kernel::stream::TokenUsage {
+                        prompt: 100_000,
+                        completion: 1_000,
+                        cached: 80_000,
+                    },
+                    used_tokens: 101_000,
+                    round,
+                    turn_id: 1,
+                    request_id: round as u64,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        kernel_events
+            .send(AgentEvent::Compacted {
+                trigger: jeikcode_kernel::message::CompactTrigger::Auto { utilization: 0.79 },
+                epoch: 1,
+                removed: 12,
+                bytes_before: 400_000,
+                bytes_after: 120_000,
+                committed: true,
+                snapshot: None,
+            })
+            .unwrap();
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("working", vec![])]),
+            })
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+            .await
+            .expect("early fresh-epoch trigger expected after drain compaction");
+        assert!(
+            matches!(first, Some(AgentCommand::ResetToFreshEpoch { .. })),
+            "expected ResetToFreshEpoch before 25-round interval when drain compaction occurred, got {first:?}"
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                .await
+                .expect("continuation expected after fresh-epoch reset"),
+            Some(AgentCommand::SendSyntheticMessage { .. })
+        ));
+
+        let mut latest_tokens_used = 0u64;
+        while let Ok(ev) = runtime_events.try_recv() {
+            if let CodingRuntimeEvent::GoalChanged(p) = ev {
+                latest_tokens_used = latest_tokens_used.max(p.tokens_used);
+            }
+        }
+        assert!(
+            latest_tokens_used >= 303_000,
+            "GoalState.tokens_used must accumulate all 3 rounds (>= 303000), got {latest_tokens_used}"
+        );
 
         handle.stop_goal().await.unwrap();
         handle.shutdown().await.unwrap();

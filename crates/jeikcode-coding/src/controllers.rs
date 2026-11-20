@@ -400,15 +400,27 @@ impl GoalState {
         None
     }
 
+    pub fn rollover_interval(&self) -> u32 {
+        self.max_rounds
+            .map_or(DEFAULT_CONTINUOUS_CHECKPOINT_INTERVAL, |m| {
+                m.min(DEFAULT_CONTINUOUS_CHECKPOINT_INTERVAL)
+            })
+            .max(1)
+    }
+
     pub fn batch_rollover_due(&self) -> bool {
         if !self.options.continuous {
             return false;
         }
-        let interval = self
-            .max_rounds
-            .unwrap_or(DEFAULT_CONTINUOUS_CHECKPOINT_INTERVAL)
-            .max(1);
-        self.round >= interval
+        self.round >= self.rollover_interval()
+    }
+
+    /// Whether advancing this turn as `NotMet` (via `bump_round()`) will reach
+    /// the continuous batch rollover boundary. Used before spawning the off-loop
+    /// evaluator/checkpoint job so milestone git checkpoints stay in sync with
+    /// the rollover cadence without off-by-one drift.
+    pub fn will_rollover_after_not_met(&self) -> bool {
+        self.options.continuous && self.round.saturating_add(1) >= self.rollover_interval()
     }
 
     pub fn rollover_batch(&mut self) {
@@ -416,6 +428,14 @@ impl GoalState {
         self.rollovers = self.rollovers.saturating_add(1);
         self.deadline = (self.max_duration_secs != 0)
             .then(|| Instant::now() + Duration::from_secs(self.max_duration_secs));
+    }
+
+    /// Reset the intra-epoch round counter and increment `rollovers` after a
+    /// `--fresh-epoch` reset without refreshing `deadline`, so wall-clock caps
+    /// remain binding across early compaction/occupancy-triggered resets.
+    pub fn record_fresh_epoch_reset(&mut self) {
+        self.round = 0;
+        self.rollovers = self.rollovers.saturating_add(1);
     }
 
     pub fn bump_round(&mut self) {
@@ -1512,5 +1532,50 @@ mod tests {
         assert!(summary.contains("crates/a/src/lib.rs"), "{summary}");
         assert!(summary.contains("crates/b/src/main.rs"), "{summary}");
         assert!(summary.contains("crates/c/src/mod.rs"), "{summary}");
+    }
+
+    #[test]
+    fn rollover_interval_caps_large_max_rounds_at_checkpoint_interval_without_extending_deadline() {
+        let mut opts = GoalOptions {
+            continuous: true,
+            fresh_epoch: true,
+            ..Default::default()
+        };
+        opts.resolve_defaults(Default::default());
+        let mut state = GoalState::new_with_options(1, "polish".into(), 300, 60, opts);
+        assert_eq!(state.rollover_interval(), 25);
+
+        let initial_deadline = state.deadline.expect("deadline set");
+        for _ in 0..24 {
+            state.bump_round();
+            assert!(!state.batch_rollover_due());
+        }
+        assert!(state.will_rollover_after_not_met());
+        state.bump_round();
+        assert!(state.batch_rollover_due());
+
+        state.record_fresh_epoch_reset();
+        assert_eq!(state.round, 0);
+        assert_eq!(state.rollovers, 1);
+        assert_eq!(state.total_rounds, 25);
+        assert_eq!(
+            state.deadline,
+            Some(initial_deadline),
+            "fresh-epoch reset must not extend wall-clock deadline"
+        );
+
+        // Small explicit `max_rounds` (e.g. 1 in tests) still governs rollover cadence.
+        let small = GoalState::new_with_options(
+            2,
+            "polish".into(),
+            1,
+            0,
+            GoalOptions {
+                continuous: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(small.rollover_interval(), 1);
+        assert!(small.will_rollover_after_not_met());
     }
 }

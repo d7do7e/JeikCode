@@ -203,7 +203,12 @@ pub const AUTO_DRAIN_UTILIZATION: f32 = 0.78;
 /// Ratio of `recent_keep` budget to lowered `auto_drain_utilization` so proactive
 /// drains (e.g., 350K on 1M) still trim older turns instead of being blocked by a
 /// fixed 250K tail budget.
-const PROACTIVE_KEEP_TO_DRAIN_RATIO: f32 = 0.4;
+///
+/// Note on the `AUTO_DRAIN_UTILIZATION` (`0.78`) cliff: when `compact_threshold`
+/// is lowered below `0.78` (e.g. `0.50` -> ~514K on 1M), `keep_budget()` activates
+/// this ratio; keeping `0.25` (12.5% = ~125K keep on 1M) frees ~350K+ per drain
+/// instead of ~210K at `0.4`, preventing 30-60 round compaction thrashing.
+const PROACTIVE_KEEP_TO_DRAIN_RATIO: f32 = 0.25;
 
 /// Fraction of the context window kept VERBATIM as recent turns when a drain
 /// summarizes old history — so a large-context model doesn't lose its recent
