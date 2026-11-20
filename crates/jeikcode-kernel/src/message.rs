@@ -959,6 +959,24 @@ impl Conversation {
         i
     }
 
+    /// Locate the active turn's trailing user or autonomous turn prompt without
+    /// reaching behind earlier assistant/tool turns, frozen prefix blocks, or
+    /// compaction anchors (preserving KV-cache prefix invariance and `sacred_floor`).
+    pub fn active_turn_prompt_mut(&mut self) -> Option<&mut Message> {
+        let tail_start = self
+            .messages
+            .iter()
+            .rposition(|m| {
+                m.role != Role::User
+                    || m.is_frozen_prefix_user()
+                    || m.text.trim_start().starts_with("<!-- jeikcode:anchor")
+            })
+            .map_or(0, |idx| idx + 1);
+        self.messages[tail_start..]
+            .iter_mut()
+            .rfind(|m| m.is_compaction_turn_start())
+    }
+
     /// Locate a prefix block by header within the frozen leading prefix.
     fn find_before_first_real_user(&self, header: &str) -> Option<usize> {
         let end = self.frozen_prefix_end();
@@ -3226,6 +3244,72 @@ mod tests {
             "cached ({}) must be clamped to scaled prompt ({})",
             meta.tokens.cached,
             meta.tokens.prompt
+        );
+    }
+
+    #[test]
+    fn active_turn_prompt_mut_never_reaches_behind_assistant_or_anchors() {
+        // Normal user turn with trailing context-update synthetic_user skips context-update.
+        let mut c = Conversation::default();
+        c.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::assistant("ok", vec![]),
+            Message::user("second"),
+            Message::synthetic_user("<!-- jeikcode:context-update:foo -->\nbar"),
+        ];
+        assert_eq!(
+            c.active_turn_prompt_mut().map(|m| m.text.as_str()),
+            Some("second")
+        );
+
+        // Autonomous synthetic_turn after assistant resolves to synthetic_turn, never "first".
+        let mut c_auto = Conversation::default();
+        c_auto.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::assistant("ok", vec![]),
+            Message::synthetic_turn("continue goal"),
+            Message::synthetic_user("<!-- jeikcode:context-update:foo -->\nbar"),
+        ];
+        assert_eq!(
+            c_auto.active_turn_prompt_mut().map(|m| m.text.as_str()),
+            Some("continue goal")
+        );
+
+        // Assistant-terminated history has no active turn prompt.
+        let mut c_done = Conversation::default();
+        c_done.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::assistant("ok", vec![]),
+        ];
+        assert!(c_done.active_turn_prompt_mut().is_none());
+
+        // Compaction anchor (with or without resume note) has no active turn prompt.
+        let mut c_anchor = Conversation::default();
+        c_anchor.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::synthetic_user("<!-- jeikcode:anchor:1 -->"),
+        ];
+        assert!(c_anchor.active_turn_prompt_mut().is_none());
+        c_anchor
+            .messages
+            .push(Message::synthetic_user("resume note"));
+        assert!(c_anchor.active_turn_prompt_mut().is_none());
+
+        // Frozen prefix synthetic users before first real user are skipped.
+        let mut c_frozen = Conversation::default();
+        c_frozen.messages = vec![
+            Message::system("sys"),
+            Message::synthetic_user("<!-- jeikcode:skills -->"),
+        ];
+        assert!(c_frozen.active_turn_prompt_mut().is_none());
+        c_frozen.messages.push(Message::user("first"));
+        assert_eq!(
+            c_frozen.active_turn_prompt_mut().map(|m| m.text.as_str()),
+            Some("first")
         );
     }
 }

@@ -23,7 +23,7 @@ use chrono::{DateTime, Local};
 use jeikcode_kernel::hook::LifecycleHooks;
 #[cfg(test)]
 use jeikcode_kernel::hook::TurnCtx;
-use jeikcode_kernel::message::{Conversation, Role};
+use jeikcode_kernel::message::Conversation;
 #[cfg(feature = "tools")]
 use jeikcode_kernel::middleware::{AfterOutcome, ToolMiddleware};
 #[cfg(feature = "tools")]
@@ -234,17 +234,15 @@ impl Default for StatusReminderHook {
 #[async_trait]
 impl LifecycleHooks for StatusReminderHook {
     async fn turn_start(&self, convo: &mut Conversation) {
-        let Some(query) = convo
-            .messages
-            .iter_mut()
-            .rfind(|m| m.role == Role::User && !m.synthetic)
-        else {
+        let Some(query) = convo.active_turn_prompt_mut() else {
             return;
         };
         if query.text.contains("<system-reminder>\nCurrent date:") {
             return;
         }
-        query.text.push_str("\n\n");
+        if !query.text.is_empty() {
+            query.text.push_str("\n\n");
+        }
         query.text.push_str(&self.render_turn_start(Local::now()));
     }
 }
@@ -569,5 +567,53 @@ mod tests {
         };
         hook.after(&mut res2, None).await;
         assert_eq!(res2.content, "next output");
+    }
+
+    #[tokio::test]
+    async fn turn_start_preserves_prefix_on_synthetic_and_empty_tail_turns() {
+        let hook = StatusReminderHook::new();
+
+        // Assistant-terminated history must not mutate earlier real user message.
+        let mut terminated = Conversation::default();
+        terminated.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::assistant("ok", vec![]),
+        ];
+        let before = terminated.messages.clone();
+        hook.turn_start(&mut terminated).await;
+        assert_eq!(terminated.messages, before);
+
+        // Synthetic turn appends reminder to the trailing synthetic_turn, leaving
+        // prior messages byte-identical even when the prior user had no date reminder.
+        let mut auto = Conversation::default();
+        auto.messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::assistant("ok", vec![]),
+            Message::synthetic_turn("continue goal"),
+        ];
+        let frozen_prefix = auto.messages[..3].to_vec();
+        hook.turn_start(&mut auto).await;
+        assert_eq!(&auto.messages[..3], &frozen_prefix[..]);
+        assert!(
+            auto.messages[3]
+                .text
+                .starts_with("continue goal\n\n<system-reminder>\nCurrent date:"),
+            "date reminder must land on active synthetic_turn: {:?}",
+            auto.messages[3].text
+        );
+
+        // Empty user query does not get a leading "\n\n".
+        let mut empty = Conversation::default();
+        empty.messages = vec![Message::system("sys"), Message::user("")];
+        hook.turn_start(&mut empty).await;
+        assert!(
+            empty.messages[1]
+                .text
+                .starts_with("<system-reminder>\nCurrent date:"),
+            "empty query must not start with blank lines: {:?}",
+            empty.messages[1].text
+        );
     }
 }

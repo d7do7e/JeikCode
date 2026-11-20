@@ -157,11 +157,7 @@ impl LifecycleHooks for PlanModeReminderHook {
         if !self.active.load(Ordering::Relaxed) {
             return;
         }
-        let Some(query) = convo
-            .messages
-            .iter_mut()
-            .rfind(|m| m.role == jeikcode_kernel::message::Role::User && !m.synthetic)
-        else {
+        let Some(query) = convo.active_turn_prompt_mut() else {
             return;
         };
         if query.text.contains(PLAN_MODE_NEEDLE) {
@@ -360,6 +356,49 @@ mod tests {
             1,
             "idempotent: {:?}",
             convo.messages[1].text
+        );
+    }
+
+    #[tokio::test]
+    async fn reminder_preserves_prefix_during_autonomous_and_assistant_terminated_turns() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let hook = PlanModeReminderHook::new(flag);
+
+        // Assistant-terminated conversation must be a no-op so earlier user messages
+        // inside sacred_floor are never mutated.
+        let mut terminated = Conversation::default();
+        terminated.messages = vec![
+            Message::system("sys"),
+            Message::user("first task"),
+            Message::assistant("done", vec![]),
+        ];
+        let before_terminated = terminated.messages.clone();
+        hook.turn_start(&mut terminated).await;
+        assert_eq!(terminated.messages, before_terminated);
+
+        // Autonomous synthetic_turn after assistant history gets the reminder on the
+        // trailing synthetic_turn; earlier real user prompt stays byte-identical.
+        let mut auto = Conversation::default();
+        auto.messages = vec![
+            Message::system("sys"),
+            Message::user("first task"),
+            Message::assistant("done", vec![]),
+            Message::synthetic_turn("continue goal"),
+        ];
+        let frozen_prefix = auto.messages[..3].to_vec();
+        hook.turn_start(&mut auto).await;
+        assert_eq!(
+            &auto.messages[..3],
+            &frozen_prefix[..],
+            "earlier prefix must stay byte-identical"
+        );
+        assert!(
+            auto.messages[3]
+                .text
+                .starts_with("continue goal\n\n<system-reminder>")
+                && auto.messages[3].text.contains(PLAN_MODE_NEEDLE),
+            "plan reminder must land on active synthetic_turn: {:?}",
+            auto.messages[3].text
         );
     }
 
