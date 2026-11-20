@@ -426,6 +426,21 @@ impl MountedTools {
         }
     }
 
+    /// Return a new [`MountedTools`] snapshot including `tool` (and its aliases)
+    /// without mutating this mount or any shared publisher.
+    pub fn with_extra_tool(&self, tool: Arc<dyn Tool>) -> Self {
+        let snap = self.snapshot();
+        let mut selected = snap.selected.clone();
+        selected.insert(tool.name().to_string(), Arc::clone(&tool));
+        for alias in tool.aliases() {
+            selected.insert((*alias).to_string(), Arc::clone(&tool));
+        }
+        let next = Arc::new(MountedToolsSnapshot::new(snap.revision, selected));
+        Self {
+            current: Arc::new(RwLock::new(next)),
+        }
+    }
+
     pub fn defs(&self) -> Vec<ToolDef> {
         self.snapshot().defs()
     }
@@ -596,6 +611,22 @@ mod tests {
         assert_eq!(defs[0].name, "risky_write");
         assert!(mounted.get("echo").is_none());
         assert!(mounted.get("risky_write").is_some());
+    }
+
+    #[test]
+    fn with_extra_tool_extends_copy_without_mutating_original() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Dummy("echo", RiskLevel::Safe)));
+        let base = reg.mount(&["echo"]);
+        let extended = base.with_extra_tool(Arc::new(Dummy("memory", RiskLevel::Safe)));
+
+        assert_eq!(base.defs().len(), 1);
+        assert!(base.get("memory").is_none());
+
+        assert_eq!(extended.defs().len(), 2);
+        assert!(extended.get("echo").is_some());
+        assert!(extended.get("memory").is_some());
+        assert_eq!(extended.snapshot().revision(), base.snapshot().revision());
     }
 
     #[tokio::test]

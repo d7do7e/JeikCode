@@ -53,9 +53,11 @@ struct MemoryToolArgs {
     append: Option<bool>,
 }
 
-/// Model-facing `memory` tool (mounted ONLY on primary parent agents, never subagents).
+/// Model-facing `memory` tool (full read/write on primary parent agents; read-only
+/// `recall` mode may be mounted on `inherit_context` `explore`/`verifier` subagents).
 pub struct MemoryTool {
     project_root: PathBuf,
+    read_only: bool,
     auto_root_override: Option<PathBuf>,
     global_path_override: Option<PathBuf>,
     legacy_project_path_override: Option<PathBuf>,
@@ -65,6 +67,17 @@ impl MemoryTool {
     pub fn for_project(project_root: &Path) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            read_only: false,
+            auto_root_override: None,
+            global_path_override: None,
+            legacy_project_path_override: None,
+        }
+    }
+
+    pub fn read_only_for_project(project_root: &Path) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            read_only: true,
             auto_root_override: None,
             global_path_override: None,
             legacy_project_path_override: None,
@@ -80,10 +93,17 @@ impl MemoryTool {
     ) -> Self {
         Self {
             project_root,
+            read_only: false,
             auto_root_override: Some(auto_root),
             global_path_override: Some(global_path),
             legacy_project_path_override: Some(legacy_project_path),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     fn auto_store(&self) -> AutoMemoryStore {
@@ -115,10 +135,39 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Persist, recall, update, or prune durable cross-session memory (`MEMORY.md` compact index + on-demand `topics/*.md`). Store only durable, non-obvious preferences, conventions, or gotchas — never secrets or ephemeral task logs."
+        if self.read_only {
+            "Read-only recall of durable cross-session memory (`MEMORY.md` compact index, `topics/*.md`, and legacy `memory.md`). Only `action: \"recall\"` is permitted."
+        } else {
+            "Persist, recall, update, or prune durable cross-session memory (`MEMORY.md` compact index + on-demand `topics/*.md`). Store only durable, non-obvious preferences, conventions, or gotchas — never secrets or ephemeral task logs."
+        }
+    }
+
+    fn read_only_hint(&self) -> bool {
+        self.read_only
     }
 
     fn parameters_schema(&self) -> Value {
+        if self.read_only {
+            return json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["recall"],
+                        "description": "Read-only recall operation."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic file slug (e.g. `build_rules`, `architecture`) stored under `topics/<slug>.md`."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword filter for `recall`."
+                    }
+                },
+                "required": ["action"]
+            });
+        }
         json!({
             "type": "object",
             "properties": {
@@ -172,6 +221,9 @@ impl Tool for MemoryTool {
         };
 
         let action = parsed.action.trim().to_ascii_lowercase();
+        if self.read_only && action != "recall" {
+            return tool_err("read-only memory tool only permits `action: \"recall\"`");
+        }
         let auto = self.auto_store();
         let global = self.global_store();
         let legacy_project = self.legacy_project_store();
@@ -600,5 +652,92 @@ mod tests {
         assert!(!updated_global.is_error, "{}", updated_global.content);
         let after_update = tool.execute(r#"{"action":"recall"}"#, &ctx).await;
         assert!(after_update.content.contains("global-pref-v2"));
+    }
+
+    #[tokio::test]
+    async fn read_only_memory_tool_allows_recall_and_rejects_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let rw_tool = test_tool(dir.path());
+        let ctx = test_ctx(dir.path());
+
+        assert!(!rw_tool.read_only_hint());
+        assert!(!rw_tool.parallel_safe("{}"));
+
+        // Seed memory via the read-write tool first.
+        let r1 = rw_tool
+            .execute(
+                r#"{"action":"remember","content":"Use --locked on workspace cargo checks"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!r1.is_error, "{}", r1.content);
+        let r2 = rw_tool
+            .execute(
+                r#"{"action":"remember","topic":"build_quirks","summary":"Build quirks","content":"Keep resources/cli-bin on disk locally."}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!r2.is_error, "{}", r2.content);
+
+        // Construct read-only MemoryTool (both constructor & test-path variant).
+        let ctor_ro = MemoryTool::read_only_for_project(dir.path());
+        assert!(ctor_ro.read_only_hint());
+        assert!(ctor_ro.parallel_safe("{}"));
+
+        let ro_tool = test_tool(dir.path()).into_read_only();
+        assert!(ro_tool.read_only_hint());
+        assert!(ro_tool.parallel_safe("{}"));
+
+        let schema = ro_tool.parameters_schema();
+        assert_eq!(schema["properties"]["action"]["enum"], json!(["recall"]));
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("topic"));
+        assert!(props.contains_key("query"));
+        for forbidden in ["scope", "content", "summary", "target", "append"] {
+            assert!(
+                !props.contains_key(forbidden),
+                "unexpected prop {forbidden}"
+            );
+        }
+
+        // Recall by topic and query succeeds.
+        let topic_recall = ro_tool
+            .execute(r#"{"action":"recall","topic":"build_quirks"}"#, &ctx)
+            .await;
+        assert!(!topic_recall.is_error, "{}", topic_recall.content);
+        assert!(topic_recall.content.contains("resources/cli-bin"));
+
+        let query_recall = ro_tool
+            .execute(r#"{"action":"recall","query":"--locked"}"#, &ctx)
+            .await;
+        assert!(!query_recall.is_error, "{}", query_recall.content);
+        assert!(query_recall.content.contains("Use --locked"));
+
+        // Every mutation action is rejected by the hard guard without touching disk.
+        for bad_args in [
+            r#"{"action":"remember","content":"Should never be persisted"}"#,
+            r#"{"action":"remember","topic":"evil","content":"Should never be created"}"#,
+            r#"{"action":"update","target":"--locked","content":"Tampered entry"}"#,
+            r#"{"action":"prune","query":"--locked"}"#,
+            r#"{"action":"prune","topic":"build_quirks"}"#,
+            r#"{"action":"unknown"}"#,
+        ] {
+            let err = ro_tool.execute(bad_args, &ctx).await;
+            assert!(err.is_error, "expected error for {bad_args}");
+            assert!(
+                err.content.contains("read-only memory tool"),
+                "unexpected error message for {bad_args}: {}",
+                err.content
+            );
+        }
+
+        // Verify stored files are intact after rejected mutations.
+        assert!(dir.path().join("auto/topics/build_quirks.md").is_file());
+        assert!(!dir.path().join("auto/topics/evil.md").exists());
+        let verify_all = ro_tool.execute(r#"{"action":"recall"}"#, &ctx).await;
+        assert!(!verify_all.is_error, "{}", verify_all.content);
+        assert!(!verify_all.content.contains("Tampered"));
+        assert!(!verify_all.content.contains("Should never"));
+        assert!(verify_all.content.contains("Use --locked"));
     }
 }

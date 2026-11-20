@@ -499,6 +499,7 @@ pub struct TaskTool {
     make_explore_tools: Arc<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Arc<dyn Fn() -> MountedTools + Send + Sync>,
     make_verifier_tools: Option<Arc<dyn Fn() -> MountedTools + Send + Sync>>,
+    recall_tool: Option<Arc<dyn Tool>>,
     /// `Some(n)` bounds how many children run at once; `None` = unbounded
     /// (config `[subagent] max_concurrent = 0`).
     max_concurrent: Option<usize>,
@@ -525,6 +526,7 @@ impl TaskTool {
             make_explore_tools: Arc::new(make_explore_tools),
             make_worker_tools: Arc::new(make_worker_tools),
             make_verifier_tools: None,
+            recall_tool: None,
             // Unbounded by default: the shipped config is `max_concurrent = 0`.
             max_concurrent: None,
             semaphore: None,
@@ -566,6 +568,15 @@ impl TaskTool {
         make_verifier_tools: impl Fn() -> MountedTools + Send + Sync + 'static,
     ) -> Self {
         self.make_verifier_tools = Some(Arc::new(make_verifier_tools));
+        self
+    }
+
+    /// Supply a read-only recall tool (e.g. `MemoryTool::read_only_for_project`)
+    /// mounted exclusively for `Explore` and `Verifier` children running with
+    /// `inherit_context: true`. `Worker` and `inherit_context: false` children
+    /// leave their toolset unchanged at zero extra schema tokens.
+    pub fn with_recall_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.recall_tool = Some(tool);
         self
     }
 
@@ -886,13 +897,23 @@ impl Tool for TaskTool {
                 (self.make_fast_provider)()
             };
             let model = provider.model_name().to_string();
-            let tools = match role {
+            let base_tools = match role {
                 SubagentRole::Worker => (self.make_worker_tools)(),
                 SubagentRole::Verifier => match &self.make_verifier_tools {
                     Some(mk) => mk(),
                     None => (self.make_explore_tools)(),
                 },
                 SubagentRole::Explore => (self.make_explore_tools)(),
+            };
+            let tools = if inherit_context
+                && matches!(role, SubagentRole::Explore | SubagentRole::Verifier)
+            {
+                match &self.recall_tool {
+                    Some(recall) => base_tools.with_extra_tool(Arc::clone(recall)),
+                    None => base_tools,
+                }
+            } else {
+                base_tools
             };
             let base_persona = match role {
                 SubagentRole::Worker => WORKER_PERSONA,

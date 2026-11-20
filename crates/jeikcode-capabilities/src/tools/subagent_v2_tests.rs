@@ -1121,3 +1121,147 @@ async fn bind_session_switch_cancels_prior_background_subagent_while_turn_cancel
         .await
         .expect("bind_session switch must cancel prior session background subagents");
 }
+
+#[tokio::test]
+async fn task_tool_mounts_recall_tool_only_for_inherit_context_explore_and_verifier() {
+    struct MockRecallTool;
+    #[async_trait]
+    impl Tool for MockRecallTool {
+        fn name(&self) -> &str {
+            "memory"
+        }
+        fn description(&self) -> &str {
+            "Read-only memory recall mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["recall"] },
+                    "topic": { "type": "string" },
+                    "query": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        }
+        fn read_only_hint(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _args: &str,
+            _ctx: &ToolContext,
+        ) -> jeikcode_kernel::tool::ToolResult {
+            jeikcode_kernel::tool::ToolResult {
+                call_id: String::new(),
+                content: "ok".into(),
+                is_error: false,
+                images: vec![],
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reg = build_test_registry();
+    let r_e = reg.clone();
+    let r_w = reg.clone();
+    let r_v = reg.clone();
+
+    let seen_msgs = Arc::new(Mutex::new(Vec::new()));
+    let seen_tools = Arc::new(Mutex::new(Vec::new()));
+    let sm = seen_msgs.clone();
+    let st = seen_tools.clone();
+
+    let make_provider = move || {
+        Arc::new(ScriptedProvider::new(
+            vec![vec![
+                StreamEvent::TextDelta("VERDICT: PASS\nSUMMARY: ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]],
+            sm.clone(),
+            st.clone(),
+        )) as Arc<dyn LlmProvider>
+    };
+
+    let tool = TaskTool::new(
+        make_provider.clone(),
+        make_provider,
+        move || r_e.mount(&["read"]),
+        move || r_w.mount(&["read", "write"]),
+    )
+    .with_verifier_tools(move || r_v.mount(&["read", "run_command"]))
+    .with_recall_tool(Arc::new(MockRecallTool));
+
+    // 1. explore + inherit_context: false -> NO memory tool
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"explore lean","prompt":"p","subagent_type":"explore"}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    // 2. explore + inherit_context: true -> mounts memory tool
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"explore inherit","prompt":"p","subagent_type":"explore","inherit_context":true}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    // 3. verifier + inherit_context: false -> NO memory tool
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"verifier lean","prompt":"p","subagent_type":"verifier"}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    // 4. verifier + inherit_context: true -> mounts memory tool
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"verifier inherit","prompt":"p","subagent_type":"verifier","inherit_context":true}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    // 5. worker + inherit_context: true -> NO memory tool
+    let out = tool
+        .execute(
+            r#"{"tasks":[{"description":"worker inherit","prompt":"p","subagent_type":"worker","scope":["src/**"],"inherit_context":true}]}"#,
+            &tool_ctx(dir.path()),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    let recorded = seen_tools.lock().unwrap();
+    assert_eq!(recorded.len(), 5);
+    assert!(
+        !recorded[0].iter().any(|n| n == "memory"),
+        "explore lean: {:?}",
+        recorded[0]
+    );
+    assert!(
+        recorded[1].iter().any(|n| n == "memory"),
+        "explore inherit: {:?}",
+        recorded[1]
+    );
+    assert!(
+        !recorded[2].iter().any(|n| n == "memory"),
+        "verifier lean: {:?}",
+        recorded[2]
+    );
+    assert!(
+        recorded[3].iter().any(|n| n == "memory"),
+        "verifier inherit: {:?}",
+        recorded[3]
+    );
+    assert!(
+        !recorded[4].iter().any(|n| n == "memory"),
+        "worker inherit: {:?}",
+        recorded[4]
+    );
+}

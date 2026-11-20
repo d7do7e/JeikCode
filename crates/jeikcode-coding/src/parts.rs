@@ -395,8 +395,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         names.push("web_search".into());
     }
 
-    // Parent-only `memory` tool (never mounted in TaskTool subagent registries or
-    // goal_verifier): two-tier `MEMORY.md` index + on-demand `topics/<slug>.md`.
+    // Parent gets full read/write `memory` tool; `Explore`/`Verifier` subagents with
+    // `inherit_context: true` may receive a read-only `recall`-only `MemoryTool`
+    // via `TaskTool::with_recall_tool`.
     if opts.memory && crate::persona::memory_tool_enabled() {
         registry.register(Arc::new(MemoryTool::for_project(&cfg.working_dir)));
         names.push("memory".to_string());
@@ -509,37 +510,47 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .as_deref(),
         );
         let include_memory_for_subagents = opts.memory;
+        let recall_tool_for_subagents: Option<Arc<dyn jeikcode_kernel::tool::Tool>> =
+            if opts.memory && crate::persona::memory_tool_enabled() {
+                Some(Arc::new(MemoryTool::read_only_for_project(
+                    &cfg.working_dir,
+                )))
+            } else {
+                None
+            };
         let extra_append_for_subagents = cfg.extra_system_append.clone();
-        let task_tool = Arc::new(
-            TaskTool::new(
-                make_fast,
-                make_capable,
-                make_explore_tools,
-                make_worker_tools,
-            )
-            .with_verifier_tools(make_verifier_tools)
-            .with_max_concurrent(max_concurrent)
-            .with_max_rounds(max_rounds)
-            .with_tool_loop_policy(cfg.tool_loop_policy)
-            .with_worker_middleware(turn_execution_policy.clone())
-            .with_project_context_loader(|wd| {
-                jeikcode_capabilities::session::instructions::render_project_instructions(wd)
-            })
-            .with_inherited_context_loader(move |wd| {
-                let ctx_hook = jeikcode_capabilities::session::SessionContextHook::new(wd)
-                    .with_extra_append(extra_append_for_subagents.clone());
-                let memory = if include_memory_for_subagents {
-                    jeikcode_capabilities::memory::MemoryHook::for_project(wd).render_block()
-                } else {
-                    None
-                };
-                jeikcode_capabilities::tools::InheritedSubagentContext {
-                    memory,
-                    user_preferences: ctx_hook.render_user_preferences_block(),
-                    project_instructions: ctx_hook.render_project_instructions_block(),
-                }
-            }),
-        );
+        let mut task_builder = TaskTool::new(
+            make_fast,
+            make_capable,
+            make_explore_tools,
+            make_worker_tools,
+        )
+        .with_verifier_tools(make_verifier_tools)
+        .with_max_concurrent(max_concurrent)
+        .with_max_rounds(max_rounds)
+        .with_tool_loop_policy(cfg.tool_loop_policy)
+        .with_worker_middleware(turn_execution_policy.clone())
+        .with_project_context_loader(|wd| {
+            jeikcode_capabilities::session::instructions::render_project_instructions(wd)
+        })
+        .with_inherited_context_loader(move |wd| {
+            let ctx_hook = jeikcode_capabilities::session::SessionContextHook::new(wd)
+                .with_extra_append(extra_append_for_subagents.clone());
+            let memory = if include_memory_for_subagents {
+                jeikcode_capabilities::memory::MemoryHook::for_project(wd).render_block()
+            } else {
+                None
+            };
+            jeikcode_capabilities::tools::InheritedSubagentContext {
+                memory,
+                user_preferences: ctx_hook.render_user_preferences_block(),
+                project_instructions: ctx_hook.render_project_instructions_block(),
+            }
+        });
+        if let Some(recall_tool) = recall_tool_for_subagents {
+            task_builder = task_builder.with_recall_tool(recall_tool);
+        }
+        let task_tool = Arc::new(task_builder);
         registry.register(task_tool.clone());
         registry.register(Arc::new(task_tool.output_tool()));
         names.push("task".to_string());
@@ -4090,8 +4101,32 @@ mod tests {
             .join("\n");
         assert!(!child_sys.contains("<project_instructions>"));
 
-        // Child must NEVER mount memory mutation tool even with inherit_context=true
-        assert!(!recorded[1].1.iter().any(|d| d.name == "memory"));
+        // Child with inherit_context=true on explore mounts ONLY read-only recall memory tool
+        let child_mem_def = recorded[1]
+            .1
+            .iter()
+            .find(|d| d.name == "memory")
+            .expect("inherit_context=true explore child must mount read-only memory tool");
+        assert_eq!(
+            child_mem_def.parameters["properties"]["action"]["enum"],
+            serde_json::json!(["recall"])
+        );
+        let child_mem_props = child_mem_def.parameters["properties"]
+            .as_object()
+            .expect("memory schema properties");
+        assert!(!child_mem_props.contains_key("scope"));
+        assert!(!child_mem_props.contains_key("content"));
+        assert!(!child_mem_props.contains_key("target"));
+
+        // Resumed explore child preserves read-only memory tool across resume
+        let resumed_mem_def =
+            recorded[3].1.iter().find(|d| d.name == "memory").expect(
+                "resumed inherit_context=true explore child must retain read-only memory tool",
+            );
+        assert_eq!(
+            resumed_mem_def.parameters["properties"]["action"]["enum"],
+            serde_json::json!(["recall"])
+        );
 
         // Round 2 resumed child preserves the exact same frozen prefix with zero duplication
         let child_r2_frozen: Vec<&str> = recorded[3]
