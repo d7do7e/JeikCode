@@ -12,8 +12,14 @@
   ; Clean up potentially locked old binaries in installation directory
   IfFileExists "$INSTDIR\resources\jeikcode.exe" 0 +2
     Delete "$INSTDIR\resources\jeikcode.exe"
+  IfFileExists "$INSTDIR\resources\jeikcode.exe.bak" 0 +2
+    Delete "$INSTDIR\resources\jeikcode.exe.bak"
   IfFileExists "$INSTDIR\resources\cli-bin" 0 +2
     Delete "$INSTDIR\resources\cli-bin"
+  IfFileExists "$INSTDIR\resources\cli-bin.bak" 0 +2
+    Delete "$INSTDIR\resources\cli-bin.bak"
+  IfFileExists "$INSTDIR\${MAINBINARYNAME}.exe.bak" 0 +2
+    Delete "$INSTDIR\${MAINBINARYNAME}.exe.bak"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

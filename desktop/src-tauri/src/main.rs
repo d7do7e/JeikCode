@@ -1739,10 +1739,17 @@ fn supervise_webui(
                 if is_shutting_down() {
                     return;
                 }
+                let fallback_port =
+                    prepare_desktop_port_for_launch(&launch.host, launch.port, &launch.bin, None);
+                if fallback_port != launch.port {
+                    launch.port = fallback_port;
+                }
                 spawn_desktop_server(&app, &launch, true, Duration::from_secs(30)).or_else(|_| {
                     if is_shutting_down() {
                         Err("desktop shutting down".to_string())
                     } else {
+                        launch.port = pick_free_loopback_port(&launch.host, launch.port)
+                            .unwrap_or(launch.port);
                         spawn_desktop_server(&app, &launch, false, Duration::from_secs(30))
                     }
                 })
@@ -2067,12 +2074,14 @@ fn daemon_health_is_stale(
     if health.service != "jeikcode-daemon" {
         return false;
     }
-    if health.version != expected_version {
-        return true;
+    // When both sides expose a SHA-256 binary_hash, matching hashes prove the exact
+    // same binary is running regardless of Cargo package version bump skew.
+    if let Some(local) = expected_binary_hash.filter(|h| !h.is_empty()) {
+        if !health.binary_hash.is_empty() {
+            return health.binary_hash != local;
+        }
     }
-    expected_binary_hash.is_some_and(|local| {
-        !health.binary_hash.is_empty() && !local.is_empty() && health.binary_hash != local
-    })
+    health.version != expected_version
 }
 
 fn parse_active_sessions_idle(status: u16, body: &str) -> bool {
@@ -2645,8 +2654,15 @@ mod tests {
             binary_hash: "abc123".to_string(),
         };
         assert!(!daemon_health_is_stale(&current, "7.5.1", Some("abc123")));
-        assert!(daemon_health_is_stale(&current, "7.5.2", Some("abc123")));
+        // Matching non-empty binary_hash proves same binary even across version string drift.
+        assert!(!daemon_health_is_stale(&current, "7.5.2", Some("abc123")));
         assert!(daemon_health_is_stale(&current, "7.5.1", Some("def456")));
+        let no_hash = DaemonHealthInfo {
+            version: "7.5.1".to_string(),
+            service: "jeikcode-daemon".to_string(),
+            binary_hash: String::new(),
+        };
+        assert!(daemon_health_is_stale(&no_hash, "7.5.2", Some("abc123")));
 
         let other = DaemonHealthInfo {
             version: "1.0.0".to_string(),

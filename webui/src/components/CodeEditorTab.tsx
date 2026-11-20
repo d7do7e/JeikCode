@@ -109,23 +109,7 @@ export function CodeEditorTab({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadTrigger, setReloadTrigger] = useState<number>(0);
 
-  // 追踪当前实例绑定的 filePath 与 stateKey，发生切换时彻底重置现场，绝不串台
-  const boundPathRef = useRef(filePath);
-  useEffect(() => {
-    if (boundPathRef.current !== filePath) {
-      boundPathRef.current = filePath;
-      const freshSnap = readEditorTabSnapshot(stateKey);
-      setContent(freshSnap?.content ?? '');
-      setIsDirty(freshSnap?.isDirty ?? false);
-      isDirtyRef.current = freshSnap?.isDirty ?? false;
-      diskStampRef.current = freshSnap?.diskStamp ?? null;
-      historyRef.current = freshSnap?.isDirty ? [{ text: freshSnap.content, cursor: freshSnap.selectionStart }] : [];
-      historyIndexRef.current = freshSnap?.isDirty ? 0 : -1;
-      setDiskConflict(false);
-      setLoading(!freshSnap);
-      setReloadTrigger((n) => n + 1);
-    }
-  }, [filePath, stateKey]);
+  const boundKeyRef = useRef(`${stateKey || ''}::${filePath}`);
 
   // 磁盘与编辑器的版本分歧：非脏标签静默覆盖，脏标签只提示、绝不丢草稿。
   const [diskConflict, setDiskConflict] = useState<boolean>(false);
@@ -490,10 +474,65 @@ export function CodeEditorTab({
     });
   }, [stateKey]);
 
+  // 追踪当前实例绑定的 (filePath, stateKey)，任一发生切换时彻底重置现场，并在同一 effect flush
+  // 中跳过当轮 snapshot 写入，防止旧文件的 content/isDirty 覆写新 stateKey 的快照。
   useEffect(() => {
+    const curKey = `${stateKey || ''}::${filePath}`;
+    if (boundKeyRef.current !== curKey) {
+      boundKeyRef.current = curKey;
+      const freshSnap = readEditorTabSnapshot(stateKey);
+      const nextContent = freshSnap?.content ?? inMemoryContent ?? '';
+      const nextDirty = freshSnap?.isDirty ?? false;
+      const nextViewMode: 'edit' | 'preview' | 'image' | 'binary' = isBinary
+        ? 'binary'
+        : freshSnap?.viewMode &&
+            ((isImage || isSvg)
+              ? freshSnap.viewMode === 'image' || freshSnap.viewMode === 'edit' || freshSnap.viewMode === 'preview'
+              : freshSnap.viewMode === 'edit' || freshSnap.viewMode === 'preview')
+          ? freshSnap.viewMode
+          : isImage || isSvg
+            ? 'image'
+            : defaultViewMode || (isMarkdown ? 'preview' : 'edit');
+      const nextImgScale = freshSnap?.imgScale ?? 1.0;
+      latestTabStateRef.current = {
+        content: nextContent,
+        isDirty: nextDirty,
+        viewMode: nextViewMode,
+        imgScale: nextImgScale,
+      };
+      setContent(nextContent);
+      setIsDirty(nextDirty);
+      isDirtyRef.current = nextDirty;
+      setViewModeState(nextViewMode);
+      setImgScale(nextImgScale);
+      diskStampRef.current = freshSnap?.diskStamp ?? null;
+      historyRef.current = nextDirty
+        ? [{ text: nextContent, cursor: freshSnap?.selectionStart ?? 0 }]
+        : [];
+      historyIndexRef.current = nextDirty ? 0 : -1;
+      setDiskConflict(false);
+      setLoading(isImage || isBinary || isMemoryPreview ? false : !freshSnap);
+      setReloadTrigger((n) => n + 1);
+      return;
+    }
     latestTabStateRef.current = { content, isDirty, viewMode, imgScale };
     persistTabSnapshot();
-  }, [persistTabSnapshot, content, isDirty, viewMode, imgScale]);
+  }, [
+    filePath,
+    stateKey,
+    inMemoryContent,
+    isImage,
+    isSvg,
+    isBinary,
+    isMarkdown,
+    defaultViewMode,
+    isMemoryPreview,
+    persistTabSnapshot,
+    content,
+    isDirty,
+    viewMode,
+    imgScale,
+  ]);
 
   // 卸载（含关闭标签）时补存最后一帧滚动 / 选区；关闭后被墓碑拦截，不会复活。
   useEffect(() => () => persistTabSnapshot(), [persistTabSnapshot]);
@@ -1015,7 +1054,7 @@ export function CodeEditorTab({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSave, isMarkdown, viewMode, findOpen, active, isEditorVisible]);
 
-  // 执行替换
+  // 执行替换（走 pushSnapshot，保证 Ctrl+Z / Ctrl+Y 可完整撤销/重做替换操作）
   const handleReplaceOne = () => {
     if (!findText) return;
     const idx = content.indexOf(findText);
@@ -1023,9 +1062,14 @@ export function CodeEditorTab({
       showToast(t('editor.noMatch'), 'info');
       return;
     }
+    if (historyRef.current.length === 0) {
+      pushSnapshot(content, textareaRef.current?.selectionStart ?? idx);
+    }
     const next = content.slice(0, idx) + replaceText + content.slice(idx + findText.length);
+    const nextCursor = idx + replaceText.length;
     setContent(next);
     setIsDirty(true);
+    pushSnapshot(next, nextCursor);
   };
 
   const handleReplaceAll = () => {
@@ -1035,9 +1079,13 @@ export function CodeEditorTab({
       showToast(t('editor.noMatch'), 'info');
       return;
     }
+    if (historyRef.current.length === 0) {
+      pushSnapshot(content, textareaRef.current?.selectionStart ?? 0);
+    }
     const next = parts.join(replaceText);
     setContent(next);
     setIsDirty(true);
+    pushSnapshot(next, textareaRef.current?.selectionStart ?? 0);
     showToast(t('editor.replaceAllSuccess', { n: String(parts.length - 1) }), 'success');
   };
 
