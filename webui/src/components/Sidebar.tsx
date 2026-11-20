@@ -779,20 +779,43 @@ export function Sidebar({
     };
   }, []);
 
-  // 刷新指定项目或所有展开项目的会话列表缓存
+  // 刷新指定项目或所有展开项目的会话列表缓存（单调递增代际号防止并发/删会话后旧请求回写复活）
+  const projectLoadEpochRef = useRef<Map<string, number>>(new Map());
+  const bumpProjectEpochs = useCallback((hashes?: Iterable<string>) => {
+    const map = projectLoadEpochRef.current;
+    if (hashes) {
+      for (const h of hashes) {
+        map.set(h, (map.get(h) ?? 0) + 1);
+      }
+      return;
+    }
+    for (const [h, ep] of map.entries()) {
+      map.set(h, ep + 1);
+    }
+  }, []);
+
+  const fetchProjectSessions = useCallback((hash: string) => {
+    if (!hash) return;
+    const map = projectLoadEpochRef.current;
+    const epoch = (map.get(hash) ?? 0) + 1;
+    map.set(hash, epoch);
+    listProjectSessions(hash)
+      .then((list) => {
+        if ((map.get(hash) ?? 0) !== epoch) return;
+        setProjectSessionsMap((m) => ({ ...m, [hash]: list }));
+      })
+      .catch(() => {});
+  }, []);
+
   const refreshProjectSessions = useCallback((targetHashes?: string[]) => {
     const hashes = new Set<string>(targetHashes ?? []);
     if (projectHash) hashes.add(projectHash);
     expandedProjects.forEach((h) => hashes.add(h));
 
     hashes.forEach((hash) => {
-      listProjectSessions(hash)
-        .then((list) => {
-          setProjectSessionsMap((m) => ({ ...m, [hash]: list }));
-        })
-        .catch(() => {});
+      fetchProjectSessions(hash);
     });
-  }, [projectHash, expandedProjects]);
+  }, [projectHash, expandedProjects, fetchProjectSessions]);
 
   const applySidebarView = useCallback((view: SidebarProjects) => {
     const hidden = new Set(view.hidden);
@@ -876,6 +899,8 @@ export function Sidebar({
         return;
       }
       if (event.type === 'session_deleted') {
+        loadEpochRef.current += 1;
+        bumpProjectEpochs(event.project_hash ? [event.project_hash] : undefined);
         const removed = new Set([event.session_id]);
         setSessions((cur) => removeSessionRows(cur, removed));
         setProjectSessionsMap((prev) => {
@@ -1036,13 +1061,9 @@ export function Sidebar({
     if (!projectHash) return;
     // 静默预加载当前项目的会话列表缓存，不强行默认自动展开空闲项目
     if (!projectSessionsMapRef.current[projectHash]) {
-      listProjectSessions(projectHash)
-        .then((list) => {
-          setProjectSessionsMap((m) => ({ ...m, [projectHash]: list }));
-        })
-        .catch(() => {});
+      fetchProjectSessions(projectHash);
     }
-  }, [projectHash]);
+  }, [projectHash, fetchProjectSessions]);
 
   // 当前会话所属项目必须在会话数据就绪后自动展开。刷新时 activeSessionId 往往
   // 先于 /sessions 与 /projects/:hash/sessions 到达；旧实现只跑一次、拿不到 hash
@@ -1123,11 +1144,7 @@ export function Sidebar({
       next.add(hash);
       manuallyCollapsedProjectsRef.current.delete(hash);
       if (!projectSessionsMapRef.current[hash]) {
-        listProjectSessions(hash)
-          .then((list) => {
-            setProjectSessionsMap((m) => ({ ...m, [hash]: list }));
-          })
-          .catch(() => {});
+        fetchProjectSessions(hash);
       }
     }
     expandedProjectsRef.current = next;
@@ -1146,11 +1163,7 @@ export function Sidebar({
       } else {
         next.add(hash);
         if (!projectSessionsMap[hash]) {
-          listProjectSessions(hash)
-            .then((list) => {
-              setProjectSessionsMap((m) => ({ ...m, [hash]: list }));
-            })
-            .catch(() => {});
+          fetchProjectSessions(hash);
         }
       }
       return next;
@@ -1167,11 +1180,7 @@ export function Sidebar({
       saveExpandedProjects(next);
     }
     if (projectSessionsMapRef.current[hash]) return;
-    listProjectSessions(hash)
-      .then((list) => {
-        setProjectSessionsMap((m) => ({ ...m, [hash]: list }));
-      })
-      .catch(() => {});
+    fetchProjectSessions(hash);
   }
 
   async function adoptProjectDirectory(path: string) {
@@ -1491,6 +1500,7 @@ export function Sidebar({
     // response so it cannot resurrect the deleted row; normal reload triggers
     // still reconcile the complete list later.
     loadEpochRef.current += 1;
+    bumpProjectEpochs();
     setLoading(false);
     const removed = new Set(ids);
 
