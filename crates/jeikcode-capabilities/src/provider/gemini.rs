@@ -206,7 +206,16 @@ impl LlmProvider for GeminiProvider {
                                 let delay = retry::compute_backoff(reopen_budget.attempt(), &policy);
                                 reopen_budget.begin_reopen();
                                 tokio::time::sleep(delay).await;
-                                let _ = client.rebuild(false);
+                                if retry::is_stale_connection_error(&e)
+                                    || retry::chain_has_tls_corruption(&e)
+                                {
+                                    if let Err(rebuild_error) = client.rebuild(
+                                        jeikcode_config::tls::should_cap_url(&url),
+                                    ) {
+                                        yield StreamEvent::Error(rebuild_error);
+                                        return;
+                                    }
+                                }
                                 match open_stream(
                                     &client,
                                     &url,
@@ -296,6 +305,7 @@ async fn open_stream(
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut tls12_probe = false;
     loop {
         let http = client.get();
         let mut req = http
@@ -306,10 +316,13 @@ async fn open_stream(
             req = req.header("x-goog-api-key", api_key).bearer_auth(api_key);
         }
         req = super::apply_session_affinity(req, session_id);
+        let was_capped = tls12_probe || jeikcode_config::tls::should_cap_url(url);
         match super::retry::send_with_ttfb(req, open_timeout).await {
             super::retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
-                    let _ = client.rebuild(false);
+                    if let Err(rebuild_error) = client.rebuild(was_capped) {
+                        return Err(rebuild_error);
+                    }
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -318,7 +331,23 @@ async fn open_stream(
             }
             super::retry::OpenSend::Transport(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    let _ = client.rebuild(false);
+                    let tls_corruption = retry::chain_has_tls_corruption(&e);
+                    let try_tls12 = jeikcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || tls_corruption,
+                    );
+                    if try_tls12
+                        || retry::is_stale_connection_error(&e)
+                        || tls_corruption
+                        || was_capped
+                    {
+                        let capped = try_tls12 || was_capped;
+                        if let Err(rebuild_error) = client.rebuild(capped) {
+                            return Err(rebuild_error);
+                        }
+                        tls12_probe = capped;
+                    }
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -330,6 +359,10 @@ async fn open_stream(
                 });
             }
             super::retry::OpenSend::Response(resp) => {
+                if tls12_probe {
+                    jeikcode_config::tls::latch_managed_tls12();
+                    tls12_probe = false;
+                }
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)
@@ -824,6 +857,7 @@ struct GeminiSseDecoder {
     buf: Vec<u8>,
     truncated: bool,
     done: bool,
+    terminal_emitted: bool,
     emitted_id: bool,
     emitted_model: bool,
     last_usage: Option<TokenUsage>,
@@ -893,13 +927,25 @@ impl GeminiSseDecoder {
                 ..Default::default()
             }));
             self.done = true;
+            self.terminal_emitted = true;
             return out;
         }
         if let Some(usage) = v.get("usageMetadata") {
             self.last_usage = Some(parse_usage(usage));
         }
+        let mut blocked = false;
+        let mut finished_reason = false;
         if let Some(cands) = v.get("candidates").and_then(Value::as_array) {
             if let Some(c) = cands.first() {
+                if let Some(parts) = c
+                    .get("content")
+                    .and_then(|content| content.get("parts"))
+                    .and_then(Value::as_array)
+                {
+                    for part in parts {
+                        out.extend(self.ingest_part(part));
+                    }
+                }
                 if let Some(reason) = c.get("finishReason").and_then(Value::as_str) {
                     match reason {
                         "MAX_TOKENS" => self.truncated = true,
@@ -909,20 +955,13 @@ impl GeminiSseDecoder {
                                 message: format!("gemini blocked the response ({reason})"),
                                 ..Default::default()
                             }));
+                            blocked = true;
                         }
                         _ => {}
                     }
                     if reason != "FINISH_REASON_UNSPECIFIED" && !reason.is_empty() {
                         self.done = true;
-                    }
-                }
-                if let Some(parts) = c
-                    .get("content")
-                    .and_then(|content| content.get("parts"))
-                    .and_then(Value::as_array)
-                {
-                    for part in parts {
-                        out.extend(self.ingest_part(part));
+                        finished_reason = true;
                     }
                 }
             }
@@ -936,8 +975,20 @@ impl GeminiSseDecoder {
                         ..Default::default()
                     }));
                     self.done = true;
+                    blocked = true;
                 }
             }
+        }
+        if blocked {
+            self.terminal_emitted = true;
+        } else if finished_reason && !self.terminal_emitted {
+            self.terminal_emitted = true;
+            if let Some(u) = self.last_usage.take() {
+                out.push(StreamEvent::Usage(u));
+            }
+            out.push(StreamEvent::Done {
+                truncated: self.truncated,
+            });
         }
         out
     }
@@ -1001,6 +1052,10 @@ impl GeminiSseDecoder {
 
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
+        if self.terminal_emitted {
+            return out;
+        }
+        self.terminal_emitted = true;
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
         }
@@ -1508,10 +1563,43 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},",
             "\"finishReason\":\"MAX_TOKENS\"}]}\n"
         );
-        let _ = d.feed(chunk.as_bytes());
-        let rest = d.finish();
-        assert!(rest
+        let mut events = d.feed(chunk.as_bytes());
+        events.extend(d.finish());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::Done { .. }))
+                .count(),
+            1
+        );
+        assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::Done { truncated: true })));
+    }
+
+    #[test]
+    fn decoder_emits_done_on_finish_reason_and_never_emits_done_after_error() {
+        let mut ok_d = GeminiSseDecoder::default();
+        let ok_chunk = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2}}\n"
+        );
+        let ok_events = ok_d.feed(ok_chunk.as_bytes());
+        assert!(ok_events.iter().any(|e| matches!(e, StreamEvent::Usage(_))));
+        assert!(ok_events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { truncated: false })));
+        assert!(ok_d.finish().is_empty());
+
+        let mut err_d = GeminiSseDecoder::default();
+        let err_chunk = "data: {\"candidates\":[{\"finishReason\":\"SAFETY\"}]}\n";
+        let err_events = err_d.feed(err_chunk.as_bytes());
+        assert!(err_events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error(_))));
+        assert!(!err_events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { .. })));
+        assert!(err_d.finish().is_empty());
     }
 }
