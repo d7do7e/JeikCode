@@ -242,6 +242,7 @@ async fn open_responses_stream(
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut tls12_probe = false;
     loop {
         let http = client.get();
         let mut req = http
@@ -266,10 +267,11 @@ async fn open_responses_stream(
             }
         }
         req = super::apply_session_affinity(req, session_id);
+        let was_capped = tls12_probe || jeikcode_config::tls::should_cap_url(url);
         let sent = match retry::send_with_ttfb(req, open_timeout).await {
             retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
-                    let _ = client.rebuild(false);
+                    let _ = client.rebuild(was_capped);
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -280,8 +282,14 @@ async fn open_responses_stream(
             retry::OpenSend::Response(resp) => Ok(resp),
         };
         match sent {
-            Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
+                if tls12_probe {
+                    jeikcode_config::tls::latch_managed_tls12();
+                    tls12_probe = false;
+                }
+                if resp.status().is_success() {
+                    return Ok(resp);
+                }
                 let status = resp.status().as_u16();
                 if retry::should_retry_open_status(status, rate_limit_retry_owner)
                     && attempt < policy.max_attempts
@@ -305,7 +313,21 @@ async fn open_responses_stream(
             }
             Err(e) => {
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    let _ = client.rebuild(false);
+                    let tls_corruption = retry::chain_has_tls_corruption(&e);
+                    let try_tls12 = jeikcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || tls_corruption,
+                    );
+                    if try_tls12
+                        || retry::is_stale_connection_error(&e)
+                        || tls_corruption
+                        || was_capped
+                    {
+                        let capped = try_tls12 || was_capped;
+                        let _ = client.rebuild(capped);
+                        tls12_probe = capped;
+                    }
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;

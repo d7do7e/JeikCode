@@ -733,27 +733,35 @@ fn apply_synthetic_user_cache_breakpoint(
 
 /// Mark the last user/assistant content block as a cache breakpoint so the next
 /// request can reuse everything up to and including this message.
+///
+/// Anthropic rejects empty `"text": ""` blocks with HTTP 400; skip any trailing
+/// empty message so the breakpoint lands on the newest non-empty message instead.
 fn apply_message_cache_breakpoint(messages: &mut [Value]) {
-    let Some(last) = messages.last_mut() else {
-        return;
-    };
-    match last.get_mut("content") {
-        Some(Value::String(text)) => {
-            let text = text.clone();
-            last["content"] = json!([{
-                "type": "text",
-                "text": text,
-                "cache_control": { "type": "ephemeral" },
-            }]);
-        }
-        Some(Value::Array(blocks)) => {
-            if let Some(block) = blocks.last_mut() {
-                if block.is_object() {
+    for msg in messages.iter_mut().rev() {
+        match msg.get_mut("content") {
+            Some(Value::String(text)) if !text.is_empty() => {
+                let text = text.clone();
+                msg["content"] = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" },
+                }]);
+                return;
+            }
+            Some(Value::Array(blocks)) => {
+                if let Some(block) = blocks.iter_mut().rev().find(|b| {
+                    b.is_object()
+                        && (b.get("type").and_then(|t| t.as_str()) != Some("text")
+                            || b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|s| !s.is_empty()))
+                }) {
                     block["cache_control"] = json!({ "type": "ephemeral" });
+                    return;
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -3135,5 +3143,18 @@ mod tests {
             single_blocks[0]["cache_control"],
             json!({ "type": "ephemeral" })
         );
+    }
+
+    #[test]
+    fn message_cache_breakpoint_skips_empty_trailing_text_message() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "real prompt"}),
+            json!({"role": "assistant", "content": ""}),
+        ];
+        super::apply_message_cache_breakpoint(&mut msgs);
+        assert_eq!(msgs[1]["content"], json!(""));
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "real prompt");
+        assert_eq!(blocks[0]["cache_control"], json!({ "type": "ephemeral" }));
     }
 }
