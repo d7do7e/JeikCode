@@ -85,7 +85,11 @@ pub fn resolve_canonical_repo_root(working_dir: &Path) -> PathBuf {
 /// Deterministic 16-hex-char bucket hash for a canonical project root path.
 pub fn project_memory_bucket(working_dir: &Path) -> String {
     let root = resolve_canonical_repo_root(working_dir);
-    let normalized = normalize_path_for_hash(&root);
+    bucket_for_canonical_root(&root)
+}
+
+fn bucket_for_canonical_root(canonical_root: &Path) -> String {
+    let normalized = normalize_path_for_hash(canonical_root);
     let mut hasher = DefaultHasher::new();
     normalized.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -121,31 +125,41 @@ pub fn validate_topic_slug(raw: &str) -> Result<String, String> {
 #[derive(Clone, Debug)]
 pub struct AutoMemoryStore {
     root_dir: PathBuf,
+    project_root_marker: Option<(PathBuf, String)>,
 }
 
 impl AutoMemoryStore {
     /// Standard project store keyed by canonical git-common-dir under `$JEIKCODE_HOME/projects/<bucket>/memory`
     /// (or `<working_dir>/<JEIKCODE_PROJECT_MEMORY_DIR>/auto` if an explicit project dir override is set).
     pub fn for_project(working_dir: &Path) -> Self {
-        if let Ok(override_dir) = std::env::var("JEIKCODE_PROJECT_MEMORY_DIR") {
-            let trimmed = override_dir.trim();
-            if !trimmed.is_empty() {
-                return Self {
-                    root_dir: working_dir.join(trimmed).join("auto"),
-                };
-            }
+        let override_dir = std::env::var("JEIKCODE_PROJECT_MEMORY_DIR").ok();
+        Self::for_project_with_override(working_dir, override_dir.as_deref())
+    }
+
+    fn for_project_with_override(working_dir: &Path, override_dir: Option<&str>) -> Self {
+        if let Some(trimmed) = override_dir.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self {
+                root_dir: working_dir.join(trimmed).join("auto"),
+                project_root_marker: None,
+            };
         }
-        let bucket = project_memory_bucket(working_dir);
-        let root_dir = super::config_dir()
-            .join("projects")
-            .join(bucket)
-            .join("memory");
-        Self { root_dir }
+        let canonical_root = resolve_canonical_repo_root(working_dir);
+        let bucket = bucket_for_canonical_root(&canonical_root);
+        let bucket_dir = super::config_dir().join("projects").join(bucket);
+        let root_dir = bucket_dir.join("memory");
+        let normalized_root = crate::pathnorm::to_display(&canonical_root);
+        Self {
+            root_dir,
+            project_root_marker: Some((bucket_dir.join(".project_root"), normalized_root)),
+        }
     }
 
     /// Explicit directory root (primarily for isolated tests).
     pub fn with_root(root_dir: PathBuf) -> Self {
-        Self { root_dir }
+        Self {
+            root_dir,
+            project_root_marker: None,
+        }
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -361,8 +375,8 @@ impl AutoMemoryStore {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.lines().next().unwrap_or(s).trim().to_string())
-            .unwrap_or_else(|| first_meaningful_line(clean, 120));
-        let short_summary: String = raw_summary.chars().take(max_summary_chars).collect();
+            .unwrap_or_else(|| first_meaningful_line(clean, max_summary_chars.min(120)));
+        let short_summary = truncate_at_word_boundary(&raw_summary, max_summary_chars);
         let pointer_line = format!("{pointer_head}{short_summary}");
 
         let existing_index = self.load_index_raw();
@@ -375,6 +389,134 @@ impl AutoMemoryStore {
         atomic_write_str(&path, &next_body).map_err(|e| e.to_string())?;
         self.write_index(&next_index).map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    /// Replace the first non-heading bullet/line matching `target` (case-insensitive) inside
+    /// `topics/<slug>.md`, preserving `#` headings and enforcing `<= 16 KiB`.
+    pub fn update_topic_entry(
+        &self,
+        slug: &str,
+        target: &str,
+        replacement: &str,
+    ) -> Result<PathBuf, String> {
+        let valid_slug = validate_topic_slug(slug)?;
+        let target_clean = target.trim();
+        if target_clean.is_empty() {
+            return Err("target query cannot be empty".to_string());
+        }
+        let repl_trimmed = replacement.trim();
+        if repl_trimmed.is_empty() {
+            return Err("replacement content cannot be empty".to_string());
+        }
+
+        let path = self.topics_dir().join(format!("{valid_slug}.md"));
+        let existing = fs::read_to_string(&path)
+            .map_err(|e| format!("topic `{valid_slug}` not found: {e}"))?;
+        let target_lower = target_clean.to_lowercase();
+        let mut updated = false;
+        let mut out_lines = Vec::new();
+
+        for line in existing.lines() {
+            let trimmed_start = line.trim_start();
+            let indent = &line[..line.len() - trimmed_start.len()];
+            if !updated
+                && !trimmed_start.is_empty()
+                && !trimmed_start.starts_with('#')
+                && line.to_lowercase().contains(&target_lower)
+            {
+                if trimmed_start.starts_with("- ") {
+                    if !repl_trimmed.contains('\n') && !repl_trimmed.contains('\r') {
+                        let body = repl_trimmed
+                            .strip_prefix("- ")
+                            .unwrap_or(repl_trimmed)
+                            .trim();
+                        out_lines.push(format!("{indent}- {body}"));
+                    } else {
+                        out_lines.push(repl_trimmed.to_string());
+                    }
+                } else if indent.is_empty() {
+                    out_lines.push(repl_trimmed.to_string());
+                } else {
+                    out_lines.push(format!("{indent}{repl_trimmed}"));
+                }
+                updated = true;
+                continue;
+            }
+            out_lines.push(line.to_string());
+        }
+
+        if !updated {
+            return Err(format!(
+                "no entry in topic `{valid_slug}` matched `{target_clean}`"
+            ));
+        }
+
+        let mut next_body = out_lines.join("\n");
+        if !next_body.is_empty() {
+            next_body.push('\n');
+        }
+        if next_body.len() > MEMORY_TOPIC_MAX_BYTES {
+            return Err(format!(
+                "topic `{valid_slug}` would exceed {MEMORY_TOPIC_MAX_BYTES} bytes ({} bytes); prune or shorten entry",
+                next_body.len()
+            ));
+        }
+
+        atomic_write_str(&path, &next_body).map_err(|e| e.to_string())?;
+        self.ensure_project_root_marker()
+            .map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Remove matching non-heading bullet/line(s) inside `topics/<slug>.md` without deleting the
+    /// topic file itself. Preserves `#` headings and remaining entries.
+    pub fn prune_topic_entries(&self, slug: &str, keyword: &str) -> Result<Vec<String>, String> {
+        let valid_slug = validate_topic_slug(slug)?;
+        let kw_clean = keyword.trim();
+        if kw_clean.is_empty() {
+            return Err("prune query cannot be empty".to_string());
+        }
+
+        let path = self.topics_dir().join(format!("{valid_slug}.md"));
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let existing = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let kw_lower = kw_clean.to_lowercase();
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && trimmed.to_lowercase().contains(&kw_lower)
+            {
+                let entry = trimmed
+                    .strip_prefix("- ")
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string();
+                removed.push(entry);
+                continue;
+            }
+            kept.push(line.to_string());
+        }
+
+        if !removed.is_empty() {
+            while kept.last().is_some_and(|l| l.trim().is_empty()) {
+                kept.pop();
+            }
+            let mut next_body = kept.join("\n");
+            if !next_body.is_empty() {
+                next_body.push('\n');
+            }
+            atomic_write_str(&path, &next_body).map_err(|e| e.to_string())?;
+            self.ensure_project_root_marker()
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(removed)
     }
 
     /// Delete a Tier-2 topic file and prune its pointer from `MEMORY.md`.
@@ -491,9 +633,22 @@ impl AutoMemoryStore {
         out
     }
 
+    fn ensure_project_root_marker(&self) -> io::Result<()> {
+        if let Some((marker_path, root_text)) = &self.project_root_marker {
+            let up_to_date = fs::read_to_string(marker_path)
+                .map(|existing| existing.trim() == root_text)
+                .unwrap_or(false);
+            if !up_to_date {
+                atomic_write_str(marker_path, &format!("{root_text}\n"))?;
+            }
+        }
+        Ok(())
+    }
+
     fn write_index(&self, content: &str) -> io::Result<()> {
         fs::create_dir_all(&self.root_dir)?;
-        atomic_write_str(&self.index_path(), content)
+        atomic_write_str(&self.index_path(), content)?;
+        self.ensure_project_root_marker()
     }
 }
 
@@ -593,7 +748,55 @@ fn first_meaningful_line(body: &str, max_chars: usize) -> String {
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .unwrap_or_else(|| body.trim());
     let stripped = line.strip_prefix("- ").unwrap_or(line).trim();
-    stripped.chars().take(max_chars).collect()
+    truncate_at_word_boundary(stripped, max_chars)
+}
+
+fn is_trailing_open_or_sep_punct(c: char) -> bool {
+    matches!(
+        c,
+        '(' | '[' | '{' | '`' | '"' | '\'' | '—' | '-' | ',' | ';' | ':'
+    )
+}
+
+fn is_separator_punct(c: char) -> bool {
+    matches!(c, ',' | ';' | ':' | '.' | '/' | '\\' | '-' | '—')
+}
+
+/// Truncate `text` cleanly at a word/punctuation boundary `<= max_chars` (UTF-8/char-safe),
+/// appending `...` only when truncation actually occurred.
+pub(crate) fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    if max_chars <= 3 {
+        return chars.into_iter().take(max_chars).collect();
+    }
+    let budget = max_chars - 3;
+
+    // Prefer a clean whitespace boundary when the cut lands inside a word or right at whitespace.
+    let mut cut_end = if chars[budget].is_whitespace() || is_separator_punct(chars[budget]) {
+        Some(budget)
+    } else {
+        (1..budget)
+            .rev()
+            .find(|&i| chars[i].is_whitespace())
+            .or_else(|| (1..budget).rev().find(|&i| is_separator_punct(chars[i])))
+    };
+
+    if let Some(mut end) = cut_end {
+        while end > 0
+            && (chars[end - 1].is_whitespace() || is_trailing_open_or_sep_punct(chars[end - 1]))
+        {
+            end -= 1;
+        }
+        cut_end = (end > 0).then_some(end);
+    }
+
+    let final_end = cut_end.unwrap_or(budget);
+    let prefix: String = chars[..final_end].iter().collect();
+    format!("{prefix}...")
 }
 
 fn truncate_utf8(s: &str, max_bytes: usize) -> String {
@@ -708,5 +911,139 @@ mod tests {
         assert!(store.delete_topic("build_rules").unwrap());
         assert!(store.list_topics().is_empty());
         assert!(!store.load_index_raw().contains("build_rules.md"));
+    }
+
+    #[test]
+    fn project_root_marker_written_idempotently_and_skipped_for_overrides() {
+        let _home = jeikcode_config::test_util::isolated_home();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("my_repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        // with_root override never writes .project_root
+        let custom_root = dir.path().join("custom_auto");
+        let custom_store = AutoMemoryStore::with_root(custom_root.clone());
+        custom_store.remember_index_entry("custom fact").unwrap();
+        assert!(!dir.path().join(".project_root").exists());
+        assert!(!custom_root.join(".project_root").exists());
+
+        // JEIKCODE_PROJECT_MEMORY_DIR override never writes .project_root
+        let override_store = AutoMemoryStore::for_project_with_override(&repo, Some(".custom_mem"));
+        override_store
+            .remember_index_entry("override fact")
+            .unwrap();
+        assert!(!repo.join(".custom_mem/.project_root").exists());
+
+        // Standard for_project writes .project_root under $JEIKCODE_HOME/projects/<bucket>/
+        let store = AutoMemoryStore::for_project_with_override(&repo, None);
+        let marker = store.root_dir().parent().unwrap().join(".project_root");
+        assert!(
+            !marker.exists(),
+            "read/construct must not eagerly create .project_root"
+        );
+
+        store.remember_index_entry("project fact").unwrap();
+        assert!(marker.is_file());
+        let expected_root = crate::pathnorm::to_display(&resolve_canonical_repo_root(&repo));
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), expected_root);
+
+        // If .project_root drifted, next topic/index write repairs it idempotently
+        fs::write(&marker, "/stale/wrong/path\n").unwrap();
+        store
+            .write_topic("setup", "- Use uv venv", Some("Setup"), false)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), expected_root);
+    }
+
+    #[test]
+    fn topic_bullet_update_and_prune_preserve_headings_and_enforce_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AutoMemoryStore::with_root(dir.path().to_path_buf());
+        store
+            .write_topic(
+                "build_rules",
+                "# Build Rules\n\n- Old rule A\n- Keep rule B\n- Old rule C",
+                Some("Build rules"),
+                false,
+            )
+            .unwrap();
+
+        // Headings must never be matched or replaced
+        let heading_err = store
+            .update_topic_entry("build_rules", "Build Rules", "Tampered")
+            .unwrap_err();
+        assert!(heading_err.contains("no entry in topic"));
+
+        // Bullet update preserves bullet prefix and other entries
+        store
+            .update_topic_entry("build_rules", "rule A", "New rule A")
+            .unwrap();
+        let body = store.read_topic("build_rules").unwrap();
+        assert!(body.contains("# Build Rules"));
+        assert!(body.contains("- New rule A"));
+        assert!(body.contains("- Keep rule B"));
+        assert!(!body.contains("Old rule A"));
+
+        // Oversized update is rejected without corrupting file
+        let huge = "z".repeat(MEMORY_TOPIC_MAX_BYTES + 64);
+        let size_err = store
+            .update_topic_entry("build_rules", "Keep rule B", &huge)
+            .unwrap_err();
+        assert!(size_err.contains("16384"));
+        assert!(store
+            .read_topic("build_rules")
+            .unwrap()
+            .contains("- Keep rule B"));
+
+        // Bullet prune removes only matching non-heading lines and keeps topic file
+        let pruned_heading = store
+            .prune_topic_entries("build_rules", "Build Rules")
+            .unwrap();
+        assert!(pruned_heading.is_empty());
+
+        let pruned = store
+            .prune_topic_entries("build_rules", "Old rule")
+            .unwrap();
+        assert_eq!(pruned, vec!["Old rule C"]);
+        let after = store.read_topic("build_rules").unwrap();
+        assert!(after.contains("# Build Rules"));
+        assert!(after.contains("- New rule A"));
+        assert!(after.contains("- Keep rule B"));
+        assert!(!after.contains("Old rule C"));
+    }
+
+    #[test]
+    fn word_boundary_summary_truncation_handles_utf8_and_backticks() {
+        assert_eq!(truncate_at_word_boundary("short text", 20), "short text");
+
+        let sample = "Always pass explicit `path` to MCP tools when running multi-workspace";
+        // Cut inside `path` ("Always pass explicit `p" = 23 + 3 = 26)
+        let truncated = truncate_at_word_boundary(sample, 26);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.chars().count() <= 26);
+        assert!(
+            !truncated.contains("`p"),
+            "must not cut mid-word/backtick: {truncated}"
+        );
+        assert_eq!(truncated, "Always pass explicit...");
+
+        // Multibyte UTF-8 safety
+        let utf8 = "中文说明 — pass explicit `workspace_path` argument";
+        let utf8_trunc = truncate_at_word_boundary(utf8, 28);
+        assert!(utf8_trunc.chars().count() <= 28);
+        assert!(utf8_trunc.ends_with("..."));
+
+        // Auto-generated pointer summary in write_topic stays bounded & word-safe
+        let dir = tempfile::tempdir().unwrap();
+        let store = AutoMemoryStore::with_root(dir.path().to_path_buf());
+        let long_first_line =
+            "- Always pass explicit `workspace_path` parameter on every DatumRef MCP invocation across concurrent multi-repo sessions to avoid routing mistakes";
+        store
+            .write_topic("datumref_rules", long_first_line, None, false)
+            .unwrap();
+        let index_entry = store.load_index_entries().pop().unwrap();
+        assert!(index_entry.chars().count() <= MEMORY_INDEX_ENTRY_MAX_CHARS);
+        assert!(index_entry.ends_with("..."));
+        assert!(!index_entry.ends_with("`..."));
     }
 }

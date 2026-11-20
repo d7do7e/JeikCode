@@ -11,6 +11,12 @@
 //! an `api_key` of the form `$VAR` is expanded from the environment. `api_key` is optional
 //! (some gateways need none).
 
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_jeikcode_home() {
+    jeikcode_kernel::test_support::isolate_home();
+}
+
 mod code;
 mod tel;
 

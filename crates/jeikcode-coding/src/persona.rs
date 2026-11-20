@@ -737,10 +737,10 @@ repetitions; honor that count or deadline, then report the outcome.";
 /// `memory` tool is actually mounted (see the `memory_tool_enabled()` gate in
 /// `coding_persona`).
 const MEMORY_USAGE: &str = "\n\n## MEMORY:\n\
-Persistent auto-memory has two tiers: a compact `MEMORY.md` index (<= 150 lines / 8 KiB, injected at session start) and on-demand `topics/<slug>.md` files. \
-When you learn something DURABLE and NON-OBVIOUS about the user or this project — a lasting preference, a correction that should stick, a non-obvious build/test gotcha, or architecture convention — persist it with the `memory` tool (`action:\"remember\"`, `\"recall\"`, `\"update\"`, `\"prune\"`). \
-Keep `MEMORY.md` entries to one concise line, move multi-line details into `topic:\"<slug>\"`, and prune stale entries instead of duplicating. \
-Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or session-specific one-offs.";
+Persistent memory separates global cross-repo traps (`~/.jeikcode/memory.md`, `<= 240` bytes/bullet, `<= 4,000` chars) from project memory: compact `MEMORY.md` index (`<= 150` lines / `8 KiB`, `<= 240` chars/bullet) and on-demand `topics/<slug>.md` files (`<= 16 KiB`, self-contained bullets). Never write `<repo>/.jeikcode/memory.md`. \
+Always run `memory(action:\"recall\")` before `remember` to check existing entries and avoid duplicates. \
+Use `update`/`prune` (including targeted `topic` + `target`/`query` bullet edits) to supersede obsolete entries; prune/consolidate at `>= 50%` (`8 KiB` topic / `4 KiB` index) before splitting a topic only when `> 12 KiB` of distinct sub-domains remain. \
+Do NOT record secrets/tokens, obvious facts, standard tool/language behavior, anything already in AGENTS.md, or ephemeral turn narration.";
 
 const SESSION_MESH_USAGE: &str = "\n\n## SESSION MESH:\n\
 Use `list_live_sessions` to find live peers (reuse known names/IDs across turns instead of re-listing), `set_session_name` to set this session's unified name across `/sessions`, UI, and mesh (e.g. `backend`), `read_session_turns` for peer context, and `send_to_session` to message a peer and await its reply (self/cycle/hop/busy guards apply; external repos tag `[EXTERNAL REPO: ...]`).";

@@ -1000,16 +1000,25 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
     }
     out.push('\n');
     out.push_str(&t(Msg::StatusMemoryFilesHeader));
-    for (scope_msg, store) in [
-        (Msg::StatusMemoryScopeGlobal, MemoryStore::global()),
+    let auto_index_path = AutoMemoryStore::for_project(working_dir).index_path();
+    let legacy_project = MemoryStore::project(working_dir);
+    let mut memory_paths = vec![
         (
-            Msg::StatusMemoryScopeProject,
-            MemoryStore::project(working_dir),
+            Msg::StatusMemoryScopeGlobal,
+            MemoryStore::global().path().to_path_buf(),
         ),
-    ] {
+        (Msg::StatusMemoryScopeProject, auto_index_path),
+    ];
+    if legacy_project.path().is_file() {
+        memory_paths.push((
+            Msg::StatusMemoryScopeProject,
+            legacy_project.path().to_path_buf(),
+        ));
+    }
+    for (scope_msg, mem_path) in memory_paths {
         let scope = t(scope_msg);
-        let path = store.path().display().to_string();
-        if store.path().is_file() {
+        let path = mem_path.display().to_string();
+        if mem_path.is_file() {
             out.push_str(&t(Msg::StatusMemoryPresent {
                 path: &path,
                 scope: &scope,
@@ -1022,6 +1031,71 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// Split a leading `--global` / `-g` flag off a slash-command argument.
+fn split_global_flag(arg: &str) -> (bool, &str) {
+    let trimmed = arg.trim();
+    for flag in ["--global", "-g"] {
+        if let Some(rest) = trimmed.strip_prefix(flag) {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return (true, rest.trim());
+            }
+        }
+    }
+    (false, trimmed)
+}
+
+fn exec_remember_with_stores(
+    global_store: &MemoryStore,
+    auto_store: &AutoMemoryStore,
+    arg: &str,
+) -> std::result::Result<Option<String>, String> {
+    let (global, content) = split_global_flag(arg);
+    if content.is_empty() {
+        return Ok(None);
+    }
+    if global {
+        match global_store.append_deduped(content) {
+            Ok(true) => Ok(Some(format!("Remembered (global): {content}"))),
+            Ok(false) => Ok(Some(format!("Already remembered (global): {content}"))),
+            Err(e) => Err(format!("Failed to remember: {e}")),
+        }
+    } else {
+        match auto_store.remember_index_entry(content) {
+            Ok(true) => Ok(Some(format!("Remembered (project): {content}"))),
+            Ok(false) => Ok(Some(format!("Already remembered (project): {content}"))),
+            Err(e) => Err(format!("Failed to remember: {e}")),
+        }
+    }
+}
+
+fn exec_forget_with_stores(
+    global_store: &MemoryStore,
+    auto_store: &AutoMemoryStore,
+    legacy_project: &MemoryStore,
+    arg: &str,
+) -> Option<String> {
+    let (global, keyword) = split_global_flag(arg);
+    if keyword.is_empty() {
+        return None;
+    }
+    let removed = if global {
+        global_store.remove_matching(keyword).unwrap_or_default()
+    } else {
+        let mut r = auto_store.prune_index(keyword).unwrap_or_default();
+        r.extend(legacy_project.remove_matching(keyword).unwrap_or_default());
+        r
+    };
+    Some(if removed.is_empty() {
+        format!("No memory entries matched '{keyword}'.")
+    } else {
+        format!(
+            "Forgot {} entr{}.",
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" }
+        )
+    })
 }
 
 /// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
@@ -2509,65 +2583,22 @@ fn execute_slash_command_impl(
         }
         "compact" => handle_compact_command(ctx, renderer, state, arg),
         "remember" => {
-            let text = arg.trim();
-            if text.is_empty() {
-                renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-                renderer.flush();
-            } else {
-                let (content, global) = if let Some(rest) = text.strip_prefix("--global ") {
-                    (rest.trim().to_string(), true)
-                } else {
-                    (text.to_string(), false)
-                };
-                if content.is_empty() {
-                    renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-                } else {
-                    let store = if global {
-                        MemoryStore::global()
-                    } else {
-                        MemoryStore::project(&ctx.working_dir)
-                    };
-                    let scope = if global { "global" } else { "project" };
-                    // Dedup on write (parity with the model-facing `memory` tool) so a
-                    // repeated /remember of the same line doesn't double-write.
-                    match store.append_deduped(&content) {
-                        Ok(true) => renderer.render(UiLine::CommandOutput(format!(
-                            "Remembered ({scope}): {content}"
-                        ))),
-                        Ok(false) => renderer.render(UiLine::CommandOutput(format!(
-                            "Already remembered ({scope}): {content}"
-                        ))),
-                        Err(e) => {
-                            renderer.render(UiLine::Error(format!("Failed to remember: {e}")))
-                        }
-                    }
-                }
-                renderer.flush();
+            let global_store = MemoryStore::global();
+            let auto_store = AutoMemoryStore::for_project(&ctx.working_dir);
+            match exec_remember_with_stores(&global_store, &auto_store, arg) {
+                Ok(Some(msg)) => renderer.render(UiLine::CommandOutput(msg)),
+                Ok(None) => renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned())),
+                Err(err) => renderer.render(UiLine::Error(err)),
             }
+            renderer.flush();
         }
         "forget" => {
-            let keyword = arg.trim();
-            if keyword.is_empty() {
-                renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
-            } else {
-                let mut removed = MemoryStore::project(&ctx.working_dir)
-                    .remove_matching(keyword)
-                    .unwrap_or_default();
-                removed.extend(
-                    MemoryStore::global()
-                        .remove_matching(keyword)
-                        .unwrap_or_default(),
-                );
-                let msg = if removed.is_empty() {
-                    format!("No memory entries matched '{keyword}'.")
-                } else {
-                    format!(
-                        "Forgot {} entr{}.",
-                        removed.len(),
-                        if removed.len() == 1 { "y" } else { "ies" }
-                    )
-                };
-                renderer.render(UiLine::CommandOutput(msg));
+            let global_store = MemoryStore::global();
+            let auto_store = AutoMemoryStore::for_project(&ctx.working_dir);
+            let legacy_project = MemoryStore::project(&ctx.working_dir);
+            match exec_forget_with_stores(&global_store, &auto_store, &legacy_project, arg) {
+                Some(msg) => renderer.render(UiLine::CommandOutput(msg)),
+                None => renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned())),
             }
             renderer.flush();
         }
@@ -8067,16 +8098,63 @@ mod tests {
 
 #[cfg(test)]
 mod memory_command_tests {
+    use super::{exec_forget_with_stores, exec_remember_with_stores, split_global_flag};
+    use jeikcode_capabilities::memory::{AutoMemoryStore, MemoryStore};
+
     #[test]
-    fn remember_project_writes_directly_to_store() {
-        use jeikcode_capabilities::memory::MemoryStore;
+    fn split_global_flag_recognizes_long_and_short_flags() {
+        assert_eq!(split_global_flag("--global prefer uv"), (true, "prefer uv"));
+        assert_eq!(split_global_flag("-g prefer uv"), (true, "prefer uv"));
+        assert_eq!(split_global_flag("-g"), (true, ""));
+        assert_eq!(split_global_flag("--globalfoo"), (false, "--globalfoo"));
+        assert_eq!(split_global_flag("-grand"), (false, "-grand"));
+        assert_eq!(split_global_flag("project fact"), (false, "project fact"));
+    }
+
+    #[test]
+    fn remember_and_forget_route_project_to_auto_store_and_global_to_memory_md() {
+        let _home = jeikcode_config::test_util::isolated_home();
         let tmp = tempfile::tempdir().unwrap();
-        let store = MemoryStore::project(tmp.path());
-        // 迁移后 /remember 走 MemoryStore::project(cwd).append —— 这里直接验证 store 语义,
-        // 命令臂在 Step 4 改为调用它。
-        store.append("uses tabs not spaces").unwrap();
-        let entries = MemoryStore::project(tmp.path()).load();
-        assert!(entries.iter().any(|e| e == "uses tabs not spaces"));
+        let global = MemoryStore::global();
+        let auto = AutoMemoryStore::for_project(tmp.path());
+        let legacy = MemoryStore::project(tmp.path());
+
+        // Project /remember writes to AutoMemoryStore MEMORY.md and never creates .jeikcode/memory.md
+        let res = exec_remember_with_stores(&global, &auto, "uses tabs not spaces").unwrap();
+        assert_eq!(
+            res.as_deref(),
+            Some("Remembered (project): uses tabs not spaces")
+        );
+        assert!(auto
+            .load_index_entries()
+            .iter()
+            .any(|e| e == "uses tabs not spaces"));
+        assert!(!legacy.path().exists());
+
+        // Global /remember (-g / --global) writes to global memory.md only
+        let g_res = exec_remember_with_stores(&global, &auto, "-g shared global trap").unwrap();
+        assert_eq!(
+            g_res.as_deref(),
+            Some("Remembered (global): shared global trap")
+        );
+        assert!(global.load().iter().any(|e| e == "shared global trap"));
+        assert!(!auto
+            .load_index_entries()
+            .iter()
+            .any(|e| e.contains("shared global trap")));
+
+        // Seed a legacy entry and verify project /forget cleans BOTH auto + legacy without touching global
+        legacy.append("legacy tabs note").unwrap();
+        let f_proj = exec_forget_with_stores(&global, &auto, &legacy, "tabs").unwrap();
+        assert!(f_proj.contains("Forgot 2 entries"));
+        assert!(auto.load_index_entries().is_empty());
+        assert!(legacy.load().is_empty());
+        assert_eq!(global.load(), vec!["shared global trap"]);
+
+        // Global /forget (--global) prunes global memory.md
+        let f_glob = exec_forget_with_stores(&global, &auto, &legacy, "--global shared").unwrap();
+        assert!(f_glob.contains("Forgot 1 entry"));
+        assert!(global.load().is_empty());
     }
 }
 

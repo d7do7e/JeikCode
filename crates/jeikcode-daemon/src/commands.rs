@@ -4,13 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::AppState;
+use jeikcode_capabilities::memory::{AutoMemoryStore, MemoryStore};
 #[cfg(test)]
 use jeikcode_capabilities::session::SessionMeta as NativeSessionMeta;
 use jeikcode_capabilities::session::{
     LoadedSession, SessionLease as NativeSessionLease, SessionManager as NativeSessionManager,
     SessionStoreError,
 };
-use jeikcode_config::config::memory::MemoryStore;
 
 #[derive(serde::Serialize)]
 pub(crate) struct CostModelResult {
@@ -547,12 +547,14 @@ async fn exec_context(
     .map_err(|e| anyhow::anyhow!("context task failed: {e}"))?
 }
 
-/// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
+/// 解析 `/remember` 与 `/forget` 参数：可选前缀 `--global` / `-g`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
 pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
     let arg = arg.trim();
-    if let Some(rest) = arg.strip_prefix("--global") {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            return (true, rest.trim());
+    for flag in ["--global", "-g"] {
+        if let Some(rest) = arg.strip_prefix(flag) {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return (true, rest.trim());
+            }
         }
     }
     (false, arg)
@@ -560,55 +562,78 @@ pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
 
 #[cfg(test)]
 fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
-    exec_remember_with_store(MemoryStore::global(), working_dir, arg)
+    exec_remember_with_stores(
+        MemoryStore::global(),
+        AutoMemoryStore::for_project(working_dir),
+        arg,
+    )
 }
 
 #[cfg(test)]
 fn exec_forget(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
-    exec_forget_with_store(MemoryStore::global(), working_dir, arg)
+    exec_forget_with_stores(
+        MemoryStore::global(),
+        AutoMemoryStore::for_project(working_dir),
+        MemoryStore::project(working_dir),
+        arg,
+    )
 }
 
-fn exec_remember_with_store(
+fn exec_remember_with_stores(
     global_store: MemoryStore,
-    working_dir: &Path,
+    auto_store: AutoMemoryStore,
     arg: &str,
 ) -> anyhow::Result<CommandResult> {
     let (global, content) = parse_remember_arg(arg);
     if content.is_empty() {
         anyhow::bail!("remember needs content");
     }
-    let store = if global {
-        global_store
+    if global {
+        global_store.append_deduped(content)?;
     } else {
-        MemoryStore::project(working_dir)
-    };
-    store.append(content)?;
+        auto_store
+            .remember_index_entry(content)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     Ok(CommandResult::Remember {
         scope: if global { "global" } else { "project" }.to_string(),
     })
 }
 
-fn exec_forget_with_store(
+fn exec_forget_with_stores(
     global_store: MemoryStore,
-    working_dir: &Path,
+    auto_store: AutoMemoryStore,
+    legacy_project: MemoryStore,
     arg: &str,
 ) -> anyhow::Result<CommandResult> {
-    let keyword = arg.trim();
+    let (global, keyword) = parse_remember_arg(arg);
     if keyword.is_empty() {
         anyhow::bail!("forget needs a keyword");
     }
-    let mut removed = global_store.remove_matching(keyword)?;
-    removed.extend(MemoryStore::project(working_dir).remove_matching(keyword)?);
+    let removed = if global {
+        global_store.remove_matching(keyword)?
+    } else {
+        let mut r = auto_store.prune_index(keyword)?;
+        r.extend(legacy_project.remove_matching(keyword)?);
+        r
+    };
     Ok(CommandResult::Forget { removed })
 }
 
-fn exec_memory_with_store(
+fn exec_memory_with_stores(
     global_store: MemoryStore,
-    working_dir: &Path,
+    auto_store: AutoMemoryStore,
+    legacy_project: MemoryStore,
 ) -> anyhow::Result<CommandResult> {
+    let mut project = auto_store.load_index_entries();
+    for entry in legacy_project.load() {
+        if !project.iter().any(|e| e.eq_ignore_ascii_case(&entry)) {
+            project.push(entry);
+        }
+    }
     Ok(CommandResult::Memory {
         global: global_store.load(),
-        project: MemoryStore::project(working_dir).load(),
+        project,
     })
 }
 
@@ -810,6 +835,8 @@ fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
 fn render_context_file_status_block_with(
     config_dir: &Path,
     global_memory: MemoryStore,
+    auto_index_path: &Path,
+    legacy_project: MemoryStore,
     working_dir: &std::path::Path,
 ) -> String {
     use jeikcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
@@ -838,16 +865,23 @@ fn render_context_file_status_block_with(
     }
     out.push('\n');
     out.push_str(&t(Msg::StatusMemoryFilesHeader));
-    for (scope_msg, store) in [
-        (Msg::StatusMemoryScopeGlobal, global_memory),
+    let mut memory_paths = vec![
         (
-            Msg::StatusMemoryScopeProject,
-            jeikcode_config::config::memory::MemoryStore::project(working_dir),
+            Msg::StatusMemoryScopeGlobal,
+            global_memory.path().to_path_buf(),
         ),
-    ] {
+        (Msg::StatusMemoryScopeProject, auto_index_path.to_path_buf()),
+    ];
+    if legacy_project.path().is_file() {
+        memory_paths.push((
+            Msg::StatusMemoryScopeProject,
+            legacy_project.path().to_path_buf(),
+        ));
+    }
+    for (scope_msg, mem_path) in memory_paths {
         let scope = t(scope_msg);
-        let path = store.path().display().to_string();
-        if store.path().is_file() {
+        let path = mem_path.display().to_string();
+        if mem_path.is_file() {
             out.push_str(&t(Msg::StatusMemoryPresent {
                 path: &path,
                 scope: &scope,
@@ -867,6 +901,8 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
     render_context_file_status_block_with(
         &jeikcode_config::config::Config::config_dir(),
         MemoryStore::global(),
+        &AutoMemoryStore::for_project(working_dir).index_path(),
+        MemoryStore::project(working_dir),
         working_dir,
     )
 }
@@ -884,6 +920,8 @@ fn exec_status_with(
     config_dir: &Path,
     config_path: &Path,
     global_memory: MemoryStore,
+    auto_index_path: &Path,
+    legacy_project: MemoryStore,
     working_dir: &std::path::Path,
     provider: Option<&str>,
 ) -> anyhow::Result<CommandResult> {
@@ -913,7 +951,13 @@ fn exec_status_with(
     let text = assemble_status(
         &body,
         &proxy_line,
-        &render_context_file_status_block_with(config_dir, global_memory, working_dir),
+        &render_context_file_status_block_with(
+            config_dir,
+            global_memory,
+            auto_index_path,
+            legacy_project,
+            working_dir,
+        ),
     );
 
     Ok(CommandResult::Status {
@@ -1313,29 +1357,37 @@ pub(crate) async fn run_command(
         }
         "remember" => {
             let global_store = MemoryStore::global();
-            let wd = working_dir.clone();
+            let auto_store = AutoMemoryStore::for_project(&working_dir);
             let arg = req.arg.clone();
-            tokio::task::spawn_blocking(move || exec_remember_with_store(global_store, &wd, &arg))
-                .await
-                .map_err(|e| anyhow::anyhow!("remember task failed: {e}"))
-                .and_then(|res| res)
+            tokio::task::spawn_blocking(move || {
+                exec_remember_with_stores(global_store, auto_store, &arg)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("remember task failed: {e}"))
+            .and_then(|res| res)
         }
         "forget" => {
             let global_store = MemoryStore::global();
-            let wd = working_dir.clone();
+            let auto_store = AutoMemoryStore::for_project(&working_dir);
+            let legacy_project = MemoryStore::project(&working_dir);
             let arg = req.arg.clone();
-            tokio::task::spawn_blocking(move || exec_forget_with_store(global_store, &wd, &arg))
-                .await
-                .map_err(|e| anyhow::anyhow!("forget task failed: {e}"))
-                .and_then(|res| res)
+            tokio::task::spawn_blocking(move || {
+                exec_forget_with_stores(global_store, auto_store, legacy_project, &arg)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("forget task failed: {e}"))
+            .and_then(|res| res)
         }
         "memory" => {
             let global_store = MemoryStore::global();
-            let wd = working_dir.clone();
-            tokio::task::spawn_blocking(move || exec_memory_with_store(global_store, &wd))
-                .await
-                .map_err(|e| anyhow::anyhow!("memory task failed: {e}"))
-                .and_then(|res| res)
+            let auto_store = AutoMemoryStore::for_project(&working_dir);
+            let legacy_project = MemoryStore::project(&working_dir);
+            tokio::task::spawn_blocking(move || {
+                exec_memory_with_stores(global_store, auto_store, legacy_project)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("memory task failed: {e}"))
+            .and_then(|res| res)
         }
         "context" => {
             exec_context(
@@ -1382,6 +1434,8 @@ pub(crate) async fn run_command(
             let config_dir = jeikcode_config::config::Config::config_dir();
             let config_path = jeikcode_config::config::Config::default_path();
             let global_memory = MemoryStore::global();
+            let auto_index_path = AutoMemoryStore::for_project(&working_dir).index_path();
+            let legacy_project = MemoryStore::project(&working_dir);
             let wd = working_dir.clone();
             let prov = req.provider.clone();
             tokio::task::spawn_blocking(move || {
@@ -1389,6 +1443,8 @@ pub(crate) async fn run_command(
                     &config_dir,
                     &config_path,
                     global_memory,
+                    &auto_index_path,
+                    legacy_project,
                     &wd,
                     prov.as_deref(),
                 )
@@ -1446,7 +1502,6 @@ mod tests {
     use super::*;
     use jeikcode_capabilities::session::PresentationFile;
     use jeikcode_capabilities::session::{StorageOwner, TurnStat};
-    use jeikcode_config::config::memory::MemoryStore;
 
     #[test]
     fn context_file_status_shows_instruction_and_memory_paths() {
@@ -1768,35 +1823,79 @@ mod tests {
     #[test]
     fn parse_remember_arg_detects_global() {
         assert_eq!(parse_remember_arg("--global 记住这个"), (true, "记住这个"));
+        assert_eq!(parse_remember_arg("-g 记住这个"), (true, "记住这个"));
         assert_eq!(parse_remember_arg("普通事实"), (false, "普通事实"));
         assert_eq!(
             parse_remember_arg("  --global   trimmed  "),
             (true, "trimmed")
         );
         assert_eq!(parse_remember_arg("--globalfoo"), (false, "--globalfoo"));
+        assert_eq!(parse_remember_arg("-grand"), (false, "-grand"));
     }
 
     #[test]
     fn remember_then_memory_roundtrip_project_scope() {
-        // hermetic：project 作用域写到 working_dir/.jeikcode/memory.md
+        let _home = jeikcode_config::test_util::isolated_home();
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
         exec_remember(wd, "阿童木用 Rust 写").unwrap();
-        let store = MemoryStore::project(wd);
-        assert!(store.load().iter().any(|e| e.contains("阿童木用 Rust 写")));
+        let auto = AutoMemoryStore::for_project(wd);
+        assert!(auto
+            .load_index_entries()
+            .iter()
+            .any(|e| e.contains("阿童木用 Rust 写")));
+        assert!(!MemoryStore::project(wd).path().exists());
+
+        exec_remember(wd, "-g 全局陷阱").unwrap();
+        assert!(MemoryStore::global()
+            .load()
+            .iter()
+            .any(|e| e.contains("全局陷阱")));
+
+        let CommandResult::Memory { global, project } = exec_memory_with_stores(
+            MemoryStore::global(),
+            AutoMemoryStore::for_project(wd),
+            MemoryStore::project(wd),
+        )
+        .unwrap() else {
+            panic!("expected Memory result");
+        };
+        assert!(global.iter().any(|e| e.contains("全局陷阱")));
+        assert!(project.iter().any(|e| e.contains("阿童木用 Rust 写")));
     }
 
     #[test]
     fn forget_removes_project_entry() {
+        let _home = jeikcode_config::test_util::isolated_home();
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
         exec_remember(wd, "delete-me fact").unwrap();
         exec_remember(wd, "keep-me fact").unwrap();
-        // exec_forget 也会扫全局，但全局此刻应无匹配；断言项目侧被删。
-        let _ = exec_forget(wd, "delete-me");
-        let remaining = MemoryStore::project(wd).load();
+        exec_remember(wd, "--global delete-me global").unwrap();
+        MemoryStore::project(wd).append("delete-me legacy").unwrap();
+
+        let CommandResult::Forget { removed } = exec_forget(wd, "delete-me").unwrap() else {
+            panic!("expected Forget result");
+        };
+        assert_eq!(removed.len(), 2);
+
+        let remaining = AutoMemoryStore::for_project(wd).load_index_entries();
         assert!(!remaining.iter().any(|e| e.contains("delete-me")));
         assert!(remaining.iter().any(|e| e.contains("keep-me")));
+        assert!(MemoryStore::project(wd).load().is_empty());
+        // Global untouched by project /forget
+        assert!(MemoryStore::global()
+            .load()
+            .iter()
+            .any(|e| e.contains("delete-me global")));
+
+        // Global /forget (--global / -g) removes global only
+        let CommandResult::Forget { removed: g_removed } = exec_forget(wd, "-g delete-me").unwrap()
+        else {
+            panic!("expected Forget result");
+        };
+        assert_eq!(g_removed.len(), 1);
+        assert!(MemoryStore::global().load().is_empty());
     }
 
     #[test]

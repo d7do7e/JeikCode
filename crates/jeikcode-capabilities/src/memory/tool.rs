@@ -136,9 +136,9 @@ impl Tool for MemoryTool {
 
     fn description(&self) -> &str {
         if self.read_only {
-            "Read-only recall of durable cross-session memory (`MEMORY.md` compact index, `topics/*.md`, and legacy `memory.md`). Only `action: \"recall\"` is permitted."
+            "Read-only recall of durable cross-session memory (`MEMORY.md` project index, `topics/*.md`, global `~/.jeikcode/memory.md`, and legacy project `memory.md`). Only `action: \"recall\"` is permitted."
         } else {
-            "Persist, recall, update, or prune durable cross-session memory (`MEMORY.md` compact index + on-demand `topics/*.md`). Store only durable, non-obvious preferences, conventions, or gotchas — never secrets or ephemeral task logs."
+            "Persist, recall, update, or prune durable cross-session memory: project `MEMORY.md` index + on-demand `topics/*.md` + global `~/.jeikcode/memory.md`. Always run `recall` before `remember` to avoid duplicates; prune/consolidate at >=50% budget before splitting >12 KiB topics; store only durable non-obvious conventions or gotchas (never secrets or turn narration)."
         }
     }
 
@@ -174,16 +174,16 @@ impl Tool for MemoryTool {
                 "action": {
                     "type": "string",
                     "enum": ["remember", "recall", "update", "prune"],
-                    "description": "Operation to perform."
+                    "description": "Operation to perform. Use `update` with `topic`+`target` for single-bullet replacement (omit `target` to rewrite whole topic), and `prune` with `topic`+`query` for bullet removal (omit `query` to delete whole topic)."
                 },
                 "scope": {
                     "type": "string",
                     "enum": ["project", "global", "topic"],
-                    "description": "Target store for `remember`/`update`/`prune` (default: `project`, or `topic` when `topic` is set)."
+                    "description": "Target store for `remember`/`update`/`prune` (default: `project` -> `MEMORY.md`, `global` -> `~/.jeikcode/memory.md`, or `topic` -> `topics/<slug>.md` when `topic` is set)."
                 },
                 "content": {
                     "type": "string",
-                    "description": "Concise one-line fact (for index/global) or markdown body (for `topic`)."
+                    "description": "Concise one-line fact (for `MEMORY.md` / global `memory.md`), markdown body (for `topic`), or replacement line (for `update`)."
                 },
                 "topic": {
                     "type": "string",
@@ -195,11 +195,11 @@ impl Tool for MemoryTool {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Keyword filter for `recall` or `prune`."
+                    "description": "Keyword filter for `recall` or `prune` (with `topic`, removes matching bullets inside `topics/<slug>.md`; without `topic`, prunes `MEMORY.md` / global `memory.md`)."
                 },
                 "target": {
                     "type": "string",
-                    "description": "Existing entry substring to replace during `update`."
+                    "description": "Existing entry substring to replace during `update` (matches inside `topics/<slug>.md` when `topic` is set, else `MEMORY.md` / global `memory.md`)."
                 },
                 "append": {
                     "type": "boolean",
@@ -359,9 +359,28 @@ impl Tool for MemoryTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    match auto.write_topic(slug, raw_content, parsed.summary.as_deref(), false) {
-                        Ok(path) => tool_ok(format!("Updated topic `{slug}` ({})", path.display())),
-                        Err(e) => tool_err(e),
+                    let target = parsed
+                        .target
+                        .as_deref()
+                        .or(parsed.query.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    if let Some(target_str) = target {
+                        match auto.update_topic_entry(slug, target_str, raw_content) {
+                            Ok(path) => tool_ok(format!(
+                                "Updated entry matching `{target_str}` in topic `{slug}` ({})",
+                                path.display()
+                            )),
+                            Err(e) => tool_err(e),
+                        }
+                    } else {
+                        match auto.write_topic(slug, raw_content, parsed.summary.as_deref(), false)
+                        {
+                            Ok(path) => {
+                                tool_ok(format!("Updated topic `{slug}` ({})", path.display()))
+                            }
+                            Err(e) => tool_err(e),
+                        }
                     }
                 } else {
                     let Some(target) = parsed
@@ -424,12 +443,29 @@ impl Tool for MemoryTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    match auto.delete_topic(slug) {
-                        Ok(true) => tool_ok(format!(
-                            "Deleted topic `{slug}` and pruned its index pointer"
-                        )),
-                        Ok(false) => tool_ok(format!("Topic `{slug}` did not exist")),
-                        Err(e) => tool_err(e),
+                    let kw = parsed
+                        .query
+                        .as_deref()
+                        .or(parsed.target.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    if let Some(kw_str) = kw {
+                        match auto.prune_topic_entries(slug, kw_str) {
+                            Ok(removed) => tool_ok(format!(
+                                "Pruned {} matching entr{} from topic `{slug}` for `{kw_str}`",
+                                removed.len(),
+                                if removed.len() == 1 { "y" } else { "ies" }
+                            )),
+                            Err(e) => tool_err(e),
+                        }
+                    } else {
+                        match auto.delete_topic(slug) {
+                            Ok(true) => tool_ok(format!(
+                                "Deleted topic `{slug}` and pruned its index pointer"
+                            )),
+                            Ok(false) => tool_ok(format!("Topic `{slug}` did not exist")),
+                            Err(e) => tool_err(e),
+                        }
                     }
                 } else {
                     let Some(kw) = parsed
@@ -739,5 +775,85 @@ mod tests {
         assert!(!verify_all.content.contains("Tampered"));
         assert!(!verify_all.content.contains("Should never"));
         assert!(verify_all.content.contains("Use --locked"));
+    }
+
+    #[tokio::test]
+    async fn memory_tool_topic_bullet_update_and_prune_vs_full_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = test_tool(dir.path());
+        let ctx = test_ctx(dir.path());
+
+        let seed = tool
+            .execute(
+                r##"{"action":"remember","topic":"rules","summary":"Project rules","content":"# Rules\n\n- Alpha old\n- Beta keep\n- Gamma drop"}"##,
+                &ctx,
+            )
+            .await;
+        assert!(!seed.is_error, "{}", seed.content);
+
+        // Targeted bullet update inside topic
+        let upd = tool
+            .execute(
+                r#"{"action":"update","topic":"rules","target":"Alpha old","content":"Alpha v2"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!upd.is_error, "{}", upd.content);
+        assert!(upd.content.starts_with("Updated "));
+
+        let body = tool
+            .execute(r#"{"action":"recall","topic":"rules"}"#, &ctx)
+            .await;
+        assert!(body.content.contains("# Rules"));
+        assert!(body.content.contains("- Alpha v2"));
+        assert!(body.content.contains("- Beta keep"));
+        assert!(body.content.contains("- Gamma drop"));
+
+        // Unmatched bullet update returns explicit error
+        let missing = tool
+            .execute(
+                r#"{"action":"update","topic":"rules","target":"NoSuchLine","content":"Replacement"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(missing.is_error);
+
+        // Targeted bullet prune keeps topic file and remaining lines
+        let pruned_line = tool
+            .execute(
+                r#"{"action":"prune","topic":"rules","query":"Gamma drop"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!pruned_line.is_error, "{}", pruned_line.content);
+        assert!(pruned_line.content.starts_with("Pruned 1 "));
+        assert!(dir.path().join("auto/topics/rules.md").is_file());
+
+        let after_prune = tool
+            .execute(r#"{"action":"recall","topic":"rules"}"#, &ctx)
+            .await;
+        assert!(after_prune.content.contains("- Beta keep"));
+        assert!(!after_prune.content.contains("Gamma drop"));
+
+        // Full-topic rewrite when target is omitted
+        let full_upd = tool
+            .execute(
+                r#"{"action":"update","topic":"rules","content":"- Fresh whole topic"}"#,
+                &ctx,
+            )
+            .await;
+        assert!(!full_upd.is_error, "{}", full_upd.content);
+        let after_full = tool
+            .execute(r#"{"action":"recall","topic":"rules"}"#, &ctx)
+            .await;
+        assert!(after_full.content.contains("- Fresh whole topic"));
+        assert!(!after_full.content.contains("Beta keep"));
+
+        // Full-topic delete when query is omitted
+        let full_prune = tool
+            .execute(r#"{"action":"prune","topic":"rules"}"#, &ctx)
+            .await;
+        assert!(!full_prune.is_error, "{}", full_prune.content);
+        assert!(!dir.path().join("auto/topics/rules.md").exists());
     }
 }

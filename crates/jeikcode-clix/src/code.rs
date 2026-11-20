@@ -15,7 +15,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use jeikcode_capabilities::memory::MemoryStore;
+use jeikcode_capabilities::memory::{AutoMemoryStore, MemoryHook, MemoryStore};
 use jeikcode_capabilities::session::SessionManager;
 use jeikcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
 use jeikcode_coding::{
@@ -557,7 +557,7 @@ fn handle_slash(cmd: &str, dir: &std::path::Path, handle: &CodingRuntimeHandle) 
         "quit" | "exit" | "q" => SlashOutcome::Quit,
         "help" | "?" => {
             eprintln!(
-                "  /remember [-g] <fact>   append to project (or -g: global) memory.md\n\
+                "  /remember [-g] <fact>   save to project MEMORY.md (or -g: global memory.md)\n\
                  \x20 /forget [-g] <keyword>  remove matching entries\n\
                  \x20 /memory                 show the merged memory the model gets\n\
                  \x20 /compact [focus]        compact the conversation (turn boundary)\n\
@@ -567,59 +567,32 @@ fn handle_slash(cmd: &str, dir: &std::path::Path, handle: &CodingRuntimeHandle) 
             SlashOutcome::Handled
         }
         "remember" => {
-            let (global, text) = split_global_flag(rest);
-            if text.is_empty() {
-                eprintln!("  usage: /remember [-g] <fact>");
-                return SlashOutcome::Handled;
-            }
-            let store = if global {
-                MemoryStore::global()
-            } else {
-                MemoryStore::project(dir)
-            };
-            match store.append(text) {
-                Ok(()) => eprintln!(
-                    "  remembered ({}) — injected from the next session start",
-                    if global { "global" } else { "project" }
-                ),
-                Err(e) => eprintln!("  failed to write memory: {e}"),
+            let global = MemoryStore::global();
+            let auto = AutoMemoryStore::for_project(dir);
+            match exec_remember_slash(&global, &auto, rest) {
+                Ok(msg) => eprintln!("  {msg}"),
+                Err(msg) => eprintln!("  {msg}"),
             }
             SlashOutcome::Handled
         }
         "forget" => {
-            let (global, kw) = split_global_flag(rest);
-            if kw.is_empty() {
-                eprintln!("  usage: /forget [-g] <keyword>");
-                return SlashOutcome::Handled;
-            }
-            let store = if global {
-                MemoryStore::global()
-            } else {
-                MemoryStore::project(dir)
-            };
-            match store.remove_matching(kw) {
-                Ok(removed) if removed.is_empty() => eprintln!("  nothing matched '{kw}'"),
-                Ok(removed) => {
-                    for r in &removed {
-                        eprintln!("  forgot: {r}");
+            let global = MemoryStore::global();
+            let auto = AutoMemoryStore::for_project(dir);
+            let legacy = MemoryStore::project(dir);
+            match exec_forget_slash(&global, &auto, &legacy, rest) {
+                Ok(lines) => {
+                    for line in lines {
+                        eprintln!("  {line}");
                     }
                 }
-                Err(e) => eprintln!("  failed to update memory: {e}"),
+                Err(msg) => eprintln!("  {msg}"),
             }
             SlashOutcome::Handled
         }
         "memory" => {
-            let merged = MemoryStore::merged_for_prompt(
-                &MemoryStore::global(),
-                &MemoryStore::project(dir),
-                &dir.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "project".into()),
-            );
-            if merged.is_empty() {
-                eprintln!("  (memory is empty — /remember <fact>)");
-            } else {
-                eprintln!("{merged}");
+            match MemoryHook::for_project(dir).render_block() {
+                None => eprintln!("  (memory is empty — /remember <fact>)"),
+                Some(merged) => eprintln!("{merged}"),
             }
             SlashOutcome::Handled
         }
@@ -653,15 +626,78 @@ fn handle_slash(cmd: &str, dir: &std::path::Path, handle: &CodingRuntimeHandle) 
 
 /// Split a leading `-g`/`--global` flag off a slash-command argument.
 fn split_global_flag(rest: &str) -> (bool, &str) {
-    for flag in ["-g ", "--global "] {
+    let rest = rest.trim();
+    for flag in ["-g", "--global"] {
         if let Some(r) = rest.strip_prefix(flag) {
-            return (true, r.trim());
+            if r.is_empty() || r.starts_with(char::is_whitespace) {
+                return (true, r.trim());
+            }
         }
     }
-    if rest == "-g" || rest == "--global" {
-        return (true, "");
-    }
     (false, rest)
+}
+
+fn exec_remember_slash(
+    global_store: &MemoryStore,
+    auto_store: &AutoMemoryStore,
+    rest: &str,
+) -> std::result::Result<String, String> {
+    let (global, text) = split_global_flag(rest);
+    if text.is_empty() {
+        return Err("usage: /remember [-g] <fact>".to_string());
+    }
+    if global {
+        match global_store.append_deduped(text) {
+            Ok(true) => {
+                Ok("remembered (global) — injected from the next session start".to_string())
+            }
+            Ok(false) => Ok("already remembered (global)".to_string()),
+            Err(e) => Err(format!("failed to write memory: {e}")),
+        }
+    } else {
+        match auto_store.remember_index_entry(text) {
+            Ok(true) => {
+                Ok("remembered (project) — injected from the next session start".to_string())
+            }
+            Ok(false) => Ok("already remembered (project)".to_string()),
+            Err(e) => Err(format!("failed to write memory: {e}")),
+        }
+    }
+}
+
+fn exec_forget_slash(
+    global_store: &MemoryStore,
+    auto_store: &AutoMemoryStore,
+    legacy_project: &MemoryStore,
+    rest: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let (global, kw) = split_global_flag(rest);
+    if kw.is_empty() {
+        return Err("usage: /forget [-g] <keyword>".to_string());
+    }
+    let removed = if global {
+        global_store
+            .remove_matching(kw)
+            .map_err(|e| format!("failed to update memory: {e}"))?
+    } else {
+        let mut r = auto_store
+            .prune_index(kw)
+            .map_err(|e| format!("failed to update memory: {e}"))?;
+        r.extend(
+            legacy_project
+                .remove_matching(kw)
+                .map_err(|e| format!("failed to update memory: {e}"))?,
+        );
+        r
+    };
+    if removed.is_empty() {
+        Ok(vec![format!("nothing matched '{kw}'")])
+    } else {
+        Ok(removed
+            .into_iter()
+            .map(|r| format!("forgot: {r}"))
+            .collect())
+    }
 }
 
 /// epoch ms → `YYYY-MM-DD HH:MM UTC` (dependency-free; UTC — labeled as such, while
@@ -757,5 +793,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn remember_and_forget_slash_route_project_to_auto_store_and_global_to_memory_md() {
+        let _home = jeikcode_config::test_util::isolated_home();
+        let dir = tempfile::tempdir().unwrap();
+        let global = MemoryStore::global();
+        let auto = AutoMemoryStore::for_project(dir.path());
+        let legacy = MemoryStore::project(dir.path());
+
+        let msg = exec_remember_slash(&global, &auto, "project cli rule").unwrap();
+        assert!(msg.contains("remembered (project)"));
+        assert!(auto
+            .load_index_entries()
+            .iter()
+            .any(|e| e == "project cli rule"));
+        assert!(!legacy.path().exists());
+
+        let g_msg = exec_remember_slash(&global, &auto, "-g global cli rule").unwrap();
+        assert!(g_msg.contains("remembered (global)"));
+        assert!(global.load().iter().any(|e| e == "global cli rule"));
+
+        let rendered = MemoryHook::for_project(dir.path()).render_block().unwrap();
+        assert!(rendered.contains("project cli rule"));
+        assert!(rendered.contains("global cli rule"));
+
+        legacy.append("legacy cli rule").unwrap();
+        let lines = exec_forget_slash(&global, &auto, &legacy, "cli rule").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(auto.load_index_entries().is_empty());
+        assert!(legacy.load().is_empty());
+        assert_eq!(global.load(), vec!["global cli rule"]);
+
+        let g_lines = exec_forget_slash(&global, &auto, &legacy, "--global cli rule").unwrap();
+        assert_eq!(g_lines.len(), 1);
+        assert!(global.load().is_empty());
     }
 }
