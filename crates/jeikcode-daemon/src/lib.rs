@@ -3454,6 +3454,8 @@ struct ActiveChatOperation {
     steer_timestamps: std::collections::VecDeque<Option<u64>>,
 }
 
+const MAX_RETAINED_SESSION_STATES: usize = 512;
+
 #[derive(Default)]
 struct ActiveChatIndex {
     operations: HashMap<String, ActiveChatOperation>,
@@ -3477,8 +3479,42 @@ struct ActiveChatIndex {
     /// 一直叠加 + 清单定格），只能靠切一次会话顺带修好。终态帧是整个回合最重要的一帧，
     /// 它必须活得比 operation 久，所以记在会话上而不是记在 operation 里。
     ///
-    /// 键是会话的 alias；值是（序号, 帧本身）。
+    /// 键是 `session_id`；值是（序号, 帧本身）。
     session_terminal: HashMap<String, (u64, ChatEvent)>,
+    /// Deduplicated insertion/recency order for bounded eviction across `session_seq` and `session_terminal`.
+    session_state_order: std::collections::VecDeque<String>,
+}
+
+impl ActiveChatIndex {
+    fn touch_session_state_key(&mut self, sid: &str) {
+        self.session_state_order.retain(|s| s != sid);
+        self.session_state_order.push_back(sid.to_string());
+        self.evict_excess_session_states();
+    }
+
+    fn evict_excess_session_states(&mut self) {
+        let len = self.session_state_order.len();
+        for _ in 0..len {
+            if self.session_seq.len() <= MAX_RETAINED_SESSION_STATES
+                && self.session_terminal.len() <= MAX_RETAINED_SESSION_STATES
+            {
+                break;
+            }
+            let Some(candidate) = self.session_state_order.pop_front() else {
+                break;
+            };
+            let is_active = self
+                .operations
+                .values()
+                .any(|op| op.session_id.as_deref() == Some(candidate.as_str()));
+            if is_active {
+                self.session_state_order.push_back(candidate);
+                continue;
+            }
+            self.session_seq.remove(&candidate);
+            self.session_terminal.remove(&candidate);
+        }
+    }
 }
 
 /// Atomic admission and identity-aware cleanup for background `/chat` turns.
@@ -4344,9 +4380,7 @@ impl ActiveChatRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .high_water();
-        for alias in &operation.aliases {
-            index.session_seq.insert(alias.clone(), next_base);
-        }
+        let sid_for_seq = operation.session_id.clone();
         for alias in operation.aliases {
             if index
                 .aliases
@@ -4357,8 +4391,12 @@ impl ActiveChatRegistry {
             }
         }
         operation.finished.notify_waiters();
+        if let Some(sid) = sid_for_seq.as_deref() {
+            index.session_seq.insert(sid.to_string(), next_base);
+            index.touch_session_state_key(sid);
+        }
         // 跨实例增量：操作结束 → 活动状态回落（不触发任何整表重拉）。
-        if let Some(sid) = operation.session_id.clone() {
+        if let Some(sid) = sid_for_seq {
             // 只结束属于本次 operation 的阶段：手动压缩归 `manual:<op>`，
             // `/chat` 自动压缩归 `turn` 前缀。绝不能无条件清掉 live 或别的 owner
             // 正在执行的压缩（旧实现正是这样让刷新误杀另一条链路）。
@@ -4402,11 +4440,11 @@ impl ActiveChatRegistry {
             .high_water()
             .saturating_add(1);
         op.terminal_reached = true;
-        let aliases = op.aliases.clone();
-        for alias in aliases {
+        if let Some(sid) = op.session_id.clone() {
             index
                 .session_terminal
-                .insert(alias, (seq, terminal.clone()));
+                .insert(sid.clone(), (seq, terminal.clone()));
+            index.touch_session_state_key(&sid);
         }
     }
 
@@ -4416,6 +4454,7 @@ impl ActiveChatRegistry {
         let mut index = self.inner.write().await;
         index.session_seq.remove(session_id);
         index.session_terminal.remove(session_id);
+        index.session_state_order.retain(|s| s != session_id);
         index.standby_watchers.remove(session_id);
         index.aliases.remove(session_id);
     }
@@ -6192,6 +6231,8 @@ pub struct AppState {
     pub http_router: Arc<std::sync::OnceLock<axum::Router>>,
     /// The extra listener, if the WebUI opened one.
     pub extra_remote: Arc<std::sync::Mutex<Option<ExtraRemoteBind>>>,
+    /// Serializes `POST /api/remote-access` stop/rebind/auth transitions.
+    pub remote_access_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A second bind opened from the WebUI remote-access control.
@@ -6207,6 +6248,12 @@ impl ExtraRemoteBind {
         for handle in &self.aborts {
             handle.abort();
         }
+    }
+}
+
+impl Drop for ExtraRemoteBind {
+    fn drop(&mut self) {
+        self.abort_all();
     }
 }
 
@@ -15886,6 +15933,15 @@ pub(crate) async fn launch_or_resume_goal_bridge(
             }
         }
 
+        if !terminal_sent {
+            let err_ev = ChatEvent::Error {
+                message: "goal runtime stream closed unexpectedly".into(),
+                message_id: None,
+            };
+            active_chats.mark_terminal(&bridge_op_id, &err_ev).await;
+            let _ = fan_tx.send(err_ev);
+        }
+
         pending_permissions.unregister_session(&bridge_session_id);
         pending_user_inputs.unregister_session(&bridge_session_id);
         active_chats.complete(&bridge_op_id).await;
@@ -16143,10 +16199,16 @@ pub(crate) async fn finalize_chat_task(
     match inner.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            let _ = event_tx.send(ChatEvent::Error {
+            let err_ev = ChatEvent::Error {
                 message: e.to_string(),
                 message_id: None,
-            });
+            };
+            if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                cleanup_chats
+                    .mark_terminal(cleanup_operation_id, &err_ev)
+                    .await;
+            }
+            let _ = event_tx.send(err_ev);
         }
         Err(join_error) => {
             tracing::error!(
@@ -16164,14 +16226,18 @@ pub(crate) async fn finalize_chat_task(
                     .session_id(cleanup_operation_id)
                     .await
                     .unwrap_or_else(|| requested_session_id.to_string());
-                let _ = event_tx.send(ChatEvent::Done {
+                let done_ev = ChatEvent::Done {
                     message_id: None,
                     tokens: 0,
                     tool_calls: 0,
                     session_id,
                     stop_reason: Some("internal_error".into()),
                     message: Some("chat task failed".into()),
-                });
+                };
+                cleanup_chats
+                    .mark_terminal(cleanup_operation_id, &done_ev)
+                    .await;
+                let _ = event_tx.send(done_ev);
             }
         }
     }
@@ -16529,6 +16595,10 @@ pub(crate) async fn process_chat_request(
                 eprintln!("Warning: Failed to save native session after early stop: {e}");
             }
         }
+        terminal_sent.store(true, std::sync::atomic::Ordering::Release);
+        active_chats
+            .mark_terminal(&operation_id, &ChatEvent::Stopped)
+            .await;
         let _ = event_tx.send(ChatEvent::Stopped);
         // Turn never ran — the turn task (which registers the responder) never
         // spawned, so this is a defensive no-op cleanup for interactive modes.
@@ -16708,16 +16778,27 @@ pub(crate) async fn process_chat_request(
     // TurnFinished event can authorize `done`.
     if !projector.terminal_seen {
         if let Some(event) = projector.finish() {
+            if matches!(
+                event,
+                ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+            ) {
+                terminal_sent.store(true, std::sync::atomic::Ordering::Release);
+                active_chats.mark_terminal(&operation_id, &event).await;
+            }
             let _ = event_tx.send(event);
         }
         let message = projector
             .last_error
             .clone()
             .unwrap_or_else(|| "coding runtime event stream closed before turn terminal".into());
-        let _ = event_tx.send(ChatEvent::Error {
+        let err_ev = ChatEvent::Error {
             message,
             message_id: None,
-        });
+        };
+        if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            active_chats.mark_terminal(&operation_id, &err_ev).await;
+        }
+        let _ = event_tx.send(err_ev);
     }
 
     // The native runtime owns turn boundaries, mid-turn cancel cleanup
@@ -24253,6 +24334,7 @@ async fn run_server_with_options(
         token_optional: Arc::new(std::sync::atomic::AtomicBool::new(inherited_no_token)),
         http_router: Arc::new(std::sync::OnceLock::new()),
         extra_remote: Arc::new(std::sync::Mutex::new(None)),
+        remote_access_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Crash recovery before accepting traffic: no active turn survives a daemon
@@ -25576,6 +25658,7 @@ mod tests {
             token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             http_router: Arc::new(std::sync::OnceLock::new()),
             extra_remote: Arc::new(std::sync::Mutex::new(None)),
+            remote_access_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -31233,5 +31316,82 @@ mod server_lifecycle_tests {
             csp.contains("sandbox") && csp.contains("default-src 'none'"),
             "{csp}"
         );
+    }
+
+    #[tokio::test]
+    async fn active_chat_index_keys_seq_and_terminal_by_session_id_and_bounds_retention() {
+        let registry = ActiveChatRegistry::default();
+        let req_alias = "req-alias-1";
+        let admission = registry
+            .admit(Some("sess-bound-1"), Some(req_alias))
+            .await
+            .unwrap();
+        let done_ev = |sid: &str| ChatEvent::Done {
+            tokens: 0,
+            tool_calls: 0,
+            session_id: sid.to_string(),
+            stop_reason: Some("stopped".into()),
+            message: None,
+            message_id: None,
+        };
+        registry
+            .mark_terminal(&admission.operation_id, &done_ev("sess-bound-1"))
+            .await;
+        assert!(registry.complete(&admission.operation_id).await);
+
+        {
+            let index = registry.inner.read().await;
+            assert!(index.session_seq.contains_key("sess-bound-1"));
+            assert!(index.session_terminal.contains_key("sess-bound-1"));
+            assert!(!index.session_seq.contains_key(req_alias));
+            assert!(!index.session_terminal.contains_key(req_alias));
+        }
+
+        // Fill past MAX_RETAINED_SESSION_STATES and verify oldest completed sessions are evicted.
+        for i in 0..=(MAX_RETAINED_SESSION_STATES + 5) {
+            let sid = format!("sess-evict-{i}");
+            let adm = registry.admit(Some(&sid), None).await.unwrap();
+            registry
+                .mark_terminal(&adm.operation_id, &done_ev(&sid))
+                .await;
+            assert!(registry.complete(&adm.operation_id).await);
+        }
+        {
+            let index = registry.inner.read().await;
+            assert!(index.session_seq.len() <= MAX_RETAINED_SESSION_STATES);
+            assert!(index.session_terminal.len() <= MAX_RETAINED_SESSION_STATES);
+            assert!(!index.session_seq.contains_key("sess-bound-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_chat_task_records_terminal_for_late_watchers_on_error_and_panic() {
+        let registry = ActiveChatRegistry::default();
+        let adm = registry.admit(Some("sess-err-crash"), None).await.unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let inner = tokio::spawn(async move { Err(anyhow::anyhow!("boom before stream")) });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &registry,
+            &adm.operation_id,
+            "sess-err-crash",
+            &terminal_sent,
+        )
+        .await;
+
+        assert!(terminal_sent.load(std::sync::atomic::Ordering::Acquire));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("sess-err-crash", None, &tx, true)
+            .await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(matches!(
+            rx.try_recv()
+                .expect("late watcher receives recorded error terminal"),
+            (_, ChatEvent::Error { .. })
+        ));
     }
 }

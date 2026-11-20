@@ -1190,6 +1190,10 @@ pub(crate) async fn post_remote_access(
     State(state): State<AppState>,
     Json(body): Json<RemoteAccessBody>,
 ) -> impl IntoResponse {
+    // Serialize remote-access mutations across stop/apply/rebind awaits so concurrent
+    // calls cannot leak an extra listener or expose a wildcard socket without auth.
+    let _remote_guard = state.remote_access_lock.lock().await;
+
     if body.stop {
         if let Some(prev) = take_extra_remote(&state) {
             prev.abort_all();
@@ -1268,20 +1272,23 @@ pub(crate) async fn post_remote_access(
                     });
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                        if let Ok(exe) = jeikcode_updater::current_exe_path() {
-                            let _ = jeikcode_updater::restart_process_with_config(
-                                &exe,
-                                old_port,
-                                if restart_host.is_empty() {
-                                    None
-                                } else {
-                                    Some(&restart_host)
-                                },
-                                restart_port,
-                                effective_token.as_deref(),
-                                Some(no_token),
-                            );
-                        }
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(exe) = jeikcode_updater::current_exe_path() {
+                                let _ = jeikcode_updater::restart_process_with_config(
+                                    &exe,
+                                    old_port,
+                                    if restart_host.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&restart_host)
+                                    },
+                                    restart_port,
+                                    effective_token.as_deref(),
+                                    Some(no_token),
+                                );
+                            }
+                        })
+                        .await;
                     });
                 }
                 Json(status).into_response()
@@ -1412,6 +1419,10 @@ pub(crate) async fn post_remote_access(
         }
     }
 
+    // Apply auth enforcement BEFORE spawning the listener tasks so an incoming
+    // wildcard connection can never race ahead of `enforce_token` / `token_optional`.
+    apply_remote_auth(&state, body.no_token);
+
     let mut aborts = Vec::new();
     let router_primary = router.clone();
     let task_primary = tokio::spawn(async move {
@@ -1431,7 +1442,6 @@ pub(crate) async fn post_remote_access(
         aborts.push(task_secondary.abort_handle());
     }
 
-    apply_remote_auth(&state, body.no_token);
     *state
         .extra_remote
         .lock()
@@ -2528,5 +2538,45 @@ mod tests {
         assert_eq!(async_status.port, sync_status.port);
         assert_eq!(async_status.active, sync_status.active);
         assert_eq!(async_status.token, sync_status.token);
+    }
+
+    #[tokio::test]
+    async fn concurrent_post_remote_access_serializes_stop_and_bind() {
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let _ = state.http_router.set(axum::Router::new());
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let enable = RemoteAccessBody {
+            host: "127.0.0.1".into(),
+            port,
+            token: "tok-concurrent".into(),
+            no_token: false,
+            stop: false,
+            apply_launch: false,
+            restart: false,
+        };
+        let stop = RemoteAccessBody {
+            host: String::new(),
+            port: 0,
+            token: String::new(),
+            no_token: false,
+            stop: true,
+            apply_launch: false,
+            restart: false,
+        };
+
+        let (r1, r2) = tokio::join!(
+            post_remote_access(axum::extract::State(state.clone()), axum::Json(enable)),
+            post_remote_access(axum::extract::State(state.clone()), axum::Json(stop)),
+        );
+        assert_eq!(r1.into_response().status(), axum::http::StatusCode::OK);
+        assert_eq!(r2.into_response().status(), axum::http::StatusCode::OK);
+        if let Some(prev) = take_extra_remote(&state) {
+            prev.abort_all();
+        }
     }
 }
