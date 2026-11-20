@@ -1155,11 +1155,7 @@ impl Tool for TaskTool {
                 }
                 let receipt_ledger = ledger.lock().map(|l| l.clone()).unwrap_or_default();
                 let telemetry = telemetry_hook.snapshot_telemetry();
-                let head = if outcome.stop == StopReason::Stopped {
-                    format!("\u{2713} done \u{b7} {label}")
-                } else {
-                    format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
-                };
+                let head = terminal_progress_head(&label, &outcome);
                 progress.emit(subtask_progress_line(&head, &model, &desc));
                 let (block, is_err) = render_subtask_outcome(
                     &label,
@@ -1277,6 +1273,18 @@ struct SubtaskTelemetry {
     output_tokens: u64,
 }
 
+fn is_synthesized_partial(outcome: &Outcome) -> bool {
+    outcome.stop == StopReason::MaxRounds && !outcome.text.trim().is_empty()
+}
+
+fn terminal_progress_head(label: &str, outcome: &Outcome) -> String {
+    if outcome.stop == StopReason::Stopped || is_synthesized_partial(outcome) {
+        format!("\u{2713} done \u{b7} {label}")
+    } else {
+        format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_subtask_outcome(
     label: &str,
@@ -1289,8 +1297,7 @@ fn render_subtask_outcome(
     artifact_store: Option<&ArtifactStore>,
     telemetry: Option<SubtaskTelemetry>,
 ) -> (String, bool) {
-    let synthesized_partial =
-        outcome.stop == StopReason::MaxRounds && !outcome.text.trim().is_empty();
+    let synthesized_partial = is_synthesized_partial(&outcome);
     let is_err = outcome.stop != StopReason::Stopped && !synthesized_partial;
     let produced = if !outcome.text.is_empty() {
         outcome.text
@@ -4404,6 +4411,133 @@ mod tests {
             out.content.contains("PolicyDenied") || out.content.contains("sensitive paths"),
             "DenySensitivePaths must remain active: {}",
             out.content
+        );
+    }
+
+    #[test]
+    fn synthesized_partial_progress_head_matches_completed_status() {
+        let mut synth = Outcome::default();
+        synth.stop = StopReason::MaxRounds;
+        synth.text = "final summary".into();
+        assert!(is_synthesized_partial(&synth));
+        assert_eq!(
+            terminal_progress_head("explore#1", &synth),
+            "\u{2713} done \u{b7} explore#1"
+        );
+
+        let mut empty_max = Outcome::default();
+        empty_max.stop = StopReason::MaxRounds;
+        empty_max.text = "   \n ".into();
+        assert!(!is_synthesized_partial(&empty_max));
+        assert_eq!(
+            terminal_progress_head("explore#1", &empty_max),
+            "\u{2717} failed (MaxRounds) \u{b7} explore#1"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_progress_line_emits_done_for_max_rounds_synthesis() {
+        use jeikcode_kernel::provider::{ChatOptions, LlmProvider};
+        use jeikcode_kernel::stream::{ProviderError, StreamEvent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SynthMaxRoundsProvider {
+            step: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmProvider for SynthMaxRoundsProvider {
+            fn model_name(&self) -> &str {
+                "synth-mock"
+            }
+            async fn chat_stream(
+                &self,
+                _m: &[Message],
+                _t: &[jeikcode_kernel::tool::ToolDef],
+                _o: &ChatOptions,
+            ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError>
+            {
+                let n = self.step.fetch_add(1, Ordering::SeqCst);
+                let evs = if n == 0 {
+                    vec![
+                        StreamEvent::ToolCall(ToolCall {
+                            id: "c1".into(),
+                            name: "noop".into(),
+                            arguments: "{}".into(),
+                        }),
+                        StreamEvent::Done { truncated: false },
+                    ]
+                } else {
+                    vec![
+                        StreamEvent::TextDelta("SYNTHESIZED_FINDINGS".into()),
+                        StreamEvent::Done { truncated: false },
+                    ]
+                };
+                Ok(futures::stream::iter(evs).boxed())
+            }
+        }
+
+        struct NoopTool;
+        #[async_trait]
+        impl Tool for NoopTool {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn description(&self) -> &str {
+                "noop"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+                crate::tools::ok("ok")
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let reg = Arc::new(reg);
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let mk = || {
+            Arc::new(SynthMaxRoundsProvider {
+                step: AtomicUsize::new(0),
+            }) as Arc<dyn LlmProvider>
+        };
+        let tool = TaskTool::new(
+            mk.clone(),
+            mk,
+            move || r1.mount(&["noop"]),
+            move || r2.mount(&[]),
+        );
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_ref = lines.clone();
+        let tctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            cancel: CancellationToken::new(),
+            progress: ProgressSink::new(Arc::new(move |msg| {
+                lines_ref.lock().unwrap().push(msg);
+            })),
+            requester: None,
+        };
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"audit step","prompt":"go","subagent_type":"explore","max_rounds":1}]}"#,
+                &tctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("partial=\"max_rounds_synthesis\""));
+        let emitted = lines.lock().unwrap();
+        assert!(
+            emitted.iter().any(|l| l
+                .starts_with("\u{2713} done \u{b7} explore#1 \u{b7} synth-mock \u{b7} audit step")),
+            "expected done progress line for synthesized partial: {emitted:?}"
+        );
+        assert!(
+            !emitted.iter().any(|l| l.contains("MaxRounds")),
+            "must not emit failed (MaxRounds) for non-empty synthesis: {emitted:?}"
         );
     }
 }

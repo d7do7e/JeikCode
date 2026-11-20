@@ -372,7 +372,8 @@ fn build_blind_verifier_prompt(
          Changed/untracked files:\n{files_section}\n\
          {diff_stat_section}\n\
          Note: The main agent believes the goal is complete ({fast_reason}). \
-         Do NOT trust this claim — inspect the actual code and run real build/test/check commands.",
+         Do NOT trust this claim — inspect the actual code and run real build/test/check commands. \
+         Evaluate regressions relative to baseline: do NOT fail solely on unmodified pre-existing test failures or unrelated baseline gaps when all goal criteria and modified/new code pass.",
         fp.hash
     )
 }
@@ -585,5 +586,28 @@ mod tests {
             _ => panic!("expected GoalResult::Met"),
         }
         assert!(outcome.verified_fingerprint.is_some());
+    }
+
+    #[test]
+    fn build_blind_verifier_prompt_includes_baseline_regression_guidance() {
+        let fp = WorkspaceFingerprint {
+            is_git_repo: true,
+            head_sha: Some("abc1234".into()),
+            hash: "fp-hash-9".into(),
+            changed_files: vec!["crates/jeikcode-coding/src/goal_verifier.rs".into()],
+            untracked_files: vec![],
+        };
+        let prompt = build_blind_verifier_prompt(
+            "goal condition text",
+            &fp,
+            Some(" 1 file changed, 3 insertions(+)"),
+            "fast check passed",
+        );
+        assert!(prompt.contains("goal condition text"));
+        assert!(prompt.contains("fp-hash-9 (HEAD: abc1234)"));
+        assert!(prompt.contains("- crates/jeikcode-coding/src/goal_verifier.rs"));
+        assert!(prompt.contains("1 file changed, 3 insertions(+)"));
+        assert!(prompt.contains("Do NOT trust this claim"));
+        assert!(prompt.contains("Evaluate regressions relative to baseline"));
     }
 }
