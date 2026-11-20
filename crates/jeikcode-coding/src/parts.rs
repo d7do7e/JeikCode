@@ -1552,6 +1552,7 @@ pub fn assemble(
                     parts.todo_enabled,
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
+                    Some(parts.git_branch.as_str()),
                     true,
                 );
                 b.resume = Some(snap);
@@ -1918,6 +1919,7 @@ pub fn assemble(
             parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
+            Some(parts.git_branch.as_str()),
             false,
         );
         builder = builder.resume(snapshot);
@@ -2042,6 +2044,7 @@ fn reconcile_coding_persona(
     todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
+    git_branch: Option<&str>,
     has_session: bool,
 ) {
     let (block_1, block_2, block_3, block_4) = crate::persona::coding_persona_blocks_with_session(
@@ -2051,7 +2054,7 @@ fn reconcile_coding_persona(
         request_user_input_enabled,
         review_enabled,
         Some(&cfg.working_dir),
-        None,
+        git_branch,
         has_session,
     );
     let is_persona = |message: &Message| is_persona_message(message);
@@ -2118,7 +2121,9 @@ fn reconcile_coding_persona(
         return;
     }
 
-    let model_unchanged = previous_model.as_deref() == Some(cfg.model.as_str());
+    let model_unchanged = previous_model
+        .as_deref()
+        .is_none_or(|previous| previous == cfg.model.as_str());
     let has_assistant = snapshot
         .messages
         .iter()
@@ -2319,7 +2324,7 @@ mod tests {
         let mut cfg = agent_config("test-model");
         cfg.working_dir = switched;
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, false);
 
         let block_1 = &snapshot.messages[0].text;
         assert!(
@@ -2344,6 +2349,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             false,
         );
 
@@ -2361,7 +2367,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
         let cfg = agent_config("deepseek-v4-flash");
 
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, None, false);
 
         // todo disabled → <todo_rules> is not materialized at all (no empty system block).
         assert!(snapshot
@@ -2405,6 +2411,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             false,
         );
 
@@ -2449,6 +2456,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             false,
         );
         reconcile_coding_persona(
@@ -2457,6 +2465,7 @@ mod tests {
             true,
             true,
             true,
+            None,
             false,
         );
 
@@ -2492,7 +2501,7 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, false);
 
         assert_eq!(snapshot.messages[0].text, b1);
         assert_eq!(snapshot.messages[1].text, b2);
@@ -2512,7 +2521,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, false);
 
         assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
         assert!(!snapshot
@@ -2545,12 +2554,13 @@ mod tests {
             true,
             true,
             true,
+            None,
             false,
         );
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, false);
 
         assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
         assert!(snapshot.messages[0]
@@ -2586,7 +2596,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(msgs);
         let initial_epoch = snapshot.cache_epoch;
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, true);
         assert_eq!(snapshot.cache_epoch, initial_epoch);
         assert!(snapshot.messages[1].text.contains("## SESSION MESH:"));
     }
@@ -2618,10 +2628,149 @@ mod tests {
         snapshot.model = Some(cfg.model.clone());
         let initial_epoch = snapshot.cache_epoch;
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, None, true);
 
         assert_eq!(snapshot.cache_epoch, initial_epoch);
         assert_eq!(snapshot.messages[0].text, b1);
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn reconcile_coding_persona_embeds_git_branch_and_stays_current_pre_assistant() {
+        jeikcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let cfg = agent_config("deepseek-v4-flash");
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_session(
+            &cfg.model,
+            cfg.preferred_language,
+            true,
+            true,
+            true,
+            Some(&cfg.working_dir),
+            Some("feat/my-branch"),
+            true,
+        );
+        let msgs: Vec<Message> = [b1.clone(), b2, b3, b4]
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(Message::system)
+            .collect();
+        let mut snapshot = SessionSnapshot::new(msgs);
+
+        reconcile_coding_persona(
+            &mut snapshot,
+            &cfg,
+            true,
+            true,
+            true,
+            Some("feat/my-branch"),
+            true,
+        );
+        assert_eq!(snapshot.cache_epoch, 0);
+        assert_eq!(snapshot.messages[0].text, b1);
+        assert!(snapshot.messages[0].text.contains("feat/my-branch"));
+
+        // Legacy pre-assistant snapshot gets the supplied git_branch instead of "(not a git repo)".
+        let mut legacy = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
+        reconcile_coding_persona(
+            &mut legacy,
+            &cfg,
+            true,
+            true,
+            true,
+            Some("feat/my-branch"),
+            true,
+        );
+        assert!(legacy.messages[0].text.contains("feat/my-branch"));
+        assert!(!legacy.messages[0].text.contains("(not a git repo)"));
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn resume_with_none_model_and_assistant_history_preserves_prefix_without_epoch_bump() {
+        jeikcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let cfg = agent_config("deepseek-v4-flash");
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_session(
+            &cfg.model,
+            cfg.preferred_language,
+            true,
+            true,
+            true,
+            Some(&cfg.working_dir),
+            Some("feat/old-branch"),
+            true,
+        );
+        let mut msgs: Vec<Message> = [b1.clone(), b2.clone(), b3, b4.clone()]
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(Message::system)
+            .collect();
+        msgs.push(Message::user("hello"));
+        msgs.push(Message::assistant("hi", vec![]));
+        let mut snapshot = SessionSnapshot::new(msgs);
+        assert!(snapshot.model.is_none());
+        let initial_epoch = snapshot.cache_epoch;
+
+        reconcile_coding_persona(
+            &mut snapshot,
+            &cfg,
+            true,
+            true,
+            true,
+            Some("feat/new-branch"),
+            true,
+        );
+
+        assert_eq!(snapshot.cache_epoch, initial_epoch);
+        assert_eq!(snapshot.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(snapshot.messages[0].text, b1);
+        assert_eq!(snapshot.messages[1].text, b2);
+        assert_eq!(snapshot.messages[2].text, b4);
+    }
+
+    #[test]
+    #[serial_test::serial(offline_verdict)]
+    fn explicit_model_change_with_assistant_history_still_emits_transition_and_bumps_epoch() {
+        jeikcode_config::config::offline::reset_offline_verdict_for_test();
+        let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let old_cfg = agent_config("old-model");
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_session(
+            &old_cfg.model,
+            old_cfg.preferred_language,
+            true,
+            true,
+            true,
+            Some(&old_cfg.working_dir),
+            Some("main"),
+            true,
+        );
+        let mut msgs: Vec<Message> = [b1, b2, b3, b4]
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(Message::system)
+            .collect();
+        msgs.push(Message::user("hello"));
+        msgs.push(Message::assistant("hi", vec![]));
+        let mut snapshot = SessionSnapshot::new(msgs);
+        snapshot.model = Some("old-model".into());
+
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("new-model"),
+            true,
+            true,
+            true,
+            Some("main"),
+            true,
+        );
+
+        assert_eq!(snapshot.cache_epoch, 1);
+        assert!(snapshot.messages[0]
+            .text
+            .contains(MODEL_CHANGE_CONTEXT_PREFIX));
+        assert!(snapshot.messages[0].text.contains("old-model"));
+        assert!(snapshot.messages[0].text.contains("new-model"));
     }
 
     #[tokio::test]
