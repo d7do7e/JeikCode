@@ -2341,6 +2341,7 @@ export interface CreateProviderBody {
   reasoning_effort?: string | null;
   reasoning_history?: string | null;
   thinking_enabled?: boolean | null;
+  thinking_type?: string | null;
   thinking_budget?: number | null;
   set_default?: boolean;
 }
@@ -2375,6 +2376,7 @@ export interface UpdateProviderBody {
   reasoning_effort?: string | null;
   reasoning_history?: string | null;
   thinking_enabled?: boolean | null;
+  thinking_type?: string | null;
   thinking_budget?: number | null;
 }
 

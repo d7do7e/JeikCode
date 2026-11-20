@@ -281,10 +281,12 @@ function AccountFormDialog({
     setError(null);
     try {
       // 编辑时 path 用原 id；body.id 可换成新名以触发服务端重命名。
+      const trimmedBaseUrl = baseUrl.trim();
       await createOrUpdateAccount(isEdit ? originalId : trimmedId, {
         id: trimmedId,
         type: toPresetProviderId(type),
-        base_url: baseUrl.trim() || undefined,
+        base_url: trimmedBaseUrl || undefined,
+        clear_base_url: isEdit && !trimmedBaseUrl,
         api_key: apiKey.trim() || undefined,
         skip_tls_verify: skipTls,
       });
@@ -1067,11 +1069,12 @@ function ProviderFormDialog({
       reasoning_model: reasoningModel,
       reasoning_effort: reasoningModel && reasoningEffort ? reasoningEffort : null,
       reasoning_history: reasoningModel ? reasoningHistory : null,
-      thinking_enabled: reasoningModel ? !isOff : undefined,
+      thinking_enabled: reasoningModel ? !isOff : (isEdit ? null : undefined),
       // Only write an explicit disabled marker. "enabled" is protocol-specific
       // (Claude legacy budget, Kimi K2, ...), so the adapters decide the mode
       // from the model generation instead of this dialog forcing one.
-      thinking_type: isOff ? 'disabled' : undefined,
+      // On edit, explicitly send `null` when not off so a prior "disabled" marker clears.
+      thinking_type: isOff ? 'disabled' : (isEdit ? null : undefined),
       thinking_budget: isOff
         ? 0
         : (reasoningModel && budgetEnabled && thinkingBudget !== ''

@@ -71,22 +71,39 @@ pub(crate) struct PatchProviderRequest {
     pub max_tokens: Option<Option<usize>>,
     #[serde(default)]
     pub clear_max_tokens: bool,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub thinking_enabled: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub thinking_budget: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub thinking_type: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub thinking_keep: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub reasoning_history: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub reasoning_effort: Option<Option<String>>,
     pub skip_tls_verify: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub pricing: Option<Option<ProviderPricing>>,
     #[serde(default)]
     pub clear_pricing: bool,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub supports_vision: Option<Option<bool>>,
     #[serde(default)]
     pub clear_supports_vision: bool,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub reasoning_model: Option<Option<bool>>,
     #[serde(default)]
     pub clear_reasoning_model: bool,
+}
+
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// POST /provider-accounts / PUT /provider-accounts/:id
@@ -2201,5 +2218,27 @@ mod tests {
                 "must reject SSRF/scheme URL: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn patch_provider_request_distinguishes_omitted_from_explicit_null() {
+        let omitted: super::PatchProviderRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.thinking_type, None);
+        assert_eq!(omitted.thinking_enabled, None);
+        assert_eq!(omitted.reasoning_effort, None);
+
+        let cleared: super::PatchProviderRequest = serde_json::from_str(
+            r#"{"thinking_type": null, "thinking_enabled": null, "reasoning_effort": null}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.thinking_type, Some(None));
+        assert_eq!(cleared.thinking_enabled, Some(None));
+        assert_eq!(cleared.reasoning_effort, Some(None));
+
+        let set: super::PatchProviderRequest =
+            serde_json::from_str(r#"{"thinking_type": "disabled", "thinking_enabled": false}"#)
+                .unwrap();
+        assert_eq!(set.thinking_type, Some(Some("disabled".to_string())));
+        assert_eq!(set.thinking_enabled, Some(Some(false)));
     }
 }
