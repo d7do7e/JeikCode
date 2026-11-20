@@ -1660,9 +1660,16 @@ pub async fn git_stage(
         return json_error(StatusCode::BAD_REQUEST, "Must specify path or all=true")
             .into_response();
     }
-    let cwd = req.cwd.clone();
     let all = req.all;
     let path = req.path.clone();
+    if !all && path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Must specify non-empty path or all=true",
+        )
+        .into_response();
+    }
+    let cwd = req.cwd.clone();
     match run_git_blocking(move || {
         let dir = resolve_target_dir(cwd.as_deref());
         if !is_git_repo(&dir) {
@@ -1676,7 +1683,7 @@ pub async fn git_stage(
             git_cmd(&dir).args(["add", "-A"]).output()
         } else {
             let p = path.as_deref().unwrap_or("");
-            git_cmd(&dir).args(["add", "--", p]).output()
+            git_cmd_literal_paths(&dir).args(["add", "--", p]).output()
         };
         Ok((dir, output))
     })
@@ -1713,9 +1720,16 @@ pub async fn git_unstage(
         return json_error(StatusCode::BAD_REQUEST, "Must specify path or all=true")
             .into_response();
     }
-    let cwd = req.cwd.clone();
     let all = req.all;
     let path = req.path.clone();
+    if !all && path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Must specify non-empty path or all=true",
+        )
+        .into_response();
+    }
+    let cwd = req.cwd.clone();
     match run_git_blocking(move || {
         let dir = resolve_target_dir(cwd.as_deref());
         if !is_git_repo(&dir) {
@@ -1729,7 +1743,7 @@ pub async fn git_unstage(
             git_cmd(&dir).args(["restore", "--staged", "."]).output()
         } else {
             let p = path.as_deref().unwrap_or("");
-            git_cmd(&dir)
+            git_cmd_literal_paths(&dir)
                 .args(["restore", "--staged", "--", p])
                 .output()
         };
@@ -2105,7 +2119,8 @@ pub async fn git_pull(
         }
     }
 
-    let out = match run_git_remote_cmd(dir, args, GIT_REMOTE_TIMEOUT_SECS, "Git pull").await {
+    let out = match run_git_remote_cmd(dir.clone(), args, GIT_REMOTE_TIMEOUT_SECS, "Git pull").await
+    {
         Ok(out) => out,
         Err(resp) => return resp,
     };
@@ -2115,6 +2130,11 @@ pub async fn git_pull(
     let combined = if stdout.is_empty() { stderr } else { stdout };
 
     if out.status.success() {
+        invalidate_git_cache(&dir);
+        crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+            cwd: dir.to_string_lossy().to_string(),
+            fetch: false,
+        });
         Json(serde_json::json!({
             "success": true,
             "message": combined.trim().to_string(),
@@ -2557,6 +2577,8 @@ mod discard_tests {
             .route("/git/action", post(git_action))
             .route("/git/commit-detail", get(get_git_commit_detail))
             .route("/git/file-diff", get(get_git_file_diff))
+            .route("/git/stage", post(git_stage))
+            .route("/git/unstage", post(git_unstage))
             .with_state(state);
 
         // /git/graph flag injection -> 400
@@ -2706,6 +2728,7 @@ mod discard_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2716,5 +2739,46 @@ mod discard_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Literal pathspec guard: wildcard "*" must not stage unrelated files
+        std::fs::write(repo.join("other.txt"), "other").unwrap();
+        let stage_glob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/git/stage")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "cwd": cwd_str,
+                            "path": "*"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stage_glob.status(), StatusCode::BAD_REQUEST);
+
+        let empty_unstage = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/git/unstage")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "cwd": cwd_str,
+                            "path": "   "
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_unstage.status(), StatusCode::BAD_REQUEST);
     }
 }
