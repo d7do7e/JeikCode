@@ -415,13 +415,17 @@ fn compat_models_from_config(config: &Config) -> Vec<CompatModelRow> {
         .collect()
 }
 
-fn load_config() -> Result<Config, String> {
-    Config::load(&Config::default_path()).map_err(|e| e.to_string())
+async fn load_config_async() -> Result<Config, String> {
+    let path = Config::default_path();
+    tokio::task::spawn_blocking(move || Config::load(&path))
+        .await
+        .map_err(|e| format!("config load task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 /// GET /v1/models — OpenAI list (`id` = `account/model`).
 pub(crate) async fn openai_list_models() -> Response {
-    let config = match load_config() {
+    let config = match load_config_async().await {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),
     };
@@ -455,7 +459,7 @@ pub(crate) async fn openai_get_model(Path(id): Path<String>) -> Response {
             "model_not_found",
         );
     }
-    let config = match load_config() {
+    let config = match load_config_async().await {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),
     };
@@ -484,7 +488,7 @@ pub(crate) async fn openai_get_model(Path(id): Path<String>) -> Response {
 
 /// GET /v1/anthropic/models — Anthropic-shaped list; same `account/model` ids.
 pub(crate) async fn anthropic_list_models() -> Response {
-    let config = match load_config() {
+    let config = match load_config_async().await {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),
     };
@@ -1025,7 +1029,7 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
     // 这是 API 客户端（OpenAI / Anthropic / Responses）的稳定契约：同一个端口
     // 上的多次请求必须落在同一个项目桶里；改了会让已有客户端突然指向别的项目。
     let working_dir = state.bind_working_dir.clone();
-    let config = match load_config() {
+    let config = match load_config_async().await {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),
     };
@@ -1650,6 +1654,38 @@ pub(crate) async fn openai_chat_completions(
     run_compat_turn(state, turn, WireFormat::OpenAiChat).await
 }
 
+async fn extract_responses_items_turn(
+    items: Vec<ResponsesInputItem>,
+) -> Result<(String, Vec<ImageInput>), String> {
+    let mut last_user_item: Option<ResponsesInputItem> = None;
+    for item in items {
+        let is_user = item.role.as_deref().map_or_else(
+            || {
+                matches!(
+                    item.kind.as_deref(),
+                    None | Some("message") | Some("input_text")
+                )
+            },
+            |r| r.eq_ignore_ascii_case("user"),
+        );
+        if is_user {
+            last_user_item = Some(item);
+        }
+    }
+    let item = last_user_item.ok_or_else(|| "no user input in responses request".to_string())?;
+    let (last_user_text, images) = if let Some(c) = item.content {
+        collect_openai_content(c).await?
+    } else if let Some(t) = item.text {
+        (t, Vec::new())
+    } else {
+        (String::new(), Vec::new())
+    };
+    if last_user_text.trim().is_empty() && images.is_empty() {
+        return Err("no user input in responses request".into());
+    }
+    Ok((last_user_text, images))
+}
+
 /// POST /v1/responses
 pub(crate) async fn openai_responses(
     State(state): State<AppState>,
@@ -1664,39 +1700,20 @@ pub(crate) async fn openai_responses(
         }
     } else {
         match body.input {
-            Some(ResponsesInput::Text(t)) => (t, Vec::new()),
-            Some(ResponsesInput::Items(items)) => {
-                let mut last_user_text = String::new();
-                let mut images = Vec::new();
-                for item in items {
-                    let role = item.role.as_deref().unwrap_or("user");
-                    if role.eq_ignore_ascii_case("system") || role.eq_ignore_ascii_case("developer")
-                    {
-                        continue;
-                    }
-                    if role.eq_ignore_ascii_case("user")
-                        || item.kind.as_deref() == Some("message")
-                        || item.kind.as_deref() == Some("input_text")
-                    {
-                        if let Some(c) = item.content {
-                            if let Ok((t, imgs)) = collect_openai_content(c).await {
-                                last_user_text = t;
-                                images = imgs;
-                            }
-                        } else if let Some(t) = item.text {
-                            last_user_text = t;
-                        }
-                    }
-                }
-                if last_user_text.trim().is_empty() && images.is_empty() {
+            Some(ResponsesInput::Text(t)) => {
+                if t.trim().is_empty() {
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "no user input in responses request",
                         "invalid_request",
                     );
                 }
-                (last_user_text, images)
+                (t, Vec::new())
             }
+            Some(ResponsesInput::Items(items)) => match extract_responses_items_turn(items).await {
+                Ok(v) => v,
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, e, "invalid_request"),
+            },
             None => {
                 return api_error(
                     StatusCode::BAD_REQUEST,
@@ -2203,5 +2220,27 @@ mod tests {
         assert!(big_err.contains("20MB"), "{big_err}");
 
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn extract_responses_items_ignores_trailing_assistant_and_propagates_bad_image() {
+        let items: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            { "type": "message", "role": "user", "content": "real user prompt" },
+            { "type": "message", "role": "assistant", "content": "prior assistant reply" }
+        ]))
+        .unwrap();
+        let (msg, imgs) = extract_responses_items_turn(items).await.unwrap();
+        assert_eq!(msg, "real user prompt");
+        assert!(imgs.is_empty());
+
+        let bad_items: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            { "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "look" },
+                { "type": "input_image", "image_url": "http://127.0.0.1:1/ssrf.png" }
+            ]}
+        ]))
+        .unwrap();
+        let err = extract_responses_items_turn(bad_items).await.unwrap_err();
+        assert!(!err.is_empty());
     }
 }
