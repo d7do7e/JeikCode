@@ -590,12 +590,50 @@ export function GitPanel({
     }
   };
 
-  // Commit and Stage state
-  const [commitMessage, setCommitMessage] = useState('');
+  // Commit and Stage state (per-repo draft map so switching repos never leaks unsent messages)
+  const repoKey = effectiveCwd || '';
+  const cwdKey = cwd || '';
+  const commitDraftsRef = useRef<Record<string, string>>({});
+  const [commitMessage, setCommitMessageState] = useState('');
+  const setCommitMessage = useCallback(
+    (next: string | ((prev: string) => string)) => {
+      setCommitMessageState((prev) => {
+        const value = typeof next === 'function' ? next(prev) : next;
+        commitDraftsRef.current[repoKey] = value;
+        return value;
+      });
+    },
+    [repoKey],
+  );
   const [isCommitting, setIsCommitting] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isFetching, setIsFetching] = useState(false);
   const [actionLoadingPath, setActionLoadingPath] = useState<string | null>(null);
+
+  // Isolate transient GitPanel state whenever cwd or activeRepoRoot changes.
+  const prevEffectiveCwdRef = useRef<string>(repoKey);
+  useEffect(() => {
+    if (prevEffectiveCwdRef.current === repoKey) return;
+    prevEffectiveCwdRef.current = repoKey;
+    setPanelError(null);
+    setSuccessMsg(null);
+    setFilterBranch('all');
+    setSelectedBranch(null);
+    setExpandedCommitHash(null);
+    setCommitFiles({});
+    setLoadingCommitHash(null);
+    setActionDropdownHash(null);
+    setContextMenu(null);
+    setCommitMessageState(commitDraftsRef.current[repoKey] ?? '');
+  }, [repoKey]);
+
+  const prevCwdForRefreshRef = useRef<string>(cwdKey);
+  useEffect(() => {
+    if (prevCwdForRefreshRef.current !== cwdKey) {
+      prevCwdForRefreshRef.current = cwdKey;
+      seenRefreshRef.current = null;
+    }
+  }, [cwdKey]);
 
   // 统一调度 Git 状态刷新（经由单例 gitStore 的 Single-flight 原子锁与防抖控制）
   const refresh = useCallback((immediate = false, forceAll = false) => {
