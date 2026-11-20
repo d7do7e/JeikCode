@@ -1883,6 +1883,42 @@ enum PromptKind {
     Synthetic,
 }
 
+fn apply_turn_rollback(convo: &mut Conversation, keep_interrupted: bool, rb: &TurnRollback) {
+    if keep_interrupted {
+        convo.backfill_cancelled_tool_results();
+        return;
+    }
+    let find_id = |id: &str| {
+        convo
+            .messages
+            .iter()
+            .position(|m| m.id.as_deref() == Some(id))
+    };
+    if let Some(idx) = convo.messages.iter().position(|m| {
+        m.id.as_deref()
+            .is_some_and(|id| rb.anchor_ids.iter().any(|a| a == id))
+    }) {
+        convo.messages.truncate(idx);
+    } else if rb.anchor_ids.is_empty() {
+        if let Some(idx) = rb.pre_turn_tail_id.as_deref().and_then(find_id) {
+            convo.messages.truncate(idx + 1);
+        } else if rb.fallback_len == 0 {
+            convo.messages.truncate(0);
+        } else {
+            convo.backfill_cancelled_tool_results();
+        }
+    } else {
+        convo.backfill_cancelled_tool_results();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TurnRollback {
+    anchor_ids: Vec<String>,
+    pre_turn_tail_id: Option<String>,
+    fallback_len: usize,
+}
+
 struct RunningAgent {
     provider: Arc<dyn LlmProvider>,
     tools: MountedTools,
@@ -2576,12 +2612,11 @@ impl RunningAgent {
             self.run_compaction(convo, trigger).await;
             boundary_compacted = true;
         }
-        // CANCEL = UNDO: remember the history length BEFORE this turn's user
-        // message is pushed, so a cancelled turn can roll all the way back to here —
-        // the prompt + any partial assistant/tool work leaves NO trace (the TUI
-        // separately restores the prompt to the input box for edit-and-resend).
-        // Captured AFTER the pre-turn compaction above so it indexes current history.
-        let rollback_len = convo.messages.len();
+        let pre_len = convo.messages.len();
+        let pre_turn_tail_id = pre_len
+            .checked_sub(1)
+            .and_then(|i| convo.messages.get(i))
+            .and_then(|m| m.id.clone());
         if let Some(context) = synthetic_context.filter(|context| !context.trim().is_empty()) {
             convo.push(Message::synthetic_user(context));
         }
@@ -2595,6 +2630,17 @@ impl RunningAgent {
             message.id = Some(id);
         }
         convo.push(message);
+        // CANCEL = UNDO: record the stable message IDs pushed for this turn (and
+        // the preceding message ID as a duplicate-submission fallback) AFTER pushing
+        // so mid-turn compaction cannot invalidate a raw Vec index.
+        let rollback = TurnRollback {
+            anchor_ids: convo.messages[pre_len..]
+                .iter()
+                .filter_map(|m| m.id.clone())
+                .collect(),
+            pre_turn_tail_id,
+            fallback_len: pre_len,
+        };
         // Identity boundary: announce the STORED user message so a client can bind
         // its optimistic first-prompt bubble to the same id the transcript carries
         // (id-based merges across refresh / session switch / replay). Synthetic
@@ -2633,7 +2679,7 @@ impl RunningAgent {
         let mut turn = Box::pin(self.run_turn(
             convo,
             turn_token.clone(),
-            rollback_len,
+            &rollback,
             steer.clone(),
             tool_loop_state.as_mut(),
             boundary_compacted,
@@ -3056,36 +3102,22 @@ impl RunningAgent {
     }
 
     /// Terminal for a CANCELLED turn under "cancel = undo" semantics: roll the
-    /// conversation back to `rollback_len` (its length before this turn's user
-    /// message was pushed) so the cancelled prompt + any partial assistant/tool
-    /// work leaves NO trace — a later unrelated message can't see it and it costs
-    /// no tokens. The TUI separately restores the prompt to the input box for
-    /// edit-and-resend. Truncating the whole turn also makes the old
-    /// `backfill_cancelled_tool_results` pairing repair unnecessary (nothing
-    /// dangles when the turn is gone). `truncate` is a safe no-op if a mid-turn
-    /// overflow compaction already shrank history below `rollback_len` (rare, off
-    /// the normal path) — it just leaves that one cancelled turn in place rather
-    /// than risk cutting compacted history at a stale index. Funnels through
-    /// `finish_turn` so the `turn_complete` hook + `TurnComplete` event still fire
-    /// (on the now-clean conversation).
-    /// Cancel funnel: called by all 7 cancel sites. Two modes:
-    /// - `keep_interrupted_context = false` (default): CANCEL = UNDO — roll back to before
-    ///   the user message so the cancelled prompt + partial work leaves NO trace.
-    /// - `keep_interrupted_context = true`: PRESERVE — keep this turn's partial
-    ///   assistant/tool work; backfill a `(cancelled)` result for every dangling
-    ///   tool_call so the wire stays API-valid. APPEND-ONLY — prefix-cache safe.
-    async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
-        if self.keep_interrupted_context {
-            // PRESERVE: keep this turn's partial assistant/tool work; backfill a
-            // `(cancelled)` result for every dangling tool_call so the wire stays
-            // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
-            // `Conversation::cancel_current_turn`.
-            convo.backfill_cancelled_tool_results();
-        } else {
-            // CANCEL = UNDO (default): roll back to before the user message so the
-            // cancelled prompt + partial work leaves NO trace.
-            convo.messages.truncate(rollback_len);
-        }
+    /// conversation back to the start of this turn (located by stable message ID
+    /// so mid-turn compaction cannot shift the cut index) so the cancelled prompt +
+    /// any partial assistant/tool work leaves NO trace. If mid-turn compaction
+    /// drained past the turn anchor itself, never truncate at a stale raw index —
+    /// backfill `(cancelled)` tool results instead so no `tool_calls` dangle.
+    ///
+    /// Cancel funnel: called by all cancel sites. Two modes:
+    /// - `keep_interrupted_context = false` (default): CANCEL = UNDO.
+    /// - `keep_interrupted_context = true`: PRESERVE — append-only backfill.
+    async fn finish_cancelled(
+        &self,
+        convo: &mut Conversation,
+        rollback: &TurnRollback,
+        ctx: &TurnCtx,
+    ) {
+        apply_turn_rollback(convo, self.keep_interrupted_context, rollback);
         self.rt.emit(AgentEvent::Cancelled);
         self.finish_turn(convo, StopReason::Cancelled, ctx).await;
     }
@@ -3110,7 +3142,7 @@ impl RunningAgent {
         &self,
         convo: &mut Conversation,
         cancel: tokio_util::sync::CancellationToken,
-        rollback_len: usize,
+        rollback: &TurnRollback,
         steer: SteerBuf,
         mut tool_loop_state: Option<&mut ToolLoopState>,
         boundary_compacted: bool,
@@ -3316,7 +3348,7 @@ impl RunningAgent {
                             // Terminate through the canonical cancel funnel so the
                             // turn ends as Cancelled — matching every other
                             // mid-turn cancel arm — not MaxRounds.
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(convo, rollback, &turn_ctx).await;
                             return;
                         } else {
                             // Explicit stop (Esc / picker) OR fail-closed default
@@ -3582,9 +3614,16 @@ impl RunningAgent {
                             .await;
                         return;
                     }
+                    let est_with_tools = est(&messages)
+                        .saturating_add(tool_defs_est)
+                        .min(u32::MAX as u64) as u32;
                     let before = est(&convo.messages);
                     let outcome = self
-                        .run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
+                        .run_compaction_with_floor(
+                            convo,
+                            CompactTrigger::Overflow { attempt: attempts },
+                            Some(est_with_tools),
+                        )
                         .await;
                     if outcome.drained {
                         token_budget_guard.note_drain_compaction();
@@ -3729,7 +3768,7 @@ impl RunningAgent {
             let opened = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                    self.finish_cancelled(convo, rollback, &turn_ctx).await;
                     return;
                 }
                 opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
@@ -3849,7 +3888,7 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(wait) => {}
@@ -3897,7 +3936,7 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(convo, rollback, &turn_ctx).await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -3931,7 +3970,7 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(convo, rollback, &turn_ctx).await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -4036,7 +4075,7 @@ impl RunningAgent {
                                 Some(&assistant_message_id),
                             );
                         }
-                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                        self.finish_cancelled(convo, rollback, &turn_ctx).await;
                         return;
                     }
                     _ = async { tokio::time::sleep_until(phase_deadline.unwrap()).await }, if phase_deadline.is_some() => {
@@ -4063,7 +4102,7 @@ impl RunningAgent {
                                     tokio::select! {
                                         biased;
                                         _ = cancel.cancelled() => {
-                                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                            self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                             return;
                                         }
                                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -4092,7 +4131,7 @@ impl RunningAgent {
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
-                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                         return;
                                     }
                                     _ = tokio::time::sleep(backoff) => {}
@@ -4363,7 +4402,7 @@ impl RunningAgent {
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
-                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                         return;
                                     }
                                     _ = tokio::time::sleep(wait) => {}
@@ -4412,7 +4451,7 @@ impl RunningAgent {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
-                                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                 return;
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -4453,7 +4492,7 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(convo, rollback, &turn_ctx).await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -4636,7 +4675,7 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(convo, rollback, &turn_ctx).await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -5002,7 +5041,7 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(convo, rollback, &turn_ctx).await;
                 return;
             }
             let call_keys_by_id: std::collections::HashMap<String, (String, String)> =
@@ -5531,7 +5570,7 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(convo, rollback, &turn_ctx).await;
                 return;
             }
             // ── Close batch (if one was opened) ──
@@ -9649,5 +9688,86 @@ mod reserve_final_synthesis_tests {
         assert_eq!(choices[1].1, ToolChoice::Auto);
         assert_eq!(choices[2].1, ToolChoice::None);
         assert_eq!(choices[3].1, ToolChoice::None);
+    }
+
+    #[test]
+    fn finish_cancelled_falls_back_to_backfill_when_anchor_drained() {
+        let mut convo = Conversation::default();
+        convo.push(Message::system("sys"));
+        convo.push(Message::user("tail"));
+        let tc = ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        };
+        convo.push(Message::assistant("", vec![tc]));
+        let rb = TurnRollback {
+            anchor_ids: vec!["x".into()],
+            pre_turn_tail_id: Some("y".into()),
+            fallback_len: 1,
+        };
+        apply_turn_rollback(&mut convo, false, &rb);
+        let t = convo.messages.last().unwrap();
+        assert_eq!(
+            (
+                convo.messages.len(),
+                t.tool_call_id.as_deref(),
+                t.text.as_str(),
+                t.is_error
+            ),
+            (4, Some("c1"), "(cancelled)", true)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_send_emergency_compaction_passes_cjk_conservative_plus_tools_floor() {
+        use crate::{message::CompactionPlan, testkit::MockProvider};
+        struct Spy(Arc<std::sync::Mutex<Vec<(CompactTrigger, u32)>>>);
+        #[async_trait::async_trait]
+        impl CompactionStrategy for Spy {
+            async fn plan(&self, v: &CompactionView<'_>) -> CompactionPlan {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((v.trigger.clone(), v.used_tokens));
+                let mut p = CompactionPlan::noop();
+                if matches!(v.trigger, CompactTrigger::Overflow { .. })
+                    && v.messages.len() > v.sacred_floor + 1
+                {
+                    (p.drain_from, p.drain_to) = (v.sacred_floor, v.messages.len() - 1);
+                }
+                p
+            }
+        }
+        let snap = SessionSnapshot::new(vec![
+            Message::system("sys"),
+            Message::user("q1"),
+            Message::assistant("测".repeat(3_200), vec![]),
+        ]);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prov = Arc::new(
+            MockProvider::new(vec![vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]])
+            .with_ctx_window(4_000),
+        );
+        let out = Agent::builder()
+            .provider(prov)
+            .tools(ToolRegistry::new().mount(&[]))
+            .persona("sys")
+            .resume(snap)
+            .compaction(Arc::new(Spy(seen.clone())))
+            .compact_threshold(1.0)
+            .compact_on_turn_end(false)
+            .build()
+            .run_to_completion("next", AutoRespond::AllowAll)
+            .await;
+        assert_eq!(out.stop, StopReason::Stopped);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(t, u)| matches!(t, CompactTrigger::Overflow { attempt: 0 }) && *u >= 3_200));
     }
 }

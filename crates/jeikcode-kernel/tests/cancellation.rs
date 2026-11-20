@@ -11,8 +11,10 @@
 
 use async_trait::async_trait;
 use jeikcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use jeikcode_kernel::message::{Message, Role};
-use jeikcode_kernel::stream::StreamEvent;
+use jeikcode_kernel::message::{
+    CompactionPlan, CompactionStrategy, CompactionView, Message, Role, SessionSnapshot,
+};
+use jeikcode_kernel::stream::{StreamEvent, TokenUsage};
 use jeikcode_kernel::testkit::{EchoTool, RecordingProvider};
 use jeikcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -764,4 +766,80 @@ async fn preserve_mode_does_not_inject_interruption_marker() {
             .all(|m| !m.text.contains("interrupted by the user")),
         "preserve mode must not invent a user-role interruption instruction: {history:?}"
     );
+}
+
+#[tokio::test]
+async fn cancel_after_midturn_compaction_rolls_back_active_turn_cleanly() {
+    struct DrainMidTurn;
+    #[async_trait]
+    impl CompactionStrategy for DrainMidTurn {
+        fn will_summarize(&self, v: &CompactionView<'_>) -> bool {
+            v.used_tokens >= 500 && v.messages.len() > v.sacred_floor + 3
+        }
+        async fn plan(&self, v: &CompactionView<'_>) -> CompactionPlan {
+            let mut p = CompactionPlan::noop();
+            if self.will_summarize(v) {
+                (p.drain_from, p.drain_to) = (3, 7);
+            }
+            p
+        }
+    }
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(SelfCancelTool));
+    reg.register(Arc::new(EchoTool));
+    let mut msgs = vec![Message::system("sys")];
+    for i in 1..=3 {
+        msgs.push(Message::user(format!("q{i}")));
+        msgs.push(Message::assistant(format!("a{i}"), vec![]));
+    }
+    let done = StreamEvent::Done { truncated: false };
+    let provider = Arc::new(
+        RecordingProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(tool_call("c1", "echo", r#"{"text":"ok"}"#)),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 500,
+                    ..Default::default()
+                }),
+                done.clone(),
+            ],
+            vec![
+                StreamEvent::ToolCall(tool_call("c2", "self_cancel", "{}")),
+                StreamEvent::ToolCall(tool_call("c3", "echo", r#"{"text":"skip"}"#)),
+                done.clone(),
+            ],
+            vec![StreamEvent::TextDelta("ok".into()), done],
+        ])
+        .with_ctx_window(1_000),
+    );
+    let calls = provider.calls();
+    let mut h = jeikcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["self_cancel", "echo"]))
+        .persona("sys")
+        .resume(SessionSnapshot::new(msgs))
+        .compaction(Arc::new(DrainMidTurn))
+        .compact_threshold(0.5)
+        .compact_on_turn_end(false)
+        .build()
+        .spawn();
+    for (p, exp) in [("q4", StopReason::Cancelled), ("q5", StopReason::Stopped)] {
+        let msg = AgentCommand::SendMessage {
+            text: p.into(),
+            images: vec![],
+        };
+        h.commands.send(msg).unwrap();
+        while let Some(ev) = h.events.recv().await {
+            if let AgentEvent::TurnComplete { reason } = ev {
+                assert_eq!(reason, exp);
+                break;
+            }
+        }
+    }
+    h.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = h.task.await;
+    let calls = calls.lock().unwrap();
+    assert!((calls.len() == 3) && !calls[1].0.iter().any(|m| m.text == "q2"));
+    let texts: Vec<_> = calls[2].0.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, vec!["sys", "q1", "a1", "q5"]);
 }
