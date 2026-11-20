@@ -1353,9 +1353,28 @@ struct WebuiLaunch {
     bin: PathBuf,
     host: String,
     port: u16,
+    configured_port: u16,
     token: String,
     home: PathBuf,
     bundled: Option<PathBuf>,
+}
+
+fn resolve_restart_port(
+    latest_port: u16,
+    previous_configured_port: u16,
+    active_port: u16,
+) -> (u16, u16) {
+    if latest_port == 0 {
+        return (active_port, previous_configured_port);
+    }
+    if latest_port == previous_configured_port && active_port != 0 && active_port != latest_port {
+        return (active_port, previous_configured_port);
+    }
+    (latest_port, latest_port)
+}
+
+fn clear_live_origin(origin: &Mutex<Option<WebuiOrigin>>) {
+    *origin.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn resolve_restart_token(
@@ -1421,6 +1440,7 @@ fn start_webui(
         bin,
         host,
         port,
+        configured_port,
         token,
         home,
         bundled,
@@ -1694,6 +1714,7 @@ fn supervise_webui(
             if !intentional_restart {
                 // 非主动请求重启的异常退出：仅允许最多一次自愈拉起，绝不陷入死循环
                 if crash_recovered {
+                    clear_live_origin(&origin);
                     let msg = match exit_code {
                         Some(code) => format!("jeikcode webui 异常退出（退出码 {code}）"),
                         None => "jeikcode webui 异常退出".to_string(),
@@ -1709,16 +1730,14 @@ fn supervise_webui(
 
             // 动态读取最新配置与二进制路径，由桌面壳直接重新拉起并存入 ChildSlot
             let (latest_host, latest_port, latest_token) = load_webui_listen();
-            let effective_port = if latest_port != 0 {
-                latest_port
-            } else {
-                launch.port
-            };
+            let (effective_port, next_configured_port) =
+                resolve_restart_port(latest_port, launch.configured_port, launch.port);
             let effective_token =
                 resolve_restart_token(latest_token, &launch.token, intentional_restart);
             launch.bin = resolve_desktop_cli(launch.bundled.as_deref());
             launch.host = latest_host;
             launch.port = effective_port;
+            launch.configured_port = next_configured_port;
             launch.token = effective_token;
 
             let spawned = if intentional_restart {
@@ -1774,6 +1793,7 @@ fn supervise_webui(
                     open_webui_in_shell(&window, &origin, &next_url);
                 }
                 Err(err) => {
+                    clear_live_origin(&origin);
                     if !is_shutting_down() {
                         show_boot_error(&window, &boot_url_slot, &err);
                     }
@@ -2966,5 +2986,24 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "read_url must abort promptly on shutdown, elapsed={elapsed:?}"
         );
+    }
+
+    #[test]
+    fn resolve_restart_port_preserves_conflict_fallback_and_clear_live_origin_unmounts() {
+        // Initial session started on fallback port 13458 while disk kept 13457:
+        // self-update restart must stay on 13458 rather than locking out on 13457.
+        assert_eq!(
+            super::resolve_restart_port(13457, 13457, 13458),
+            (13458, 13457)
+        );
+        // If user explicitly changed disk port to 14000, switch to 14000.
+        assert_eq!(
+            super::resolve_restart_port(14000, 13457, 13458),
+            (14000, 14000)
+        );
+        // Clearing origin unmounts close prompt guard.
+        let slot = Mutex::new(Some(origin("127.0.0.1", 13458)));
+        super::clear_live_origin(&slot);
+        assert!(slot.lock().unwrap().is_none());
     }
 }
