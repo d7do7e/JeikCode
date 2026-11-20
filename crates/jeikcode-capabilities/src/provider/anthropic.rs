@@ -239,6 +239,7 @@ impl LlmProvider for AnthropicProvider {
                 let mut emitted_replay_sensitive = false;
                 let mut saw_usable_content = false;
                 let mut pending_metadata = Vec::new();
+                let mut pending_signatures = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
                 loop {
@@ -258,7 +259,10 @@ impl LlmProvider for AnthropicProvider {
                                 // Upstream closed the HTTP 200 SSE stream before emitting
                                 // `message_stop` and without any text, reasoning text, or
                                 // tool call (e.g. a `thinking_signature`-only premature drop).
-                                // Surface an explicit error instead of fabricating `Done`.
+                                // Surface an explicit retryable error instead of fabricating `Done`
+                                // or leaking an orphan signature into kernel `saw_stream_content`.
+                                let saw_signature_only = !pending_signatures.is_empty();
+                                pending_signatures.clear();
                                 for metadata in pending_metadata.drain(..) {
                                     if !matches!(metadata, StreamEvent::Usage(_)) {
                                         yield metadata;
@@ -266,7 +270,7 @@ impl LlmProvider for AnthropicProvider {
                                 }
                                 yield StreamEvent::Error(ProviderError {
                                     retryable: !emitted_replay_sensitive,
-                                    message: if emitted_replay_sensitive {
+                                    message: if saw_signature_only {
                                         "upstream stream ended prematurely before emitting content (thinking signature only, missing message_stop)".to_string()
                                     } else {
                                         "upstream stream ended prematurely before emitting content (missing message_stop)".to_string()
@@ -276,18 +280,16 @@ impl LlmProvider for AnthropicProvider {
                                 return;
                             }
                             for ev in trailing {
-                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
-                                    pending_metadata.push(ev);
-                                    continue;
+                                let ready = flush_or_buffer_stream_event(
+                                    ev,
+                                    &mut emitted_replay_sensitive,
+                                    &mut saw_usable_content,
+                                    &mut pending_metadata,
+                                    &mut pending_signatures,
+                                );
+                                for out_ev in ready {
+                                    yield out_ev;
                                 }
-                                if retry::is_replay_sensitive_event(&ev)
-                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
-                                {
-                                    for metadata in pending_metadata.drain(..) { yield metadata; }
-                                }
-                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                saw_usable_content |= is_usable_content_event(&ev);
-                                yield ev;
                             }
                             return;
                         }
@@ -352,21 +354,19 @@ impl LlmProvider for AnthropicProvider {
                         Ok(Some(Ok(chunk))) => {
                             let mut saw_done = false;
                             for ev in dec.feed(chunk.as_ref()) {
-                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
-                                    pending_metadata.push(ev);
-                                    continue;
+                                let ready = flush_or_buffer_stream_event(
+                                    ev,
+                                    &mut emitted_replay_sensitive,
+                                    &mut saw_usable_content,
+                                    &mut pending_metadata,
+                                    &mut pending_signatures,
+                                );
+                                for out_ev in ready {
+                                    if matches!(out_ev, StreamEvent::Done { .. }) {
+                                        saw_done = true;
+                                    }
+                                    yield out_ev;
                                 }
-                                if retry::is_replay_sensitive_event(&ev)
-                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
-                                {
-                                    for metadata in pending_metadata.drain(..) { yield metadata; }
-                                }
-                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                saw_usable_content |= is_usable_content_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
-                                }
-                                yield ev;
                             }
                             if saw_done { return; }
                         }
@@ -377,6 +377,40 @@ impl LlmProvider for AnthropicProvider {
 
         Ok(s.boxed())
     }
+}
+
+fn flush_or_buffer_stream_event(
+    ev: StreamEvent,
+    emitted_replay_sensitive: &mut bool,
+    saw_usable_content: &mut bool,
+    pending_metadata: &mut Vec<StreamEvent>,
+    pending_signatures: &mut Vec<StreamEvent>,
+) -> Vec<StreamEvent> {
+    if !*emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+        pending_metadata.push(ev);
+        return Vec::new();
+    }
+    if !*saw_usable_content && matches!(ev, StreamEvent::ReasoningSignature { .. }) {
+        pending_signatures.push(ev);
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if is_usable_content_event(&ev) || matches!(ev, StreamEvent::Done { .. }) {
+        out.append(pending_metadata);
+        for sig in pending_signatures.drain(..) {
+            *emitted_replay_sensitive |= retry::is_replay_sensitive_event(&sig);
+            out.push(sig);
+        }
+    } else if matches!(ev, StreamEvent::Error(_)) {
+        out.append(pending_metadata);
+        pending_signatures.clear();
+    } else if retry::is_replay_sensitive_event(&ev) {
+        out.append(pending_metadata);
+    }
+    *emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+    *saw_usable_content |= is_usable_content_event(&ev);
+    out.push(ev);
+    out
 }
 
 /// Open one `/v1/messages` stream, retrying the OPEN (transient status /
@@ -2934,8 +2968,11 @@ mod tests {
         let events: Vec<StreamEvent> = stream.collect().await;
 
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
-            "premature EOF without message_stop or usable content must NOT emit Done: {events:?}"
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Done { .. } | StreamEvent::ReasoningSignature { .. }
+            )),
+            "must not emit Done or leak ReasoningSignature: {events:?}"
         );
         let err = events
             .iter()
@@ -2943,12 +2980,147 @@ mod tests {
                 StreamEvent::Error(err) => Some(err),
                 _ => None,
             })
-            .expect("must surface StreamEvent::Error on signature-only premature EOF");
+            .expect("must surface Error");
+        assert!(
+            err.retryable,
+            "signature-only premature EOF must be retryable: {err:?}"
+        );
         assert!(
             err.message.contains("missing message_stop")
                 && err.message.contains("thinking signature only"),
-            "unexpected error message: {}",
+            "{}",
             err.message
+        );
+        let _ = handle.join();
+    }
+
+    fn sig_only_sse(id: &str, sig: &str) -> String {
+        format!(
+            "{}{}{}{}",
+            line(
+                "message_start",
+                json!({"type":"message_start","message":{"id":id,"usage":{"input_tokens":5}}})
+            ),
+            line(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})
+            ),
+            line(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":sig}})
+            ),
+            line(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0})
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn signature_only_block_followed_by_text_flushes_signature_before_text() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_http_request(&mut s);
+            let body = format!(
+                "{}{}{}{}{}{}",
+                sig_only_sse("msg_sig", "sig-deferred"),
+                line(
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}})
+                ),
+                line(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}})
+                ),
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":1})
+                ),
+                line(
+                    "message_delta",
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})
+                ),
+                line("message_stop", json!({"type":"message_stop"})),
+            );
+            s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}").as_bytes()).unwrap();
+        });
+        let provider = AnthropicProvider::new(AnthropicConfig::new(
+            "k",
+            format!("http://127.0.0.1:{port}"),
+            "claude-test",
+        ))
+        .unwrap();
+        let events: Vec<StreamEvent> = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(
+            kinds(&events),
+            vec!["response_id", "reasonsig", "text", "usage", "done"]
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ReasoningSignature { opaque, .. } if opaque == "sig-deferred")
+        );
+        assert!(matches!(&events[2], StreamEvent::TextDelta(t) if t == "ok"));
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn signature_only_block_followed_by_transport_reset_reopens_cleanly() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s1, _) = listener.accept().unwrap();
+            read_http_request(&mut s1);
+            let b1 = sig_only_sse("msg_drop", "sig-stale");
+            s1.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{b1}\r\n", b1.len()).as_bytes()).unwrap();
+            drop(s1);
+            let (mut s2, _) = listener.accept().unwrap();
+            read_http_request(&mut s2);
+            let b2 = format!(
+                "{}{}{}{}",
+                line(
+                    "message_start",
+                    json!({"type":"message_start","message":{"id":"msg_ok","usage":{"input_tokens":6}}})
+                ),
+                line(
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
+                ),
+                line(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"recovered"}})
+                ),
+                line("message_stop", json!({"type":"message_stop"})),
+            );
+            s2.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{b2}").as_bytes()).unwrap();
+        });
+        let mut cfg = AnthropicConfig::new("k", format!("http://127.0.0.1:{port}"), "claude-test");
+        cfg.retry.base_delay = std::time::Duration::from_millis(1);
+        cfg.retry.max_delay = std::time::Duration::from_millis(2);
+        let events: Vec<StreamEvent> = AnthropicProvider::new(cfg)
+            .unwrap()
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))
+            || matches!(e, StreamEvent::ReasoningSignature { opaque, .. } if opaque == "sig-stale")
+            || matches!(e, StreamEvent::ResponseId(id) if id == "msg_drop")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ResponseId(id) if id == "msg_ok"))
+                && events
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "recovered"))
         );
         let _ = handle.join();
     }
